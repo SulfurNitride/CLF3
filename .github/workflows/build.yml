@@ -1,0 +1,41 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Download 7-Zip
+        run: |
+          wget https://7-zip.org/a/7z2408-linux-x64.tar.xz
+          mkdir -p release/bin
+          tar -xf 7z2408-linux-x64.tar.xz -C release/bin
+
+      - name: Package release
+        run: |
+          cp target/release/clf3 release/
+          chmod +x release/clf3
+          chmod +x release/bin/7zz
+          tar -czvf clf3-linux-x64.tar.gz -C release .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clf3-linux-x64
+          path: clf3-linux-x64.tar.gz
