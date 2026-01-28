@@ -1,6 +1,5 @@
 /target
 /bin
 /release
-Cargo.lock
 *.db
 *.db-journal
