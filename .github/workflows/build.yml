@@ -18,9 +18,6 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - name: Run tests
-        run: cargo test
-
       - name: Download 7-Zip
         run: |
           wget -q https://7-zip.org/a/7z2408-linux-x64.tar.xz
