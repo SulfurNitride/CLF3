@@ -1,4 +1,5 @@
 //! File router module for determining where mod files should be installed.
+#![allow(unused_imports)] // Re-exports for public API
 //!
 //! This module analyzes file paths from mod archives and determines whether
 //! they should be installed to:

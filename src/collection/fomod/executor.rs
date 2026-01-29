@@ -83,7 +83,7 @@ pub fn execute_fomod(
 
             for plugin in &group.plugins {
                 // Check if this plugin is selected in choices
-                let is_selected = group_choices.map_or(false, |g| {
+                let is_selected = group_choices.is_some_and(|g| {
                     g.choices.iter().any(|c| c.name.eq_ignore_ascii_case(&plugin.name))
                 });
 
@@ -137,7 +137,7 @@ fn evaluate_dependencies(deps: &Dependencies, flags: &HashMap<String, String>) -
     for flag_dep in &deps.flags {
         let matches = flags
             .get(&flag_dep.flag)
-            .map_or(false, |v| v.eq_ignore_ascii_case(&flag_dep.value));
+            .is_some_and(|v| v.eq_ignore_ascii_case(&flag_dep.value));
         results.push(matches);
     }
 
@@ -194,9 +194,7 @@ fn install_file(
     if dest_lower == "data" || dest_lower == "data/" || dest_lower == "data\\" {
         // Just "Data" or "Data/" means root
         dest_normalized = String::new();
-    } else if dest_lower.starts_with("data/") {
-        dest_normalized = dest_normalized[5..].to_string();
-    } else if dest_lower.starts_with("data\\") {
+    } else if dest_lower.starts_with("data/") || dest_lower.starts_with("data\\") {
         dest_normalized = dest_normalized[5..].to_string();
     }
 

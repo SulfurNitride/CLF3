@@ -1,4 +1,5 @@
 //! FOMOD installer support for Nexus Collections.
+#![allow(unused_imports)] // Re-exports for public API
 //!
 //! FOMOD (Fallout Mod) is an XML-based mod installer format originally created
 //! for Fallout 3/NV but now widely used across Bethesda games. It provides:

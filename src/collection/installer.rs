@@ -1099,6 +1099,7 @@ impl CollectionInstaller {
     /// Uses LOOT for optimal plugin sorting based on:
     /// - Plugin master dependencies
     /// - LOOT masterlist rules
+    ///
     /// Falls back to collection order if LOOT fails.
     pub fn phase_generate_plugins(&mut self) -> Result<()> {
         self.report_progress(InstallProgress::PhaseStarted {

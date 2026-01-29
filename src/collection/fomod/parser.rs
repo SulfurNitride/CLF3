@@ -42,6 +42,7 @@ pub struct OptionGroup {
 
 /// Group selection type.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum GroupType {
     #[default]
     SelectAny,
@@ -52,6 +53,7 @@ pub enum GroupType {
 }
 
 impl GroupType {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "selectexactlyone" => GroupType::SelectExactlyOne,
@@ -90,6 +92,7 @@ pub enum PluginType {
 }
 
 impl PluginType {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "required" => PluginType::Required,
@@ -152,6 +155,7 @@ pub enum DependencyOperator {
 }
 
 impl DependencyOperator {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "or" => DependencyOperator::Or,
@@ -181,7 +185,7 @@ pub fn parse_fomod(path: &Path) -> Result<FomodConfig> {
 fn unescape_attr(attr: &quick_xml::events::attributes::Attribute) -> String {
     attr.unescape_value()
         .map(|s| s.to_string())
-        .unwrap_or_else(|_| unescape_attr(&attr))
+        .unwrap_or_else(|_| unescape_attr(attr))
 }
 
 /// Parse FOMOD configuration from XML string.

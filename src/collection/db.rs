@@ -40,6 +40,7 @@ impl ModStatus {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "pending" => ModStatus::Pending,
@@ -875,7 +876,7 @@ impl ModDbEntry {
 
     /// Check if this mod has expected file hashes (for hash-based installation)
     pub fn has_hashes(&self) -> bool {
-        self.hashes_json.as_ref().map_or(false, |j| !j.is_empty() && j != "[]")
+        self.hashes_json.as_ref().is_some_and(|j| !j.is_empty() && j != "[]")
     }
 
     /// Get expected file paths from hashes (normalized to forward slashes, lowercase)

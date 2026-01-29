@@ -1,4 +1,5 @@
 //! Mod Organizer 2 portable instance creation.
+#![allow(unused_imports)] // Re-exports for public API
 //!
 //! This module handles:
 //! - Downloading MO2 from GitHub releases

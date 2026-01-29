@@ -254,8 +254,8 @@ impl ModListGenerator {
         }
 
         let mut violations = 0;
-        for i in 0..n {
-            for &pred in &predecessors[i] {
+        for (i, preds) in predecessors.iter().enumerate() {
+            for &pred in preds {
                 if final_position.get(&pred).unwrap_or(&0) > final_position.get(&i).unwrap_or(&0) {
                     violations += 1;
                 }

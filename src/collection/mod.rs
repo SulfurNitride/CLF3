@@ -1,4 +1,5 @@
 //! Nexus Collections support module.
+#![allow(unused_imports)] // Re-exports for public API
 //!
 //! This module provides functionality to parse and install Nexus Mods Collections.
 //! Collections are JSON files that describe a curated set of mods with:

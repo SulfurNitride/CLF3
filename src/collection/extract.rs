@@ -785,7 +785,7 @@ fn is_root_level_file(rel_path: &str) -> bool {
     ];
 
     // Check for ENB config files at root
-    if ENB_ROOT_FILES.iter().any(|&f| filename == f) {
+    if ENB_ROOT_FILES.contains(&filename) {
         // Must not be inside a subfolder (except wrapper folders)
         // If the path has multiple components and contains data folders, reject
         if lower.contains("data/") || lower.contains("data\\") {

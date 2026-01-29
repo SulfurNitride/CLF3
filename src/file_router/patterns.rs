@@ -135,7 +135,7 @@ pub fn is_root_ini(filename: &str) -> bool {
 pub fn starts_with_root_dir(path: &str) -> bool {
     let lower = path.to_lowercase();
     let first_component = lower.split(['/', '\\']).next().unwrap_or("");
-    ROOT_DIRECTORIES.iter().any(|&dir| first_component == dir)
+    ROOT_DIRECTORIES.contains(&first_component)
 }
 
 /// Returns true if the path ends with a Data folder extension.
@@ -148,7 +148,7 @@ pub fn has_data_extension(path: &str) -> bool {
 pub fn starts_with_data_dir(path: &str) -> bool {
     let lower = path.to_lowercase();
     let first_component = lower.split(['/', '\\']).next().unwrap_or("");
-    DATA_DIRECTORIES.iter().any(|&dir| first_component == dir)
+    DATA_DIRECTORIES.contains(&first_component)
 }
 
 #[cfg(test)]

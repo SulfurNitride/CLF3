@@ -12,7 +12,7 @@
 //! Integration approach TBD - likely via subprocess with a small .NET AOT-compiled CLI
 //! that outputs JSON, which Rust parses.
 
-use std::path::PathBuf;
+use std::path::Path;
 
 /// Supported game types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -78,7 +78,7 @@ impl std::fmt::Display for GameType {
 }
 
 /// Validates that a game installation directory looks correct.
-pub fn validate_game_path(game_type: GameType, path: &PathBuf) -> anyhow::Result<()> {
+pub fn validate_game_path(game_type: GameType, path: &Path) -> anyhow::Result<()> {
     if !path.exists() {
         anyhow::bail!("Game path does not exist: {}", path.display());
     }
