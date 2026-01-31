@@ -102,7 +102,7 @@ where
     tracing::info!("Extracting MO2 to {}", output_dir.display());
     std::fs::create_dir_all(output_dir).context("Failed to create output directory")?;
 
-    sevenz_rust::decompress_file(&archive_path, output_dir)
+    crate::archive::sevenzip::extract_all(&archive_path, output_dir)
         .context("Failed to extract MO2 archive")?;
 
     // Verify extraction

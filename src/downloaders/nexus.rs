@@ -1,13 +1,13 @@
-//! Nexus Mods downloader with rate limiting
+//! Nexus Mods downloader with rate limiting and Premium support
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 const API_BASE_URL: &str = "https://api.nexusmods.com";
 const AUTH_HEADER: &str = "apikey";
@@ -29,11 +29,23 @@ impl Default for NexusRateLimits {
             hourly_limit: 100,
             hourly_remaining: 100,
             hourly_reset: None,
-            daily_limit: 2500,
-            daily_remaining: 2500,
+            // Premium users have 20,000 daily limit
+            daily_limit: 20000,
+            daily_remaining: 20000,
             daily_reset: None,
         }
     }
+}
+
+/// User info from Nexus API validation
+#[derive(Debug, Clone, Deserialize)]
+pub struct NexusUserInfo {
+    pub name: String,
+    #[serde(rename = "is_premium?")]
+    pub is_premium: bool,
+    #[serde(rename = "is_supporter?")]
+    pub is_supporter: bool,
+    pub user_id: u64,
 }
 
 impl NexusRateLimits {
@@ -78,6 +90,10 @@ pub struct NexusDownloader {
     rate_limits: RwLock<NexusRateLimits>,
     /// Total requests made this session
     request_count: AtomicUsize,
+    /// Whether user has Premium status (enables direct API downloads)
+    is_premium: AtomicBool,
+    /// Whether we've validated the API key
+    validated: AtomicBool,
 }
 
 impl NexusDownloader {
@@ -99,7 +115,64 @@ impl NexusDownloader {
             client,
             rate_limits: RwLock::new(NexusRateLimits::default()),
             request_count: AtomicUsize::new(0),
+            is_premium: AtomicBool::new(false),
+            validated: AtomicBool::new(false),
         })
+    }
+
+    /// Validate the API key and get user info (including Premium status)
+    ///
+    /// This should be called once at startup to verify credentials and check
+    /// if the user has Premium (which enables direct API downloads without rate limits).
+    pub async fn validate(&self) -> Result<NexusUserInfo> {
+        let url = format!("{}/v1/users/validate.json", API_BASE_URL);
+
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to validate API key")?;
+
+        // Update rate limits from response
+        if let Some(limits) = NexusRateLimits::from_response(&response) {
+            *self.rate_limits.write().unwrap() = limits;
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            bail!("Nexus API key validation failed ({}): {}", status, body);
+        }
+
+        let user_info: NexusUserInfo = response
+            .json()
+            .await
+            .context("Failed to parse user info")?;
+
+        // Store Premium status
+        self.is_premium.store(user_info.is_premium, Ordering::Relaxed);
+        self.validated.store(true, Ordering::Relaxed);
+
+        info!(
+            "Nexus user '{}' validated (Premium: {})",
+            user_info.name, user_info.is_premium
+        );
+
+        Ok(user_info)
+    }
+
+    /// Check if user has Premium status
+    ///
+    /// Premium users can use direct API downloads with 20,000 daily limit.
+    /// Non-premium users are limited and may need NXM browser mode.
+    pub fn is_premium(&self) -> bool {
+        self.is_premium.load(Ordering::Relaxed)
+    }
+
+    /// Check if API key has been validated
+    pub fn is_validated(&self) -> bool {
+        self.validated.load(Ordering::Relaxed)
     }
 
     /// Get current rate limits
@@ -107,12 +180,43 @@ impl NexusDownloader {
         self.rate_limits.read().unwrap().clone()
     }
 
-    /// Get download URL for a file (Premium only)
+    /// Get download URL for a file (direct API mode for Premium users)
+    ///
+    /// Premium users can call this directly with 20,000 daily limit.
+    /// Non-premium users may hit rate limits and should use NXM mode.
     pub async fn get_download_link(
         &self,
         game_domain: &str,
         mod_id: u64,
         file_id: u64,
+    ) -> Result<String> {
+        self.get_download_link_internal(game_domain, mod_id, file_id, None, None).await
+    }
+
+    /// Get download URL for a file with NXM key/expires (bypasses hourly limit, uses daily limit)
+    ///
+    /// The `key` and `expires` parameters come from NXM links generated when the user
+    /// clicks "Download with Manager" on the Nexus website. When these params are provided,
+    /// the request bypasses the hourly API limit and instead uses the daily download limit.
+    pub async fn get_download_link_with_nxm_key(
+        &self,
+        game_domain: &str,
+        mod_id: u64,
+        file_id: u64,
+        key: &str,
+        expires: u64,
+    ) -> Result<String> {
+        self.get_download_link_internal(game_domain, mod_id, file_id, Some(key), Some(expires)).await
+    }
+
+    /// Internal method for getting download links with optional NXM key
+    async fn get_download_link_internal(
+        &self,
+        game_domain: &str,
+        mod_id: u64,
+        file_id: u64,
+        nxm_key: Option<&str>,
+        nxm_expires: Option<u64>,
     ) -> Result<String> {
         // Log current rate limit state (but don't pre-emptively fail - limits may have reset)
         {
@@ -128,10 +232,20 @@ impl NexusDownloader {
             }
         }
 
-        let url = format!(
-            "{}/v1/games/{}/mods/{}/files/{}/download_link.json",
-            API_BASE_URL, game_domain, mod_id, file_id
-        );
+        // Build URL with optional NXM key/expires params
+        let url = if let (Some(key), Some(expires)) = (nxm_key, nxm_expires) {
+            // NXM mode: add key/expires to bypass hourly limit
+            format!(
+                "{}/v1/games/{}/mods/{}/files/{}/download_link.json?key={}&expires={}",
+                API_BASE_URL, game_domain, mod_id, file_id, key, expires
+            )
+        } else {
+            // Standard API mode
+            format!(
+                "{}/v1/games/{}/mods/{}/files/{}/download_link.json",
+                API_BASE_URL, game_domain, mod_id, file_id
+            )
+        };
 
         debug!("Fetching download link from: {}", url);
 
@@ -164,12 +278,29 @@ impl NexusDownloader {
             if status.as_u16() == 429 {
                 let limits = self.rate_limits.read().unwrap();
                 bail!(
-                    "Nexus API rate limit hit (429). Current limits - Hourly: {}/{}, Daily: {}/{}. Wait for reset.",
+                    "Nexus API rate limit hit (429). Hourly: {}/{}, Daily: {}/{}. Wait for reset or use NXM mode.",
                     limits.hourly_remaining,
                     limits.hourly_limit,
                     limits.daily_remaining,
                     limits.daily_limit
                 );
+            }
+
+            // Check for forbidden (403) - usually means non-Premium trying direct API
+            if status.as_u16() == 403 {
+                let is_premium = self.is_premium.load(Ordering::Relaxed);
+                if !is_premium {
+                    bail!(
+                        "Nexus API forbidden (403). Your account is not Premium. \
+                        Free users need to use NXM browser mode for downloads. \
+                        Re-run with --nxm flag or get Nexus Premium for direct downloads."
+                    );
+                } else {
+                    // Premium user got 403 - might be deleted mod or permissions issue
+                    bail!(
+                        "Nexus API forbidden (403). The mod may be hidden, deleted, or requires special permissions."
+                    );
+                }
             }
 
             let body = response.text().await.unwrap_or_default();

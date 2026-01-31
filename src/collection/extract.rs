@@ -5,9 +5,10 @@
 //! - Archive indexing for case-insensitive lookups
 //! - Parallel extraction using rayon
 //! - Progress display with indicatif
+//! - 7z binary for all archive formats (ZIP, 7z, RAR)
 
 use std::fs::{self, File};
-use std::io::{BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,6 +20,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use tracing::{info, warn};
 
+use crate::archive::sevenzip;
 use crate::file_router::FileRouter;
 
 use super::db::{ArchiveFileEntry, CollectionDb, ModDbEntry, ModStatus};
@@ -140,24 +142,10 @@ pub fn list_archive_files(archive_path: &Path) -> Result<Vec<ArchiveFileEntry>> 
     Ok(files)
 }
 
-/// List files in a ZIP archive (faster than 7z for ZIPs)
+/// List files in a ZIP archive using 7z binary
 pub fn list_zip_files(archive_path: &Path) -> Result<Vec<ArchiveFileEntry>> {
-    let file = File::open(archive_path)?;
-    let reader = BufReader::new(file);
-    let mut archive = zip::ZipArchive::new(reader)?;
-
-    let mut files = Vec::new();
-    for i in 0..archive.len() {
-        let file = archive.by_index_raw(i)?;
-        if !file.is_dir() {
-            files.push(ArchiveFileEntry {
-                file_path: file.name().to_string(),
-                file_size: file.size(),
-            });
-        }
-    }
-
-    Ok(files)
+    // Use 7z for all archive listing (consistent behavior)
+    list_archive_files(archive_path)
 }
 
 /// Detect archive type by magic bytes
@@ -331,32 +319,88 @@ pub fn index_all_archives(
     Ok(indexed_count)
 }
 
-/// Extract a single file from a ZIP archive
-fn extract_from_zip(archive_path: &Path, file_path: &str) -> Result<Vec<u8>> {
-    let file = File::open(archive_path)?;
-    let reader = BufReader::new(file);
-    let mut archive = zip::ZipArchive::new(reader)?;
+/// Extract a single file from an archive using 7z binary
+fn extract_single_file_from_archive(archive_path: &Path, file_path: &str, temp_base_dir: &Path) -> Result<Vec<u8>> {
+    let sevenz_path = get_7z_path()?;
 
-    // Try exact match first
-    if let Ok(mut entry) = archive.by_name(file_path) {
-        let mut data = Vec::with_capacity(entry.size() as usize);
-        entry.read_to_end(&mut data)?;
-        return Ok(data);
+    // Create temp dir for extraction
+    let temp_dir = tempfile::tempdir_in(temp_base_dir)
+        .context("Failed to create temp directory")?;
+
+    // Extract just the specific file using 7z
+    let output = Command::new(&sevenz_path)
+        .arg("x")
+        .arg("-y")
+        .arg(format!("-o{}", temp_dir.path().display()))
+        .arg(archive_path)
+        .arg(file_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("Failed to extract '{}' from {}", file_path, archive_path.display()))?;
+
+    if !output.status.success() {
+        // 7z returns non-zero even if file not found, try case-insensitive
+        // Fall back to full extraction and search
+        return extract_file_case_insensitive(archive_path, file_path, temp_base_dir);
     }
 
-    // Try case-insensitive match
-    let normalized = file_path.to_lowercase().replace('\\', "/");
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        let entry_normalized = entry.name().to_lowercase().replace('\\', "/");
-        if entry_normalized == normalized {
-            let mut data = Vec::with_capacity(entry.size() as usize);
-            entry.read_to_end(&mut data)?;
-            return Ok(data);
+    // Read the extracted file
+    let extracted_path = temp_dir.path().join(file_path);
+    if extracted_path.exists() {
+        return fs::read(&extracted_path)
+            .with_context(|| format!("Failed to read extracted file: {}", extracted_path.display()));
+    }
+
+    // File not found at exact path, try case-insensitive search
+    extract_file_case_insensitive(archive_path, file_path, temp_base_dir)
+}
+
+/// Extract a file with case-insensitive path matching
+fn extract_file_case_insensitive(archive_path: &Path, file_path: &str, temp_base_dir: &Path) -> Result<Vec<u8>> {
+    let sevenz_path = get_7z_path()?;
+
+    // Create temp dir for full extraction
+    let temp_dir = tempfile::tempdir_in(temp_base_dir)
+        .context("Failed to create temp directory")?;
+
+    // Extract entire archive
+    let output = Command::new(&sevenz_path)
+        .arg("x")
+        .arg("-y")
+        .arg(format!("-o{}", temp_dir.path().display()))
+        .arg(archive_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("Failed to extract archive: {}", archive_path.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("7z extraction failed: {}", stderr.lines().next().unwrap_or("unknown error"));
+    }
+
+    // Normalize the target path for comparison
+    let target_normalized = file_path.to_lowercase().replace('\\', "/");
+
+    // Search for the file case-insensitively
+    for entry in walkdir::WalkDir::new(temp_dir.path())
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let rel_path = entry.path()
+            .strip_prefix(temp_dir.path())
+            .unwrap_or(entry.path());
+        let rel_normalized = rel_path.to_string_lossy().to_lowercase().replace('\\', "/");
+
+        if rel_normalized == target_normalized {
+            return fs::read(entry.path())
+                .with_context(|| format!("Failed to read extracted file: {}", entry.path().display()));
         }
     }
 
-    bail!("File '{}' not found in archive", file_path)
+    bail!("File '{}' not found in archive '{}'", file_path, archive_path.display())
 }
 
 /// Extract entire archive to a directory using 7z
@@ -733,34 +777,12 @@ pub fn extract_and_route_mod(
     Ok(stats)
 }
 
-/// Extract ZIP to a directory (simple extraction, no routing)
+/// Extract ZIP to a directory using 7z binary
 fn extract_zip_to_dir(archive_path: &Path, output_dir: &Path) -> Result<()> {
-    let file = File::open(archive_path)?;
-    let reader = BufReader::new(file);
-    let mut archive = zip::ZipArchive::new(reader)?;
-
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        // Normalize path: Windows ZIPs have backslashes, convert to forward slashes
-        let entry_path = entry.name().replace('\\', "/");
-
-        if entry.is_dir() {
-            let dir_path = output_dir.join(&entry_path);
-            fs::create_dir_all(dir_path)?;
-        } else {
-            let file_path = output_dir.join(&entry_path);
-            if let Some(parent) = file_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut data = Vec::with_capacity(entry.size() as usize);
-            entry.read_to_end(&mut data)?;
-            let mut output = File::create(&file_path)?;
-            output.write_all(&data)?;
-        }
-    }
-
+    crate::archive::sevenzip::extract_all(archive_path, output_dir)?;
     Ok(())
 }
+
 
 /// Check if a file should go to game root (for dinput/enb mods)
 /// Handles: DLLs, EXEs, ENB configs, and ENB preset folders
@@ -1132,36 +1154,38 @@ fn merge_directories(src: &Path, dst: &Path) -> Result<()> {
 ///
 /// For mods that have a FOMOD archive but no choices recorded in the collection,
 /// we use the `hashes` array to determine which files should be installed.
-/// Extract ZIP with proper routing for root vs data files
+/// Extract archive with proper routing for root vs data files
+///
+/// Uses 7z binary for extraction with file routing based on whether the mod
+/// is a root-level mod (files go to stock_game_dir) or regular mod (files go to mod_dir).
 fn extract_zip_with_routing(
     archive_path: &Path,
     mod_dir: &Path,
     stock_game_dir: &Path,
     is_root_mod: bool,
 ) -> Result<ExtractStats> {
+    use crate::archive::sevenzip;
+
     let mut stats = ExtractStats::default();
 
-    let file = File::open(archive_path)?;
-    let reader = BufReader::new(file);
-    let mut archive = zip::ZipArchive::new(reader)?;
+    // List archive contents using 7z
+    let entries = sevenzip::list_archive(archive_path)?;
 
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-
-        if entry.is_dir() {
+    for entry in &entries {
+        if entry.is_dir {
             continue;
         }
 
-        let entry_path = entry.name().to_string();
+        let entry_path = &entry.path;
         let lower_path = entry_path.to_lowercase();
 
         // Determine where this file should go
         let dest_path = if is_root_mod && is_root_level_file(&lower_path) {
             // Root mod file: determine correct path in game root
-            get_root_dest_path(stock_game_dir, &entry_path)
+            get_root_dest_path(stock_game_dir, entry_path)
         } else {
             // Everything else: preserve structure in mod folder
-            mod_dir.join(&entry_path)
+            mod_dir.join(entry_path)
         };
 
         // Create parent dirs
@@ -1169,9 +1193,8 @@ fn extract_zip_with_routing(
             fs::create_dir_all(parent)?;
         }
 
-        // Extract file
-        let mut data = Vec::with_capacity(entry.size() as usize);
-        entry.read_to_end(&mut data)?;
+        // Extract file using 7z
+        let data = sevenzip::extract_file(archive_path, entry_path)?;
 
         let mut output = File::create(&dest_path)?;
         output.write_all(&data)?;

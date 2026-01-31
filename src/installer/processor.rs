@@ -1,18 +1,19 @@
 //! Directive processor - TTW-style batch processing
 //!
 //! Architecture:
-//! - All archives: Use 7z binary for reliable extraction
-//! - BSA: Direct extraction via ba2 crate
+//! - ZIP/7z/RAR: Extraction using 7z binary via crate::archive::sevenzip
+//! - ZIP: zip crate is used for reading .wabbajack files (they are ZIP archives)
+//! - BSA/BA2: Direct extraction via ba2 crate
 //! - Nested BSA: Extract BSA from archive, then extract file from BSA
 //! - Parallel processing using rayon
 
 use crate::bsa::{self, BsaCache, list_files as list_bsa_files};
 use crate::modlist::{ArchiveFileEntry, Directive, FromArchiveDirective, ModlistDb};
 use crate::paths;
-use std::io::BufRead;
 
 use super::config::InstallConfig;
 use super::handlers;
+use super::handlers::from_archive::{ArchiveType, detect_archive_type, extract_from_archive_with_temp};
 
 use anyhow::{bail, Context, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -22,115 +23,126 @@ use std::fs::{self, File};
 use std::io::{BufReader, Write};
 use zip::ZipArchive;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-/// Get path to bundled 7zzs binary
-fn get_7z_path() -> Result<PathBuf> {
-    // Look next to executable
-    let exe_path = std::env::current_exe().context("Failed to get executable path")?;
-    let exe_dir = exe_path.parent().unwrap_or(Path::new("."));
+/// List files in an archive using pure Rust crates
+fn list_archive_files_rust(archive_path: &Path) -> Result<Vec<ArchiveFileEntry>> {
+    let archive_type = detect_archive_type(archive_path)?;
 
-    // Try various locations
-    let candidates = [
-        exe_dir.join("7zzs"),
-        exe_dir.join("bin/7zzs"),
-        PathBuf::from("bin/7zzs"),
-        PathBuf::from("7zzs"),
-    ];
-
-    for path in &candidates {
-        if path.exists() {
-            return Ok(path.clone());
+    match archive_type {
+        ArchiveType::Zip => list_zip_files(archive_path),
+        ArchiveType::SevenZ => list_7z_files(archive_path),
+        ArchiveType::Rar => list_rar_files(archive_path),
+        ArchiveType::Bsa | ArchiveType::Ba2 => {
+            list_bsa_files(archive_path).map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|e| ArchiveFileEntry {
+                        file_path: e.path,
+                        file_size: e.size,
+                    })
+                    .collect()
+            })
+        }
+        ArchiveType::Unknown => {
+            list_zip_files(archive_path)
+                .or_else(|_| list_7z_files(archive_path))
+                .or_else(|_| list_rar_files(archive_path))
+                .with_context(|| format!("Failed to list archive: {}", archive_path.display()))
         }
     }
-
-    // Try system PATH as fallback
-    if let Ok(output) = Command::new("which").arg("7z").output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            return Ok(PathBuf::from(path));
-        }
-    }
-
-    bail!("7zzs binary not found. Please place it next to the clf3 executable.")
 }
 
-/// Extract a single file from an archive using 7z (extracts whole archive to temp, finds file)
-fn extract_with_7z(
-    sevenz_path: &Path,
+/// List files in a ZIP archive
+fn list_zip_files(archive_path: &Path) -> Result<Vec<ArchiveFileEntry>> {
+    let file = File::open(archive_path)
+        .with_context(|| format!("Failed to open ZIP: {}", archive_path.display()))?;
+    let reader = BufReader::new(file);
+    let mut archive = zip::ZipArchive::new(reader)
+        .with_context(|| format!("Failed to read ZIP: {}", archive_path.display()))?;
+
+    let mut files = Vec::new();
+    for i in 0..archive.len() {
+        let entry = archive.by_index_raw(i)?;
+        if !entry.is_dir() {
+            files.push(ArchiveFileEntry {
+                file_path: entry.name().to_string(),
+                file_size: entry.size(),
+            });
+        }
+    }
+    Ok(files)
+}
+
+/// List files in a 7z archive using 7z binary
+fn list_7z_files(archive_path: &Path) -> Result<Vec<ArchiveFileEntry>> {
+    let entries = crate::archive::sevenzip::list_archive(archive_path)
+        .with_context(|| format!("Failed to list 7z: {}", archive_path.display()))?;
+
+    Ok(entries
+        .into_iter()
+        .map(|e| ArchiveFileEntry {
+            file_path: e.path,
+            file_size: e.size,
+        })
+        .collect())
+}
+
+/// List files in a RAR archive using 7z binary
+fn list_rar_files(archive_path: &Path) -> Result<Vec<ArchiveFileEntry>> {
+    let entries = crate::archive::sevenzip::list_archive(archive_path)
+        .with_context(|| format!("Failed to list RAR: {}", archive_path.display()))?;
+
+    Ok(entries
+        .into_iter()
+        .map(|e| ArchiveFileEntry {
+            file_path: e.path,
+            file_size: e.size,
+        })
+        .collect())
+}
+
+/// Extract a single file from an archive (pure Rust implementation)
+fn extract_single_file(
     archive_path: &Path,
     file_path: &str,
     temp_base_dir: &Path,
 ) -> Result<Vec<u8>> {
-    // Create temp dir for extraction
-    let temp_dir = tempfile::tempdir_in(temp_base_dir)
-        .context("Failed to create temp directory for 7z extraction")?;
-
-    // Extract entire archive
-    let output = Command::new(sevenz_path)
-        .arg("x")
-        .arg("-y")
-        .arg(format!("-o{}", temp_dir.path().display()))
-        .arg(archive_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("Failed to run 7z on {}", archive_path.display()))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("7z extraction failed: {}", stderr.lines().next().unwrap_or("unknown error"));
-    }
-
-    // Find the file case-insensitively
-    let target_normalized = paths::normalize_for_lookup(file_path);
-
-    for entry in walkdir::WalkDir::new(temp_dir.path())
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if entry.file_type().is_file() {
-            if let Ok(rel_path) = entry.path().strip_prefix(temp_dir.path()) {
-                let normalized = paths::normalize_for_lookup(&rel_path.to_string_lossy());
-                if normalized == target_normalized {
-                    return fs::read(entry.path())
-                        .with_context(|| format!("Failed to read extracted file: {}", entry.path().display()));
-                }
-            }
-        }
-    }
-
-    bail!("File '{}' not found in archive '{}'", file_path, archive_path.display())
+    extract_from_archive_with_temp(archive_path, file_path, temp_base_dir)
 }
 
-/// Extract entire archive to temp dir, return map of normalized_path -> data for requested files
-fn extract_batch_with_7z(
-    sevenz_path: &Path,
+/// Extract multiple files from an archive (extracts whole archive, returns needed files)
+fn extract_batch_rust(
     archive_path: &Path,
     file_paths: &[&str],
-    temp_dir: &Path,
+    temp_base_dir: &Path,
 ) -> Result<HashMap<String, Vec<u8>>> {
     if file_paths.is_empty() {
         return Ok(HashMap::new());
     }
 
-    // Extract entire archive - simpler and avoids path matching issues
-    let output = Command::new(sevenz_path)
-        .arg("x")                    // Extract with full paths
-        .arg("-y")                   // Yes to all
-        .arg(format!("-o{}", temp_dir.display()))
-        .arg(archive_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("Failed to run 7z on {}", archive_path.display()))?;
+    let archive_type = detect_archive_type(archive_path)?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("7z extraction failed: {}", stderr.lines().next().unwrap_or("unknown error"));
+    // Create temp dir for extraction
+    let temp_dir = tempfile::tempdir_in(temp_base_dir)
+        .context("Failed to create temp directory")?;
+
+    // Extract entire archive based on type
+    match archive_type {
+        ArchiveType::Zip => extract_zip_to_temp(archive_path, temp_dir.path())?,
+        ArchiveType::SevenZ => extract_7z_to_temp(archive_path, temp_dir.path())?,
+        ArchiveType::Rar => extract_rar_to_temp(archive_path, temp_dir.path())?,
+        ArchiveType::Bsa | ArchiveType::Ba2 => {
+            bail!("BSA/BA2 should not use batch extraction")
+        }
+        ArchiveType::Unknown => {
+            extract_zip_to_temp(archive_path, temp_dir.path())
+                .or_else(|_| extract_7z_to_temp(archive_path, temp_dir.path()))
+                .or_else(|_| extract_rar_to_temp(archive_path, temp_dir.path()))
+                .with_context(|| format!("Failed to extract: {}", archive_path.display()))?
+        }
     }
 
     // Build set of normalized paths we need
@@ -141,9 +153,53 @@ fn extract_batch_with_7z(
 
     // Walk temp dir and collect files we need
     let mut results = HashMap::new();
-    collect_needed_files(temp_dir, temp_dir, &needed, &mut results)?;
+    collect_needed_files(temp_dir.path(), temp_dir.path(), &needed, &mut results)?;
 
     Ok(results)
+}
+
+/// Extract entire ZIP to temp directory
+fn extract_zip_to_temp(archive_path: &Path, temp_dir: &Path) -> Result<()> {
+    let file = File::open(archive_path)?;
+    let reader = BufReader::new(file);
+    let mut archive = zip::ZipArchive::new(reader)?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        let entry_path = match entry.enclosed_name() {
+            Some(p) => p.to_path_buf(),
+            None => continue,
+        };
+
+        let output_path = temp_dir.join(&entry_path);
+
+        if entry.is_dir() {
+            fs::create_dir_all(&output_path)?;
+        } else {
+            if let Some(parent) = output_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut outfile = File::create(&output_path)?;
+            std::io::copy(&mut entry, &mut outfile)?;
+        }
+    }
+    Ok(())
+}
+
+/// Extract entire 7z to temp directory using 7z binary
+fn extract_7z_to_temp(archive_path: &Path, temp_dir: &Path) -> Result<()> {
+    crate::archive::sevenzip::extract_all(archive_path, temp_dir)
+        .map(|_| ())
+        .with_context(|| format!("Failed to extract 7z: {}", archive_path.display()))
+}
+
+/// Extract entire RAR to temp directory using 7z binary
+///
+/// The 7z binary handles RAR5 reference records correctly, unlike the unrar crate.
+fn extract_rar_to_temp(archive_path: &Path, temp_dir: &Path) -> Result<()> {
+    crate::archive::sevenzip::extract_all(archive_path, temp_dir)
+        .map(|_| ())
+        .with_context(|| format!("Failed to extract RAR: {}", archive_path.display()))
 }
 
 /// Recursively collect files from extracted archive
@@ -176,66 +232,8 @@ fn collect_needed_files(
     Ok(())
 }
 
-/// List all files in an archive using 7z
-fn list_archive_files(sevenz_path: &Path, archive_path: &Path) -> Result<Vec<ArchiveFileEntry>> {
-    let output = Command::new(sevenz_path)
-        .arg("l")           // List
-        .arg("-slt")        // Technical listing (one field per line)
-        .arg("-ba")         // Bare output (no headers)
-        .arg(archive_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("Failed to list archive: {}", archive_path.display()))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("7z list failed: {}", stderr.lines().next().unwrap_or("unknown error"));
-    }
-
-    let mut files = Vec::new();
-    let mut current_path: Option<String> = None;
-    let mut current_size: u64 = 0;
-    let mut is_folder = false;
-
-    for line in output.stdout.lines() {
-        let line = line?;
-        if let Some(path) = line.strip_prefix("Path = ") {
-            // Save previous entry if it was a file
-            if let Some(prev_path) = current_path.take() {
-                if !is_folder {
-                    files.push(ArchiveFileEntry {
-                        file_path: prev_path,
-                        file_size: current_size,
-                    });
-                }
-            }
-            current_path = Some(path.to_string());
-            current_size = 0;
-            is_folder = false;
-        } else if let Some(size) = line.strip_prefix("Size = ") {
-            current_size = size.parse().unwrap_or(0);
-        } else if let Some(folder) = line.strip_prefix("Folder = ") {
-            is_folder = folder.trim() == "+";
-        }
-    }
-
-    // Don't forget last entry
-    if let Some(path) = current_path {
-        if !is_folder {
-            files.push(ArchiveFileEntry {
-                file_path: path,
-                file_size: current_size,
-            });
-        }
-    }
-
-    Ok(files)
-}
-
 /// Index all archives that need indexing
 fn index_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
-    let sevenz_path = get_7z_path()?;
 
     // Get all archives
     let archives = db.get_all_archives()?;
@@ -280,11 +278,17 @@ fn index_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
 
         pb.set_message(format!("Indexing {}...", archive.name));
 
-        // Detect archive type to use appropriate listing method
-        let archive_type = detect_archive_type(&archive_path);
+        // Detect archive type using magic bytes
+        let archive_type = match detect_archive_type(&archive_path) {
+            Ok(t) => t,
+            Err(_) => ArchiveType::Unknown,
+        };
 
         // Skip non-archive files (game files like ESM, ESL, INI, BIK, etc.)
-        let is_indexable = matches!(archive_type.as_str(), "zip" | "7z" | "rar" | "bsa");
+        let is_indexable = matches!(
+            archive_type,
+            ArchiveType::Zip | ArchiveType::SevenZ | ArchiveType::Rar | ArchiveType::Bsa | ArchiveType::Ba2
+        );
         if !is_indexable {
             // Mark as indexed with empty file list (it's a single file, not a container)
             let _ = db.index_archive_files(&archive.hash, &[]);
@@ -292,21 +296,8 @@ fn index_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
             continue;
         }
 
-        let list_result = if archive_type == "bsa" {
-            // Use BSA-specific listing
-            list_bsa_files(&archive_path).map(|entries| {
-                entries
-                    .into_iter()
-                    .map(|e| ArchiveFileEntry {
-                        file_path: e.path,
-                        file_size: e.size,
-                    })
-                    .collect()
-            })
-        } else {
-            // Use 7z for ZIP/7z/RAR archives
-            list_archive_files(&sevenz_path, &archive_path)
-        };
+        // Use pure Rust listing for all archive types
+        let list_result = list_archive_files_rust(&archive_path);
 
         match list_result {
             Ok(files) => {
@@ -599,34 +590,6 @@ fn check_missing_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<Vec<(S
     Ok(missing)
 }
 
-/// Detect archive type by magic bytes (more reliable than extension)
-fn detect_archive_type(path: &Path) -> String {
-    if let Ok(mut file) = File::open(path) {
-        let mut magic = [0u8; 8];
-        if std::io::Read::read(&mut file, &mut magic).is_ok() {
-            // Check magic bytes
-            if &magic[0..4] == b"PK\x03\x04" || &magic[0..4] == b"PK\x05\x06" {
-                return "zip".to_string();
-            }
-            if &magic[0..6] == b"7z\xBC\xAF\x27\x1C" {
-                return "7z".to_string();
-            }
-            if &magic[0..4] == b"Rar!" {
-                return "rar".to_string();
-            }
-            if &magic[0..4] == b"BSA\x00" || &magic[0..4] == b"BTDX" {
-                return "bsa".to_string();
-            }
-        }
-    }
-    // Fall back to extension
-    path.extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase()
-}
-
-
 /// Check if a file path looks like a BSA/BA2 archive
 fn is_bsa_file(path: &str) -> bool {
     let lower = path.to_lowercase();
@@ -649,6 +612,152 @@ fn get_bsa_working_path(downloads_dir: &Path, archive_hash: &str, bsa_path: &str
     working_dir.join(safe_name)
 }
 
+/// Clean up BSA temp directories after installation completes.
+/// Call this as post-install cleanup, not at startup.
+pub fn cleanup_bsa_temp_dirs(config: &InstallConfig) -> Result<()> {
+    // 1. Clean up TEMP_BSA_FILES staging directory
+    let staging_root = config.output_dir.join("TEMP_BSA_FILES");
+    if staging_root.exists() {
+        eprintln!("Cleaning up orphaned BSA staging directories...");
+        match std::fs::remove_dir_all(&staging_root) {
+            Ok(()) => eprintln!("  Removed: {}", staging_root.display()),
+            Err(e) => eprintln!("  WARN: Failed to remove {}: {}", staging_root.display(), e),
+        }
+    }
+
+    // 2. Clean up Working_BSA cache
+    let working_dir = get_bsa_working_dir(&config.downloads_dir);
+    if working_dir.exists() {
+        eprintln!("Cleaning up BSA working cache...");
+        match std::fs::remove_dir_all(&working_dir) {
+            Ok(()) => eprintln!("  Removed: {}", working_dir.display()),
+            Err(e) => eprintln!("  WARN: Failed to remove {}: {}", working_dir.display(), e),
+        }
+    }
+
+    Ok(())
+}
+
+/// Process all pending directives using streaming pipeline.
+///
+/// This is an alternative to `process_directives` that uses a streaming
+/// architecture with separate extraction and mover worker pools.
+///
+/// Benefits:
+/// - Configurable worker pools (default 8+8 workers)
+/// - Memory-aware backpressure to prevent OOM
+/// - Better I/O pipelining for large modlists
+///
+/// Use this when installing large modlists or on systems with limited RAM.
+pub fn process_directives_streaming(
+    db: &ModlistDb,
+    config: &InstallConfig,
+    _extraction_workers: usize,
+    _mover_workers: usize,
+) -> Result<ProcessStats> {
+    let ctx = ProcessContext::new(config, db)?;
+
+    // Show directive counts
+    let type_counts = db.get_directive_type_counts()?;
+    println!("Directive types:");
+    for (dtype, count) in &type_counts {
+        println!("  {:>8}  {}", count, dtype);
+    }
+    println!();
+
+    // Pre-flight check
+    println!("--- Pre-flight: Checking archives ---\n");
+    let missing_archives = check_missing_archives(db, &ctx)?;
+    if !missing_archives.is_empty() {
+        println!("ERROR: {} archives are missing! Re-run to download them:\n", missing_archives.len());
+        for (name, hash) in missing_archives.iter().take(20) {
+            println!("  - {} ({})", name, hash);
+        }
+        if missing_archives.len() > 20 {
+            println!("  ... and {} more", missing_archives.len() - 20);
+        }
+        bail!("Missing archives - re-run the installer to download them");
+    }
+    println!("All needed archives present\n");
+
+    // Phase 3a: Index archive contents
+    println!("--- Phase 3a: Index archive contents ---\n");
+    index_archives(db, &ctx)?;
+
+    // Phase 3b: Process directives using streaming pipeline
+    println!("\n--- Phase 3b: Process directives (streaming) ---\n");
+
+    let stats = db.get_directive_stats()?;
+    let total_pending = stats.pending;
+
+    if total_pending == 0 {
+        println!("No directives to process");
+        return Ok(ProcessStats::default());
+    }
+
+    println!("Processing {} directives...\n", total_pending);
+
+    let pb = ProgressBar::new(total_pending as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {msg}",
+            )
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+    pb.enable_steady_tick(Duration::from_millis(100));
+
+    let completed = AtomicUsize::new(0);
+    let skipped = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
+
+    // Use streaming pipeline for FromArchive directives
+    let streaming_config = super::streaming::StreamingConfig::default();
+    pb.set_message("Processing FromArchive (streaming)...");
+    let streaming_stats = super::streaming::process_from_archive_streaming(db, &ctx, streaming_config, &pb)?;
+    completed.fetch_add(streaming_stats.written, Ordering::Relaxed);
+    skipped.fetch_add(streaming_stats.skipped, Ordering::Relaxed);
+    failed.fetch_add(streaming_stats.failed, Ordering::Relaxed);
+
+    // Process other directives using standard methods
+    pb.set_message("Processing InlineFile...");
+    process_simple_directives(db, &ctx, "InlineFile", &pb, &completed, &skipped, &failed)?;
+
+    pb.set_message("Processing RemappedInlineFile...");
+    process_simple_directives(db, &ctx, "RemappedInlineFile", &pb, &completed, &skipped, &failed)?;
+
+    pb.set_message("Processing PatchedFromArchive...");
+    process_patched_from_archive(db, &ctx, &pb, &completed, &skipped, &failed)?;
+
+    pb.set_message("Processing TransformedTexture...");
+    process_transformed_texture(db, &ctx, &pb, &completed, &skipped, &failed)?;
+
+    pb.set_message("Processing CreateBSA...");
+    process_create_bsa(db, &ctx, &pb, &completed, &skipped, &failed)?;
+
+    pb.finish_and_clear();
+
+    let stats = ProcessStats {
+        completed: completed.load(Ordering::Relaxed),
+        skipped: skipped.load(Ordering::Relaxed),
+        failed: failed.load(Ordering::Relaxed),
+    };
+
+    println!(
+        "Processed {} directives ({} completed, {} skipped, {} failed)",
+        stats.completed + stats.skipped + stats.failed,
+        stats.completed,
+        stats.skipped,
+        stats.failed
+    );
+
+    // Phase 4: Clean up extra files
+    println!("\n--- Phase 4: Cleanup extra files ---\n");
+    cleanup_extra_files(db, &ctx)?;
+
+    Ok(stats)
+}
 
 /// Process all pending directives
 pub fn process_directives(db: &ModlistDb, config: &InstallConfig) -> Result<ProcessStats> {
@@ -959,11 +1068,9 @@ fn process_from_archive_fast(
         pb.println(format!("Resolved {} paths from archive index", path_lookups));
     }
 
-    // Get 7z binary path
-    let sevenz_path = get_7z_path()?;
-    pb.println(format!("Using 7z: {}", sevenz_path.display()));
+    pb.println("Using 7z binary for archive extraction (ZIP, 7z, RAR)");
 
-    // Separate BSA archives from others (BSA uses ba2 crate, everything else uses 7z)
+    // Separate BSA archives from others (BSA uses ba2 crate, everything else uses pure Rust)
     let mut bsa_archives: Vec<_> = Vec::new();
     let mut other_archives: Vec<_> = Vec::new();
 
@@ -989,17 +1096,17 @@ fn process_from_archive_fast(
             }
         };
 
-        // Only separate BSA/BA2 files - everything else goes through 7z
-        let archive_type = detect_archive_type(&archive_path);
-        match archive_type.as_str() {
-            "bsa" | "ba2" => bsa_archives.push((archive_hash, archive_path, directives)),
+        // Separate BSA/BA2 files from others
+        let archive_type = detect_archive_type(&archive_path).unwrap_or(ArchiveType::Unknown);
+        match archive_type {
+            ArchiveType::Bsa | ArchiveType::Ba2 => bsa_archives.push((archive_hash, archive_path, directives)),
             _ => other_archives.push((archive_hash, archive_path, directives)),
         }
     }
 
     let num_threads = rayon::current_num_threads();
 
-    // Phase 1: Process regular archives in parallel using 7z
+    // Phase 1: Process regular archives in parallel using pure Rust crates
     if !other_archives.is_empty() {
         // Hide main progress bar during multi-progress phase
         pb.set_draw_target(indicatif::ProgressDrawTarget::hidden());
@@ -1019,7 +1126,6 @@ fn process_from_archive_fast(
         // Wrap in Arc for sharing across threads
         let mp = Arc::new(mp);
         let overall_pb = Arc::new(overall_pb);
-        let sevenz_path = Arc::new(sevenz_path);
         let failure_tracker = failure_tracker.clone();
 
         other_archives.par_iter().for_each(|(archive_hash, archive_path, directives)| {
@@ -1114,19 +1220,31 @@ fn process_from_archive_fast(
                 // Collect unique paths for extraction
                 let paths: Vec<&str> = to_extract.iter().map(|(_, _, p)| p.as_str()).collect();
 
-                // Batch extract
-                let extracted = match extract_batch_with_7z(&sevenz_path, archive_path, &paths, temp_dir.path()) {
+                // Batch extract using pure Rust
+                let extracted = match extract_batch_rust(archive_path, &paths, temp_dir.path()) {
                     Ok(data) => data,
                     Err(e) => {
                         // Log the error and fall back to per-file extraction
                         overall_pb.println(format!("BATCH FAIL {}: {}", archive_name, e));
                         archive_pb.set_message(format!("{} (fallback mode)", display_name));
                         let mut fallback_data = HashMap::new();
-                        for (_, _, path) in &to_extract {
-                            if let Ok(data) = extract_with_7z(&sevenz_path, archive_path, path, &ctx.config.downloads_dir) {
-                                let key = paths::normalize_for_lookup(path);
-                                fallback_data.insert(key, data);
+                        let mut fallback_errors = 0;
+                        for (id, _, path) in &to_extract {
+                            match extract_single_file(archive_path, path, &ctx.config.downloads_dir) {
+                                Ok(data) => {
+                                    let key = paths::normalize_for_lookup(path);
+                                    fallback_data.insert(key, data);
+                                }
+                                Err(e) => {
+                                    fallback_errors += 1;
+                                    if fallback_errors <= 3 {
+                                        overall_pb.println(format!("FALLBACK ERR [{}]: {} - {:#}", id, path, e));
+                                    }
+                                }
                             }
+                        }
+                        if fallback_errors > 3 {
+                            overall_pb.println(format!("... and {} more fallback errors", fallback_errors - 3));
                         }
                         fallback_data
                     }
@@ -1177,7 +1295,7 @@ fn process_from_archive_fast(
 
                     // Extract BSA if temp file doesn't exist
                     if !bsa_temp_path.exists() {
-                        let data = extract_with_7z(&sevenz_path, archive_path, bsa_path, &ctx.config.downloads_dir)
+                        let data = extract_single_file(archive_path, bsa_path, &ctx.config.downloads_dir)
                             .with_context(|| format!("Failed to extract BSA '{}' from archive", bsa_path))?;
                         fs::write(&bsa_temp_path, &data)
                             .with_context(|| format!("Failed to write BSA temp file: {}", bsa_temp_path.display()))?;
@@ -1349,7 +1467,19 @@ fn write_output(ctx: &ProcessContext, directive: &FromArchiveDirective, data: &[
     Ok(())
 }
 
-/// Process PatchedFromArchive directives with progress display
+/// Process PatchedFromArchive directives with producer-consumer pipeline.
+///
+/// Architecture:
+/// - Patch applier workers (N/2 threads): Extract source, apply delta patch, produce patched data
+/// - Writer workers (N/2 threads): Consume and write to disk
+/// Process PatchedFromArchive directives with memory-optimized disk-based extraction.
+///
+/// This uses disk-based extraction and memory-mapped files to minimize RAM usage:
+/// - Source files are extracted to temp directory, not loaded into RAM
+/// - Patches are applied using memory-mapped source files
+/// - Output is streamed directly to disk
+///
+/// Memory usage is bounded to ~O(delta_size) per patch instead of O(source + delta + output).
 fn process_patched_from_archive(
     db: &ModlistDb,
     ctx: &ProcessContext,
@@ -1359,8 +1489,12 @@ fn process_patched_from_archive(
     failed: &AtomicUsize,
 ) -> Result<()> {
     use crate::modlist::PatchedFromArchiveDirective;
+    use crossbeam_channel::bounded;
 
     let failure_tracker = Arc::new(FailureTracker::new());
+
+    // Clean up any leftover temp dirs from previous interrupted runs
+    crate::installer::streaming::cleanup_temp_dirs(&ctx.config.downloads_dir);
 
     pb.set_message("Loading PatchedFromArchive directives...");
     let all_raw = db.get_all_pending_directives_of_type("PatchedFromArchive")?;
@@ -1370,15 +1504,26 @@ fn process_patched_from_archive(
         return Ok(());
     }
 
-    pb.set_message(format!("Parsing {} PatchedFromArchive directives...", all_raw.len()));
+    pb.set_message("Pre-filtering completed patches...");
 
-    // Parse and group by archive
+    // Parse, pre-filter against existing files, and group by archive
     let mut by_archive: HashMap<String, Vec<(i64, PatchedFromArchiveDirective)>> = HashMap::new();
     let mut parse_failures = 0;
+    let mut pre_skipped = 0usize;
 
     for (id, json) in all_raw {
         match serde_json::from_str::<Directive>(&json) {
             Ok(Directive::PatchedFromArchive(d)) => {
+                // PRE-FILTER: Skip if output already exists with correct size
+                let normalized_to = paths::normalize_for_lookup(&d.to);
+                if let Some(&existing_size) = ctx.existing_files.get(&normalized_to) {
+                    if existing_size == d.size {
+                        pre_skipped += 1;
+                        skipped.fetch_add(1, Ordering::Relaxed);
+                        continue; // Skip this directive entirely
+                    }
+                }
+
                 if let Some(hash) = d.archive_hash_path.first() {
                     by_archive.entry(hash.clone()).or_default().push((id, d));
                 }
@@ -1391,236 +1536,122 @@ fn process_patched_from_archive(
         }
     }
 
+    if pre_skipped > 0 {
+        eprintln!("Pre-filtered {} already-complete patches", pre_skipped);
+    }
     if parse_failures > 0 {
         pb.println(format!("WARN: {} PatchedFromArchive directives failed to parse", parse_failures));
     }
 
-    let total_archives = by_archive.len();
-    let total_directives: usize = by_archive.values().map(|v| v.len()).sum();
-    pb.println(format!("Processing {} patches across {} archives...", total_directives, total_archives));
+    // Build archive list with sizes for sorting
+    let mut archives_with_size: Vec<(String, Vec<(i64, PatchedFromArchiveDirective)>, u64)> = by_archive
+        .into_iter()
+        .map(|(hash, directives)| {
+            let size = ctx.get_archive_path(&hash)
+                .and_then(|p| fs::metadata(p).ok())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            (hash, directives, size)
+        })
+        .collect();
 
-    let failure_tracker = failure_tracker.clone();
-    let archives_processed = AtomicUsize::new(0);
+    // Sort archives smallest to largest for better throughput
+    archives_with_size.sort_by_key(|(_, _, size)| *size);
 
-    // Process archives in parallel
-    let archives_vec: Vec<_> = by_archive.into_iter().collect();
+    let total_archives = archives_with_size.len();
+    let total_directives: usize = archives_with_size.iter().map(|(_, d, _)| d.len()).sum();
 
-    let sevenz_path = get_7z_path().ok();
+    eprintln!(
+        "Processing {} patches across {} archives (mmap-based, parallel)...",
+        total_directives, total_archives
+    );
 
-    archives_vec.par_iter().for_each(|(archive_hash, directives)| {
-        let archive_path = match ctx.get_archive_path(archive_hash) {
-            Some(p) => p.clone(),
-            None => {
-                // Archive not found - but check if outputs already exist first
-                let mut any_needed = false;
-                for (_, directive) in directives {
-                    if output_exists(ctx, &directive.to, directive.size) {
-                        skipped.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                        any_needed = true;
-                    }
-                    pb.inc(1);
-                }
-                if any_needed {
-                    pb.println(format!("WARN: Archive not found for patching: {}", archive_hash));
-                }
-                archives_processed.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        };
+    // Reset progress bar for patching phase
+    pb.finish_and_clear();
+    pb.reset();
+    pb.set_length(total_directives as u64);
+    pb.set_position(0);
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-        // Filter to directives that need processing
-        let to_process: Vec<_> = directives
-            .iter()
-            .filter(|(_, d)| !output_exists(ctx, &d.to, d.size))
-            .collect();
+    // Create a dummy channel (not used, but keeps API compatible)
+    // The new process_archive_patches writes directly to disk
+    let (tx, _rx) = bounded::<(Vec<u8>, PathBuf, u64, i64)>(1);
 
-        // Count skipped
-        let skip_count = directives.len() - to_process.len();
-        if skip_count > 0 {
-            skipped.fetch_add(skip_count, Ordering::Relaxed);
-            pb.inc(skip_count as u64);
+    // Wrap counters in Arc for sharing
+    let completed = Arc::new(AtomicUsize::new(completed.load(Ordering::Relaxed)));
+    let failed = Arc::new(AtomicUsize::new(failed.load(Ordering::Relaxed)));
+    let skipped = Arc::new(AtomicUsize::new(skipped.load(Ordering::Relaxed)));
+
+    // Tier archives by size (same approach as FromArchive)
+    const HALF_GB: u64 = 512 * 1024 * 1024;
+    const TWO_GB: u64 = 2 * 1024 * 1024 * 1024;
+
+    let mut small_archives = Vec::new();  // ≤512MB - full parallel
+    let mut medium_archives = Vec::new(); // 512MB-2GB - limited parallel
+    let mut large_archives = Vec::new();  // ≥2GB - sequential
+
+    for (hash, directives, size) in archives_with_size {
+        if size <= HALF_GB {
+            small_archives.push((hash, directives, size));
+        } else if size < TWO_GB {
+            medium_archives.push((hash, directives, size));
+        } else {
+            large_archives.push((hash, directives, size));
         }
+    }
 
-        if to_process.is_empty() {
-            archives_processed.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
+    eprintln!(
+        "Patching: {} small + {} medium + {} large archives",
+        small_archives.len(), medium_archives.len(), large_archives.len()
+    );
 
-        // Collect unique source paths needed from this archive
-        // Simple paths (len == 2): file directly in archive
-        // Nested BSA (len >= 3): BSA in archive, file in BSA
-        let mut simple_paths: HashMap<String, String> = HashMap::new(); // normalized -> original
-        let mut nested_bsas: HashMap<String, Vec<String>> = HashMap::new(); // bsa_path -> [files_in_bsa]
-
-        for (_, directive) in &to_process {
-            if directive.archive_hash_path.len() == 2 {
-                let path = &directive.archive_hash_path[1];
-                let normalized = paths::normalize_for_lookup(path);
-                simple_paths.insert(normalized, path.clone());
-            } else if directive.archive_hash_path.len() >= 3 {
-                let bsa_path = &directive.archive_hash_path[1];
-                let file_in_bsa = &directive.archive_hash_path[2];
-                nested_bsas.entry(bsa_path.clone()).or_default().push(file_in_bsa.clone());
-                // Also need to extract the BSA itself
-                let normalized = paths::normalize_for_lookup(bsa_path);
-                simple_paths.insert(normalized, bsa_path.clone());
-            }
-        }
-
-        // Batch extract all needed files from this archive
-        let mut extracted: HashMap<String, Vec<u8>> = HashMap::new();
-
-        if !simple_paths.is_empty() {
-            let archive_type = detect_archive_type(&archive_path);
-            let batch_result = match archive_type.as_str() {
-                "zip" => {
-                    // ZIP: extract needed files directly (random access)
-                    let mut result = HashMap::new();
-                    if let Ok(file) = File::open(&archive_path) {
-                        if let Ok(mut archive) = zip::ZipArchive::new(BufReader::new(file)) {
-                            for i in 0..archive.len() {
-                                if let Ok(mut entry) = archive.by_index(i) {
-                                    let entry_name = entry.name().to_string();
-                                    let normalized = paths::normalize_for_lookup(&entry_name);
-                                    if simple_paths.contains_key(&normalized) {
-                                        let mut data = Vec::with_capacity(entry.size() as usize);
-                                        if std::io::Read::read_to_end(&mut entry, &mut data).is_ok() {
-                                            result.insert(normalized, data);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    result
-                }
-                "bsa" => {
-                    // BSA: extract needed files directly
-                    let mut result = HashMap::new();
-                    for (normalized, original) in &simple_paths {
-                        if let Ok(data) = bsa::extract_file(&archive_path, original) {
-                            result.insert(normalized.clone(), data);
-                        }
-                    }
-                    result
-                }
-                _ => {
-                    // 7z/RAR/other: batch extract entire archive to temp, then read needed files
-                    if let Some(ref sevenz) = sevenz_path {
-                        if let Ok(temp_dir) = tempfile::tempdir_in(&ctx.config.downloads_dir) {
-                            let paths_vec: Vec<&str> = simple_paths.values().map(|s| s.as_str()).collect();
-                            extract_batch_with_7z(sevenz, &archive_path, &paths_vec, temp_dir.path())
-                                .unwrap_or_default()
-                        } else {
-                            HashMap::new()
-                        }
-                    } else {
-                        HashMap::new()
-                    }
-                }
-            };
-            extracted.extend(batch_result);
-        }
-
-        // For nested BSAs: extract files from BSAs we just extracted
-        for (bsa_path, files_in_bsa) in &nested_bsas {
-            let bsa_normalized = paths::normalize_for_lookup(bsa_path);
-            if let Some(bsa_data) = extracted.get(&bsa_normalized) {
-                // Write BSA to temp file and extract from it
-                if let Ok(temp_bsa) = tempfile::Builder::new()
-                    .prefix(".clf3_bsa_")
-                    .suffix(".bsa")
-                    .tempfile_in(&ctx.config.downloads_dir)
-                {
-                    if fs::write(temp_bsa.path(), bsa_data).is_ok() {
-                        for file_path in files_in_bsa {
-                            if let Ok(file_data) = bsa::extract_file(temp_bsa.path(), file_path) {
-                                // Key: "bsa_path/file_path" normalized
-                                let key = format!("{}/{}", bsa_path, file_path);
-                                let normalized_key = paths::normalize_for_lookup(&key);
-                                extracted.insert(normalized_key, file_data);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let archive_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-
-        // Process each patch using the extracted data
-        for (id, directive) in to_process {
-            let result: Result<()> = (|| {
-                // Get source data from extracted cache
-                let source_data = if directive.archive_hash_path.len() == 1 {
-                    // Whole file is the source
-                    fs::read(&archive_path)?
-                } else if directive.archive_hash_path.len() == 2 {
-                    // Simple: file directly in archive
-                    let path = &directive.archive_hash_path[1];
-                    let normalized = paths::normalize_for_lookup(path);
-                    extracted.get(&normalized)
-                        .cloned()
-                        .ok_or_else(|| anyhow::anyhow!("Source file not found in extracted cache: {}", path))?
-                } else if directive.archive_hash_path.len() >= 3 {
-                    // Nested BSA: file inside BSA inside archive
-                    let bsa_path = &directive.archive_hash_path[1];
-                    let file_in_bsa = &directive.archive_hash_path[2];
-                    let key = format!("{}/{}", bsa_path, file_in_bsa);
-                    let normalized = paths::normalize_for_lookup(&key);
-                    extracted.get(&normalized)
-                        .cloned()
-                        .ok_or_else(|| anyhow::anyhow!("Source file not found in BSA cache: {} / {}", bsa_path, file_in_bsa))?
-                } else {
-                    anyhow::bail!("Invalid archive_hash_path");
-                };
-
-                // Load delta patch from wabbajack
-                let patch_name = directive.patch_id.to_string();
-                let delta_data = ctx.read_wabbajack_file(&patch_name)?;
-
-                // Apply delta patch
-                use crate::octodiff::DeltaReader;
-                use std::io::Cursor;
-                let basis = Cursor::new(source_data);
-                let delta = Cursor::new(delta_data);
-                let mut reader = DeltaReader::new(basis, delta)?;
-                let mut patched_data = Vec::with_capacity(directive.size as usize);
-                std::io::Read::read_to_end(&mut reader, &mut patched_data)?;
-
-                // Verify size
-                if patched_data.len() as u64 != directive.size {
-                    anyhow::bail!("Size mismatch: expected {}, got {}", directive.size, patched_data.len());
-                }
-
-                // Write output
-                let output_path = ctx.resolve_output_path(&directive.to);
-                paths::ensure_parent_dirs(&output_path)?;
-                let mut file = File::create(&output_path)?;
-                file.write_all(&patched_data)?;
-
-                Ok(())
-            })();
-
-            match result {
-                Ok(()) => {
-                    completed.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    failure_tracker.record_failure(&archive_name, &e.to_string());
-                    if failed.load(Ordering::Relaxed) <= 10 {
-                        pb.println(format!("FAIL [{}] patch: {:#}", id, e));
-                    }
-                }
-            }
-            pb.inc(1);
-        }
-
-        archives_processed.fetch_add(1, Ordering::Relaxed);
+    // Process SMALL archives in full parallel
+    small_archives.par_iter().for_each(|(archive_hash, directives, _size)| {
+        process_archive_patches(
+            ctx,
+            archive_hash,
+            directives,
+            &tx,
+            pb,
+            &skipped,
+            &failed,
+            &failure_tracker,
+            &completed,
+        );
     });
+
+    // Process MEDIUM archives with limited parallelism (half threads)
+    let half_threads = (rayon::current_num_threads() / 2).max(1);
+    for chunk in medium_archives.chunks(half_threads) {
+        chunk.par_iter().for_each(|(archive_hash, directives, _size)| {
+            process_archive_patches(
+                ctx,
+                archive_hash,
+                directives,
+                &tx,
+                pb,
+                &skipped,
+                &failed,
+                &failure_tracker,
+                &completed,
+            );
+        });
+    }
+
+    // Process LARGE archives sequentially (one at a time, all threads for extraction)
+    for (archive_hash, directives, _size) in &large_archives {
+        process_archive_patches(
+            ctx,
+            archive_hash,
+            directives,
+            &tx,
+            pb,
+            &skipped,
+            &failed,
+            &failure_tracker,
+            &completed,
+        );
+    }
 
     // Print failure summary
     failure_tracker.print_summary(pb);
@@ -1628,6 +1659,352 @@ fn process_patched_from_archive(
     Ok(())
 }
 
+/// Process patches for a single archive using disk-based extraction (memory-optimized).
+///
+/// Instead of loading all source files into RAM, extracts to temp directory and uses
+/// memory-mapped files for patching. Writes output directly to disk.
+fn process_archive_patches(
+    ctx: &ProcessContext,
+    archive_hash: &str,
+    directives: &[(i64, crate::modlist::PatchedFromArchiveDirective)],
+    _tx: &crossbeam_channel::Sender<(Vec<u8>, PathBuf, u64, i64)>,
+    pb: &ProgressBar,
+    skipped: &Arc<AtomicUsize>,
+    failed: &Arc<AtomicUsize>,
+    failure_tracker: &Arc<FailureTracker>,
+    completed: &Arc<AtomicUsize>,
+) {
+    let archive_path = match ctx.get_archive_path(archive_hash) {
+        Some(p) => p.clone(),
+        None => {
+            // Archive not found - but check if outputs already exist first
+            let mut any_needed = false;
+            for (_, directive) in directives {
+                if output_exists(ctx, &directive.to, directive.size) {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    any_needed = true;
+                }
+                pb.inc(1);
+            }
+            if any_needed {
+                pb.println(format!("WARN: Archive not found for patching: {}", archive_hash));
+            }
+            return;
+        }
+    };
+
+    // Filter to directives that need processing
+    let to_process: Vec<_> = directives
+        .iter()
+        .filter(|(_, d)| !output_exists(ctx, &d.to, d.size))
+        .collect();
+
+    // Count skipped
+    let skip_count = directives.len() - to_process.len();
+    if skip_count > 0 {
+        skipped.fetch_add(skip_count, Ordering::Relaxed);
+        pb.inc(skip_count as u64);
+    }
+
+    if to_process.is_empty() {
+        return;
+    }
+
+    // Collect unique source paths needed from this archive
+    let mut simple_paths: HashMap<String, String> = HashMap::new();
+    let mut nested_bsas: HashMap<String, Vec<String>> = HashMap::new();
+
+    for (_, directive) in &to_process {
+        if directive.archive_hash_path.len() == 2 {
+            let path = &directive.archive_hash_path[1];
+            let normalized = paths::normalize_for_lookup(path);
+            simple_paths.insert(normalized, path.clone());
+        } else if directive.archive_hash_path.len() >= 3 {
+            let bsa_path = &directive.archive_hash_path[1];
+            let file_in_bsa = &directive.archive_hash_path[2];
+            nested_bsas.entry(bsa_path.clone()).or_default().push(file_in_bsa.clone());
+            let normalized = paths::normalize_for_lookup(bsa_path);
+            simple_paths.insert(normalized, bsa_path.clone());
+        }
+    }
+
+    // Extract source files to temp directory (disk-based, not RAM)
+    let temp_dir = match tempfile::tempdir_in(&ctx.config.downloads_dir) {
+        Ok(dir) => dir,
+        Err(e) => {
+            for (_id, _) in &to_process {
+                failed.fetch_add(1, Ordering::Relaxed);
+                failure_tracker.record_failure("tempdir", &e.to_string());
+                pb.inc(1);
+            }
+            return;
+        }
+    };
+
+    let extracted_paths = extract_source_files_to_disk(
+        ctx,
+        &archive_path,
+        &simple_paths,
+        &nested_bsas,
+        temp_dir.path(),
+    );
+
+    let archive_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+
+    // Process each patch sequentially (to limit memory), write directly to disk
+    for (id, directive) in &to_process {
+        let result = apply_patch_streaming(
+            ctx,
+            &archive_path,
+            directive,
+            &extracted_paths,
+        );
+
+        match result {
+            Ok(()) => {
+                completed.fetch_add(1, Ordering::Relaxed);
+                pb.inc(1);
+            }
+            Err(e) => {
+                failed.fetch_add(1, Ordering::Relaxed);
+                failure_tracker.record_failure(&archive_name, &e.to_string());
+                if failed.load(Ordering::Relaxed) <= 10 {
+                    pb.println(format!("FAIL [{}] patch: {:#}", id, e));
+                }
+                pb.inc(1);
+            }
+        }
+    }
+
+    // temp_dir is dropped here, cleaning up extracted files
+}
+
+/// Extract source files needed for patching to disk (memory-optimized).
+///
+/// Returns a map of normalized path -> temp file path on disk.
+/// Files are extracted to the provided temp directory, not loaded into RAM.
+fn extract_source_files_to_disk(
+    _ctx: &ProcessContext,
+    archive_path: &Path,
+    simple_paths: &HashMap<String, String>,
+    nested_bsas: &HashMap<String, Vec<String>>,
+    temp_dir: &Path,
+) -> HashMap<String, PathBuf> {
+    let mut extracted: HashMap<String, PathBuf> = HashMap::new();
+
+    if !simple_paths.is_empty() {
+        let archive_type = detect_archive_type(archive_path).unwrap_or(ArchiveType::Unknown);
+
+        match archive_type {
+            ArchiveType::Zip => {
+                if let Ok(file) = File::open(archive_path) {
+                    if let Ok(mut archive) = zip::ZipArchive::new(BufReader::new(file)) {
+                        for i in 0..archive.len() {
+                            if let Ok(mut entry) = archive.by_index(i) {
+                                let entry_name = entry.name().to_string();
+                                let normalized = paths::normalize_for_lookup(&entry_name);
+                                if simple_paths.contains_key(&normalized) {
+                                    // Extract to temp file instead of RAM
+                                    let temp_file_path = temp_dir.join(format!("src_{}.tmp", i));
+                                    if let Ok(mut out_file) = File::create(&temp_file_path) {
+                                        if std::io::copy(&mut entry, &mut out_file).is_ok() {
+                                            extracted.insert(normalized, temp_file_path);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ArchiveType::Bsa | ArchiveType::Ba2 => {
+                // BSA files: extract each needed file to disk
+                for (idx, (normalized, original)) in simple_paths.iter().enumerate() {
+                    if let Ok(data) = bsa::extract_file(archive_path, original) {
+                        let temp_file_path = temp_dir.join(format!("bsa_{}.tmp", idx));
+                        if fs::write(&temp_file_path, &data).is_ok() {
+                            extracted.insert(normalized.clone(), temp_file_path);
+                        }
+                    }
+                }
+            }
+            ArchiveType::SevenZ | ArchiveType::Rar => {
+                // Extract entire archive to temp (one fast 7z call)
+                // This is much faster than streaming individual files (one 7z call per file)
+                let extract_dir = temp_dir.join("archive_extract");
+                let _ = fs::create_dir_all(&extract_dir);
+
+                if crate::archive::sevenzip::extract_all(archive_path, &extract_dir).is_ok() {
+                    // Walk extracted files and find what we need
+                    for entry in walkdir::WalkDir::new(&extract_dir)
+                        .into_iter()
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.file_type().is_file())
+                    {
+                        if let Ok(rel_path) = entry.path().strip_prefix(&extract_dir) {
+                            let normalized = paths::normalize_for_lookup(&rel_path.to_string_lossy());
+                            if simple_paths.contains_key(&normalized) {
+                                extracted.insert(normalized, entry.path().to_path_buf());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                // Unknown format: try all extraction methods, extract entire archive to temp
+                let extract_dir = temp_dir.join("archive_extract");
+                let _ = fs::create_dir_all(&extract_dir);
+
+                let extract_result = extract_zip_to_temp(archive_path, &extract_dir)
+                    .or_else(|_| extract_7z_to_temp(archive_path, &extract_dir))
+                    .or_else(|_| extract_rar_to_temp(archive_path, &extract_dir));
+
+                if extract_result.is_ok() {
+                    // Walk extracted files and collect paths for needed files
+                    collect_needed_file_paths(
+                        &extract_dir,
+                        &extract_dir,
+                        simple_paths,
+                        &mut extracted,
+                    );
+                }
+            }
+        }
+    }
+
+    // For nested BSAs: extract files from BSAs we just extracted to disk
+    for (bsa_path, files_in_bsa) in nested_bsas {
+        let bsa_normalized = paths::normalize_for_lookup(bsa_path);
+        // Clone the path to avoid borrow conflict
+        let bsa_file_path = match extracted.get(&bsa_normalized) {
+            Some(p) => p.clone(),
+            None => continue,
+        };
+        // Extract files from the BSA to disk
+        for (idx, file_path) in files_in_bsa.iter().enumerate() {
+            if let Ok(file_data) = bsa::extract_file(&bsa_file_path, file_path) {
+                let key = format!("{}/{}", bsa_path, file_path);
+                let normalized_key = paths::normalize_for_lookup(&key);
+                let temp_file_path = temp_dir.join(format!("nested_{}_{}.tmp",
+                    bsa_normalized.replace(['/', '\\'], "_"), idx));
+                if fs::write(&temp_file_path, &file_data).is_ok() {
+                    extracted.insert(normalized_key, temp_file_path);
+                }
+            }
+        }
+    }
+
+    extracted
+}
+
+/// Recursively collect file paths from extracted archive (disk-based version)
+fn collect_needed_file_paths(
+    base: &Path,
+    current: &Path,
+    needed: &HashMap<String, String>,
+    results: &mut HashMap<String, PathBuf>,
+) {
+    let needed_normalized: std::collections::HashSet<String> =
+        needed.keys().cloned().collect();
+
+    if let Ok(entries) = fs::read_dir(current) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_needed_file_paths(base, &path, needed, results);
+            } else if path.is_file() {
+                // Get relative path from base
+                if let Ok(rel) = path.strip_prefix(base) {
+                    let rel_str = rel.to_string_lossy();
+                    let normalized = paths::normalize_for_lookup(&rel_str);
+
+                    if needed_normalized.contains(&normalized) {
+                        results.insert(normalized, path.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Apply a delta patch using memory-mapped files, streaming output directly to disk.
+///
+/// This is the memory-optimized version that:
+/// 1. Memory-maps the source file (OS manages paging, not loaded to RAM)
+/// 2. Reads delta from wabbajack (deltas are small, ~KB)
+/// 3. Streams output directly to disk via buffered writer
+fn apply_patch_streaming(
+    ctx: &ProcessContext,
+    archive_path: &Path,
+    directive: &crate::modlist::PatchedFromArchiveDirective,
+    extracted_paths: &HashMap<String, PathBuf>,
+) -> Result<()> {
+    use memmap2::Mmap;
+    use std::io::{BufWriter, Cursor};
+    use crate::octodiff::DeltaReader;
+
+    // Get source file path from extracted cache
+    let source_path = if directive.archive_hash_path.len() == 1 {
+        // Whole archive file is the source
+        archive_path.to_path_buf()
+    } else if directive.archive_hash_path.len() == 2 {
+        // Simple: file directly in archive
+        let path = &directive.archive_hash_path[1];
+        let normalized = paths::normalize_for_lookup(path);
+        extracted_paths.get(&normalized)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Source file not found in extracted cache: {}", path))?
+    } else if directive.archive_hash_path.len() >= 3 {
+        // Nested BSA: file inside BSA inside archive
+        let bsa_path = &directive.archive_hash_path[1];
+        let file_in_bsa = &directive.archive_hash_path[2];
+        let key = format!("{}/{}", bsa_path, file_in_bsa);
+        let normalized = paths::normalize_for_lookup(&key);
+        extracted_paths.get(&normalized)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Source file not found in BSA cache: {} / {}", bsa_path, file_in_bsa))?
+    } else {
+        anyhow::bail!("Invalid archive_hash_path");
+    };
+
+    // Memory-map source file (OS manages paging, not loaded to RAM)
+    let source_file = File::open(&source_path)
+        .with_context(|| format!("Failed to open source file: {}", source_path.display()))?;
+    let source_mmap = unsafe {
+        Mmap::map(&source_file)
+            .with_context(|| format!("Failed to mmap source file: {}", source_path.display()))?
+    };
+
+    // Load delta patch from wabbajack (deltas are small, typically KB)
+    let patch_name = directive.patch_id.to_string();
+    let delta_data = ctx.read_wabbajack_file(&patch_name)?;
+
+    // Create DeltaReader with mmap'd source
+    let basis = Cursor::new(&source_mmap[..]);
+    let delta = Cursor::new(delta_data);
+    let mut reader = DeltaReader::new(basis, delta)?;
+
+    // Stream directly to output file
+    let output_path = ctx.resolve_output_path(&directive.to);
+    paths::ensure_parent_dirs(&output_path)?;
+    let output_file = File::create(&output_path)
+        .with_context(|| format!("Failed to create output file: {}", output_path.display()))?;
+    let mut writer = BufWriter::new(output_file);
+
+    let written = std::io::copy(&mut reader, &mut writer)
+        .with_context(|| format!("Failed to write patched file: {}", output_path.display()))?;
+
+    // Verify size
+    if written != directive.size {
+        // Remove incomplete file
+        let _ = fs::remove_file(&output_path);
+        anyhow::bail!("Size mismatch: expected {}, got {}", directive.size, written);
+    }
+
+    Ok(())
+}
 /// Process TransformedTexture directives with progress display
 fn process_transformed_texture(
     db: &ModlistDb,
@@ -1693,10 +2070,16 @@ fn process_transformed_texture(
 
     let total_archives = by_archive.len();
     let total_directives: usize = by_archive.values().map(|v| v.len()).sum();
-    pb.println(format!("Processing {} textures across {} archives...", total_directives, total_archives));
+    eprintln!("Processing {} textures across {} archives...", total_directives, total_archives);
+
+    // Reset progress bar for texture phase
+    pb.finish_and_clear();
+    pb.reset();
+    pb.set_length(total_directives as u64);
+    pb.set_position(0);
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
     let failure_tracker = failure_tracker.clone();
-    let sevenz_path = get_7z_path().ok();
 
     // Process archives in parallel
     let archives_vec: Vec<_> = by_archive.into_iter().collect();
@@ -1769,9 +2152,9 @@ fn process_transformed_texture(
         let mut extracted: HashMap<String, Vec<u8>> = HashMap::new();
 
         if !simple_paths.is_empty() {
-            let archive_type = detect_archive_type(&archive_path);
-            let batch_result = match archive_type.as_str() {
-                "zip" => {
+            let archive_type = detect_archive_type(&archive_path).unwrap_or(ArchiveType::Unknown);
+            let batch_result = match archive_type {
+                ArchiveType::Zip => {
                     let mut result = HashMap::new();
                     if let Ok(file) = File::open(&archive_path) {
                         if let Ok(mut archive) = zip::ZipArchive::new(BufReader::new(file)) {
@@ -1791,7 +2174,7 @@ fn process_transformed_texture(
                     }
                     result
                 }
-                "bsa" => {
+                ArchiveType::Bsa | ArchiveType::Ba2 => {
                     let mut result = HashMap::new();
                     for (normalized, original) in &simple_paths {
                         if let Ok(data) = bsa::extract_file(&archive_path, original) {
@@ -1801,15 +2184,11 @@ fn process_transformed_texture(
                     result
                 }
                 _ => {
-                    // 7z/RAR/other: batch extract
-                    if let Some(ref sevenz) = sevenz_path {
-                        if let Ok(temp_dir) = tempfile::tempdir_in(&ctx.config.downloads_dir) {
-                            let paths_vec: Vec<&str> = simple_paths.values().map(|s| s.as_str()).collect();
-                            extract_batch_with_7z(sevenz, &archive_path, &paths_vec, temp_dir.path())
-                                .unwrap_or_default()
-                        } else {
-                            HashMap::new()
-                        }
+                    // 7z/RAR/other: batch extract using pure Rust
+                    if let Ok(temp_dir) = tempfile::tempdir_in(&ctx.config.downloads_dir) {
+                        let paths_vec: Vec<&str> = simple_paths.values().map(|s| s.as_str()).collect();
+                        extract_batch_rust(&archive_path, &paths_vec, temp_dir.path())
+                            .unwrap_or_default()
                     } else {
                         HashMap::new()
                     }
@@ -1910,10 +2289,17 @@ fn process_create_bsa(
         return Ok(());
     }
 
-    pb.println(format!("Building {} BSA archives...", all_raw.len()));
+    eprintln!("Building {} BSA archives...", all_raw.len());
+
+    // Reset progress bar for BSA build phase
+    pb.finish_and_clear();
+    pb.reset();
+    pb.set_length(all_raw.len() as u64);
+    pb.set_position(0);
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
     // Parse all directives
-    let directives: Vec<(i64, CreateBSADirective)> = all_raw
+    let mut directives: Vec<(i64, CreateBSADirective)> = all_raw
         .into_iter()
         .filter_map(|(id, json)| {
             match serde_json::from_str::<Directive>(&json) {
@@ -1927,9 +2313,53 @@ fn process_create_bsa(
         })
         .collect();
 
-    // Process each BSA (not parallelized - they may share staging dirs)
-    for (id, directive) in directives {
-        // Check if output already exists and is valid
+    // Sort by file count (smallest first) for faster progress feedback
+    directives.sort_by_key(|(_, d)| d.file_states.len());
+
+    // Simple threshold: ≤250 files parallel, >250 files sequential
+    const PARALLEL_THRESHOLD: usize = 250;
+
+    let (small, large): (Vec<_>, Vec<_>) = directives
+        .into_iter()
+        .partition(|(_, d)| d.file_states.len() <= PARALLEL_THRESHOLD);
+
+    eprintln!(
+        "Processing {} BSAs: {} small (≤{} files, 4 at a time), {} large (>{} files, sequential)",
+        small.len() + large.len(),
+        small.len(), PARALLEL_THRESHOLD,
+        large.len(), PARALLEL_THRESHOLD
+    );
+
+    // Process SMALL BSAs in batches of 4
+    for chunk in small.chunks(4) {
+        chunk.par_iter().for_each(|(id, directive)| {
+            if handlers::output_bsa_valid(ctx, directive) {
+                skipped.fetch_add(1, Ordering::Relaxed);
+                pb.inc(1);
+                return;
+            }
+
+            let bsa_name = std::path::Path::new(&directive.to)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| directive.to.clone());
+
+            match handlers::handle_create_bsa(ctx, directive) {
+                Ok(()) => {
+                    completed.fetch_add(1, Ordering::Relaxed);
+                    pb.println(format!("Created BSA: {}", bsa_name));
+                }
+                Err(e) => {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    pb.println(format!("FAIL [{}] create BSA {}: {:#}", id, bsa_name, e));
+                }
+            }
+            pb.inc(1);
+        });
+    }
+
+    // Process LARGE BSAs sequentially (one at a time, full thread usage)
+    for (id, directive) in large {
         if handlers::output_bsa_valid(ctx, &directive) {
             skipped.fetch_add(1, Ordering::Relaxed);
             pb.inc(1);
@@ -1940,6 +2370,8 @@ fn process_create_bsa(
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| directive.to.clone());
+
+        pb.set_message(format!("{} ({} files) [LARGE]", bsa_name, directive.file_states.len()));
 
         match handlers::handle_create_bsa(ctx, &directive) {
             Ok(()) => {

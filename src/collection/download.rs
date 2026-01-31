@@ -226,6 +226,39 @@ pub async fn download_mods(
 
     info!("Need to download {} mods", need_download.len());
 
+    // Create Nexus client and validate API key + Premium status
+    let nexus = NexusDownloader::new(nexus_api_key)?;
+
+    // Validate and check Premium status before downloading
+    println!("Validating Nexus API key...");
+    match nexus.validate().await {
+        Ok(user_info) => {
+            if user_info.is_premium {
+                println!(
+                    "✓ Logged in as '{}' (Premium) - Direct API downloads enabled (20,000/day limit)",
+                    user_info.name
+                );
+            } else {
+                println!(
+                    "⚠ Logged in as '{}' (Free) - Limited downloads, may need NXM mode for large collections",
+                    user_info.name
+                );
+            }
+        }
+        Err(e) => {
+            println!("⚠ Could not validate API key: {}", e);
+            println!("  Downloads may fail if the API key is invalid.");
+        }
+    }
+
+    // Show current rate limits
+    let limits = nexus.rate_limits();
+    println!(
+        "Rate limits: {}/{} hourly, {}/{} daily",
+        limits.hourly_remaining, limits.hourly_limit,
+        limits.daily_remaining, limits.daily_limit
+    );
+
     // Route to NXM mode if enabled
     if nxm_mode {
         let mut stats = download_mods_nxm(db, downloads_dir, game_domain, need_download).await?;
@@ -247,7 +280,7 @@ pub async fn download_mods(
 
     // Create shared context
     let ctx = Arc::new(DownloadContext {
-        nexus: NexusDownloader::new(nexus_api_key)?,
+        nexus,
         http: HttpClient::new()?,
         game_domain: game_domain.to_string(),
         downloads_dir: downloads_dir.to_path_buf(),
@@ -721,16 +754,30 @@ async fn download_direct_url(
 // NXM Browser Mode (TODO: Implement when needed)
 // ============================================================================
 
-/// Download mods using NXM browser mode (bypasses API rate limits)
+/// Download mods using NXM browser mode (for non-Premium users)
 ///
 /// This mode opens browser tabs for each mod and waits for the user to click
 /// "Download with Manager" which sends an nxm:// link back to our handler.
+/// The NXM link contains key/expires tokens that bypass API rate limits.
+///
+/// NOTE: Premium users should NOT need this mode - they can use direct API
+/// downloads with 20,000 daily limit. If you're Premium and hitting issues,
+/// please report the specific error message.
 async fn download_mods_nxm(
     _db: &CollectionDb,
     _downloads_dir: &Path,
     _game_domain: &str,
-    _pending: Vec<ModDbEntry>,
+    pending: Vec<ModDbEntry>,
 ) -> Result<DownloadStats> {
+    // NXM browser mode for non-Premium users
+    println!("\n=== NXM Browser Mode ===");
+    println!("This mode is for NON-Premium Nexus users.");
+    println!("Premium users should use direct API mode (remove --nxm flag).\n");
+    println!("To use NXM mode, we would need to:");
+    println!("  1. Open {} browser tabs for Nexus mod pages", pending.len());
+    println!("  2. You click 'Download with Manager' on each page");
+    println!("  3. The NXM links are captured and downloads start automatically\n");
+
     // TODO: Implement NXM browser mode similar to Wabbajack's installer/downloader.rs
     // Key steps:
     // 1. Start NXM server with nxm_handler::start_server(port)
@@ -740,9 +787,14 @@ async fn download_mods_nxm(
     // 5. Fetch actual download URL from that endpoint
     // 6. Download the file
     //
-    // For now, NXM mode is not implemented for collections.
-    // Use direct API mode (nxm_mode=false).
-    anyhow::bail!("NXM browser mode not yet implemented for collections. Use direct API mode.")
+    // For now, NXM mode is not fully implemented for collections.
+    anyhow::bail!(
+        "NXM browser mode not yet fully implemented for collections.\n\
+        If you're a Premium user, remove the --nxm flag and use direct API mode.\n\
+        If you're hitting rate limits as a Premium user, please report this issue with:\n\
+        - The specific error message you see\n\
+        - Your rate limit values (shown at download start)"
+    )
 }
 
 #[cfg(test)]

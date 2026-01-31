@@ -430,6 +430,61 @@ impl ModlistDb {
         Ok(count)
     }
 
+    /// Get all completed directives of a given type with their expected sizes.
+    /// Returns (id, to_path, size, archive_hash) for verification purposes.
+    pub fn get_completed_directives_of_type(
+        &self,
+        directive_type: &str,
+    ) -> Result<Vec<(i64, String, i64, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, to_path, size, archive_hash FROM directives
+             WHERE directive_type = ?1 AND status = 'completed'
+             AND to_path IS NOT NULL AND to_path != ''"
+        )?;
+
+        let rows = stmt.query_map([directive_type], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Reset directives for a specific archive back to pending (for reprocessing).
+    pub fn reset_directives_for_archive(&self, archive_hash: &str) -> Result<usize> {
+        let count = self.conn.execute(
+            "UPDATE directives SET status = 'pending', error_message = NULL, updated_at = datetime('now')
+             WHERE archive_hash = ?1 AND (status = 'completed' OR status = 'failed')",
+            params![archive_hash],
+        )?;
+        Ok(count)
+    }
+
+    /// Get all expected output paths from all directive types.
+    /// Used for clean install verification (finding unexpected files).
+    pub fn get_all_expected_output_paths(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT to_path FROM directives
+             WHERE to_path IS NOT NULL AND to_path != ''"
+        )?;
+
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
     /// Get archive info by hash
     pub fn get_archive(&self, hash: &str) -> Result<Option<ArchiveInfo>> {
         let mut stmt = self.conn.prepare_cached(
@@ -776,6 +831,53 @@ impl ModlistDb {
         Ok(count as usize)
     }
 
+    /// Look up file path by size and filename (for recovery of misclassified directives)
+    /// Returns the first matching file path in the archive
+    pub fn lookup_archive_file_by_size_and_name(
+        &self,
+        archive_hash: &str,
+        expected_size: u64,
+        filename: &str,
+    ) -> Result<Option<String>> {
+        let normalized_filename = filename.to_lowercase();
+
+        // Try to find a file in the archive that matches both size AND ends with the filename
+        let result = self.conn.query_row(
+            "SELECT file_path FROM archive_files
+             WHERE archive_hash = ?1 AND file_size = ?2
+             AND LOWER(file_path) LIKE ?3",
+            params![archive_hash, expected_size as i64, format!("%{}", normalized_filename)],
+            |row| row.get(0),
+        );
+
+        match result {
+            Ok(path) => Ok(Some(path)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e).context("Failed to lookup archive file by size"),
+        }
+    }
+
+    /// Look up file path by size only (fallback for recovery)
+    /// Returns the first matching file path in the archive with the given size
+    pub fn lookup_archive_file_by_size(
+        &self,
+        archive_hash: &str,
+        expected_size: u64,
+    ) -> Result<Option<String>> {
+        let result = self.conn.query_row(
+            "SELECT file_path FROM archive_files
+             WHERE archive_hash = ?1 AND file_size = ?2 LIMIT 1",
+            params![archive_hash, expected_size as i64],
+            |row| row.get(0),
+        );
+
+        match result {
+            Ok(path) => Ok(Some(path)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e).context("Failed to lookup archive file by size"),
+        }
+    }
+
     /// Get all directive output info for smart download checking
     /// Returns (to_path, size, archive_hash) for all directives that need archives
     pub fn get_directive_outputs_with_archives(&self) -> Result<Vec<(String, i64, String)>> {
@@ -840,7 +942,10 @@ impl ModlistDb {
 
 /// Normalize a path for case-insensitive lookup
 fn normalize_path(path: &str) -> String {
-    path.to_lowercase().replace('\\', "/")
+    path.to_lowercase()
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_string()
 }
 
 #[cfg(test)]

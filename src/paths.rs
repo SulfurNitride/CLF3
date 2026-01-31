@@ -23,9 +23,12 @@ pub fn to_native_pathbuf(path: &str) -> PathBuf {
     PathBuf::from(to_linux_path(path))
 }
 
-/// Normalize a path for lookups and comparisons (lowercase, forward slashes)
+/// Normalize a path for lookups and comparisons (lowercase, forward slashes, trimmed)
 pub fn normalize_for_lookup(path: &str) -> String {
-    path.to_lowercase().replace('\\', "/")
+    path.to_lowercase()
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_string()
 }
 
 /// Check if two paths are equal (case-insensitive)

@@ -9,6 +9,8 @@ pub mod config;
 pub mod downloader;
 pub mod handlers;
 pub mod processor;
+pub mod streaming;
+pub mod verify;
 
 pub use config::InstallConfig;
 
@@ -201,4 +203,94 @@ impl Installer {
         Ok(errors)
     }
 
+    /// Run the full installation using streaming pipeline.
+    ///
+    /// This is an alternative to `run()` that uses a streaming architecture
+    /// with separate extraction and mover worker pools for better performance
+    /// on large modlists.
+    ///
+    /// Arguments:
+    /// - `extraction_workers`: Number of workers for extracting files from archives (default: 8)
+    /// - `mover_workers`: Number of workers for writing files to disk (default: 8)
+    pub async fn run_streaming(
+        &mut self,
+        extraction_workers: usize,
+        mover_workers: usize,
+    ) -> Result<InstallStats> {
+        let mut stats = InstallStats::default();
+
+        // Phase 1: Downloads (same as regular mode)
+        println!("=== Phase 1: Download Archives ===\n");
+        let download_stats = self.download_phase().await?;
+        stats.archives_downloaded = download_stats.downloaded;
+        stats.archives_skipped = download_stats.skipped;
+        stats.archives_failed = download_stats.failed;
+        stats.archives_manual = download_stats.manual;
+
+        // If there are manual downloads needed, stop here
+        if stats.archives_manual > 0 || stats.archives_failed > 0 {
+            return Ok(stats);
+        }
+
+        // Phase 2: Validate all downloaded archives (same as regular mode)
+        println!("\n=== Phase 2: Validate Archives ===\n");
+        let mut validation_attempts = 0;
+        const MAX_VALIDATION_ATTEMPTS: usize = 3;
+
+        loop {
+            validation_attempts += 1;
+            let validation_errors = self.validate_archives()?;
+
+            if validation_errors.is_empty() {
+                println!("All archives validated successfully!\n");
+                break;
+            }
+
+            if validation_attempts >= MAX_VALIDATION_ATTEMPTS {
+                println!("\nValidation failed after {} attempts! {} archives still have issues:",
+                    MAX_VALIDATION_ATTEMPTS, validation_errors.len());
+                for (name, error) in &validation_errors {
+                    println!("  - {}: {}", name, error);
+                }
+                bail!("Archive validation failed");
+            }
+
+            // Auto-fix: delete bad files and re-download
+            println!("\nFound {} corrupted archives, auto-fixing...", validation_errors.len());
+            for (name, error) in &validation_errors {
+                println!("  - {}: {}", name, error);
+                let file_path = self.config.downloads_dir.join(name);
+                if file_path.exists() {
+                    let _ = fs::remove_file(&file_path);
+                }
+                let _ = self.db.reset_archive_download_status(name);
+            }
+
+            println!("\nRe-downloading {} files...\n", validation_errors.len());
+            let redownload_stats = self.download_phase().await?;
+
+            if redownload_stats.failed > 0 {
+                println!("Re-download had {} failures", redownload_stats.failed);
+            }
+        }
+
+        // Phase 3: Process directives using STREAMING pipeline
+        println!("=== Phase 3: Process Directives (Streaming) ===\n");
+        let process_stats = processor::process_directives_streaming(
+            &self.db,
+            &self.config,
+            extraction_workers,
+            mover_workers,
+        )?;
+        stats.directives_completed = process_stats.completed;
+        stats.directives_failed = process_stats.failed;
+
+        if stats.directives_failed > 0 {
+            println!("\nDirective processing incomplete. {} failures.", stats.directives_failed);
+        } else {
+            println!("\nAll directives processed successfully!");
+        }
+
+        Ok(stats)
+    }
 }

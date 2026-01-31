@@ -30,16 +30,17 @@ anyhow = "1.0"
 thiserror = "2.0"
 
 # Compression/Archives
+# Note: zip crate is required for reading .wabbajack files (which are ZIP archives)
+# 7z binary is used for mod archive extraction (ZIP, 7z, RAR)
 zip = "7.2"
 flate2 = "1.1"
-sevenz-rust = "0.6.1"
-unrar = "0.5.8"
 
 # BSA/BA2 archives
 ba2 = "3.0.1"
 
 # Parallelism
 rayon = "1.11.0"
+crossbeam-channel = "0.5"
 
 # System info (memory monitoring)
 sysinfo = "0.38.0"
@@ -74,6 +75,8 @@ indicatif = "0.18"
 # File utilities
 walkdir = "2.5"
 tempfile = "3.24"
+memmap2 = "0.9"
+reflink-copy = "0.1.28"
 
 # NXM handler server
 axum = "0.8.8"

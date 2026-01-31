@@ -3,3 +3,11 @@
 /release
 *.db
 *.db-journal
+
+# Claude/AI tool configs
+.claude/
+.claude-flow/
+.hive-mind/
+.swarm/
+.mcp.json
+CLAUDE.md

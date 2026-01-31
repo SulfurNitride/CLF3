@@ -970,7 +970,10 @@ pub struct ModRuleDbEntry {
 
 /// Normalize a path for case-insensitive lookup
 fn normalize_path(path: &str) -> String {
-    path.to_lowercase().replace('\\', "/")
+    path.to_lowercase()
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_string()
 }
 
 #[cfg(test)]

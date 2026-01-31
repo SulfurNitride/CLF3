@@ -3,6 +3,7 @@
 //! Named after Chlorine Trifluoride - burns through modlists
 //! like CLF3 burns through concrete.
 
+mod archive;
 mod bsa;
 mod collection;
 mod downloaders;
@@ -198,7 +199,9 @@ async fn main() -> Result<()> {
             };
 
             let mut installer = Installer::new(config)?;
-            let stats = installer.run().await?;
+            // Use streaming pipeline with 8 extraction + 8 mover workers
+            // Processes archives in batches: ZIP (fastest) -> RAR -> 7z (slowest)
+            let stats = installer.run_streaming(8, 8).await?;
 
             println!("\n=== Installation Summary ===");
             println!("Downloads:  {} downloaded, {} skipped, {} manual, {} failed",
