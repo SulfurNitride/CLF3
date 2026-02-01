@@ -7,9 +7,11 @@
 
 mod types;
 mod db;
+pub mod browser;
 
 pub use types::*;
 pub use db::*;
+pub use browser::*;
 
 use anyhow::{Context, Result};
 use std::fs::{self, File};

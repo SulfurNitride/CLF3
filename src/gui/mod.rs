@@ -3,7 +3,10 @@
 //! Provides a graphical interface for the modlist installer.
 
 mod settings;
+mod image_cache;
+
 pub use settings::Settings;
+pub use image_cache::ImageCache;
 
 // Main window component - full installer UI with setup form
 slint::slint! {
@@ -434,6 +437,7 @@ slint::slint! {
         callback validate_api_key(string);
         callback open_api_key_page();
         callback open_settings();
+        callback browse_modlists();
         callback source_edited(string);
         callback install_edited(string);
         callback downloads_edited(string);
@@ -479,6 +483,39 @@ slint::slint! {
                             enabled: !is_running;
                             browse-clicked => { browse_source(); }
                             edited(text) => { source_edited(text); }
+                        }
+
+                        // Browse modlists gallery button
+                        Rectangle {
+                            height: 36px;
+                            background: gallery_btn.has-hover ? #45475a : #313244;
+                            border-radius: 6px;
+
+                            gallery_btn := TouchArea {
+                                enabled: !is_running;
+                                clicked => { browse_modlists(); }
+                            }
+
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                spacing: 8px;
+
+                                Text {
+                                    text: "Browse Modlist Gallery";
+                                    font-size: 13px;
+                                    color: #89b4fa;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                }
+
+                                Text {
+                                    text: ">";
+                                    font-size: 14px;
+                                    color: #6c7086;
+                                    vertical-alignment: center;
+                                }
+                            }
                         }
 
                         // Detected game indicator (shown when game is auto-detected)
@@ -1194,6 +1231,591 @@ slint::slint! {
 
                     TouchArea {
                         clicked => { save_settings(); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Modlist Browser Dialog for browsing and downloading modlists
+slint::slint! {
+    import { Button, ScrollView, ProgressIndicator } from "std-widgets.slint";
+
+    // Modlist info for display in list
+    export struct ModlistInfo {
+        index: int,
+        title: string,
+        author: string,
+        game: string,
+        download_size: string,
+        install_size: string,
+        description: string,
+        is_nsfw: bool,
+        is_official: bool,
+        image: image,
+        has_image: bool,
+    }
+
+    // Modlist Browser Dialog
+    export component ModlistBrowserDialog inherits Window {
+        title: "Browse Modlists";
+        min-width: 900px;
+        min-height: 650px;
+        max-width: 1400px;
+        max-height: 1000px;
+        background: #1e1e2e;
+
+        // State
+        in-out property <string> search_text: "";
+        in-out property <string> selected_game: "All Games";
+        in-out property <[string]> game_list: ["All Games"];
+        in-out property <int> game_index: 0;
+        in-out property <[ModlistInfo]> modlists: [];
+        in-out property <bool> is_loading: true;
+        in-out property <string> status_message: "Loading modlists...";
+        in-out property <int> selected_index: -1;
+        in-out property <bool> is_downloading: false;
+        in-out property <float> download_progress: 0.0;
+        in-out property <bool> show_unofficial: true;
+        in-out property <bool> show_nsfw: false;
+        in-out property <bool> game_dropdown_open: false;
+
+        // Callbacks
+        callback search_changed(string);
+        callback game_filter_changed(string);
+        callback filter_changed(bool, bool);
+        callback select_modlist(int);
+        callback cancel();
+        callback refresh();
+
+        VerticalLayout {
+            padding: 20px;
+            spacing: 16px;
+
+            // Header
+            HorizontalLayout {
+                spacing: 12px;
+
+                Text {
+                    text: "Browse Modlists";
+                    font-size: 24px;
+                    font-weight: 700;
+                    color: #cdd6f4;
+                    vertical-alignment: center;
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                // Refresh button
+                Rectangle {
+                    width: 36px;
+                    height: 36px;
+                    background: refresh_touch.has-hover ? #45475a : #313244;
+                    border-radius: 6px;
+
+                    refresh_touch := TouchArea {
+                        enabled: !is_loading && !is_downloading;
+                        clicked => { refresh(); }
+                    }
+
+                    Text {
+                        text: "↻";
+                        font-size: 18px;
+                        color: #cdd6f4;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            // Search and filter row
+            HorizontalLayout {
+                spacing: 12px;
+
+                // Search box
+                Rectangle {
+                    horizontal-stretch: 2;
+                    height: 40px;
+                    background: #11111b;
+                    border-radius: 8px;
+
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 8px;
+
+                        Text {
+                            text: "🔍";
+                            font-size: 14px;
+                            color: #6c7086;
+                            vertical-alignment: center;
+                        }
+
+                        search_input := TextInput {
+                            text <=> search_text;
+                            font-size: 14px;
+                            color: #cdd6f4;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            enabled: !is_loading && !is_downloading;
+                            accepted => { search_changed(self.text); }
+                            edited => { search_changed(self.text); }
+                        }
+                    }
+                }
+
+                // Game filter dropdown
+                Rectangle {
+                    width: 220px;
+                    height: 40px;
+                    background: game_dropdown_btn.has-hover ? #252536 : #11111b;
+                    border-radius: 8px;
+
+                    game_dropdown_btn := TouchArea {
+                        enabled: !is_loading && !is_downloading;
+                        clicked => {
+                            game_dropdown_open = !game_dropdown_open;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+
+                        Text {
+                            text: selected_game;
+                            font-size: 14px;
+                            color: #cdd6f4;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+
+                        Text {
+                            text: game_dropdown_open ? "▲" : "▼";
+                            font-size: 10px;
+                            color: #6c7086;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            // Filter checkboxes row
+            HorizontalLayout {
+                spacing: 24px;
+                height: 30px;
+
+                // Show Unofficial checkbox
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    Rectangle {
+                        width: 20px;
+                        height: 20px;
+                        background: show_unofficial ? #89b4fa : #313244;
+                        border-radius: 4px;
+                        border-width: 1px;
+                        border-color: #45475a;
+
+                        unofficial_check := TouchArea {
+                            clicked => {
+                                show_unofficial = !show_unofficial;
+                                filter_changed(show_unofficial, show_nsfw);
+                            }
+                        }
+
+                        if show_unofficial: Text {
+                            text: "✓";
+                            font-size: 14px;
+                            font-weight: 700;
+                            color: #1e1e2e;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Text {
+                        text: "Show Unofficial";
+                        font-size: 13px;
+                        color: #cdd6f4;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // Show NSFW checkbox
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    Rectangle {
+                        width: 20px;
+                        height: 20px;
+                        background: show_nsfw ? #f38ba8 : #313244;
+                        border-radius: 4px;
+                        border-width: 1px;
+                        border-color: #45475a;
+
+                        nsfw_check := TouchArea {
+                            clicked => {
+                                show_nsfw = !show_nsfw;
+                                filter_changed(show_unofficial, show_nsfw);
+                            }
+                        }
+
+                        if show_nsfw: Text {
+                            text: "✓";
+                            font-size: 14px;
+                            font-weight: 700;
+                            color: #1e1e2e;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Text {
+                        text: "Show NSFW";
+                        font-size: 13px;
+                        color: #cdd6f4;
+                        vertical-alignment: center;
+                    }
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                // Status/count
+                Text {
+                    text: is_loading ? status_message : modlists.length + " modlists";
+                    font-size: 12px;
+                    color: #6c7086;
+                    vertical-alignment: center;
+                }
+            }
+
+            // Main content area with game dropdown overlay
+            Rectangle {
+                vertical-stretch: 1;
+
+                // Modlist list
+                ScrollView {
+                    x: 0;
+                    y: 0;
+                    width: parent.width;
+                    height: parent.height;
+
+                    VerticalLayout {
+                        spacing: 8px;
+                        padding-right: 10px;
+
+                        // Loading indicator
+                        if is_loading: Rectangle {
+                            height: 200px;
+
+                            Text {
+                                text: status_message;
+                                font-size: 16px;
+                                color: #6c7086;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        // Modlist cards with images
+                        for modlist[idx] in modlists: Rectangle {
+                            height: 220px;
+                            background: selected_index == modlist.index ? #313244 : (card_touch.has-hover ? #252536 : #1e1e2e);
+                            border-radius: 8px;
+                            border-width: 1px;
+                            border-color: selected_index == modlist.index ? #89b4fa : #313244;
+
+                            card_touch := TouchArea {
+                                enabled: !is_downloading && !game_dropdown_open;
+                                clicked => {
+                                    selected_index = modlist.index;
+                                }
+                            }
+
+                            HorizontalLayout {
+                                padding: 10px;
+                                spacing: 12px;
+
+                                // Left: Modlist image (320x200)
+                                Rectangle {
+                                    width: 320px;
+                                    height: 200px;
+                                    background: #11111b;
+                                    border-radius: 6px;
+                                    clip: true;
+
+                                    if modlist.has_image: Image {
+                                        source: modlist.image;
+                                        width: parent.width;
+                                        height: parent.height;
+                                        image-fit: cover;
+                                    }
+
+                                    // Placeholder when no image
+                                    if !modlist.has_image: Text {
+                                        text: "🎮";
+                                        font-size: 48px;
+                                        color: #45475a;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                // Middle: Title and info
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    spacing: 6px;
+                                    padding-top: 4px;
+
+                                    // Title row with badges
+                                    HorizontalLayout {
+                                        spacing: 8px;
+
+                                        Text {
+                                            text: modlist.title;
+                                            font-size: 16px;
+                                            font-weight: 600;
+                                            color: #cdd6f4;
+                                            overflow: elide;
+                                            horizontal-stretch: 1;
+                                        }
+
+                                        if modlist.is_official: Rectangle {
+                                            width: 55px;
+                                            height: 18px;
+                                            background: #89b4fa;
+                                            border-radius: 4px;
+
+                                            Text {
+                                                text: "Official";
+                                                font-size: 10px;
+                                                font-weight: 600;
+                                                color: #1e1e2e;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+
+                                        if modlist.is_nsfw: Rectangle {
+                                            width: 45px;
+                                            height: 18px;
+                                            background: #f38ba8;
+                                            border-radius: 4px;
+
+                                            Text {
+                                                text: "NSFW";
+                                                font-size: 10px;
+                                                font-weight: 600;
+                                                color: #1e1e2e;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                    }
+
+                                    // Author
+                                    Text {
+                                        text: "by " + modlist.author;
+                                        font-size: 13px;
+                                        color: #a6adc8;
+                                    }
+
+                                    // Description (2-3 lines)
+                                    Text {
+                                        text: modlist.description;
+                                        font-size: 12px;
+                                        color: #6c7086;
+                                        wrap: word-wrap;
+                                        overflow: elide;
+                                        vertical-stretch: 1;
+                                    }
+
+                                    // Bottom row: game tag and sizes
+                                    HorizontalLayout {
+                                        spacing: 16px;
+
+                                        // Game tag
+                                        Rectangle {
+                                            height: 24px;
+                                            width: game_text.preferred-width + 16px;
+                                            background: #313244;
+                                            border-radius: 4px;
+
+                                            game_text := Text {
+                                                text: modlist.game;
+                                                font-size: 11px;
+                                                color: #94e2d5;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+
+                                        // Download size
+                                        HorizontalLayout {
+                                            spacing: 4px;
+                                            Text {
+                                                text: "↓";
+                                                font-size: 14px;
+                                                color: #89b4fa;
+                                                vertical-alignment: center;
+                                            }
+                                            Text {
+                                                text: modlist.download_size;
+                                                font-size: 12px;
+                                                color: #89b4fa;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+
+                                        // Install size
+                                        HorizontalLayout {
+                                            spacing: 4px;
+                                            Text {
+                                                text: "⛁";
+                                                font-size: 14px;
+                                                color: #a6e3a1;
+                                                vertical-alignment: center;
+                                            }
+                                            Text {
+                                                text: modlist.install_size;
+                                                font-size: 12px;
+                                                color: #a6e3a1;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+
+                                        Rectangle { horizontal-stretch: 1; }
+                                    }
+                                }
+
+                                // Right: Select button
+                                VerticalLayout {
+                                    alignment: center;
+
+                                    Rectangle {
+                                        width: 80px;
+                                        height: 36px;
+                                        background: select_btn.has-hover ? #7aa2f7 : #89b4fa;
+                                        border-radius: 6px;
+
+                                        select_btn := TouchArea {
+                                            enabled: !is_downloading && !game_dropdown_open;
+                                            clicked => { select_modlist(modlist.index); }
+                                        }
+
+                                        Text {
+                                            text: "Select";
+                                            font-size: 13px;
+                                            font-weight: 600;
+                                            color: #1e1e2e;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Game dropdown popup (overlay)
+                if game_dropdown_open: Rectangle {
+                    x: parent.width - 220px - 20px;
+                    y: 0;
+                    width: 220px;
+                    height: min(300px, game_list.length * 36px + 8px);
+                    background: #181825;
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: #45475a;
+                    drop-shadow-blur: 10px;
+                    drop-shadow-color: #00000080;
+
+                    ScrollView {
+                        VerticalLayout {
+                            padding: 4px;
+
+                            for game[g_idx] in game_list: Rectangle {
+                                height: 36px;
+                                background: game_item_touch.has-hover ? #313244 : transparent;
+                                border-radius: 4px;
+
+                                game_item_touch := TouchArea {
+                                    clicked => {
+                                        selected_game = game;
+                                        game_index = g_idx;
+                                        game_dropdown_open = false;
+                                        game_filter_changed(game);
+                                    }
+                                }
+
+                                Text {
+                                    x: 12px;
+                                    text: game;
+                                    font-size: 13px;
+                                    color: selected_game == game ? #89b4fa : #cdd6f4;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Bottom bar
+            HorizontalLayout {
+                height: 50px;
+                spacing: 12px;
+
+                // Download progress (shown when downloading)
+                if is_downloading: Rectangle {
+                    horizontal-stretch: 1;
+                    background: #11111b;
+                    border-radius: 8px;
+
+                    HorizontalLayout {
+                        padding: 12px;
+                        spacing: 12px;
+
+                        Text {
+                            text: "Downloading...";
+                            font-size: 13px;
+                            color: #cdd6f4;
+                            vertical-alignment: center;
+                        }
+
+                        ProgressIndicator {
+                            horizontal-stretch: 1;
+                            progress: download_progress;
+                        }
+                    }
+                }
+
+                // Spacer when not downloading
+                if !is_downloading: Rectangle {
+                    horizontal-stretch: 1;
+                }
+
+                // Cancel button
+                Rectangle {
+                    width: 100px;
+                    height: 40px;
+                    background: cancel_btn.has-hover ? #45475a : #313244;
+                    border-radius: 6px;
+
+                    cancel_btn := TouchArea {
+                        clicked => { cancel(); }
+                    }
+
+                    Text {
+                        text: "Cancel";
+                        font-size: 14px;
+                        color: #cdd6f4;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
                     }
                 }
             }
@@ -2584,6 +3206,531 @@ pub fn run() -> Result<(), slint::PlatformError> {
         let _ = std::process::Command::new("xdg-open")
             .arg("https://www.nexusmods.com/users/myaccount?tab=api")
             .spawn();
+    });
+
+    // Set up browse modlists callback (opens modlist gallery dialog)
+    window.on_browse_modlists({
+        let window_weak = window.as_weak();
+        move || {
+            let main_window = window_weak.unwrap();
+
+            // Create the browser dialog
+            let dialog = match ModlistBrowserDialog::new() {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("Failed to create modlist browser: {}", e);
+                    main_window.set_log_text(format!("Error opening modlist browser: {}\n", e).into());
+                    return;
+                }
+            };
+
+            // Helper function to format file sizes
+            fn format_size(bytes: u64) -> String {
+                const KB: u64 = 1024;
+                const MB: u64 = KB * 1024;
+                const GB: u64 = MB * 1024;
+
+                if bytes >= GB {
+                    format!("{:.1} GB", bytes as f64 / GB as f64)
+                } else if bytes >= MB {
+                    format!("{:.1} MB", bytes as f64 / MB as f64)
+                } else if bytes >= KB {
+                    format!("{:.1} KB", bytes as f64 / KB as f64)
+                } else {
+                    format!("{} B", bytes)
+                }
+            }
+
+            // Store modlist data for callbacks (Arc+Mutex for thread safety)
+            let modlist_data: std::sync::Arc<std::sync::Mutex<Vec<crate::modlist::ModlistMetadata>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+            // Create image cache (shared across callbacks)
+            let image_cache: std::sync::Arc<std::sync::Mutex<image_cache::ImageCache>> =
+                match image_cache::ImageCache::new() {
+                    Ok(cache) => std::sync::Arc::new(std::sync::Mutex::new(cache)),
+                    Err(e) => {
+                        eprintln!("Warning: Could not create image cache: {}", e);
+                        std::sync::Arc::new(std::sync::Mutex::new(image_cache::ImageCache::new().unwrap()))
+                    }
+                };
+
+            // Fetch modlists in background thread
+            let dialog_weak = dialog.as_weak();
+            let modlist_data_clone = modlist_data.clone();
+            let image_cache_clone = image_cache.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result: Result<Vec<crate::modlist::ModlistMetadata>, anyhow::Error> = rt.block_on(async {
+                    let mut browser = crate::modlist::ModlistBrowser::new()?;
+                    let modlists = browser.fetch_modlists().await?;
+                    Ok(modlists.to_vec())
+                });
+
+                slint::invoke_from_event_loop(move || {
+                    if let Some(dialog) = dialog_weak.upgrade() {
+                        match result {
+                            Ok(modlists) => {
+                                // Build unique game list
+                                let mut games: Vec<String> = vec!["All Games".to_string()];
+                                let mut seen_games: std::collections::HashSet<String> = std::collections::HashSet::new();
+                                for m in &modlists {
+                                    if !m.game.is_empty() && seen_games.insert(m.game.clone()) {
+                                        games.push(m.game.clone());
+                                    }
+                                }
+                                games[1..].sort();
+
+                                // Convert to UI model (filter based on default show_unofficial=true, show_nsfw=false)
+                                let cache = image_cache_clone.lock().unwrap();
+                                let ui_modlists: Vec<ModlistInfo> = modlists
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, m)| !m.nsfw) // Default: hide NSFW
+                                    .map(|(idx, m)| {
+                                        let dl_size = m.download_metadata.as_ref()
+                                            .map(|d| format_size(d.size_of_archives))
+                                            .unwrap_or_else(|| "Unknown".into());
+                                        let inst_size = m.download_metadata.as_ref()
+                                            .map(|d| format_size(d.size_of_installed_files))
+                                            .unwrap_or_else(|| "Unknown".into());
+
+                                        // Try to load cached image
+                                        let (image, has_image) = if let Some(path) = cache.get_cached_path(&m.machine_name) {
+                                            match slint::Image::load_from_path(&path) {
+                                                Ok(img) => (img, true),
+                                                Err(_) => (slint::Image::default(), false),
+                                            }
+                                        } else {
+                                            (slint::Image::default(), false)
+                                        };
+
+                                        ModlistInfo {
+                                            index: idx as i32,
+                                            title: m.title.clone().into(),
+                                            author: m.author.clone().into(),
+                                            game: m.game.clone().into(),
+                                            download_size: dl_size.into(),
+                                            install_size: inst_size.into(),
+                                            description: m.description.clone().into(),
+                                            is_nsfw: m.nsfw,
+                                            is_official: m.official,
+                                            image,
+                                            has_image,
+                                        }
+                                    })
+                                    .collect();
+                                drop(cache);
+
+                                // Store full metadata for download
+                                *modlist_data_clone.lock().unwrap() = modlists.clone();
+
+                                // Set game list
+                                let game_model: Vec<slint::SharedString> = games.iter().map(|g| g.clone().into()).collect();
+                                dialog.set_game_list(std::rc::Rc::new(slint::VecModel::from(game_model)).into());
+
+                                dialog.set_modlists(std::rc::Rc::new(slint::VecModel::from(ui_modlists)).into());
+                                dialog.set_is_loading(false);
+                                dialog.set_status_message("Syncing images...".into());
+
+                                // Start background image sync
+                                let dialog_weak2 = dialog.as_weak();
+                                let modlist_data_for_sync = modlist_data_clone.clone();
+                                let image_cache_for_sync = image_cache_clone.clone();
+                                std::thread::spawn(move || {
+                                    let rt = tokio::runtime::Runtime::new().unwrap();
+                                    rt.block_on(async {
+                                        let modlists = modlist_data_for_sync.lock().unwrap().clone();
+                                        let image_data: Vec<(String, String)> = modlists
+                                            .iter()
+                                            .filter_map(|m| {
+                                                m.image_url().map(|url| (m.machine_name.clone(), url.to_string()))
+                                            })
+                                            .collect();
+
+                                        let mut cache = image_cache_for_sync.lock().unwrap();
+                                        let result = cache.sync_images(&image_data, None::<fn(usize, usize, &str)>).await;
+                                        drop(cache);
+
+                                        if let Ok(sync_result) = result {
+                                            println!("[images] Sync complete: {}", sync_result);
+                                        }
+
+                                        // Refresh UI with loaded images
+                                        slint::invoke_from_event_loop(move || {
+                                            if let Some(dialog) = dialog_weak2.upgrade() {
+                                                let all_modlists = modlist_data_for_sync.lock().unwrap();
+                                                let cache = image_cache_for_sync.lock().unwrap();
+
+                                                let ui_modlists: Vec<ModlistInfo> = all_modlists
+                                                    .iter()
+                                                    .enumerate()
+                                                    .filter(|(_, m)| {
+                                                        let show_unofficial = dialog.get_show_unofficial();
+                                                        let show_nsfw = dialog.get_show_nsfw();
+                                                        (show_unofficial || m.official) && (show_nsfw || !m.nsfw)
+                                                    })
+                                                    .map(|(idx, m)| {
+                                                        let dl_size = m.download_metadata.as_ref()
+                                                            .map(|d| format_size(d.size_of_archives))
+                                                            .unwrap_or_else(|| "Unknown".into());
+                                                        let inst_size = m.download_metadata.as_ref()
+                                                            .map(|d| format_size(d.size_of_installed_files))
+                                                            .unwrap_or_else(|| "Unknown".into());
+
+                                                        let (image, has_image) = if let Some(path) = cache.get_cached_path(&m.machine_name) {
+                                                            match slint::Image::load_from_path(&path) {
+                                                                Ok(img) => (img, true),
+                                                                Err(_) => (slint::Image::default(), false),
+                                                            }
+                                                        } else {
+                                                            (slint::Image::default(), false)
+                                                        };
+
+                                                        ModlistInfo {
+                                                            index: idx as i32,
+                                                            title: m.title.clone().into(),
+                                                            author: m.author.clone().into(),
+                                                            game: m.game.clone().into(),
+                                                            download_size: dl_size.into(),
+                                                            install_size: inst_size.into(),
+                                                            description: m.description.clone().into(),
+                                                            is_nsfw: m.nsfw,
+                                                            is_official: m.official,
+                                                            image,
+                                                            has_image,
+                                                        }
+                                                    })
+                                                    .collect();
+
+                                                dialog.set_modlists(std::rc::Rc::new(slint::VecModel::from(ui_modlists)).into());
+                                                dialog.set_status_message("".into());
+                                            }
+                                        }).ok();
+                                    });
+                                });
+                            }
+                            Err(e) => {
+                                dialog.set_is_loading(false);
+                                dialog.set_status_message(format!("Error: {}", e).into());
+                            }
+                        }
+                    }
+                }).ok();
+            });
+
+            // Cancel callback
+            dialog.on_cancel({
+                let dialog_weak = dialog.as_weak();
+                move || {
+                    if let Some(dialog) = dialog_weak.upgrade() {
+                        dialog.hide().ok();
+                    }
+                }
+            });
+
+            // Helper function to filter modlists based on current filters
+            fn filter_modlists(
+                all_modlists: &[crate::modlist::ModlistMetadata],
+                query: &str,
+                game: &str,
+                show_unofficial: bool,
+                show_nsfw: bool,
+                image_cache: &image_cache::ImageCache,
+            ) -> Vec<ModlistInfo> {
+                let query_lower = query.to_lowercase();
+                let game_filter = if game == "All Games" { "" } else { game };
+
+                all_modlists
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| {
+                        // Query filter
+                        let matches_query = query_lower.is_empty() ||
+                            m.title.to_lowercase().contains(&query_lower) ||
+                            m.author.to_lowercase().contains(&query_lower) ||
+                            m.game.to_lowercase().contains(&query_lower);
+
+                        // Game filter
+                        let matches_game = game_filter.is_empty() || m.game == game_filter;
+
+                        // Unofficial filter (if show_unofficial is false, only show official)
+                        let matches_unofficial = show_unofficial || m.official;
+
+                        // NSFW filter
+                        let matches_nsfw = show_nsfw || !m.nsfw;
+
+                        matches_query && matches_game && matches_unofficial && matches_nsfw
+                    })
+                    .map(|(idx, m)| {
+                        let dl_size = m.download_metadata.as_ref()
+                            .map(|d| format_size(d.size_of_archives))
+                            .unwrap_or_else(|| "Unknown".into());
+                        let inst_size = m.download_metadata.as_ref()
+                            .map(|d| format_size(d.size_of_installed_files))
+                            .unwrap_or_else(|| "Unknown".into());
+
+                        // Try to load cached image
+                        let (image, has_image) = if let Some(path) = image_cache.get_cached_path(&m.machine_name) {
+                            match slint::Image::load_from_path(&path) {
+                                Ok(img) => (img, true),
+                                Err(_) => (slint::Image::default(), false),
+                            }
+                        } else {
+                            (slint::Image::default(), false)
+                        };
+
+                        ModlistInfo {
+                            index: idx as i32,
+                            title: m.title.clone().into(),
+                            author: m.author.clone().into(),
+                            game: m.game.clone().into(),
+                            download_size: dl_size.into(),
+                            install_size: inst_size.into(),
+                            description: m.description.clone().into(),
+                            is_nsfw: m.nsfw,
+                            is_official: m.official,
+                            image,
+                            has_image,
+                        }
+                    })
+                    .collect()
+            }
+
+            // Search callback
+            dialog.on_search_changed({
+                let dialog_weak = dialog.as_weak();
+                let modlist_data = modlist_data.clone();
+                let image_cache = image_cache.clone();
+                move |query| {
+                    if let Some(dialog) = dialog_weak.upgrade() {
+                        let all_modlists = modlist_data.lock().unwrap();
+                        let cache = image_cache.lock().unwrap();
+                        let filtered = filter_modlists(
+                            &all_modlists,
+                            &query.to_string(),
+                            &dialog.get_selected_game().to_string(),
+                            dialog.get_show_unofficial(),
+                            dialog.get_show_nsfw(),
+                            &cache,
+                        );
+                        dialog.set_modlists(std::rc::Rc::new(slint::VecModel::from(filtered)).into());
+                    }
+                }
+            });
+
+            // Game filter callback
+            dialog.on_game_filter_changed({
+                let dialog_weak = dialog.as_weak();
+                let modlist_data = modlist_data.clone();
+                let image_cache = image_cache.clone();
+                move |game| {
+                    if let Some(dialog) = dialog_weak.upgrade() {
+                        let all_modlists = modlist_data.lock().unwrap();
+                        let cache = image_cache.lock().unwrap();
+                        let filtered = filter_modlists(
+                            &all_modlists,
+                            &dialog.get_search_text().to_string(),
+                            &game.to_string(),
+                            dialog.get_show_unofficial(),
+                            dialog.get_show_nsfw(),
+                            &cache,
+                        );
+                        dialog.set_modlists(std::rc::Rc::new(slint::VecModel::from(filtered)).into());
+                    }
+                }
+            });
+
+            // Filter changed callback (unofficial/nsfw checkboxes)
+            dialog.on_filter_changed({
+                let dialog_weak = dialog.as_weak();
+                let modlist_data = modlist_data.clone();
+                let image_cache = image_cache.clone();
+                move |show_unofficial, show_nsfw| {
+                    if let Some(dialog) = dialog_weak.upgrade() {
+                        let all_modlists = modlist_data.lock().unwrap();
+                        let cache = image_cache.lock().unwrap();
+                        let filtered = filter_modlists(
+                            &all_modlists,
+                            &dialog.get_search_text().to_string(),
+                            &dialog.get_selected_game().to_string(),
+                            show_unofficial,
+                            show_nsfw,
+                            &cache,
+                        );
+                        dialog.set_modlists(std::rc::Rc::new(slint::VecModel::from(filtered)).into());
+                    }
+                }
+            });
+
+            // Select modlist callback - downloads and sets path
+            dialog.on_select_modlist({
+                let dialog_weak = dialog.as_weak();
+                let main_window_weak = window_weak.clone();
+                let modlist_data = modlist_data.clone();
+                move |index| {
+                    let data = modlist_data.lock().unwrap();
+                    if let Some(metadata) = data.get(index as usize) {
+                        let dialog_weak = dialog_weak.clone();
+                        let main_window_weak = main_window_weak.clone();
+                        let metadata = metadata.clone();
+
+                        // Update UI to show downloading
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_is_downloading(true);
+                            dialog.set_download_progress(0.0);
+                        }
+
+                        // Download in background
+                        std::thread::spawn(move || {
+                            let rt = tokio::runtime::Runtime::new().unwrap();
+                            let result = rt.block_on(async {
+                                let browser = crate::modlist::ModlistBrowser::new()?;
+                                let downloads_dir = dirs::download_dir()
+                                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                                browser.download_modlist(&metadata, &downloads_dir).await
+                            });
+
+                            slint::invoke_from_event_loop(move || {
+                                if let Some(dialog) = dialog_weak.upgrade() {
+                                    dialog.set_is_downloading(false);
+
+                                    match result {
+                                        Ok(path) => {
+                                            // Set the path in main window
+                                            if let Some(main_window) = main_window_weak.upgrade() {
+                                                main_window.set_source_path(path.display().to_string().into());
+                                                main_window.set_log_text(format!(
+                                                    "Downloaded modlist: {} to {}\n",
+                                                    metadata.title,
+                                                    path.display()
+                                                ).into());
+
+                                                // Trigger game detection
+                                                main_window.set_detected_game("Loading...".into());
+                                            }
+                                            dialog.hide().ok();
+                                        }
+                                        Err(e) => {
+                                            dialog.set_status_message(format!("Download failed: {}", e).into());
+                                        }
+                                    }
+                                }
+                            }).ok();
+                        });
+                    }
+                }
+            });
+
+            // Refresh callback
+            dialog.on_refresh({
+                let dialog_weak = dialog.as_weak();
+                let modlist_data = modlist_data.clone();
+                let image_cache = image_cache.clone();
+                move || {
+                    if let Some(dialog) = dialog_weak.upgrade() {
+                        dialog.set_is_loading(true);
+                        dialog.set_status_message("Refreshing modlists...".into());
+
+                        let dialog_weak = dialog_weak.clone();
+                        let modlist_data = modlist_data.clone();
+                        let image_cache = image_cache.clone();
+                        std::thread::spawn(move || {
+                            let rt = tokio::runtime::Runtime::new().unwrap();
+                            let result: Result<Vec<crate::modlist::ModlistMetadata>, anyhow::Error> = rt.block_on(async {
+                                let mut browser = crate::modlist::ModlistBrowser::new()?;
+                                let modlists = browser.fetch_modlists().await?;
+                                Ok(modlists.to_vec())
+                            });
+
+                            slint::invoke_from_event_loop(move || {
+                                if let Some(dialog) = dialog_weak.upgrade() {
+                                    match result {
+                                        Ok(modlists) => {
+                                            // Rebuild game list
+                                            let mut games: Vec<String> = vec!["All Games".to_string()];
+                                            let mut seen_games: std::collections::HashSet<String> = std::collections::HashSet::new();
+                                            for m in &modlists {
+                                                if !m.game.is_empty() && seen_games.insert(m.game.clone()) {
+                                                    games.push(m.game.clone());
+                                                }
+                                            }
+                                            games[1..].sort();
+
+                                            // Apply current filters
+                                            let show_unofficial = dialog.get_show_unofficial();
+                                            let show_nsfw = dialog.get_show_nsfw();
+                                            let cache = image_cache.lock().unwrap();
+
+                                            let ui_modlists: Vec<ModlistInfo> = modlists
+                                                .iter()
+                                                .enumerate()
+                                                .filter(|(_, m)| {
+                                                    (show_unofficial || m.official) && (show_nsfw || !m.nsfw)
+                                                })
+                                                .map(|(idx, m)| {
+                                                    let dl_size = m.download_metadata.as_ref()
+                                                        .map(|d| format_size(d.size_of_archives))
+                                                        .unwrap_or_else(|| "Unknown".into());
+                                                    let inst_size = m.download_metadata.as_ref()
+                                                        .map(|d| format_size(d.size_of_installed_files))
+                                                        .unwrap_or_else(|| "Unknown".into());
+
+                                                    let (image, has_image) = if let Some(path) = cache.get_cached_path(&m.machine_name) {
+                                                        match slint::Image::load_from_path(&path) {
+                                                            Ok(img) => (img, true),
+                                                            Err(_) => (slint::Image::default(), false),
+                                                        }
+                                                    } else {
+                                                        (slint::Image::default(), false)
+                                                    };
+
+                                                    ModlistInfo {
+                                                        index: idx as i32,
+                                                        title: m.title.clone().into(),
+                                                        author: m.author.clone().into(),
+                                                        game: m.game.clone().into(),
+                                                        download_size: dl_size.into(),
+                                                        install_size: inst_size.into(),
+                                                        description: m.description.clone().into(),
+                                                        is_nsfw: m.nsfw,
+                                                        is_official: m.official,
+                                                        image,
+                                                        has_image,
+                                                    }
+                                                })
+                                                .collect();
+                                            drop(cache);
+
+                                            *modlist_data.lock().unwrap() = modlists.to_vec();
+
+                                            // Update game list
+                                            let game_model: Vec<slint::SharedString> = games.iter().map(|g| g.clone().into()).collect();
+                                            dialog.set_game_list(std::rc::Rc::new(slint::VecModel::from(game_model)).into());
+
+                                            // Reset game filter to "All Games"
+                                            dialog.set_selected_game("All Games".into());
+                                            dialog.set_game_index(0);
+
+                                            dialog.set_modlists(std::rc::Rc::new(slint::VecModel::from(ui_modlists)).into());
+                                            dialog.set_is_loading(false);
+                                            dialog.set_status_message("".into());
+                                        }
+                                        Err(e) => {
+                                            dialog.set_is_loading(false);
+                                            dialog.set_status_message(format!("Error: {}", e).into());
+                                        }
+                                    }
+                                }
+                            }).ok();
+                        });
+                    }
+                }
+            });
+
+            // Show the dialog
+            dialog.show().ok();
+        }
     });
 
     window.on_open_settings({
