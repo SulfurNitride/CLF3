@@ -50,8 +50,13 @@ image_dds = "0.7.2"
 image = "0.25.9"
 directxtex = "1.3.0"
 
+# GPU acceleration
+wgpu = "28.0"
+block_compression = { version = "0.8", features = ["wgpu", "bc7"] }
+pollster = "0.4"
+
 # HTTP client
-reqwest = { version = "0.13.1", features = ["stream", "cookies", "json"] }
+reqwest = { version = "0.13.1", features = ["stream", "cookies", "json", "blocking"] }
 futures = "0.3.31"
 
 # Date/time

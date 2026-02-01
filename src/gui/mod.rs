@@ -2,6 +2,9 @@
 //!
 //! Provides a graphical interface for the modlist installer.
 
+mod settings;
+pub use settings::Settings;
+
 // Main window component - full installer UI with setup form
 slint::slint! {
     import { Button, CheckBox, ScrollView, ProgressIndicator } from "std-widgets.slint";
@@ -312,9 +315,10 @@ slint::slint! {
         }
     }
 
-    // API Key status indicator
+    // API Key status indicator (clickable for help when state is Unknown)
     component ApiKeyStatus inherits Rectangle {
         in property <ApiKeyState> state: ApiKeyState.Unknown;
+        callback clicked();
 
         width: 24px;
         height: 24px;
@@ -322,7 +326,7 @@ slint::slint! {
         background: state == ApiKeyState.Valid ? Theme.green :
                     state == ApiKeyState.Invalid ? Theme.red :
                     state == ApiKeyState.Validating ? Theme.yellow :
-                    Theme.surface1;
+                    (touch.has-hover ? Theme.surface2 : Theme.surface1);
 
         Text {
             text: state == ApiKeyState.Valid ? "OK" :
@@ -334,6 +338,15 @@ slint::slint! {
             color: state == ApiKeyState.Unknown ? Theme.overlay0 : Theme.crust;
             horizontal-alignment: center;
             vertical-alignment: center;
+        }
+
+        touch := TouchArea {
+            mouse-cursor: state == ApiKeyState.Unknown ? pointer : default;
+            clicked => {
+                if state == ApiKeyState.Unknown {
+                    clicked();
+                }
+            }
         }
     }
 
@@ -566,6 +579,7 @@ slint::slint! {
 
                                 ApiKeyStatus {
                                     state: api_key_state;
+                                    clicked => { open_api_key_page(); }
                                 }
                             }
                         }
@@ -822,6 +836,364 @@ slint::slint! {
                     LinkButton {
                         label: "Settings";
                         clicked => { open_settings(); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Settings dialog component
+slint::slint! {
+    import { Button, ComboBox, ScrollView } from "std-widgets.slint";
+
+    // GPU info for dropdown
+    export struct GpuOption {
+        index: int,
+        name: string,
+    }
+
+    // Settings dialog window
+    export component SettingsDialog inherits Window {
+        title: "CLF3 Settings";
+        min-width: 500px;
+        min-height: 420px;
+        background: #1e1e2e;
+
+        // Settings values
+        in-out property <string> default_install_dir: "";
+        in-out property <string> default_downloads_dir: "";
+        in-out property <string> nexus_api_key: "";
+        in-out property <[GpuOption]> gpu_options: [];
+        in-out property <int> selected_gpu_index: -1;
+
+        // Callbacks
+        callback browse_install();
+        callback browse_downloads();
+        callback save_settings();
+        callback cancel_settings();
+        callback gpu_selected(int);
+
+        VerticalLayout {
+            padding: 20px;
+            spacing: 16px;
+
+            // Title
+            Text {
+                text: "Settings";
+                font-size: 24px;
+                font-weight: 700;
+                color: #cdd6f4;
+            }
+
+            Text {
+                text: "Configure default paths and preferences";
+                font-size: 13px;
+                color: #a6adc8;
+            }
+
+            // Separator
+            Rectangle {
+                height: 1px;
+                background: #313244;
+            }
+
+            // Default Install Directory
+            VerticalLayout {
+                spacing: 6px;
+
+                Text {
+                    text: "Default Install Directory";
+                    font-size: 13px;
+                    font-weight: 500;
+                    color: #bac2de;
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 36px;
+                        background: #11111b;
+                        border-radius: 6px;
+
+                        Text {
+                            x: 12px;
+                            text: default_install_dir == "" ? "Not set" : default_install_dir;
+                            font-size: 13px;
+                            color: default_install_dir == "" ? #6c7086 : #cdd6f4;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+
+                    Rectangle {
+                        width: 70px;
+                        height: 36px;
+                        background: #313244;
+                        border-radius: 6px;
+
+                        Text {
+                            text: "Browse";
+                            font-size: 13px;
+                            color: #89b4fa;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        TouchArea {
+                            clicked => { browse_install(); }
+                        }
+                    }
+                }
+            }
+
+            // Default Downloads Directory
+            VerticalLayout {
+                spacing: 6px;
+
+                Text {
+                    text: "Default Downloads Directory";
+                    font-size: 13px;
+                    font-weight: 500;
+                    color: #bac2de;
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 36px;
+                        background: #11111b;
+                        border-radius: 6px;
+
+                        Text {
+                            x: 12px;
+                            text: default_downloads_dir == "" ? "Not set" : default_downloads_dir;
+                            font-size: 13px;
+                            color: default_downloads_dir == "" ? #6c7086 : #cdd6f4;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+
+                    Rectangle {
+                        width: 70px;
+                        height: 36px;
+                        background: #313244;
+                        border-radius: 6px;
+
+                        Text {
+                            text: "Browse";
+                            font-size: 13px;
+                            color: #89b4fa;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        TouchArea {
+                            clicked => { browse_downloads(); }
+                        }
+                    }
+                }
+            }
+
+            // API Key
+            VerticalLayout {
+                spacing: 6px;
+
+                Text {
+                    text: "Nexus Mods API Key";
+                    font-size: 13px;
+                    font-weight: 500;
+                    color: #bac2de;
+                }
+
+                Rectangle {
+                    height: 36px;
+                    background: #11111b;
+                    border-radius: 6px;
+
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+
+                        TextInput {
+                            text <=> nexus_api_key;
+                            font-size: 13px;
+                            color: #cdd6f4;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            input-type: password;
+                        }
+                    }
+                }
+
+                Text {
+                    text: "Stored securely in ~/.config/clf3/settings.json";
+                    font-size: 11px;
+                    color: #6c7086;
+                }
+            }
+
+            // GPU Selection
+            VerticalLayout {
+                spacing: 6px;
+
+                Text {
+                    text: "GPU for Texture Processing";
+                    font-size: 13px;
+                    font-weight: 500;
+                    color: #bac2de;
+                }
+
+                Rectangle {
+                    height: 36px;
+                    background: #11111b;
+                    border-radius: 6px;
+
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+
+                        Text {
+                            text: selected_gpu_index < 0 ? "Auto-select (recommended)" :
+                                  (selected_gpu_index < gpu_options.length ? gpu_options[selected_gpu_index].name : "Unknown");
+                            font-size: 13px;
+                            color: selected_gpu_index < 0 ? #a6adc8 : #cdd6f4;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                }
+
+                // GPU list (simple clickable items)
+                for gpu[idx] in gpu_options: Rectangle {
+                    height: 32px;
+                    background: selected_gpu_index == gpu.index ? #313244 : transparent;
+                    border-radius: 4px;
+
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-top: 8px;
+                        padding-bottom: 8px;
+                        spacing: 10px;
+
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 16px;
+                                height: 16px;
+                                border-radius: 8px;
+                                border-width: 2px;
+                                border-color: #89b4fa;
+                                background: selected_gpu_index == gpu.index ? #89b4fa : transparent;
+                            }
+                        }
+
+                        Text {
+                            text: gpu.name;
+                            font-size: 12px;
+                            color: #cdd6f4;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    TouchArea {
+                        clicked => { gpu_selected(gpu.index); }
+                    }
+                }
+
+                // Auto-select option
+                Rectangle {
+                    height: 32px;
+                    background: selected_gpu_index < 0 ? #313244 : transparent;
+                    border-radius: 4px;
+
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-top: 8px;
+                        padding-bottom: 8px;
+                        spacing: 10px;
+
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 16px;
+                                height: 16px;
+                                border-radius: 8px;
+                                border-width: 2px;
+                                border-color: #89b4fa;
+                                background: selected_gpu_index < 0 ? #89b4fa : transparent;
+                            }
+                        }
+
+                        Text {
+                            text: "Auto-select best GPU";
+                            font-size: 12px;
+                            color: #a6adc8;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    TouchArea {
+                        clicked => { gpu_selected(-1); }
+                    }
+                }
+            }
+
+            // Spacer
+            Rectangle {
+                vertical-stretch: 1;
+            }
+
+            // Buttons
+            HorizontalLayout {
+                spacing: 12px;
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+
+                Rectangle {
+                    width: 100px;
+                    height: 40px;
+                    background: #313244;
+                    border-radius: 8px;
+
+                    Text {
+                        text: "Cancel";
+                        font-size: 14px;
+                        font-weight: 500;
+                        color: #cdd6f4;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    TouchArea {
+                        clicked => { cancel_settings(); }
+                    }
+                }
+
+                Rectangle {
+                    width: 100px;
+                    height: 40px;
+                    background: #89b4fa;
+                    border-radius: 8px;
+
+                    Text {
+                        text: "Save";
+                        font-size: 14px;
+                        font-weight: 600;
+                        color: #1e1e2e;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    TouchArea {
+                        clicked => { save_settings(); }
                     }
                 }
             }
@@ -1933,6 +2305,38 @@ pub fn get_progress_sender() -> Sender<ProgressUpdate> {
 pub fn run() -> Result<(), slint::PlatformError> {
     let window = MainWindow::new()?;
 
+    // Load settings and apply defaults
+    let loaded_settings = Settings::load();
+    if !loaded_settings.default_install_dir.is_empty() {
+        window.set_install_dir(loaded_settings.default_install_dir.clone().into());
+    }
+    if !loaded_settings.default_downloads_dir.is_empty() {
+        window.set_downloads_dir(loaded_settings.default_downloads_dir.clone().into());
+    }
+    if !loaded_settings.nexus_api_key.is_empty() {
+        window.set_nexus_api_key(loaded_settings.nexus_api_key.clone().into());
+
+        // Validate saved API key on startup
+        let api_key = loaded_settings.nexus_api_key.clone();
+        window.set_api_key_state(ApiKeyState::Validating);
+        let window_weak = window.as_weak();
+        std::thread::spawn(move || {
+            let is_valid = validate_nexus_api_key(&api_key);
+            slint::invoke_from_event_loop(move || {
+                if let Some(window) = window_weak.upgrade() {
+                    if is_valid {
+                        window.set_api_key_state(ApiKeyState::Valid);
+                    } else {
+                        window.set_api_key_state(ApiKeyState::Invalid);
+                    }
+                }
+            }).ok();
+        });
+    }
+
+    // Store settings in a shared cell for access in callbacks
+    let settings = std::rc::Rc::new(std::cell::RefCell::new(loaded_settings));
+
     // Set up browse source callback with rfd file dialog
     // Parsing is done in a background thread to avoid UI freeze
     window.on_browse_source({
@@ -2137,8 +2541,42 @@ pub fn run() -> Result<(), slint::PlatformError> {
         }
     });
 
-    window.on_validate_api_key(|key| {
-        println!("Validating API key: {}...", &key.chars().take(8).collect::<String>());
+    window.on_validate_api_key({
+        let window_weak = window.as_weak();
+        move |key| {
+            let key_str = key.to_string();
+
+            // Don't validate empty keys
+            if key_str.is_empty() {
+                if let Some(window) = window_weak.upgrade() {
+                    window.set_api_key_state(ApiKeyState::Unknown);
+                }
+                return;
+            }
+
+            // Set to validating state
+            if let Some(window) = window_weak.upgrade() {
+                window.set_api_key_state(ApiKeyState::Validating);
+            }
+
+            // Validate in background thread
+            let window_weak_bg = window_weak.clone();
+            std::thread::spawn(move || {
+                // Make request to Nexus API to validate key
+                let is_valid = validate_nexus_api_key(&key_str);
+
+                // Update UI from main thread
+                slint::invoke_from_event_loop(move || {
+                    if let Some(window) = window_weak_bg.upgrade() {
+                        if is_valid {
+                            window.set_api_key_state(ApiKeyState::Valid);
+                        } else {
+                            window.set_api_key_state(ApiKeyState::Invalid);
+                        }
+                    }
+                }).ok();
+            });
+        }
     });
 
     window.on_open_api_key_page(|| {
@@ -2148,8 +2586,129 @@ pub fn run() -> Result<(), slint::PlatformError> {
             .spawn();
     });
 
-    window.on_open_settings(|| {
-        println!("Settings clicked");
+    window.on_open_settings({
+        let settings = settings.clone();
+        let window_weak = window.as_weak();
+        move || {
+            // Open settings dialog
+            let dialog = match SettingsDialog::new() {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("Failed to create settings dialog: {}", e);
+                    return;
+                }
+            };
+
+            // Load current settings into dialog
+            let current = settings.borrow();
+            dialog.set_default_install_dir(current.default_install_dir.clone().into());
+            dialog.set_default_downloads_dir(current.default_downloads_dir.clone().into());
+            dialog.set_nexus_api_key(current.nexus_api_key.clone().into());
+            dialog.set_selected_gpu_index(current.gpu_index.map(|i| i as i32).unwrap_or(-1));
+            drop(current);
+
+            // Load available GPUs
+            let gpus = settings::get_available_gpus();
+            let gpu_options: Vec<GpuOption> = gpus
+                .iter()
+                .map(|(idx, name)| GpuOption {
+                    index: *idx as i32,
+                    name: name.clone().into(),
+                })
+                .collect();
+            dialog.set_gpu_options(std::rc::Rc::new(slint::VecModel::from(gpu_options)).into());
+
+            // Browse install callback
+            dialog.on_browse_install({
+                let dialog_weak = dialog.as_weak();
+                move || {
+                    if let Some(dialog) = dialog_weak.upgrade() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_title("Select Default Install Directory")
+                            .pick_folder()
+                        {
+                            dialog.set_default_install_dir(path.display().to_string().into());
+                        }
+                    }
+                }
+            });
+
+            // Browse downloads callback
+            dialog.on_browse_downloads({
+                let dialog_weak = dialog.as_weak();
+                move || {
+                    if let Some(dialog) = dialog_weak.upgrade() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_title("Select Default Downloads Directory")
+                            .pick_folder()
+                        {
+                            dialog.set_default_downloads_dir(path.display().to_string().into());
+                        }
+                    }
+                }
+            });
+
+            // GPU selection callback
+            dialog.on_gpu_selected({
+                let dialog_weak = dialog.as_weak();
+                move |idx| {
+                    if let Some(dialog) = dialog_weak.upgrade() {
+                        dialog.set_selected_gpu_index(idx);
+                    }
+                }
+            });
+
+            // Save callback
+            dialog.on_save_settings({
+                let dialog_weak = dialog.as_weak();
+                let settings = settings.clone();
+                let window_weak = window_weak.clone();
+                move || {
+                    if let Some(dialog) = dialog_weak.upgrade() {
+                        // Update settings
+                        let mut s = settings.borrow_mut();
+                        s.default_install_dir = dialog.get_default_install_dir().to_string();
+                        s.default_downloads_dir = dialog.get_default_downloads_dir().to_string();
+                        s.nexus_api_key = dialog.get_nexus_api_key().to_string();
+                        let gpu_idx = dialog.get_selected_gpu_index();
+                        s.gpu_index = if gpu_idx < 0 { None } else { Some(gpu_idx as usize) };
+
+                        // Save to disk
+                        if let Err(e) = s.save() {
+                            eprintln!("Failed to save settings: {}", e);
+                        }
+
+                        // Apply to main window
+                        if let Some(window) = window_weak.upgrade() {
+                            if !s.default_install_dir.is_empty() && window.get_install_dir().is_empty() {
+                                window.set_install_dir(s.default_install_dir.clone().into());
+                            }
+                            if !s.default_downloads_dir.is_empty() && window.get_downloads_dir().is_empty() {
+                                window.set_downloads_dir(s.default_downloads_dir.clone().into());
+                            }
+                            if !s.nexus_api_key.is_empty() && window.get_nexus_api_key().is_empty() {
+                                window.set_nexus_api_key(s.nexus_api_key.clone().into());
+                            }
+                        }
+
+                        dialog.hide().ok();
+                    }
+                }
+            });
+
+            // Cancel callback
+            dialog.on_cancel_settings({
+                let dialog_weak = dialog.as_weak();
+                move || {
+                    if let Some(dialog) = dialog_weak.upgrade() {
+                        dialog.hide().ok();
+                    }
+                }
+            });
+
+            // Show dialog
+            dialog.show().ok();
+        }
     });
 
     window.on_source_edited(|text| {
@@ -2768,6 +3327,32 @@ fn game_name_to_display(game: &str) -> &str {
         "EnderalSE" | "EnderalSpecialEdition" => "Enderal Special Edition",
         "Starfield" => "Starfield",
         _ => game,
+    }
+}
+
+/// Validate a Nexus Mods API key by making a test request
+///
+/// Returns true if the key is valid, false otherwise
+fn validate_nexus_api_key(api_key: &str) -> bool {
+    // Use a simple blocking HTTP client to validate
+    // The Nexus API returns user info for valid keys
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    let response = client
+        .get("https://api.nexusmods.com/v1/users/validate.json")
+        .header("apikey", api_key)
+        .header("User-Agent", "CLF3/0.0.1")
+        .send();
+
+    match response {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
     }
 }
 
