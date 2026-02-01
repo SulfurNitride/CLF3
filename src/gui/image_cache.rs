@@ -218,18 +218,9 @@ impl ImageCache {
         self.manifest.save(&self.manifest_path)
     }
 
-    /// Sync images with current modlist data (parallel downloads)
-    /// Downloads missing/updated images and removes stale ones
-    pub async fn sync_images<F>(
-        &mut self,
-        modlists: &[(String, String)], // (machine_name, image_url)
-        _progress_callback: Option<F>,
-    ) -> Result<SyncResult>
-    where
-        F: Fn(usize, usize, &str) + Send,
-    {
-        use futures::stream::{self, StreamExt};
-
+    /// Prepare sync - cleanup stale images and return list of images to download
+    /// Call this while holding the lock, then release lock before downloading
+    pub fn prepare_sync(&mut self, modlists: &[(String, String)]) -> Result<(Vec<(String, String)>, usize, usize)> {
         // Build set of current machine names for cleanup
         let current_names: HashSet<String> = modlists.iter().map(|(n, _)| n.clone()).collect();
 
@@ -245,67 +236,20 @@ impl ImageCache {
 
         let skipped = modlists.len() - to_download.len();
 
-        if to_download.is_empty() {
-            return Ok(SyncResult {
-                downloaded: 0,
-                skipped,
-                failed: 0,
-                removed,
-            });
+        Ok((to_download, skipped, removed))
+    }
+
+    /// Update manifest with download results
+    pub fn finish_sync(&mut self, results: &[(String, String)]) -> Result<()> {
+        for (name, url) in results {
+            self.manifest.images.insert(name.clone(), url.clone());
         }
+        self.save_manifest()
+    }
 
-        // Use system thread count for concurrency
-        let concurrency = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-
-        info!("Downloading {} images with {} parallel connections...", to_download.len(), concurrency);
-
-        let client = self.client.clone();
-        let cache_dir = self.cache_dir.clone();
-
-        let results: Vec<Result<(String, String), (String, String)>> = stream::iter(to_download)
-            .map(|(name, url)| {
-                let client = client.clone();
-                let cache_dir = cache_dir.clone();
-                async move {
-                    match download_single_image(&client, &cache_dir, &name, &url).await {
-                        Ok(_) => Ok((name, url)),
-                        Err(e) => {
-                            warn!("Failed to download image for {}: {}", name, e);
-                            Err((name, url))
-                        }
-                    }
-                }
-            })
-            .buffer_unordered(concurrency)
-            .collect()
-            .await;
-
-        let mut downloaded = 0;
-        let mut failed = 0;
-
-        for result in results {
-            match result {
-                Ok((name, url)) => {
-                    self.manifest.images.insert(name, url);
-                    downloaded += 1;
-                }
-                Err(_) => {
-                    failed += 1;
-                }
-            }
-        }
-
-        // Save manifest
-        self.save_manifest()?;
-
-        Ok(SyncResult {
-            downloaded,
-            skipped,
-            failed,
-            removed,
-        })
+    /// Get client and cache_dir for standalone downloads
+    pub fn get_download_context(&self) -> (Client, PathBuf) {
+        (self.client.clone(), self.cache_dir.clone())
     }
 }
 
@@ -362,6 +306,61 @@ async fn download_single_image(
 
     debug!("Downloaded {} ({} bytes, {})", machine_name, bytes.len(), ext);
     Ok(path)
+}
+
+/// Download images in parallel (standalone, doesn't need cache lock)
+/// Returns list of successfully downloaded (machine_name, url) pairs
+pub async fn download_images_parallel(
+    client: &Client,
+    cache_dir: &Path,
+    to_download: Vec<(String, String)>,
+) -> (Vec<(String, String)>, usize) {
+    use futures::stream::{self, StreamExt};
+
+    if to_download.is_empty() {
+        return (Vec::new(), 0);
+    }
+
+    // Use system thread count for concurrency
+    let concurrency = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
+    info!(
+        "Downloading {} images with {} parallel connections...",
+        to_download.len(),
+        concurrency
+    );
+
+    let results: Vec<Result<(String, String), (String, String)>> = stream::iter(to_download)
+        .map(|(name, url)| {
+            let client = client.clone();
+            let cache_dir = cache_dir.to_path_buf();
+            async move {
+                match download_single_image(&client, &cache_dir, &name, &url).await {
+                    Ok(_) => Ok((name, url)),
+                    Err(e) => {
+                        warn!("Failed to download image for {}: {}", name, e);
+                        Err((name, url))
+                    }
+                }
+            }
+        })
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
+
+    let mut succeeded = Vec::new();
+    let mut failed = 0;
+
+    for result in results {
+        match result {
+            Ok(pair) => succeeded.push(pair),
+            Err(_) => failed += 1,
+        }
+    }
+
+    (succeeded, failed)
 }
 
 /// Result of a sync operation

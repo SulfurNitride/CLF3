@@ -1288,6 +1288,7 @@ slint::slint! {
         callback select_modlist(int);
         callback cancel();
         callback refresh();
+        callback load_visible_images();
 
         VerticalLayout {
             padding: 20px;
@@ -1495,17 +1496,20 @@ slint::slint! {
             // Main content area with game dropdown overlay
             Rectangle {
                 vertical-stretch: 1;
+                background: #1e1e2e;  // Match window background
+                clip: true;
 
-                // Modlist list
-                ScrollView {
+                // Modlist list (using Flickable to avoid scrollbar black box)
+                modlist_scroll := Flickable {
                     x: 0;
                     y: 0;
                     width: parent.width;
                     height: parent.height;
+                    viewport-height: is_loading ? 200px : (modlists.length * 228px + 16px);
 
                     VerticalLayout {
                         spacing: 8px;
-                        padding-right: 10px;
+                        padding-right: 8px;
 
                         // Loading indicator
                         if is_loading: Rectangle {
@@ -1721,20 +1725,25 @@ slint::slint! {
                     }
                 }
 
-                // Game dropdown popup (overlay)
+                // Game dropdown popup (overlay) - positioned at top-right of content area
                 if game_dropdown_open: Rectangle {
-                    x: parent.width - 220px - 20px;
-                    y: 0;
-                    width: 220px;
-                    height: min(300px, game_list.length * 36px + 8px);
+                    x: parent.width - 232px;
+                    y: -52px;  // Position above content area, below the dropdown button
+                    width: 232px;
+                    height: min(350px, game_list.length * 36px + 8px);
                     background: #181825;
                     border-radius: 8px;
                     border-width: 1px;
                     border-color: #45475a;
                     drop-shadow-blur: 10px;
                     drop-shadow-color: #00000080;
+                    clip: true;
 
-                    ScrollView {
+                    Flickable {
+                        width: parent.width;
+                        height: parent.height;
+                        viewport-height: game_list.length * 36px + 8px;
+
                         VerticalLayout {
                             padding: 4px;
 
@@ -2881,6 +2890,7 @@ slint::slint! {
 // =============================================================================
 
 use once_cell::sync::Lazy;
+use slint::Model;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Mutex;
 
@@ -2921,6 +2931,44 @@ static PROGRESS_CHANNEL: Lazy<(Mutex<Sender<ProgressUpdate>>, Mutex<Receiver<Pro
 /// Get a clone of the progress sender for use in background threads
 pub fn get_progress_sender() -> Sender<ProgressUpdate> {
     PROGRESS_CHANNEL.0.lock().unwrap().clone()
+}
+
+/// Normalize game name for display (add spaces, proper casing)
+fn normalize_game_name(name: &str) -> String {
+    // Known game name mappings for clean display
+    let lower = name.to_lowercase();
+    match lower.as_str() {
+        "skyrimspecialedition" => "Skyrim Special Edition".to_string(),
+        "skyrimvr" => "Skyrim VR".to_string(),
+        "fallout4" => "Fallout 4".to_string(),
+        "fallout4vr" => "Fallout 4 VR".to_string(),
+        "falloutnewvegas" | "newvegas" => "Fallout New Vegas".to_string(),
+        "fallout3" => "Fallout 3".to_string(),
+        "oblivion" => "Oblivion".to_string(),
+        "morrowind" => "Morrowind".to_string(),
+        "starfield" => "Starfield".to_string(),
+        "baldursgate3" => "Baldur's Gate 3".to_string(),
+        "cyberpunk2077" => "Cyberpunk 2077".to_string(),
+        "dragonageorigins" => "Dragon Age Origins".to_string(),
+        "dragonage2" => "Dragon Age 2".to_string(),
+        "dragonageinquisition" => "Dragon Age Inquisition".to_string(),
+        "witcher3" | "thewitcher3" => "The Witcher 3".to_string(),
+        "enderalspecialedition" | "enderal" => "Enderal".to_string(),
+        "nomanssky" => "No Man's Sky".to_string(),
+        "mountandblade2bannerlord" | "bannerlord" => "Mount & Blade II: Bannerlord".to_string(),
+        "stardewvalley" => "Stardew Valley".to_string(),
+        "darkestdungeon" => "Darkest Dungeon".to_string(),
+        "kingdomcomedeliverance" => "Kingdom Come: Deliverance".to_string(),
+        "dishonored" => "Dishonored".to_string(),
+        _ => {
+            // Fallback: capitalize first letter
+            let mut chars = name.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => name.to_string(),
+            }
+        }
+    }
 }
 
 /// Initialize and run the main GUI application
@@ -3271,18 +3319,20 @@ pub fn run() -> Result<(), slint::PlatformError> {
                     if let Some(dialog) = dialog_weak.upgrade() {
                         match result {
                             Ok(modlists) => {
-                                // Build unique game list
+                                // Build unique game list (case-insensitive dedup, pick best display name)
                                 let mut games: Vec<String> = vec!["All Games".to_string()];
-                                let mut seen_games: std::collections::HashSet<String> = std::collections::HashSet::new();
+                                let mut seen_games: std::collections::HashMap<String, String> = std::collections::HashMap::new();
                                 for m in &modlists {
-                                    if !m.game.is_empty() && seen_games.insert(m.game.clone()) {
-                                        games.push(m.game.clone());
+                                    if !m.game.is_empty() {
+                                        let key = m.game.to_lowercase();
+                                        seen_games.entry(key).or_insert_with(|| normalize_game_name(&m.game));
                                     }
                                 }
-                                games[1..].sort();
+                                let mut game_names: Vec<String> = seen_games.into_values().collect();
+                                game_names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+                                games.extend(game_names);
 
-                                // Convert to UI model (filter based on default show_unofficial=true, show_nsfw=false)
-                                let cache = image_cache_clone.lock().unwrap();
+                                // Convert to UI model (no images initially - they load in background)
                                 let ui_modlists: Vec<ModlistInfo> = modlists
                                     .iter()
                                     .enumerate()
@@ -3295,32 +3345,21 @@ pub fn run() -> Result<(), slint::PlatformError> {
                                             .map(|d| format_size(d.size_of_installed_files))
                                             .unwrap_or_else(|| "Unknown".into());
 
-                                        // Try to load cached image
-                                        let (image, has_image) = if let Some(path) = cache.get_cached_path(&m.machine_name) {
-                                            match slint::Image::load_from_path(&path) {
-                                                Ok(img) => (img, true),
-                                                Err(_) => (slint::Image::default(), false),
-                                            }
-                                        } else {
-                                            (slint::Image::default(), false)
-                                        };
-
                                         ModlistInfo {
                                             index: idx as i32,
                                             title: m.title.clone().into(),
                                             author: m.author.clone().into(),
-                                            game: m.game.clone().into(),
+                                            game: normalize_game_name(&m.game).into(),
                                             download_size: dl_size.into(),
                                             install_size: inst_size.into(),
                                             description: m.description.clone().into(),
                                             is_nsfw: m.nsfw,
                                             is_official: m.official,
-                                            image,
-                                            has_image,
+                                            image: slint::Image::default(),
+                                            has_image: false,
                                         }
                                     })
                                     .collect();
-                                drop(cache);
 
                                 // Store full metadata for download
                                 *modlist_data_clone.lock().unwrap() = modlists.clone();
@@ -3333,7 +3372,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                                 dialog.set_is_loading(false);
                                 dialog.set_status_message("Syncing images...".into());
 
-                                // Start background image sync
+                                // Sync images in background (download missing, don't load into UI - lazy loader handles that)
                                 let dialog_weak2 = dialog.as_weak();
                                 let modlist_data_for_sync = modlist_data_clone.clone();
                                 let image_cache_for_sync = image_cache_clone.clone();
@@ -3348,63 +3387,36 @@ pub fn run() -> Result<(), slint::PlatformError> {
                                             })
                                             .collect();
 
-                                        let mut cache = image_cache_for_sync.lock().unwrap();
-                                        let result = cache.sync_images(&image_data, None::<fn(usize, usize, &str)>).await;
-                                        drop(cache);
+                                        // Prepare sync (hold lock briefly)
+                                        let (to_download, skipped, removed, client, cache_dir) = {
+                                            let mut cache = image_cache_for_sync.lock().unwrap();
+                                            let (to_download, skipped, removed) = cache.prepare_sync(&image_data).unwrap_or_default();
+                                            let (client, cache_dir) = cache.get_download_context();
+                                            (to_download, skipped, removed, client, cache_dir)
+                                        };
 
-                                        if let Ok(sync_result) = result {
-                                            println!("[images] Sync complete: {}", sync_result);
+                                        // Download without holding lock
+                                        let (succeeded, failed) = image_cache::download_images_parallel(
+                                            &client,
+                                            &cache_dir,
+                                            to_download,
+                                        ).await;
+
+                                        // Update manifest
+                                        {
+                                            let mut cache = image_cache_for_sync.lock().unwrap();
+                                            let _ = cache.finish_sync(&succeeded);
                                         }
 
-                                        // Refresh UI with loaded images
+                                        println!("[images] Sync complete: Downloaded: {}, Skipped: {}, Failed: {}, Removed: {}",
+                                            succeeded.len(), skipped, failed, removed);
+
+                                        // Clear status and trigger lazy load for visible items
                                         slint::invoke_from_event_loop(move || {
                                             if let Some(dialog) = dialog_weak2.upgrade() {
-                                                let all_modlists = modlist_data_for_sync.lock().unwrap();
-                                                let cache = image_cache_for_sync.lock().unwrap();
-
-                                                let ui_modlists: Vec<ModlistInfo> = all_modlists
-                                                    .iter()
-                                                    .enumerate()
-                                                    .filter(|(_, m)| {
-                                                        let show_unofficial = dialog.get_show_unofficial();
-                                                        let show_nsfw = dialog.get_show_nsfw();
-                                                        (show_unofficial || m.official) && (show_nsfw || !m.nsfw)
-                                                    })
-                                                    .map(|(idx, m)| {
-                                                        let dl_size = m.download_metadata.as_ref()
-                                                            .map(|d| format_size(d.size_of_archives))
-                                                            .unwrap_or_else(|| "Unknown".into());
-                                                        let inst_size = m.download_metadata.as_ref()
-                                                            .map(|d| format_size(d.size_of_installed_files))
-                                                            .unwrap_or_else(|| "Unknown".into());
-
-                                                        let (image, has_image) = if let Some(path) = cache.get_cached_path(&m.machine_name) {
-                                                            match slint::Image::load_from_path(&path) {
-                                                                Ok(img) => (img, true),
-                                                                Err(_) => (slint::Image::default(), false),
-                                                            }
-                                                        } else {
-                                                            (slint::Image::default(), false)
-                                                        };
-
-                                                        ModlistInfo {
-                                                            index: idx as i32,
-                                                            title: m.title.clone().into(),
-                                                            author: m.author.clone().into(),
-                                                            game: m.game.clone().into(),
-                                                            download_size: dl_size.into(),
-                                                            install_size: inst_size.into(),
-                                                            description: m.description.clone().into(),
-                                                            is_nsfw: m.nsfw,
-                                                            is_official: m.official,
-                                                            image,
-                                                            has_image,
-                                                        }
-                                                    })
-                                                    .collect();
-
-                                                dialog.set_modlists(std::rc::Rc::new(slint::VecModel::from(ui_modlists)).into());
                                                 dialog.set_status_message("".into());
+                                                // Trigger lazy image loading
+                                                dialog.invoke_load_visible_images();
                                             }
                                         }).ok();
                                     });
@@ -3429,37 +3441,30 @@ pub fn run() -> Result<(), slint::PlatformError> {
                 }
             });
 
-            // Helper function to filter modlists based on current filters
+            // Helper function to filter modlists (no image loading for speed)
             fn filter_modlists(
                 all_modlists: &[crate::modlist::ModlistMetadata],
                 query: &str,
                 game: &str,
                 show_unofficial: bool,
                 show_nsfw: bool,
-                image_cache: &image_cache::ImageCache,
             ) -> Vec<ModlistInfo> {
                 let query_lower = query.to_lowercase();
-                let game_filter = if game == "All Games" { "" } else { game };
+                let game_filter_lower = if game == "All Games" { String::new() } else { game.to_lowercase() };
 
                 all_modlists
                     .iter()
                     .enumerate()
                     .filter(|(_, m)| {
-                        // Query filter
                         let matches_query = query_lower.is_empty() ||
                             m.title.to_lowercase().contains(&query_lower) ||
                             m.author.to_lowercase().contains(&query_lower) ||
                             m.game.to_lowercase().contains(&query_lower);
-
-                        // Game filter
-                        let matches_game = game_filter.is_empty() || m.game == game_filter;
-
-                        // Unofficial filter (if show_unofficial is false, only show official)
+                        // Case-insensitive game matching
+                        let matches_game = game_filter_lower.is_empty() ||
+                            m.game.to_lowercase() == game_filter_lower;
                         let matches_unofficial = show_unofficial || m.official;
-
-                        // NSFW filter
                         let matches_nsfw = show_nsfw || !m.nsfw;
-
                         matches_query && matches_game && matches_unofficial && matches_nsfw
                     })
                     .map(|(idx, m)| {
@@ -3470,28 +3475,18 @@ pub fn run() -> Result<(), slint::PlatformError> {
                             .map(|d| format_size(d.size_of_installed_files))
                             .unwrap_or_else(|| "Unknown".into());
 
-                        // Try to load cached image
-                        let (image, has_image) = if let Some(path) = image_cache.get_cached_path(&m.machine_name) {
-                            match slint::Image::load_from_path(&path) {
-                                Ok(img) => (img, true),
-                                Err(_) => (slint::Image::default(), false),
-                            }
-                        } else {
-                            (slint::Image::default(), false)
-                        };
-
                         ModlistInfo {
                             index: idx as i32,
                             title: m.title.clone().into(),
                             author: m.author.clone().into(),
-                            game: m.game.clone().into(),
+                            game: normalize_game_name(&m.game).into(),
                             download_size: dl_size.into(),
                             install_size: inst_size.into(),
                             description: m.description.clone().into(),
                             is_nsfw: m.nsfw,
                             is_official: m.official,
-                            image,
-                            has_image,
+                            image: slint::Image::default(),
+                            has_image: false,
                         }
                     })
                     .collect()
@@ -3501,20 +3496,19 @@ pub fn run() -> Result<(), slint::PlatformError> {
             dialog.on_search_changed({
                 let dialog_weak = dialog.as_weak();
                 let modlist_data = modlist_data.clone();
-                let image_cache = image_cache.clone();
                 move |query| {
                     if let Some(dialog) = dialog_weak.upgrade() {
                         let all_modlists = modlist_data.lock().unwrap();
-                        let cache = image_cache.lock().unwrap();
                         let filtered = filter_modlists(
                             &all_modlists,
                             &query.to_string(),
                             &dialog.get_selected_game().to_string(),
                             dialog.get_show_unofficial(),
                             dialog.get_show_nsfw(),
-                            &cache,
                         );
                         dialog.set_modlists(std::rc::Rc::new(slint::VecModel::from(filtered)).into());
+                        // Reload images for filtered list
+                        dialog.invoke_load_visible_images();
                     }
                 }
             });
@@ -3523,20 +3517,19 @@ pub fn run() -> Result<(), slint::PlatformError> {
             dialog.on_game_filter_changed({
                 let dialog_weak = dialog.as_weak();
                 let modlist_data = modlist_data.clone();
-                let image_cache = image_cache.clone();
                 move |game| {
                     if let Some(dialog) = dialog_weak.upgrade() {
                         let all_modlists = modlist_data.lock().unwrap();
-                        let cache = image_cache.lock().unwrap();
                         let filtered = filter_modlists(
                             &all_modlists,
                             &dialog.get_search_text().to_string(),
                             &game.to_string(),
                             dialog.get_show_unofficial(),
                             dialog.get_show_nsfw(),
-                            &cache,
                         );
                         dialog.set_modlists(std::rc::Rc::new(slint::VecModel::from(filtered)).into());
+                        // Reload images for filtered list
+                        dialog.invoke_load_visible_images();
                     }
                 }
             });
@@ -3545,20 +3538,19 @@ pub fn run() -> Result<(), slint::PlatformError> {
             dialog.on_filter_changed({
                 let dialog_weak = dialog.as_weak();
                 let modlist_data = modlist_data.clone();
-                let image_cache = image_cache.clone();
                 move |show_unofficial, show_nsfw| {
                     if let Some(dialog) = dialog_weak.upgrade() {
                         let all_modlists = modlist_data.lock().unwrap();
-                        let cache = image_cache.lock().unwrap();
                         let filtered = filter_modlists(
                             &all_modlists,
                             &dialog.get_search_text().to_string(),
                             &dialog.get_selected_game().to_string(),
                             show_unofficial,
                             show_nsfw,
-                            &cache,
                         );
                         dialog.set_modlists(std::rc::Rc::new(slint::VecModel::from(filtered)).into());
+                        // Reload images for filtered list
+                        dialog.invoke_load_visible_images();
                     }
                 }
             });
@@ -3647,20 +3639,22 @@ pub fn run() -> Result<(), slint::PlatformError> {
                                 if let Some(dialog) = dialog_weak.upgrade() {
                                     match result {
                                         Ok(modlists) => {
-                                            // Rebuild game list
+                                            // Rebuild game list (case-insensitive dedup)
                                             let mut games: Vec<String> = vec!["All Games".to_string()];
-                                            let mut seen_games: std::collections::HashSet<String> = std::collections::HashSet::new();
+                                            let mut seen_games: std::collections::HashMap<String, String> = std::collections::HashMap::new();
                                             for m in &modlists {
-                                                if !m.game.is_empty() && seen_games.insert(m.game.clone()) {
-                                                    games.push(m.game.clone());
+                                                if !m.game.is_empty() {
+                                                    let key = m.game.to_lowercase();
+                                                    seen_games.entry(key).or_insert_with(|| normalize_game_name(&m.game));
                                                 }
                                             }
-                                            games[1..].sort();
+                                            let mut game_names: Vec<String> = seen_games.into_values().collect();
+                                            game_names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+                                            games.extend(game_names);
 
-                                            // Apply current filters
+                                            // Apply current filters - no image loading yet
                                             let show_unofficial = dialog.get_show_unofficial();
                                             let show_nsfw = dialog.get_show_nsfw();
-                                            let cache = image_cache.lock().unwrap();
 
                                             let ui_modlists: Vec<ModlistInfo> = modlists
                                                 .iter()
@@ -3676,31 +3670,21 @@ pub fn run() -> Result<(), slint::PlatformError> {
                                                         .map(|d| format_size(d.size_of_installed_files))
                                                         .unwrap_or_else(|| "Unknown".into());
 
-                                                    let (image, has_image) = if let Some(path) = cache.get_cached_path(&m.machine_name) {
-                                                        match slint::Image::load_from_path(&path) {
-                                                            Ok(img) => (img, true),
-                                                            Err(_) => (slint::Image::default(), false),
-                                                        }
-                                                    } else {
-                                                        (slint::Image::default(), false)
-                                                    };
-
                                                     ModlistInfo {
                                                         index: idx as i32,
                                                         title: m.title.clone().into(),
                                                         author: m.author.clone().into(),
-                                                        game: m.game.clone().into(),
+                                                        game: normalize_game_name(&m.game).into(),
                                                         download_size: dl_size.into(),
                                                         install_size: inst_size.into(),
                                                         description: m.description.clone().into(),
                                                         is_nsfw: m.nsfw,
                                                         is_official: m.official,
-                                                        image,
-                                                        has_image,
+                                                        image: slint::Image::default(),
+                                                        has_image: false,
                                                     }
                                                 })
                                                 .collect();
-                                            drop(cache);
 
                                             *modlist_data.lock().unwrap() = modlists.to_vec();
 
@@ -3715,6 +3699,9 @@ pub fn run() -> Result<(), slint::PlatformError> {
                                             dialog.set_modlists(std::rc::Rc::new(slint::VecModel::from(ui_modlists)).into());
                                             dialog.set_is_loading(false);
                                             dialog.set_status_message("".into());
+
+                                            // Trigger lazy image loading for visible items
+                                            dialog.invoke_load_visible_images();
                                         }
                                         Err(e) => {
                                             dialog.set_is_loading(false);
@@ -3727,6 +3714,93 @@ pub fn run() -> Result<(), slint::PlatformError> {
                     }
                 }
             });
+
+            // Load all cached images in background batches (images are already on disk, so this is fast)
+            dialog.on_load_visible_images({
+                let dialog_weak = dialog.as_weak();
+                let modlist_data = modlist_data.clone();
+                let image_cache = image_cache.clone();
+                move || {
+                    let dialog_weak = dialog_weak.clone();
+                    let modlist_data = modlist_data.clone();
+                    let image_cache = image_cache.clone();
+
+                    std::thread::spawn(move || {
+                        let all_modlists = modlist_data.lock().unwrap().clone();
+                        let cache = image_cache.lock().unwrap();
+                        let cache_dir = cache.cache_dir().to_path_buf();
+                        drop(cache);
+
+                        // Build list of all cached images
+                        let image_tasks: Vec<(usize, std::path::PathBuf)> = all_modlists
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(idx, m)| {
+                                for ext in &["png", "jpg", "webp", "gif"] {
+                                    let path = cache_dir.join(format!("{}.{}", m.machine_name, ext));
+                                    if path.exists() {
+                                        return Some((idx, path));
+                                    }
+                                }
+                                None
+                            })
+                            .collect();
+
+                        // Load in batches of 12 to keep UI responsive
+                        for chunk in image_tasks.chunks(12) {
+                            let chunk: Vec<_> = chunk.to_vec();
+                            let dialog_weak_inner = dialog_weak.clone();
+
+                            // Decode this batch
+                            let decoded: Vec<(usize, u32, u32, Vec<u8>)> = chunk
+                                .iter()
+                                .filter_map(|(idx, path)| {
+                                    match image::open(path) {
+                                        Ok(img) => {
+                                            let rgba = img.to_rgba8();
+                                            let (w, h) = rgba.dimensions();
+                                            Some((*idx, w, h, rgba.into_raw()))
+                                        }
+                                        Err(_) => None,
+                                    }
+                                })
+                                .collect();
+
+                            // Send to UI thread
+                            slint::invoke_from_event_loop(move || {
+                                if let Some(dialog) = dialog_weak_inner.upgrade() {
+                                    let model = dialog.get_modlists();
+                                    let count = model.row_count();
+
+                                    for (orig_idx, width, height, pixels) in decoded {
+                                        let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                                            &pixels, width, height
+                                        );
+                                        let img = slint::Image::from_rgba8(buffer);
+
+                                        for row in 0..count {
+                                            if let Some(mut item) = model.row_data(row) {
+                                                if item.index == orig_idx as i32 {
+                                                    item.image = img;
+                                                    item.has_image = true;
+                                                    model.set_row_data(row, item);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }).ok();
+
+                            // Small delay between batches to keep UI responsive
+                            std::thread::sleep(std::time::Duration::from_millis(30));
+                        }
+                    });
+                }
+            });
+
+            // Trigger image loading
+            dialog.invoke_load_visible_images();
 
             // Show the dialog
             dialog.show().ok();
