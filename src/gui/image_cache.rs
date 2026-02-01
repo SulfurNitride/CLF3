@@ -218,20 +218,17 @@ impl ImageCache {
         self.manifest.save(&self.manifest_path)
     }
 
-    /// Sync images with current modlist data
+    /// Sync images with current modlist data (parallel downloads)
     /// Downloads missing/updated images and removes stale ones
     pub async fn sync_images<F>(
         &mut self,
         modlists: &[(String, String)], // (machine_name, image_url)
-        progress_callback: Option<F>,
+        _progress_callback: Option<F>,
     ) -> Result<SyncResult>
     where
         F: Fn(usize, usize, &str) + Send,
     {
-        let total = modlists.len();
-        let mut downloaded = 0;
-        let mut skipped = 0;
-        let mut failed = 0;
+        use futures::stream::{self, StreamExt};
 
         // Build set of current machine names for cleanup
         let current_names: HashSet<String> = modlists.iter().map(|(n, _)| n.clone()).collect();
@@ -239,27 +236,64 @@ impl ImageCache {
         // Clean up stale images first
         let removed = self.cleanup_stale(&current_names)?;
 
-        // Download missing/updated images
-        for (idx, (machine_name, url)) in modlists.iter().enumerate() {
-            if url.is_empty() {
-                skipped += 1;
-                continue;
-            }
+        // Filter to only images that need downloading
+        let to_download: Vec<(String, String)> = modlists
+            .iter()
+            .filter(|(name, url)| !url.is_empty() && self.needs_download(name, url))
+            .cloned()
+            .collect();
 
-            if let Some(ref callback) = progress_callback {
-                callback(idx + 1, total, machine_name);
-            }
+        let skipped = modlists.len() - to_download.len();
 
-            if self.needs_download(machine_name, url) {
-                match self.download_image(machine_name, url).await {
-                    Ok(_) => downloaded += 1,
-                    Err(e) => {
-                        warn!("Failed to download image for {}: {}", machine_name, e);
-                        failed += 1;
+        if to_download.is_empty() {
+            return Ok(SyncResult {
+                downloaded: 0,
+                skipped,
+                failed: 0,
+                removed,
+            });
+        }
+
+        // Use system thread count for concurrency
+        let concurrency = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+
+        info!("Downloading {} images with {} parallel connections...", to_download.len(), concurrency);
+
+        let client = self.client.clone();
+        let cache_dir = self.cache_dir.clone();
+
+        let results: Vec<Result<(String, String), (String, String)>> = stream::iter(to_download)
+            .map(|(name, url)| {
+                let client = client.clone();
+                let cache_dir = cache_dir.clone();
+                async move {
+                    match download_single_image(&client, &cache_dir, &name, &url).await {
+                        Ok(_) => Ok((name, url)),
+                        Err(e) => {
+                            warn!("Failed to download image for {}: {}", name, e);
+                            Err((name, url))
+                        }
                     }
                 }
-            } else {
-                skipped += 1;
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+
+        let mut downloaded = 0;
+        let mut failed = 0;
+
+        for result in results {
+            match result {
+                Ok((name, url)) => {
+                    self.manifest.images.insert(name, url);
+                    downloaded += 1;
+                }
+                Err(_) => {
+                    failed += 1;
+                }
             }
         }
 
@@ -273,6 +307,61 @@ impl ImageCache {
             removed,
         })
     }
+}
+
+/// Detect image format from magic bytes (standalone for parallel use)
+fn detect_format(bytes: &[u8]) -> &'static str {
+    if bytes.len() < 12 {
+        return "bin";
+    }
+    if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return "png";
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return "jpg";
+    }
+    if bytes.starts_with(b"RIFF") && bytes.len() >= 12 && &bytes[8..12] == b"WEBP" {
+        return "webp";
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return "gif";
+    }
+    "bin"
+}
+
+/// Download a single image (standalone for parallel use)
+async fn download_single_image(
+    client: &Client,
+    cache_dir: &Path,
+    machine_name: &str,
+    url: &str,
+) -> Result<PathBuf> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("Failed to fetch image: {}", url))?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("Failed to download image: HTTP {}", response.status());
+    }
+
+    let bytes = response.bytes().await?;
+    let ext = detect_format(&bytes);
+
+    // Remove old versions with different extensions
+    for old_ext in &["png", "jpg", "webp", "gif", "bin"] {
+        let old_path = cache_dir.join(format!("{}.{}", machine_name, old_ext));
+        let _ = std::fs::remove_file(&old_path);
+    }
+
+    let path = cache_dir.join(format!("{}.{}", machine_name, ext));
+    let mut file = fs::File::create(&path).await?;
+    file.write_all(&bytes).await?;
+    file.flush().await?;
+
+    debug!("Downloaded {} ({} bytes, {})", machine_name, bytes.len(), ext);
+    Ok(path)
 }
 
 /// Result of a sync operation
