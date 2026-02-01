@@ -4,13 +4,13 @@
 //! Supports both direct API mode (premium) and NXM browser mode (free/rate-limit bypass).
 
 use crate::downloaders::{
-    download_file_with_progress, GoogleDriveDownloader, HttpClient, MediaFireDownloader,
-    NexusDownloader, WabbajackCdnDownloader,
+    download_file_with_callback, GoogleDriveDownloader, HttpClient, MediaFireDownloader,
+    NexusDownloader, ProgressCallback as HttpProgressCallback, WabbajackCdnDownloader,
 };
 use crate::modlist::{ArchiveInfo, DownloadState, ModlistDb, NexusState};
 use crate::nxm_handler;
 
-use super::config::InstallConfig;
+use super::config::{InstallConfig, ProgressEvent};
 
 use anyhow::{bail, Context, Result};
 use futures::stream::{self, StreamExt};
@@ -103,6 +103,9 @@ struct DownloadContext {
     failed: AtomicUsize,
     manual_downloads: Mutex<Vec<ManualDownloadInfo>>,
     failed_downloads: Mutex<Vec<FailedDownloadInfo>>,
+    // Progress tracking for callbacks
+    completed_archives: AtomicUsize,
+    total_archives: usize,
 }
 
 /// Download all pending archives (smart mode: only downloads archives needed for missing outputs)
@@ -143,6 +146,7 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
 
     // Now check which of these archives are actually downloaded (with correct size)
     let mut already_downloaded = 0usize;
+    let mut already_downloaded_size: u64 = 0;
     let mut need_download: Vec<ArchiveInfo> = Vec::new();
     let mut truncated_count = 0usize;
 
@@ -154,6 +158,7 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
                     // Already downloaded with correct size - mark in DB
                     db.mark_archive_downloaded(&archive.hash, output_path.to_string_lossy().as_ref())?;
                     already_downloaded += 1;
+                    already_downloaded_size += archive.size as u64;
                     continue;
                 } else {
                     // File exists but wrong size - truncated/corrupted, delete and re-download
@@ -173,7 +178,14 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
     }
 
     if already_downloaded > 0 {
-        println!("Found {} archives already downloaded", already_downloaded);
+        println!("Found {} archives already downloaded ({} bytes)", already_downloaded, already_downloaded_size);
+        // Report skipped archives to progress callback
+        if let Some(ref callback) = config.progress_callback {
+            callback(ProgressEvent::DownloadSkipped {
+                count: already_downloaded,
+                total_size: already_downloaded_size,
+            });
+        }
     }
 
     if need_download.is_empty() {
@@ -210,6 +222,7 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
     overall_pb.set_message("Starting downloads...");
 
     // Create shared context
+    let total_archives = pending.len();
     let ctx = Arc::new(DownloadContext {
         nexus: NexusDownloader::new(&config.nexus_api_key)?,
         http: HttpClient::new()?,
@@ -224,6 +237,8 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
         failed: AtomicUsize::new(0),
         manual_downloads: Mutex::new(Vec::new()),
         failed_downloads: Mutex::new(Vec::new()),
+        completed_archives: AtomicUsize::new(0),
+        total_archives,
     });
 
     // Process downloads in parallel
@@ -350,6 +365,7 @@ async fn process_archive(
                 ctx.skipped.fetch_add(1, Ordering::Relaxed);
                 ctx.overall_pb.inc(1);
                 update_overall_message(ctx);
+                report_archive_complete(ctx, &archive.name);
                 return (DownloadResult::Skipped, None);
             }
         }
@@ -371,6 +387,7 @@ async fn process_archive(
         ctx.manual_downloads.lock().await.push(manual_info);
         ctx.overall_pb.inc(1);
         update_overall_message(ctx);
+        report_archive_complete(ctx, &archive.name);
         return (DownloadResult::Manual, None);
     }
 
@@ -398,6 +415,7 @@ async fn process_archive(
             ctx.downloaded.fetch_add(1, Ordering::Relaxed);
             ctx.overall_pb.inc(1);
             update_overall_message(ctx);
+            report_archive_complete(ctx, &archive.name);
             (DownloadResult::Success, url_to_cache)
         }
         Err(e) => {
@@ -416,6 +434,7 @@ async fn process_archive(
                 error: error_msg,
                 expected_size: archive.size as u64,
             });
+            report_archive_complete(ctx, &archive.name);
             (DownloadResult::Failed, None)
         }
     }
@@ -430,6 +449,24 @@ fn update_overall_message(ctx: &DownloadContext) {
         "OK:{} Skip:{} Fail:{}",
         downloaded, skipped, failed
     ));
+}
+
+/// Report archive completion via progress callback
+fn report_archive_complete(ctx: &DownloadContext, name: &str) {
+    // Increment completed count and get new value (1-based for display)
+    let completed = ctx.completed_archives.fetch_add(1, Ordering::Relaxed) + 1;
+    let total = ctx.total_archives;
+
+    // Call progress callback if configured
+    if let Some(ref callback) = ctx.config.progress_callback {
+        callback(ProgressEvent::DownloadComplete {
+            name: name.to_string(),
+        });
+        callback(ProgressEvent::ArchiveComplete {
+            index: completed,
+            total,
+        });
+    }
 }
 
 /// Check if this is a manual download type
@@ -599,6 +636,25 @@ async fn download_archive(
     }
 }
 
+/// Create a progress callback that emits ProgressEvent::DownloadProgress
+fn make_progress_callback(
+    archive_name: String,
+    callback: &Option<crate::installer::config::ProgressCallback>,
+) -> Option<HttpProgressCallback> {
+    callback.as_ref().map(|cb| {
+        let cb = cb.clone();
+        let name = archive_name;
+        Box::new(move |downloaded: u64, total: u64, speed: f64| {
+            cb(ProgressEvent::DownloadProgress {
+                name: name.clone(),
+                downloaded,
+                total,
+                speed,
+            });
+        }) as HttpProgressCallback
+    })
+}
+
 /// Inner download function (single attempt)
 async fn download_archive_inner(
     state: &DownloadState,
@@ -607,6 +663,13 @@ async fn download_archive_inner(
     ctx: &DownloadContext,
     pb: &ProgressBar,
 ) -> Result<((), Option<(String, i64)>)> {
+    // Create progress callback for GUI updates
+    let progress_callback = make_progress_callback(
+        archive.name.clone(),
+        &ctx.config.progress_callback,
+    );
+    let callback_ref = progress_callback.as_ref();
+
     // Returns (result, optional url to cache)
     match state {
         DownloadState::Nexus(nexus_state) => {
@@ -649,12 +712,12 @@ async fn download_archive_inner(
             };
 
             // Download the file with progress
-            download_file_with_progress(&ctx.http, &url, output_path, Some(archive.size as u64), Some(pb)).await?;
+            download_file_with_callback(&ctx.http, &url, output_path, Some(archive.size as u64), Some(pb), callback_ref).await?;
             Ok(((), url_to_cache))
         }
 
         DownloadState::Http(http_state) => {
-            download_file_with_progress(&ctx.http, &http_state.url, output_path, Some(archive.size as u64), Some(pb)).await?;
+            download_file_with_callback(&ctx.http, &http_state.url, output_path, Some(archive.size as u64), Some(pb), callback_ref).await?;
             Ok(((), None))
         }
 
@@ -662,24 +725,51 @@ async fn download_archive_inner(
             // CDN has its own progress tracking, we just update at the end
             ctx.cdn.download(&cdn_state.url, output_path, archive.size as u64).await?;
             pb.set_position(archive.size as u64);
+            // Report final progress for GUI
+            if let Some(ref cb) = ctx.config.progress_callback {
+                cb(ProgressEvent::DownloadProgress {
+                    name: archive.name.clone(),
+                    downloaded: archive.size as u64,
+                    total: archive.size as u64,
+                    speed: 0.0, // CDN doesn't provide speed info
+                });
+            }
             Ok(((), None))
         }
 
         DownloadState::GoogleDrive(gd_state) => {
             // Use gdrive's own client to maintain cookies through the confirmation flow
             ctx.gdrive.download_to_file(&gd_state.id, output_path, archive.size as u64, Some(pb)).await?;
+            // Report final progress for GUI
+            if let Some(ref cb) = ctx.config.progress_callback {
+                cb(ProgressEvent::DownloadProgress {
+                    name: archive.name.clone(),
+                    downloaded: archive.size as u64,
+                    total: archive.size as u64,
+                    speed: 0.0, // GDrive doesn't provide speed info through this path
+                });
+            }
             Ok(((), None))
         }
 
         DownloadState::MediaFire(mf_state) => {
             let url = ctx.mediafire.get_download_url(&mf_state.url).await?;
-            download_file_with_progress(&ctx.http, &url, output_path, Some(archive.size as u64), Some(pb)).await?;
+            download_file_with_callback(&ctx.http, &url, output_path, Some(archive.size as u64), Some(pb), callback_ref).await?;
             Ok(((), None))
         }
 
         DownloadState::GameFileSource(gf_state) => {
             copy_game_file(gf_state, archive, output_path, &ctx.config)?;
             pb.set_position(archive.size as u64);
+            // Report final progress for GUI (game file copies are instant)
+            if let Some(ref cb) = ctx.config.progress_callback {
+                cb(ProgressEvent::DownloadProgress {
+                    name: archive.name.clone(),
+                    downloaded: archive.size as u64,
+                    total: archive.size as u64,
+                    speed: 0.0,
+                });
+            }
             Ok(((), None))
         }
 
@@ -917,6 +1007,13 @@ async fn download_archives_nxm(
         pb.enable_steady_tick(Duration::from_millis(100));
         pb.set_message(truncate_name(&pending.archive.name, 40));
 
+        // Create progress callback for GUI updates
+        let progress_callback = make_progress_callback(
+            pending.archive.name.clone(),
+            &config.progress_callback,
+        );
+        let callback_ref = progress_callback.as_ref();
+
         // Get download URL using NXM key (bypasses rate limit)
         let download_result = async {
             // Call Nexus API with the NXM key
@@ -941,8 +1038,8 @@ async fn download_archives_nxm(
                 .and_then(|u| u.as_str())
                 .context("No download URL in response")?;
 
-            // Download the file
-            download_file_with_progress(&http, url, &pending.output_path, Some(pending.archive.size as u64), Some(&pb)).await?;
+            // Download the file with callback for GUI
+            download_file_with_callback(&http, url, &pending.output_path, Some(pending.archive.size as u64), Some(&pb), callback_ref).await?;
 
             Ok::<_, anyhow::Error>(())
         }.await;
@@ -1010,6 +1107,7 @@ async fn download_non_nexus_files(
     overall_pb.enable_steady_tick(Duration::from_millis(100));
     overall_pb.set_message("Starting downloads...");
 
+    let total_archives = pending.len();
     let ctx = Arc::new(DownloadContext {
         nexus: NexusDownloader::new(&config.nexus_api_key)?,
         http: HttpClient::new()?,
@@ -1024,6 +1122,8 @@ async fn download_non_nexus_files(
         failed: AtomicUsize::new(0),
         manual_downloads: Mutex::new(Vec::new()),
         failed_downloads: Mutex::new(Vec::new()),
+        completed_archives: AtomicUsize::new(0),
+        total_archives,
     });
 
     let concurrency = config.max_concurrent_downloads;

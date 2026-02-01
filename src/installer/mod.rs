@@ -12,7 +12,7 @@ pub mod processor;
 pub mod streaming;
 pub mod verify;
 
-pub use config::InstallConfig;
+pub use config::{InstallConfig, ProgressCallback, ProgressEvent};
 
 use crate::modlist::{import_wabbajack_to_db, ModlistDb};
 use anyhow::{bail, Context, Result};
@@ -62,6 +62,13 @@ impl Installer {
         println!("Directives: {} total ({} pending)\n", stats.total, stats.pending);
 
         Ok(Self { config, db })
+    }
+
+    /// Report a progress event to the callback if one is set
+    fn report_progress(&self, event: ProgressEvent) {
+        if let Some(ref callback) = self.config.progress_callback {
+            callback(event);
+        }
     }
 
     /// Run the full installation
@@ -276,6 +283,13 @@ impl Installer {
 
         // Phase 3: Process directives using STREAMING pipeline
         println!("=== Phase 3: Process Directives (Streaming) ===\n");
+        self.report_progress(ProgressEvent::PhaseChange {
+            phase: "Extracting".to_string(),
+        });
+        self.report_progress(ProgressEvent::Status {
+            message: "Processing directives...".to_string(),
+        });
+
         let process_stats = processor::process_directives_streaming(
             &self.db,
             &self.config,

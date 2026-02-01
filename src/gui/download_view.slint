@@ -1,0 +1,324 @@
+// CLF3 Download View - NXM Download Mode UI
+// Slint UI component for browser-based Nexus downloads
+
+import { Button, ProgressIndicator, VerticalBox, HorizontalBox, GroupBox } from "std-widgets.slint";
+
+// Download state enumeration
+export enum DownloadState {
+    Idle,
+    WaitingForBrowser,
+    Downloading,
+    Complete,
+    Error,
+}
+
+// Mod information structure
+export struct ModInfo {
+    mod_name: string,
+    mod_id: int,
+    file_id: int,
+    file_size: string,
+}
+
+// Download View Component
+export component DownloadView inherits Window {
+    title: "NXM Download Mode";
+    min-width: 600px;
+    min-height: 450px;
+    background: #1e1e2e;
+
+    // Properties
+    in-out property <int> queue_position: 0;
+    in-out property <int> queue_total: 0;
+    in-out property <ModInfo> current_mod: {
+        mod_name: "",
+        mod_id: 0,
+        file_id: 0,
+        file_size: "0 B",
+    };
+    in-out property <DownloadState> state: DownloadState.Idle;
+    in-out property <float> progress: 0.0;
+    in-out property <string> status_message: "Ready";
+    in-out property <string> error_message: "";
+    in-out property <bool> has_error: false;
+
+    // Callbacks
+    callback register_nxm_handler();
+    callback open_in_browser();
+    callback skip_download();
+    callback next_download();
+    callback cancel_download();
+
+    VerticalBox {
+        padding: 20px;
+        spacing: 15px;
+
+        // Title
+        Text {
+            text: "NXM Download Mode";
+            font-size: 24px;
+            font-weight: 700;
+            color: #cdd6f4;
+            horizontal-alignment: center;
+        }
+
+        // Queue Progress Indicator
+        HorizontalBox {
+            alignment: center;
+            spacing: 10px;
+
+            Text {
+                text: "Queue Progress:";
+                font-size: 14px;
+                color: #a6adc8;
+                vertical-alignment: center;
+            }
+
+            Rectangle {
+                width: 80px;
+                height: 36px;
+                background: #313244;
+                border-radius: 6px;
+
+                Text {
+                    text: queue_position + "/" + queue_total;
+                    font-size: 18px;
+                    font-weight: 600;
+                    color: #89b4fa;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // Current Mod Info Panel
+        GroupBox {
+            title: "Current Download";
+
+            VerticalBox {
+                padding: 10px;
+                spacing: 8px;
+
+                // Mod Name
+                HorizontalBox {
+                    spacing: 10px;
+                    Text {
+                        text: "Mod Name:";
+                        font-size: 13px;
+                        color: #a6adc8;
+                        min-width: 80px;
+                    }
+                    Text {
+                        text: current_mod.mod_name == "" ? "—" : current_mod.mod_name;
+                        font-size: 13px;
+                        color: #cdd6f4;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                }
+
+                // Mod ID
+                HorizontalBox {
+                    spacing: 10px;
+                    Text {
+                        text: "Mod ID:";
+                        font-size: 13px;
+                        color: #a6adc8;
+                        min-width: 80px;
+                    }
+                    Text {
+                        text: current_mod.mod_id == 0 ? "—" : current_mod.mod_id;
+                        font-size: 13px;
+                        color: #cdd6f4;
+                    }
+                }
+
+                // File ID
+                HorizontalBox {
+                    spacing: 10px;
+                    Text {
+                        text: "File ID:";
+                        font-size: 13px;
+                        color: #a6adc8;
+                        min-width: 80px;
+                    }
+                    Text {
+                        text: current_mod.file_id == 0 ? "—" : current_mod.file_id;
+                        font-size: 13px;
+                        color: #cdd6f4;
+                    }
+                }
+
+                // File Size
+                HorizontalBox {
+                    spacing: 10px;
+                    Text {
+                        text: "File Size:";
+                        font-size: 13px;
+                        color: #a6adc8;
+                        min-width: 80px;
+                    }
+                    Text {
+                        text: current_mod.file_size;
+                        font-size: 13px;
+                        color: #cdd6f4;
+                    }
+                }
+            }
+        }
+
+        // State Indicator
+        Rectangle {
+            height: 40px;
+            background: state == DownloadState.WaitingForBrowser ? #45475a :
+                        state == DownloadState.Downloading ? #313244 :
+                        state == DownloadState.Complete ? #1e3a28 :
+                        state == DownloadState.Error ? #3b1f2b :
+                        #313244;
+            border-radius: 8px;
+
+            HorizontalBox {
+                padding-left: 15px;
+                padding-right: 15px;
+                alignment: center;
+                spacing: 10px;
+
+                // State Icon (represented as colored circle)
+                Rectangle {
+                    width: 12px;
+                    height: 12px;
+                    border-radius: 6px;
+                    background: state == DownloadState.Idle ? #6c7086 :
+                                state == DownloadState.WaitingForBrowser ? #f9e2af :
+                                state == DownloadState.Downloading ? #89b4fa :
+                                state == DownloadState.Complete ? #a6e3a1 :
+                                state == DownloadState.Error ? #f38ba8 :
+                                #6c7086;
+                }
+
+                Text {
+                    text: state == DownloadState.Idle ? "Idle" :
+                          state == DownloadState.WaitingForBrowser ? "Waiting for Browser..." :
+                          state == DownloadState.Downloading ? "Downloading..." :
+                          state == DownloadState.Complete ? "Complete" :
+                          state == DownloadState.Error ? "Error" :
+                          "Unknown";
+                    font-size: 14px;
+                    font-weight: 500;
+                    color: #cdd6f4;
+                }
+            }
+        }
+
+        // Progress Bar
+        Rectangle {
+            height: 24px;
+            background: #313244;
+            border-radius: 4px;
+
+            Rectangle {
+                x: 0;
+                y: 0;
+                width: parent.width * clamp(progress, 0.0, 1.0);
+                height: parent.height;
+                background: state == DownloadState.Error ? #f38ba8 :
+                            state == DownloadState.Complete ? #a6e3a1 :
+                            #89b4fa;
+                border-radius: 4px;
+            }
+
+            Text {
+                text: round(progress * 100) + "%";
+                font-size: 12px;
+                font-weight: 600;
+                color: #cdd6f4;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        // Status Message Area
+        Rectangle {
+            height: 30px;
+            background: transparent;
+
+            Text {
+                text: status_message;
+                font-size: 13px;
+                color: #a6adc8;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        // Error Message Area (only visible when has_error is true)
+        if has_error: Rectangle {
+            height: 50px;
+            background: #45303a;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: #f38ba8;
+
+            HorizontalBox {
+                padding: 10px;
+                spacing: 10px;
+
+                Text {
+                    text: "Error:";
+                    font-size: 13px;
+                    font-weight: 600;
+                    color: #f38ba8;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: error_message;
+                    font-size: 13px;
+                    color: #f5c2c7;
+                    overflow: elide;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+
+        // Spacer
+        Rectangle {
+            vertical-stretch: 1;
+        }
+
+        // Button Row
+        HorizontalBox {
+            spacing: 10px;
+            alignment: center;
+
+            Button {
+                text: "Register NXM Handler";
+                clicked => { register_nxm_handler(); }
+            }
+
+            Button {
+                text: "Open in Browser";
+                enabled: state == DownloadState.WaitingForBrowser || state == DownloadState.Idle;
+                clicked => { open_in_browser(); }
+            }
+
+            Button {
+                text: "Skip";
+                enabled: state != DownloadState.Idle;
+                clicked => { skip_download(); }
+            }
+
+            Button {
+                text: "Next";
+                enabled: state == DownloadState.Complete || state == DownloadState.Error;
+                clicked => { next_download(); }
+            }
+
+            Button {
+                text: "Cancel";
+                clicked => { cancel_download(); }
+            }
+        }
+    }
+}

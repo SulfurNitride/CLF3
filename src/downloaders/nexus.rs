@@ -94,6 +94,8 @@ pub struct NexusDownloader {
     is_premium: AtomicBool,
     /// Whether we've validated the API key
     validated: AtomicBool,
+    /// Override to force non-premium mode even if account is premium
+    premium_override: AtomicBool,
 }
 
 impl NexusDownloader {
@@ -117,6 +119,7 @@ impl NexusDownloader {
             request_count: AtomicUsize::new(0),
             is_premium: AtomicBool::new(false),
             validated: AtomicBool::new(false),
+            premium_override: AtomicBool::new(false),
         })
     }
 
@@ -166,8 +169,34 @@ impl NexusDownloader {
     ///
     /// Premium users can use direct API downloads with 20,000 daily limit.
     /// Non-premium users are limited and may need NXM browser mode.
+    ///
+    /// Note: If premium override is active, this returns false even if the
+    /// account is actually premium, forcing NXM browser mode.
     pub fn is_premium(&self) -> bool {
+        if self.premium_override.load(Ordering::Relaxed) {
+            return false;
+        }
         self.is_premium.load(Ordering::Relaxed)
+    }
+
+    /// Set premium override to force non-premium mode
+    ///
+    /// When `force_non_premium` is true, `is_premium()` will return false
+    /// regardless of actual account status, forcing NXM browser mode.
+    /// This is useful for users who want to use browser-based downloads
+    /// even if they have a premium account.
+    pub fn set_premium_override(&self, force_non_premium: bool) {
+        self.premium_override.store(force_non_premium, Ordering::Relaxed);
+        if force_non_premium {
+            info!("Premium override enabled - forcing non-premium (NXM browser) mode");
+        } else {
+            debug!("Premium override disabled - using actual account status");
+        }
+    }
+
+    /// Check if premium override is currently active
+    pub fn is_premium_override_active(&self) -> bool {
+        self.premium_override.load(Ordering::Relaxed)
     }
 
     /// Check if API key has been validated
@@ -404,5 +433,28 @@ mod tests {
             ..Default::default()
         };
         assert!(limits.is_exhausted());
+    }
+
+    #[test]
+    fn test_premium_override() {
+        let downloader = NexusDownloader::new("test_api_key").unwrap();
+
+        // Initially, premium should be false (not validated yet)
+        assert!(!downloader.is_premium());
+        assert!(!downloader.is_premium_override_active());
+
+        // Manually set premium to true (simulating validated premium account)
+        downloader.is_premium.store(true, Ordering::Relaxed);
+        assert!(downloader.is_premium());
+
+        // Enable premium override - should force non-premium mode
+        downloader.set_premium_override(true);
+        assert!(downloader.is_premium_override_active());
+        assert!(!downloader.is_premium()); // Should return false despite account being premium
+
+        // Disable override - should return to actual premium status
+        downloader.set_premium_override(false);
+        assert!(!downloader.is_premium_override_active());
+        assert!(downloader.is_premium()); // Should return true again
     }
 }

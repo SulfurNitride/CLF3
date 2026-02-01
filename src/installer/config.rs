@@ -3,9 +3,79 @@
 //! Defines the configuration structure for modlist installation.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+
+/// Progress callback type for reporting download/installation progress
+pub type ProgressCallback = Arc<dyn Fn(ProgressEvent) + Send + Sync>;
+
+/// Events reported during installation for progress tracking
+#[derive(Debug, Clone)]
+pub enum ProgressEvent {
+    /// A download has started
+    DownloadStarted {
+        name: String,
+        size: u64,
+    },
+    /// Download progress update
+    DownloadProgress {
+        name: String,
+        downloaded: u64,
+        total: u64,
+        /// Bytes per second
+        speed: f64,
+    },
+    /// A download has completed
+    DownloadComplete {
+        name: String,
+    },
+    /// An archive has been processed (downloaded or skipped)
+    ArchiveComplete {
+        /// 1-based index of the completed archive
+        index: usize,
+        /// Total number of archives
+        total: usize,
+    },
+    /// Archives were skipped (already downloaded)
+    DownloadSkipped {
+        /// Number of archives skipped
+        count: usize,
+        /// Total size of skipped archives in bytes
+        total_size: u64,
+    },
+    /// Installation phase changed (e.g., "Downloading", "Extracting", "Installing")
+    PhaseChange {
+        phase: String,
+    },
+    /// A directive processing started
+    DirectiveStarted {
+        index: usize,
+        total: usize,
+        name: String,
+    },
+    /// A directive completed
+    DirectiveComplete {
+        index: usize,
+        total: usize,
+    },
+    /// Status message update
+    Status {
+        message: String,
+    },
+    /// Log message
+    Log {
+        message: String,
+    },
+    /// Directive processing phase started (e.g., FromArchive, PatchedFromArchive)
+    DirectivePhaseStarted {
+        /// Type of directive being processed
+        directive_type: String,
+        /// Total directives of this type to process
+        total: usize,
+    },
+}
 
 /// Configuration for a modlist installation
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct InstallConfig {
     /// Path to the .wabbajack file
     pub wabbajack_path: PathBuf,
@@ -33,6 +103,26 @@ pub struct InstallConfig {
 
     /// Browser command to open Nexus pages
     pub browser: String,
+
+    /// Optional callback for progress reporting
+    pub progress_callback: Option<ProgressCallback>,
+}
+
+impl std::fmt::Debug for InstallConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstallConfig")
+            .field("wabbajack_path", &self.wabbajack_path)
+            .field("output_dir", &self.output_dir)
+            .field("downloads_dir", &self.downloads_dir)
+            .field("game_dir", &self.game_dir)
+            .field("nexus_api_key", &"[REDACTED]")
+            .field("max_concurrent_downloads", &self.max_concurrent_downloads)
+            .field("nxm_mode", &self.nxm_mode)
+            .field("nxm_port", &self.nxm_port)
+            .field("browser", &self.browser)
+            .field("progress_callback", &self.progress_callback.as_ref().map(|_| "<callback>"))
+            .finish()
+    }
 }
 
 impl InstallConfig {

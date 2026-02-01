@@ -7,6 +7,7 @@
 //! - Auto-retry on failures
 //! - Size verification
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,6 +22,7 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::downloaders::{download_file_with_progress, HttpClient, NexusDownloader};
+use crate::nxm_handler;
 
 use super::db::{CollectionDb, ModDbEntry, ModStatus};
 use super::verify::compute_md5;
@@ -261,7 +263,7 @@ pub async fn download_mods(
 
     // Route to NXM mode if enabled
     if nxm_mode {
-        let mut stats = download_mods_nxm(db, downloads_dir, game_domain, need_download).await?;
+        let mut stats = download_mods_nxm(db, downloads_dir, game_domain, nexus_api_key, need_download).await?;
         stats.skipped += already_downloaded;
         return Ok(stats);
     }
@@ -751,8 +753,19 @@ async fn download_direct_url(
 }
 
 // ============================================================================
-// NXM Browser Mode (TODO: Implement when needed)
+// NXM Browser Mode
 // ============================================================================
+
+/// NXM server port for collection downloads
+const NXM_PORT: u16 = 8007;
+/// Browser command to open URLs
+const BROWSER_CMD: &str = "xdg-open";
+
+/// Pending Nexus download info for NXM mode
+struct NexusPending {
+    mod_entry: ModDbEntry,
+    output_path: PathBuf,
+}
 
 /// Download mods using NXM browser mode (for non-Premium users)
 ///
@@ -764,37 +777,374 @@ async fn download_direct_url(
 /// downloads with 20,000 daily limit. If you're Premium and hitting issues,
 /// please report the specific error message.
 async fn download_mods_nxm(
-    _db: &CollectionDb,
-    _downloads_dir: &Path,
-    _game_domain: &str,
+    db: &CollectionDb,
+    downloads_dir: &Path,
+    game_domain: &str,
+    nexus_api_key: &str,
     pending: Vec<ModDbEntry>,
 ) -> Result<DownloadStats> {
-    // NXM browser mode for non-Premium users
     println!("\n=== NXM Browser Mode ===");
-    println!("This mode is for NON-Premium Nexus users.");
-    println!("Premium users should use direct API mode (remove --nxm flag).\n");
-    println!("To use NXM mode, we would need to:");
-    println!("  1. Open {} browser tabs for Nexus mod pages", pending.len());
-    println!("  2. You click 'Download with Manager' on each page");
-    println!("  3. The NXM links are captured and downloads start automatically\n");
+    println!("This mode opens browser tabs for Nexus downloads.");
+    println!("Click 'Slow Download' or 'Download with Manager' for each file.\n");
 
-    // TODO: Implement NXM browser mode similar to Wabbajack's installer/downloader.rs
-    // Key steps:
-    // 1. Start NXM server with nxm_handler::start_server(port)
-    // 2. Open browser tabs with nxm_handler::nexus_mod_url()
-    // 3. Wait for NXM links via the receiver channel
-    // 4. For each link, call link.api_url() to get Nexus API endpoint
-    // 5. Fetch actual download URL from that endpoint
-    // 6. Download the file
-    //
-    // For now, NXM mode is not fully implemented for collections.
-    anyhow::bail!(
-        "NXM browser mode not yet fully implemented for collections.\n\
-        If you're a Premium user, remove the --nxm flag and use direct API mode.\n\
-        If you're hitting rate limits as a Premium user, please report this issue with:\n\
-        - The specific error message you see\n\
-        - Your rate limit values (shown at download start)"
-    )
+    // Separate Nexus downloads from direct URL downloads
+    let mut nexus_pending: Vec<NexusPending> = Vec::new();
+    let mut direct_pending: Vec<ModDbEntry> = Vec::new();
+
+    for mod_entry in pending {
+        let filename = get_filename(&mod_entry);
+        let output_path = downloads_dir.join(&filename);
+
+        // Skip if already exists with correct size
+        if output_path.exists() {
+            if let Ok(meta) = fs::metadata(&output_path) {
+                if meta.len() == mod_entry.file_size as u64 {
+                    continue;
+                }
+            }
+        }
+
+        if mod_entry.source_type == "nexus" && mod_entry.mod_id > 0 && mod_entry.file_id > 0 {
+            nexus_pending.push(NexusPending {
+                mod_entry,
+                output_path,
+            });
+        } else if mod_entry.source_type == "direct" && !mod_entry.source_url.is_empty() {
+            direct_pending.push(mod_entry);
+        }
+    }
+
+    println!("Nexus downloads (NXM mode): {}", nexus_pending.len());
+    println!("Direct downloads:           {}", direct_pending.len());
+
+    let mut stats = DownloadStats::default();
+
+    // Handle direct URL downloads first (no NXM needed)
+    if !direct_pending.is_empty() {
+        println!("\n--- Downloading direct URL files ---");
+        let http = HttpClient::new()?;
+
+        for mod_entry in direct_pending {
+            let filename = get_filename(&mod_entry);
+            let output_path = downloads_dir.join(&filename);
+            let display_name = truncate_name(&mod_entry.name, 40);
+
+            println!("Downloading: {}", display_name);
+
+            match download_direct_with_retry(&http, &mod_entry, &output_path).await {
+                Ok(()) => {
+                    db.mark_mod_downloaded(mod_entry.id, output_path.to_string_lossy().as_ref())?;
+                    stats.downloaded += 1;
+                }
+                Err(e) => {
+                    println!("FAIL {} - {}", display_name, e);
+                    stats.failed += 1;
+                }
+            }
+        }
+    }
+
+    // Now handle Nexus downloads via NXM
+    if nexus_pending.is_empty() {
+        println!("\nNo Nexus downloads needed in NXM mode.");
+        return Ok(stats);
+    }
+
+    println!("\n--- Starting NXM server on port {} ---", NXM_PORT);
+
+    // Auto-register NXM handler for non-premium users
+    println!("Checking NXM handler registration...");
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Err(e) = crate::nxm_handler::register_handler(
+            exe_path.to_string_lossy().as_ref(),
+            NXM_PORT
+        ) {
+            println!("Warning: Could not register NXM handler: {}", e);
+            println!("You may need to run 'clf3 nxm-register' manually.");
+        } else {
+            println!("NXM handler registered successfully.");
+        }
+    }
+
+    // Start NXM server
+    let (mut rx, _state): (tokio::sync::mpsc::UnboundedReceiver<nxm_handler::NxmLink>, std::sync::Arc<nxm_handler::NxmState>) = nxm_handler::start_server(NXM_PORT).await?;
+
+    // Create HTTP client for downloads
+    let http = HttpClient::new()?;
+
+    // Build lookup map: "game:mod_id:file_id" -> pending info
+    let mut lookup: HashMap<String, NexusPending> = HashMap::new();
+    for pending in nexus_pending {
+        let key = format!("{}:{}:{}", game_domain, pending.mod_entry.mod_id, pending.mod_entry.file_id);
+        lookup.insert(key, pending);
+    }
+
+    let total_nexus = lookup.len();
+    println!("Waiting for {} NXM links...\n", total_nexus);
+
+    // Progress display
+    let multi_progress = MultiProgress::new();
+    let overall_pb = multi_progress.add(ProgressBar::new(total_nexus as u64));
+    overall_pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} | {msg}")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+    overall_pb.enable_steady_tick(Duration::from_millis(100));
+    overall_pb.set_message("Opening browser tabs...");
+
+    // Open browser tabs for each pending download
+    println!("Opening browser tabs...");
+    for pending in lookup.values() {
+        let url = nxm_handler::nexus_mod_url(
+            game_domain,
+            pending.mod_entry.mod_id as u64,
+            pending.mod_entry.file_id as u64,
+        );
+
+        // Open in browser
+        let _ = std::process::Command::new(BROWSER_CMD)
+            .arg(&url)
+            .spawn();
+
+        // Small delay to avoid overwhelming the browser
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    overall_pb.set_message("Waiting for browser clicks...");
+    println!("\nClick 'Slow Download' or 'Download with Manager' on each Nexus page.");
+    println!("Then select 'CLF3' or 'NXM Handler' when prompted.\n");
+
+    // Process incoming NXM links
+    let mut downloaded = 0;
+    let mut failed = 0;
+
+    while !lookup.is_empty() {
+        // Wait for next NXM link (with timeout)
+        let link: nxm_handler::NxmLink = match tokio::time::timeout(Duration::from_secs(300), rx.recv()).await {
+            Ok(Some(link)) => link,
+            Ok(None) => {
+                println!("NXM server closed unexpectedly");
+                break;
+            }
+            Err(_) => {
+                println!("Timeout waiting for NXM links. {} remaining.", lookup.len());
+                break;
+            }
+        };
+
+        // Find matching pending download
+        let key = link.lookup_key();
+        let Some(pending) = lookup.remove(&key) else {
+            println!("Received NXM link for unknown file: {}", key);
+            continue;
+        };
+
+        let display_name = truncate_name(&pending.mod_entry.name, 40);
+        overall_pb.set_message(format!("Downloading: {}", display_name));
+
+        // Create progress bar for this download
+        let pb = multi_progress.insert_before(&overall_pb, ProgressBar::new(pending.mod_entry.file_size as u64));
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("  {spinner:.blue} {wide_msg} [{bar:30.white/dim}] {bytes}/{total_bytes} {bytes_per_sec}")
+                .unwrap()
+                .progress_chars("=>-"),
+        );
+        pb.enable_steady_tick(Duration::from_millis(100));
+        pb.set_message(display_name.clone());
+
+        // Get download URL using NXM key (bypasses rate limit)
+        let download_result = download_with_nxm_key(
+            &http,
+            &link,
+            nexus_api_key,
+            &pending.mod_entry,
+            &pending.output_path,
+            &pb,
+        ).await;
+
+        pb.finish_and_clear();
+
+        match download_result {
+            Ok(()) => {
+                downloaded += 1;
+                db.mark_mod_downloaded(
+                    pending.mod_entry.id,
+                    pending.output_path.to_string_lossy().as_ref(),
+                )?;
+                overall_pb.inc(1);
+            }
+            Err(e) => {
+                failed += 1;
+                overall_pb.println(format!("FAIL {} - {}", display_name, e));
+                overall_pb.inc(1);
+            }
+        }
+
+        overall_pb.set_message(format!("OK:{} Fail:{} Remaining:{}", downloaded, failed, lookup.len()));
+    }
+
+    overall_pb.finish_and_clear();
+
+    // Add remaining as failed
+    failed += lookup.len();
+    stats.downloaded += downloaded;
+    stats.failed += failed;
+
+    // Print summary
+    println!("\n=== NXM Download Summary ===");
+    println!("Downloaded: {}", stats.downloaded);
+    println!("Skipped:    {}", stats.skipped);
+    println!("Failed:     {}", stats.failed);
+
+    if !lookup.is_empty() {
+        println!("\n{} mods did not receive NXM links:", lookup.len());
+        for (_, pending) in lookup.iter().take(10) {
+            let url = nxm_handler::nexus_mod_url(
+                game_domain,
+                pending.mod_entry.mod_id as u64,
+                pending.mod_entry.file_id as u64,
+            );
+            println!("  - {} ({})", pending.mod_entry.name, url);
+        }
+        if lookup.len() > 10 {
+            println!("  ... and {} more", lookup.len() - 10);
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Download a file using the NXM key to bypass rate limits
+async fn download_with_nxm_key(
+    http: &HttpClient,
+    link: &nxm_handler::NxmLink,
+    api_key: &str,
+    mod_entry: &ModDbEntry,
+    output_path: &Path,
+    pb: &ProgressBar,
+) -> Result<()> {
+    // Call Nexus API with the NXM key to get download URL
+    let api_url = link.api_url();
+    let response = reqwest::Client::new()
+        .get(&api_url)
+        .header("apikey", api_key)
+        .send()
+        .await
+        .context("Failed to get download link from Nexus API")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!("Nexus API error {}: {}", status, body);
+    }
+
+    let links: Vec<serde_json::Value> = response.json().await?;
+    let url = links
+        .first()
+        .and_then(|l| l.get("URI"))
+        .and_then(|u| u.as_str())
+        .context("No download URL in Nexus response")?;
+
+    // Download with retry
+    let expected_size = mod_entry.file_size as u64;
+    let mut attempt = 0u32;
+
+    loop {
+        attempt += 1;
+
+        if attempt > 1 {
+            pb.set_position(0);
+            let _ = fs::remove_file(output_path);
+        }
+
+        match download_file_with_progress(http, url, output_path, Some(expected_size), Some(pb)).await {
+            Ok(_) => {
+                // Verify size
+                if let Ok(meta) = fs::metadata(output_path) {
+                    if meta.len() == expected_size {
+                        return Ok(());
+                    } else if attempt < MAX_RETRIES {
+                        let _ = fs::remove_file(output_path);
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    } else {
+                        bail!("Size mismatch: expected {} bytes, got {}", expected_size, meta.len());
+                    }
+                } else if attempt < MAX_RETRIES {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                } else {
+                    bail!("Could not verify downloaded file");
+                }
+            }
+            Err(e) => {
+                if attempt < MAX_RETRIES {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// Download a direct URL file with retry logic
+async fn download_direct_with_retry(
+    http: &HttpClient,
+    mod_entry: &ModDbEntry,
+    output_path: &Path,
+) -> Result<()> {
+    let expected_size = mod_entry.file_size as u64;
+    let mut attempt = 0u32;
+
+    loop {
+        attempt += 1;
+
+        if attempt > 1 {
+            let _ = fs::remove_file(output_path);
+        }
+
+        match download_file_with_progress(http, &mod_entry.source_url, output_path, Some(expected_size), None).await {
+            Ok(_) => {
+                // Verify size
+                if let Ok(meta) = fs::metadata(output_path) {
+                    if meta.len() == expected_size {
+                        return Ok(());
+                    } else if attempt < MAX_RETRIES {
+                        let _ = fs::remove_file(output_path);
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    } else {
+                        bail!("Size mismatch: expected {} bytes, got {}", expected_size, meta.len());
+                    }
+                } else if attempt < MAX_RETRIES {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                } else {
+                    bail!("Could not verify downloaded file");
+                }
+            }
+            Err(e) => {
+                let error_str = format!("{:#}", e);
+                let is_timeout = error_str.to_lowercase().contains("timeout")
+                    || error_str.to_lowercase().contains("timed out")
+                    || error_str.contains("connection");
+
+                if attempt < MAX_RETRIES && is_timeout {
+                    println!("  Retry {}/{} after connection error...", attempt, MAX_RETRIES);
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                } else if attempt < MAX_RETRIES {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

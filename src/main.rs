@@ -31,7 +31,7 @@ use tracing_subscriber::EnvFilter;
 #[command(about = "Wabbajack modlist installer - burns through modlists like CLF3 burns through concrete")]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 
     /// Enable verbose logging (use RUST_LOG=debug for more detail)
     #[arg(short, long, global = true)]
@@ -145,6 +145,13 @@ enum Commands {
         #[arg(long, env = "NEXUS_API_KEY")]
         nexus_key: Option<String>,
     },
+
+    /// Launch the graphical interface
+    Gui {
+        /// Nexus Mods API key
+        #[arg(long, env = "NEXUS_API_KEY")]
+        nexus_key: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -162,7 +169,12 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        Commands::Install {
+        None => {
+            // No command = launch GUI (double-click behavior)
+            println!("Launching CLF3...");
+            clf3::gui::run()?;
+        }
+        Some(Commands::Install {
             wabbajack_file,
             output,
             downloads,
@@ -172,7 +184,7 @@ async fn main() -> Result<()> {
             nxm_mode,
             nxm_port,
             browser,
-        } => {
+        }) => {
             // Default to CPU thread count
             let thread_count = std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -196,6 +208,7 @@ async fn main() -> Result<()> {
                 nxm_mode,
                 nxm_port,
                 browser,
+                progress_callback: None, // CLI doesn't need progress callback
             };
 
             let mut installer = Installer::new(config)?;
@@ -218,16 +231,16 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::NxmRegister { port } => {
+        Some(Commands::NxmRegister { port }) => {
             let exe = std::env::current_exe()?.to_string_lossy().to_string();
             nxm_handler::register_handler(&exe, port)?;
         }
 
-        Commands::NxmHandle { url, port } => {
+        Some(Commands::NxmHandle { url, port }) => {
             nxm_handler::send_to_server(port, &url).await?;
         }
 
-        Commands::ListBsa { bsa_file } => {
+        Some(Commands::ListBsa { bsa_file }) => {
             let files = bsa::list_files(&bsa_file)?;
             for f in &files {
                 println!("{}", f.path.to_lowercase());
@@ -235,17 +248,17 @@ async fn main() -> Result<()> {
             eprintln!("\nTotal: {} files", files.len());
         }
 
-        Commands::ExtractBsa {
+        Some(Commands::ExtractBsa {
             bsa_file,
             file_path,
             output,
-        } => {
+        }) => {
             let data = bsa::extract_file(&bsa_file, &file_path)?;
             std::fs::write(&output, &data)?;
             println!("Extracted {} bytes to {}", data.len(), output.display());
         }
 
-        Commands::Info { wabbajack_file } => {
+        Some(Commands::Info { wabbajack_file }) => {
             println!("Parsing {}...\n", wabbajack_file.display());
 
             let modlist = modlist::parse_wabbajack_file(&wabbajack_file)?;
@@ -298,12 +311,12 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Collection {
+        Some(Commands::Collection {
             collection,
             output,
             game,
             nexus_key,
-        } => {
+        }) => {
             // Use CPU thread count for concurrency
             let thread_count = std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -399,7 +412,7 @@ async fn main() -> Result<()> {
             println!("MO2 instance created at: {}", output.display());
         }
 
-        Commands::CollectionInfo { collection, nexus_key } => {
+        Some(Commands::CollectionInfo { collection, nexus_key }) => {
             // Resolve collection path - either from URL or local file
             let collection_path = if collection::is_url(&collection) {
                 // Parse URL and fetch collection from Nexus
@@ -467,6 +480,10 @@ async fn main() -> Result<()> {
             println!("\nTotal size:  {:.2} GB", total_size as f64 / 1024.0 / 1024.0 / 1024.0);
         }
 
+        Some(Commands::Gui { nexus_key: _ }) => {
+            println!("Launching CLF3 GUI...");
+            clf3::gui::run()?;
+        }
     }
 
     Ok(())

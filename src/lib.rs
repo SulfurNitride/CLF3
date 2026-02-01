@@ -4,12 +4,21 @@
 //! like CLF3 burns through concrete.
 
 pub mod archive;
+pub mod bsa;
 pub mod collection;
 pub mod downloaders;
 pub mod file_router;
+pub mod game_finder;
 pub mod games;
+pub mod gui;
+pub mod installer;
 pub mod loot;
 pub mod mo2;
+pub mod modlist;
+pub mod nxm_handler;
+pub mod octodiff;
+pub mod paths;
+pub mod textures;
 
 // Re-export commonly used types
 pub use collection::{Collection, CollectionInstaller, InstallerConfig};
