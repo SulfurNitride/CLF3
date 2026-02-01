@@ -33,10 +33,9 @@ slint::slint! {
         out property <color> lavender: #b4befe;
     }
 
-    // Install mode enumeration
+    // Install mode enumeration (Wabbajack only - Collection support removed)
     export enum InstallMode {
         Wabbajack,
-        Collection,
     }
 
     // Installation state
@@ -459,36 +458,10 @@ slint::slint! {
                             color: Theme.subtext0;
                         }
 
-                        // Tab selector
-                        Rectangle {
-                            height: 52px;
-                            background: Theme.mantle;
-                            border-radius: 10px;
-
-                            HorizontalLayout {
-                                padding: 4px;
-                                spacing: 4px;
-
-                                TabButton {
-                                    label: "Wabbajack Modlist";
-                                    active: mode == InstallMode.Wabbajack;
-                                    clicked => { mode = InstallMode.Wabbajack; }
-                                }
-
-                                TabButton {
-                                    label: "Nexus Collection";
-                                    active: mode == InstallMode.Collection;
-                                    clicked => { mode = InstallMode.Collection; }
-                                }
-                            }
-                        }
-
-                        // Source input
+                        // Source input (Wabbajack only)
                         PathInput {
-                            label: mode == InstallMode.Wabbajack ? "Wabbajack File" : "Collection URL or File";
-                            placeholder: mode == InstallMode.Wabbajack ?
-                                        "/path/to/modlist.wabbajack" :
-                                        "https://nexusmods.com/.../collections/... or /path/to/collection.json";
+                            label: "Wabbajack File";
+                            placeholder: "/path/to/modlist.wabbajack";
                             value <=> source_path;
                             enabled: !is_running;
                             browse-clicked => { browse_source(); }
@@ -1968,7 +1941,6 @@ pub fn run() -> Result<(), slint::PlatformError> {
             let window = window_weak.unwrap();
             if let Some(path) = rfd::FileDialog::new()
                 .add_filter("Wabbajack", &["wabbajack"])
-                .add_filter("Collection", &["json"])
                 .pick_file()
             {
                 window.set_source_path(path.display().to_string().into());
@@ -2105,8 +2077,6 @@ pub fn run() -> Result<(), slint::PlatformError> {
             println!("  Install: {}", install_dir);
             println!("  Downloads: {}", downloads_dir);
 
-            // Determine installation mode
-            let is_collection = matches!(window.get_mode(), InstallMode::Collection);
             let non_premium = window.get_non_premium_mode();
 
             // Clone values for the spawned thread
@@ -2116,7 +2086,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
             let api_key_clone = api_key.clone();
 
             // Spawn installation in background thread
-            println!("[GUI] Spawning installation thread (collection={}, non_premium={})...", is_collection, non_premium);
+            println!("[GUI] Spawning installation thread (non_premium={})...", non_premium);
             std::thread::spawn(move || {
                 println!("[GUI] Background thread started");
 
@@ -2134,25 +2104,14 @@ pub fn run() -> Result<(), slint::PlatformError> {
 
                 println!("[GUI] Starting async block...");
                 rt.block_on(async {
-                    println!("[GUI] Inside async block, is_collection={}", is_collection);
-                    let result = if is_collection {
-                        // Collection installation
-                        run_collection_install(
-                            &source_clone,
-                            &install_clone,
-                            &downloads_clone,
-                            &api_key_clone,
-                        ).await
-                    } else {
-                        // Wabbajack modlist installation
-                        run_wabbajack_install(
-                            &source_clone,
-                            &install_clone,
-                            &downloads_clone,
-                            &api_key_clone,
-                            non_premium,
-                        ).await
-                    };
+                    // Wabbajack modlist installation
+                    let result = run_wabbajack_install(
+                        &source_clone,
+                        &install_clone,
+                        &downloads_clone,
+                        &api_key_clone,
+                        non_premium,
+                    ).await;
 
                     match result {
                         Ok(_) => println!("[GUI] Installation complete!"),
@@ -2306,15 +2265,6 @@ impl MainWindowHandle {
         Ok(Self { window })
     }
 
-    /// Set the installation mode
-    pub fn set_mode(&self, is_collection: bool) {
-        self.window.set_mode(if is_collection {
-            InstallMode::Collection
-        } else {
-            InstallMode::Wabbajack
-        });
-    }
-
     /// Set source path
     pub fn set_source_path(&self, path: &str) {
         self.window.set_source_path(path.into());
@@ -2464,11 +2414,6 @@ impl MainWindowHandle {
     /// Check if non-premium mode is enabled
     pub fn is_non_premium_mode(&self) -> bool {
         self.window.get_non_premium_mode()
-    }
-
-    /// Check if in collection mode
-    pub fn is_collection_mode(&self) -> bool {
-        matches!(self.window.get_mode(), InstallMode::Collection)
     }
 
     /// Set detected game info (displayed after auto-detection)
@@ -3221,164 +3166,3 @@ async fn run_wabbajack_install(
     Ok(())
 }
 
-/// Run a Nexus Collection installation
-///
-/// This is called from a background thread with its own tokio runtime.
-async fn run_collection_install(
-    source_path: &str,
-    install_dir: &str,
-    downloads_dir: &str,
-    api_key: &str,
-) -> anyhow::Result<()> {
-    use crate::collection::{self, InstallerConfig, CollectionInstaller};
-    use std::path::PathBuf;
-
-    let tx = get_progress_sender();
-
-    // Send initial status
-    tx.send(ProgressUpdate::Phase("Validating".to_string())).ok();
-    tx.send(ProgressUpdate::Status("Loading collection...".to_string())).ok();
-    tx.send(ProgressUpdate::Log("[INFO] Starting Collection installation...".to_string())).ok();
-
-    println!("[GUI] Starting Collection installation...");
-
-    // Get thread count for concurrency
-    let thread_count = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-
-    let output_dir = PathBuf::from(install_dir);
-
-    // Resolve collection path - either from URL or local file
-    let collection_path = if collection::is_url(source_path) {
-        // Parse URL and fetch collection from Nexus
-        let url_info = match collection::parse_collection_url(source_path) {
-            Some(info) => info,
-            None => {
-                let err = "Invalid collection URL format".to_string();
-                tx.send(ProgressUpdate::Error(err.clone())).ok();
-                anyhow::bail!(err);
-            }
-        };
-
-        tx.send(ProgressUpdate::Status("Fetching collection from Nexus...".to_string())).ok();
-        tx.send(ProgressUpdate::Log(format!("[INFO] Fetching collection: {} / {}", url_info.game, url_info.slug))).ok();
-
-        println!("[GUI] Fetching collection from Nexus...");
-        println!("[GUI]   Game: {}", url_info.game);
-        println!("[GUI]   Slug: {}", url_info.slug);
-
-        // Ensure output dir exists for temp files
-        std::fs::create_dir_all(&output_dir)?;
-
-        match collection::fetch_collection(&url_info, api_key, &output_dir).await {
-            Ok(path) => path,
-            Err(e) => {
-                tx.send(ProgressUpdate::Error(format!("Failed to fetch collection: {}", e))).ok();
-                return Err(e);
-            }
-        }
-    } else {
-        PathBuf::from(source_path)
-    };
-
-    // Load collection to detect game type
-    let coll = match collection::load_collection(&collection_path) {
-        Ok(c) => c,
-        Err(e) => {
-            tx.send(ProgressUpdate::Error(format!("Failed to load collection: {}", e))).ok();
-            return Err(e);
-        }
-    };
-    let game_domain = coll.get_domain_name();
-    tx.send(ProgressUpdate::Log(format!("[INFO] Collection game: {}", game_domain))).ok();
-
-    // Map domain name to Steam app ID
-    let app_id = match game_domain {
-        "skyrimspecialedition" => "489830",
-        "skyrim" => "72850",
-        "fallout4" => "377160",
-        "falloutnewvegas" => "22380",
-        "fallout3" => "22300",
-        "oblivion" => "22330",
-        "morrowind" => "22320",
-        "starfield" => "1716740",
-        "enderal" => "933480",
-        "enderalspecialedition" => "976620",
-        _ => {
-            let err = format!("Unsupported game domain: {}", game_domain);
-            tx.send(ProgressUpdate::Error(err.clone())).ok();
-            anyhow::bail!(err);
-        }
-    };
-
-    // Find the game installation path
-    let game_path = match crate::game_finder::find_game_install_path(app_id) {
-        Some(path) => {
-            tx.send(ProgressUpdate::Log(format!("[INFO] Found game at: {}", path.display()))).ok();
-            path
-        }
-        None => {
-            let err = format!("Game not found for domain: {}. Please ensure the game is installed.", game_domain);
-            tx.send(ProgressUpdate::Error(err.clone())).ok();
-            anyhow::bail!(err);
-        }
-    };
-
-    println!("[GUI] Detected game: {} at {}", game_domain, game_path.display());
-
-    // Downloads directory
-    let downloads_path = if downloads_dir.is_empty() {
-        output_dir.join("downloads")
-    } else {
-        PathBuf::from(downloads_dir)
-    };
-
-    // Database path
-    let db_path = output_dir.join("clf3_collection.db");
-
-    // Setup config
-    let config = InstallerConfig {
-        collection_path,
-        output_dir: output_dir.clone(),
-        game_path,
-        game_type: None, // Auto-detect from collection
-        nexus_api_key: api_key.to_string(),
-        concurrent_downloads: thread_count,
-        downloads_dir: Some(downloads_path),
-    };
-
-    // Create installer
-    tx.send(ProgressUpdate::Status("Initializing installer...".to_string())).ok();
-    let mut installer = match CollectionInstaller::new(config, &db_path) {
-        Ok(i) => i,
-        Err(e) => {
-            tx.send(ProgressUpdate::Error(format!("Failed to create installer: {}", e))).ok();
-            return Err(e);
-        }
-    };
-
-    // Start download phase
-    tx.send(ProgressUpdate::Phase("Downloading".to_string())).ok();
-    tx.send(ProgressUpdate::Status("Downloading mods...".to_string())).ok();
-    tx.send(ProgressUpdate::Log("[INFO] Starting download phase...".to_string())).ok();
-
-    // Run installation
-    match installer.install().await {
-        Ok(_) => {}
-        Err(e) => {
-            tx.send(ProgressUpdate::Error(format!("Installation failed: {}", e))).ok();
-            return Err(e);
-        }
-    }
-
-    // Success!
-    tx.send(ProgressUpdate::Complete).ok();
-    tx.send(ProgressUpdate::Log(format!("[INFO] MO2 instance created at: {}", output_dir.display()))).ok();
-    tx.send(ProgressUpdate::Log("[INFO] Collection installation completed successfully!".to_string())).ok();
-
-    println!("[GUI] Collection installation complete!");
-    println!("[GUI] MO2 instance created at: {}", output_dir.display());
-
-    Ok(())
-}

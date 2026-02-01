@@ -5,7 +5,6 @@
 
 pub mod archive;
 pub mod bsa;
-pub mod collection;
 pub mod downloaders;
 pub mod file_router;
 pub mod game_finder;
@@ -21,7 +20,6 @@ pub mod paths;
 pub mod textures;
 
 // Re-export commonly used types
-pub use collection::{Collection, CollectionInstaller, InstallerConfig};
 pub use file_router::{FileRouter, ModType};
 pub use games::{validate_game_path, GameType};
 pub use mo2::Mo2Instance;
