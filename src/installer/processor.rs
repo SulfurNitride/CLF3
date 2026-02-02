@@ -439,6 +439,16 @@ impl ProgressReporter {
     pub fn set_count(&self, count: usize) {
         self.processed_count.store(count, Ordering::Relaxed);
     }
+
+    /// Get a clone of the callback (for passing to other threads)
+    pub fn get_callback(&self) -> Option<super::ProgressCallback> {
+        self.callback.clone()
+    }
+
+    /// Get the total directive count
+    pub fn get_total(&self) -> usize {
+        self.total_directives
+    }
 }
 
 /// Context for processing directives (thread-safe)
@@ -809,7 +819,21 @@ pub fn process_directives_streaming(
     let streaming_config = super::streaming::StreamingConfig::default();
     pb.set_message("Processing FromArchive (streaming)...");
     reporter.phase_started("FromArchive", from_archive_count);
-    let streaming_stats = super::streaming::process_from_archive_streaming(db, &ctx, streaming_config, &pb)?;
+
+    // Create progress callback for streaming - calls reporter for each written file
+    let progress_callback: Option<super::streaming::ProgressCallback> = if let Some(callback) = reporter.get_callback() {
+        let total = reporter.get_total();
+        Some(std::sync::Arc::new(move |written_count| {
+            callback(super::ProgressEvent::DirectiveComplete {
+                index: written_count,
+                total,
+            });
+        }))
+    } else {
+        None
+    };
+
+    let streaming_stats = super::streaming::process_from_archive_streaming(db, &ctx, streaming_config, &pb, progress_callback)?;
     completed.fetch_add(streaming_stats.written, Ordering::Relaxed);
     skipped.fetch_add(streaming_stats.skipped, Ordering::Relaxed);
     failed.fetch_add(streaming_stats.failed, Ordering::Relaxed);

@@ -64,7 +64,7 @@ impl ModlistDb {
              PRAGMA cache_size = 10000;
              PRAGMA temp_store = MEMORY;
              PRAGMA mmap_size = 268435456;"
-        ).context("Failed to configure SQLite pragmas")?;
+        ).with_context(|| format!("Failed to configure SQLite pragmas for {}", db_path.display()))?;
 
         let db = Self { conn };
         db.create_tables()?;

@@ -166,6 +166,10 @@ pub fn cleanup_temp_dirs(downloads_dir: &std::path::Path) -> usize {
     cleaned
 }
 
+/// Progress callback type for streaming extraction.
+/// Called with the current count of written files.
+pub type ProgressCallback = Arc<dyn Fn(usize) + Send + Sync>;
+
 /// Main entry point for streaming extraction with producer-consumer pipeline.
 ///
 /// Processes archives using a decoupled extraction/move pipeline:
@@ -176,6 +180,7 @@ pub fn process_from_archive_streaming(
     ctx: &ProcessContext,
     _config: StreamingConfig,
     pb: &ProgressBar,
+    progress_callback: Option<ProgressCallback>,
 ) -> Result<StreamingStats> {
     // Clean up any leftover temp dirs from previous interrupted runs
     cleanup_temp_dirs(&ctx.config.downloads_dir);
@@ -347,6 +352,7 @@ pub fn process_from_archive_streaming(
             Some(ArchiveSizeTier::Small.threads_per_archive()),
             extractor_threads,
             mover_threads,
+            progress_callback.clone(),
         );
     }
 
@@ -369,6 +375,7 @@ pub fn process_from_archive_streaming(
                 Some(ArchiveSizeTier::Medium.threads_per_archive()),
                 extractor_threads,
                 mover_threads,
+                progress_callback.clone(),
             );
         }
     }
@@ -393,6 +400,7 @@ pub fn process_from_archive_streaming(
             None, // All threads for large archives
             extractor_threads,
             mover_threads,
+            progress_callback.clone(),
         );
     }
 
@@ -414,6 +422,7 @@ pub fn process_from_archive_streaming(
             &skipped,
             &failed,
             &logged_failures,
+            progress_callback.clone(),
         );
 
         pb.inc(1);
@@ -457,6 +466,7 @@ fn process_archives_with_pipeline(
     threads_per_archive: Option<usize>,
     _extractor_threads: usize,
     mover_threads: usize,
+    progress_callback: Option<ProgressCallback>,
 ) {
     const MAX_LOGGED_FAILURES: usize = 100;
 
@@ -468,6 +478,7 @@ fn process_archives_with_pipeline(
     let written_clone = Arc::clone(written);
     let failed_clone = Arc::clone(failed);
     let logged_failures_clone = Arc::clone(logged_failures);
+    let progress_callback_clone = progress_callback.clone();
 
     // Spawn mover workers in a separate thread pool
     let mover_handle = thread::spawn(move || {
@@ -539,7 +550,11 @@ fn process_archives_with_pipeline(
                     }
                 }
 
-                written_clone.fetch_add(1, Ordering::Relaxed);
+                let new_count = written_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                // Call progress callback if provided
+                if let Some(ref callback) = progress_callback_clone {
+                    callback(new_count);
+                }
             });
         });
     });
@@ -886,6 +901,7 @@ fn process_bsa_archive(
     skipped: &Arc<AtomicUsize>,
     failed: &Arc<AtomicUsize>,
     logged_failures: &Arc<AtomicUsize>,
+    progress_callback: Option<ProgressCallback>,
 ) {
     const MAX_LOGGED_FAILURES: usize = 100;
 
@@ -955,7 +971,11 @@ fn process_bsa_archive(
         }
 
         extracted.fetch_add(1, Ordering::Relaxed);
-        written.fetch_add(1, Ordering::Relaxed);
+        let new_count = written.fetch_add(1, Ordering::Relaxed) + 1;
+        // Call progress callback if provided
+        if let Some(ref callback) = progress_callback {
+            callback(new_count);
+        }
     });
 }
 

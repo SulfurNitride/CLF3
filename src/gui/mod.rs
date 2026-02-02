@@ -3136,6 +3136,13 @@ pub fn run() -> Result<(), slint::PlatformError> {
             {
                 window.set_source_path(path.display().to_string().into());
 
+                // Reset install state so user can start a new installation
+                window.set_install_state(InstallState::Idle);
+                window.set_progress(0.0);
+                window.set_files_completed(0);
+                window.set_files_total(0);
+                window.set_status_message("Ready to install".into());
+
                 // Auto-detect game from .wabbajack file (async to avoid UI freeze)
                 if path.extension().map(|e| e == "wabbajack").unwrap_or(false) {
                     // Show loading state immediately
@@ -3156,7 +3163,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                                     }
                                     Err(e) => {
                                         eprintln!("Failed to detect game: {}", e);
-                                        window.set_detected_game("Error loading".into());
+                                        window.set_detected_game(format!("Error: {}", e).into());
                                     }
                                 }
                             }
@@ -3918,7 +3925,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                                                                 }
                                                                 Err(e) => {
                                                                     eprintln!("Failed to detect game: {}", e);
-                                                                    window.set_detected_game("Error loading".into());
+                                                                    window.set_detected_game(format!("Error: {}", e).into());
                                                                 }
                                                             }
                                                         }

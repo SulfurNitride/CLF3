@@ -310,14 +310,26 @@ impl ModlistBrowser {
 
         let output_path = output_dir.join(&filename);
 
-        info!("Downloading {} to {:?}", metadata.title, output_path);
-
         // Get expected size from metadata (0 if unknown)
         let expected_size = metadata
             .download_metadata
             .as_ref()
             .map(|d| d.size)
             .unwrap_or(0);
+
+        // Check if file already exists with correct size (cache check)
+        if output_path.exists() && expected_size > 0 {
+            if let Ok(file_meta) = std::fs::metadata(&output_path) {
+                if file_meta.len() == expected_size {
+                    info!("Using cached file: {} (size matches: {} bytes)", output_path.display(), expected_size);
+                    return Ok(output_path);
+                } else {
+                    debug!("Cached file size mismatch: expected {} got {}, re-downloading", expected_size, file_meta.len());
+                }
+            }
+        }
+
+        info!("Downloading {} to {:?}", metadata.title, output_path);
 
         // Use the CDN downloader for chunked parallel downloads
         let cdn_downloader = WabbajackCdnDownloader::new()?;

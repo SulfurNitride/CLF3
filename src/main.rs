@@ -21,7 +21,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use installer::{InstallConfig, Installer};
 use std::path::PathBuf;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 #[derive(Parser)]
 #[command(name = "clf3")]
@@ -128,15 +128,47 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Only initialize logging if verbose or RUST_LOG is set
+    // Set up file logging (always enabled) next to the executable
+    let log_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    // Create timestamped log filename
+    let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
+    let log_filename = format!("clf3-{}.log", timestamp);
+
+    // Set up file appender
+    let file_appender = tracing_appender::rolling::never(&log_dir, &log_filename);
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    // Create filter - file always gets debug level, console follows user preference
+    let file_filter = EnvFilter::new("clf3=debug,warn");
+    let console_filter = EnvFilter::from_default_env()
+        .add_directive(if cli.verbose { "clf3=debug".parse()? } else { "clf3=warn".parse()? });
+
+    // File layer (always enabled)
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_filter(file_filter);
+
+    // Console layer (only if verbose or RUST_LOG is set)
     if cli.verbose || std::env::var("RUST_LOG").is_ok() {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::from_default_env()
-                    .add_directive(if cli.verbose { "clf3=debug".parse()? } else { "clf3=warn".parse()? }),
-            )
+        let console_layer = tracing_subscriber::fmt::layer()
+            .with_filter(console_filter);
+
+        tracing_subscriber::registry()
+            .with(file_layer)
+            .with(console_layer)
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(file_layer)
             .init();
     }
+
+    tracing::info!("CLF3 started, logging to {}", log_dir.join(&log_filename).display());
 
     match cli.command {
         None => {
