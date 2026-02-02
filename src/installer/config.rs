@@ -127,8 +127,23 @@ impl std::fmt::Debug for InstallConfig {
 
 impl InstallConfig {
     /// Get the path to the state database
+    /// Uses local cache directory (~/.cache/clf3/) to avoid network filesystem issues
     pub fn db_path(&self) -> PathBuf {
-        self.downloads_dir.join(".clf3_state.db")
+        // Use modlist name for the database filename
+        let modlist_name = self.wabbajack_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+
+        // Store in local cache directory to avoid CIFS/NFS locking issues
+        let cache_dir = dirs::cache_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("clf3");
+
+        // Create cache directory if it doesn't exist
+        let _ = std::fs::create_dir_all(&cache_dir);
+
+        cache_dir.join(format!("{}.db", modlist_name))
     }
 
     /// Validate the configuration
