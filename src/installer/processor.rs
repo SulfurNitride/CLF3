@@ -939,6 +939,10 @@ pub fn process_directives_streaming(
     println!("\n--- Phase 4: Cleanup extra files ---\n");
     cleanup_extra_files(db, &ctx)?;
 
+    // Phase 5: Clean up BSA temp directories
+    println!("\n--- Phase 5: Cleanup BSA temp files ---\n");
+    cleanup_bsa_temp_dirs(&ctx.config)?;
+
     Ok(stats)
 }
 
@@ -1056,6 +1060,10 @@ pub fn process_directives(db: &ModlistDb, config: &InstallConfig) -> Result<Proc
     // Phase 4: Clean up files not in the modlist
     println!("\n--- Phase 4: Cleanup extra files ---\n");
     cleanup_extra_files(db, &ctx)?;
+
+    // Phase 5: Clean up BSA temp directories
+    println!("\n--- Phase 5: Cleanup BSA temp files ---\n");
+    cleanup_bsa_temp_dirs(&ctx.config)?;
 
     Ok(stats)
 }
