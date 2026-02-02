@@ -488,7 +488,12 @@ impl<'a> ProcessContext<'a> {
         }
 
         // SQLite cache for 7z/RAR extractions (persists across runs)
-        let cache_path = config.downloads_dir.join(".clf3_extraction_cache.db");
+        // Use local cache directory to avoid CIFS/NFS locking issues
+        let cache_dir = dirs::cache_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("clf3");
+        let _ = std::fs::create_dir_all(&cache_dir);
+        let cache_path = cache_dir.join("extraction_cache.db");
         let extraction_cache =
             BsaCache::at_path(&cache_path).context("Failed to create extraction cache")?;
 
@@ -674,8 +679,14 @@ fn is_bsa_file(path: &str) -> bool {
 }
 
 /// Get the working folder for BSA files extracted from archives
-fn get_bsa_working_dir(downloads_dir: &Path) -> PathBuf {
-    downloads_dir.join("Working_BSA_Because_Its_Too_Big_For_SQL")
+/// Uses local cache directory to avoid CIFS/NFS issues
+fn get_bsa_working_dir(_downloads_dir: &Path) -> PathBuf {
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("clf3")
+        .join("bsa_working");
+    let _ = std::fs::create_dir_all(&cache_dir);
+    cache_dir
 }
 
 /// Generate a stable filename for a BSA in the working folder
