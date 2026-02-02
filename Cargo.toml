@@ -95,6 +95,8 @@ encoding_rs = "0.8.35"
 
 # Hashing
 md5 = "0.7"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+base64 = "0.22"
 
 # Plugin sorting (LOOT)
 libloot = "0.28.4"

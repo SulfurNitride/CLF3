@@ -10,6 +10,7 @@ pub mod file_router;
 pub mod game_finder;
 pub mod games;
 pub mod gui;
+pub mod hash;
 pub mod installer;
 pub mod loot;
 pub mod mo2;

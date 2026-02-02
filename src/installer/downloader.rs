@@ -7,6 +7,7 @@ use crate::downloaders::{
     download_file_with_callback, GoogleDriveDownloader, HttpClient, MediaFireDownloader,
     NexusDownloader, ProgressCallback as HttpProgressCallback, WabbajackCdnDownloader,
 };
+use crate::hash::verify_file_hash;
 use crate::modlist::{ArchiveInfo, DownloadState, ModlistDb, NexusState};
 use crate::nxm_handler;
 
@@ -150,15 +151,16 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
     let mut need_download: Vec<ArchiveInfo> = Vec::new();
     let mut truncated_count = 0usize;
 
+    // First pass: check which archives exist with correct size
+    let mut archives_to_verify: Vec<(ArchiveInfo, PathBuf)> = Vec::new();
+
     for archive in archives_to_check {
         let output_path = config.downloads_dir.join(&archive.name);
         if output_path.exists() {
             if let Ok(meta) = fs::metadata(&output_path) {
                 if meta.len() == archive.size as u64 {
-                    // Already downloaded with correct size - mark in DB
-                    db.mark_archive_downloaded(&archive.hash, output_path.to_string_lossy().as_ref())?;
-                    already_downloaded += 1;
-                    already_downloaded_size += archive.size as u64;
+                    // Size matches - queue for hash verification
+                    archives_to_verify.push((archive, output_path));
                     continue;
                 } else {
                     // File exists but wrong size - truncated/corrupted, delete and re-download
@@ -173,8 +175,47 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
         need_download.push(archive);
     }
 
-    if truncated_count > 0 {
-        println!("Found {} truncated/corrupted archives - will re-download", truncated_count);
+    // Second pass: verify hashes of existing archives
+    let mut corrupted_count = 0usize;
+    if !archives_to_verify.is_empty() {
+        println!("Verifying {} existing archives...", archives_to_verify.len());
+
+        for (i, (archive, output_path)) in archives_to_verify.iter().enumerate() {
+            // Show progress
+            print!("\r  Verifying {}/{}: {}...", i + 1, archives_to_verify.len(),
+                truncate_name(&archive.name, 40));
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+
+            match verify_file_hash(&output_path, &archive.hash) {
+                Ok(true) => {
+                    // Hash matches - archive is valid
+                    db.mark_archive_downloaded(&archive.hash, output_path.to_string_lossy().as_ref())?;
+                    already_downloaded += 1;
+                    already_downloaded_size += archive.size as u64;
+                }
+                Ok(false) => {
+                    // Hash mismatch - corrupted, delete and re-download
+                    println!("\r  Corrupted (hash mismatch): {}                    ", archive.name);
+                    let _ = fs::remove_file(&output_path);
+                    corrupted_count += 1;
+                    need_download.push(archive.clone());
+                }
+                Err(e) => {
+                    // Error reading file - treat as corrupted
+                    println!("\r  Verify error for {}: {}                    ", archive.name, e);
+                    let _ = fs::remove_file(&output_path);
+                    corrupted_count += 1;
+                    need_download.push(archive.clone());
+                }
+            }
+        }
+        println!("\r  Verified {} archives ({} valid, {} corrupted)                    ",
+            archives_to_verify.len(), already_downloaded, corrupted_count);
+    }
+
+    if truncated_count > 0 || corrupted_count > 0 {
+        println!("Found {} truncated, {} corrupted archives - will re-download",
+            truncated_count, corrupted_count);
     }
 
     if already_downloaded > 0 {
@@ -605,6 +646,45 @@ async fn download_archive(
                         }
                     }
                 }
+
+                // Verify hash after size check passes
+                pb.set_message(format!("{} (verifying...)", truncate_name(&archive.name, 30)));
+                match verify_file_hash(output_path, &archive.hash) {
+                    Ok(true) => {
+                        // Hash matches - success!
+                    }
+                    Ok(false) => {
+                        // Hash mismatch - corrupted download, delete and retry
+                        let _ = std::fs::remove_file(output_path);
+                        if attempt < MAX_RETRIES {
+                            ctx.overall_pb.println(format!(
+                                "Hash mismatch for {}, re-downloading...",
+                                truncate_name(&archive.name, 35)
+                            ));
+                            tokio::time::sleep(RETRY_DELAY).await;
+                            continue;
+                        } else {
+                            bail!(
+                                "Hash verification failed after {} attempts for {}",
+                                MAX_RETRIES, archive.name
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // Hash computation failed - treat as retry
+                        if attempt < MAX_RETRIES {
+                            ctx.overall_pb.println(format!(
+                                "Hash verify error for {} ({}), retrying...",
+                                truncate_name(&archive.name, 25), e
+                            ));
+                            tokio::time::sleep(RETRY_DELAY).await;
+                            continue;
+                        } else {
+                            bail!("Hash verification error: {}", e);
+                        }
+                    }
+                }
+
                 return Ok(url_to_cache);
             }
             Err(e) => {
@@ -1048,11 +1128,28 @@ async fn download_archives_nxm(
 
         match download_result {
             Ok(()) => {
-                downloaded += 1;
-                db.mark_archive_downloaded(
-                    &pending.archive.hash,
-                    pending.output_path.to_string_lossy().as_ref(),
-                )?;
+                // Verify hash after download
+                overall_pb.set_message(format!("Verifying {}...", truncate_name(&pending.archive.name, 30)));
+                match verify_file_hash(&pending.output_path, &pending.archive.hash) {
+                    Ok(true) => {
+                        downloaded += 1;
+                        db.mark_archive_downloaded(
+                            &pending.archive.hash,
+                            pending.output_path.to_string_lossy().as_ref(),
+                        )?;
+                    }
+                    Ok(false) => {
+                        // Hash mismatch - corrupted download
+                        overall_pb.println(format!("FAIL {} - hash mismatch (corrupted download)", pending.archive.name));
+                        let _ = fs::remove_file(&pending.output_path);
+                        failed += 1;
+                    }
+                    Err(e) => {
+                        overall_pb.println(format!("FAIL {} - hash verify error: {}", pending.archive.name, e));
+                        let _ = fs::remove_file(&pending.output_path);
+                        failed += 1;
+                    }
+                }
                 overall_pb.inc(1);
             }
             Err(e) => {

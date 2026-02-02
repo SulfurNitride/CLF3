@@ -761,7 +761,7 @@ impl ModlistDb {
 }
 
 /// Archive info from database
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ArchiveInfo {
     pub hash: String,
     pub name: String,

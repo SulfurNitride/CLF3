@@ -8,6 +8,7 @@ mod bsa;
 mod downloaders;
 mod file_router;
 mod games;
+mod hash;
 mod installer;
 mod loot;
 mod mo2;
