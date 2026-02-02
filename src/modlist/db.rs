@@ -54,6 +54,16 @@ pub struct ModlistDb {
 impl ModlistDb {
     /// Open or create a modlist database
     pub fn open(db_path: &Path) -> Result<Self> {
+        // Clean up any stale WAL files that might cause issues on network filesystems
+        let wal_path = db_path.with_extension("db-wal");
+        let shm_path = db_path.with_extension("db-shm");
+        if wal_path.exists() {
+            let _ = std::fs::remove_file(&wal_path);
+        }
+        if shm_path.exists() {
+            let _ = std::fs::remove_file(&shm_path);
+        }
+
         let conn = Connection::open(db_path)
             .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
 
@@ -155,7 +165,7 @@ impl ModlistDb {
             CREATE INDEX IF NOT EXISTS idx_archive_files_hash ON archive_files(archive_hash);
             CREATE INDEX IF NOT EXISTS idx_archive_files_normalized ON archive_files(archive_hash, normalized_path);
             "#
-        ).context("Failed to create tables")?;
+        ).with_context(|| "Failed to create tables")?;
 
         Ok(())
     }
