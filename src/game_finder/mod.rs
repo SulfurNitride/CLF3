@@ -21,6 +21,7 @@
 
 mod heroic;
 pub mod known_games;
+pub mod proton;
 mod steam;
 mod vdf;
 
@@ -28,6 +29,7 @@ use std::path::PathBuf;
 
 pub use heroic::detect_heroic_games;
 pub use known_games::{find_by_gog_id, find_by_name, find_by_steam_id, KnownGame, KNOWN_GAMES};
+pub use proton::{find_steam_path, find_steam_protons, SteamProton};
 pub use steam::{detect_steam_games, find_game_install_path, find_game_prefix_path, get_known_game};
 
 // ============================================================================

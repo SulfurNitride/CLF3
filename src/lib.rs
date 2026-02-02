@@ -14,6 +14,7 @@ pub mod installer;
 pub mod loot;
 pub mod mo2;
 pub mod modlist;
+pub mod nak;
 pub mod nxm_handler;
 pub mod octodiff;
 pub mod paths;
