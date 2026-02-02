@@ -142,8 +142,8 @@ async fn main() -> Result<()> {
     let file_appender = tracing_appender::rolling::never(&log_dir, &log_filename);
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
-    // Create filter - file always gets debug level, console follows user preference
-    let file_filter = EnvFilter::new("clf3=debug,warn");
+    // Create filter - file gets info level, console follows user preference
+    let file_filter = EnvFilter::new("clf3=info,warn");
     let console_filter = EnvFilter::from_default_env()
         .add_directive(if cli.verbose { "clf3=debug".parse()? } else { "clf3=warn".parse()? });
 
