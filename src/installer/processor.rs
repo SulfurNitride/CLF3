@@ -873,7 +873,8 @@ pub fn process_directives_streaming(
     };
 
     let streaming_stats = super::streaming::process_from_archive_streaming(db, &ctx, streaming_config, &pb, progress_callback)?;
-    completed.fetch_add(streaming_stats.written, Ordering::Relaxed);
+    // Use 'extracted' not 'written' - BSA direct writes and whole-file copies only increment extracted
+    completed.fetch_add(streaming_stats.extracted, Ordering::Relaxed);
     skipped.fetch_add(streaming_stats.skipped, Ordering::Relaxed);
     failed.fetch_add(streaming_stats.failed, Ordering::Relaxed);
 
