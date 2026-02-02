@@ -34,6 +34,7 @@ thiserror = "2.0"
 # 7z binary is used for mod archive extraction (ZIP, 7z, RAR)
 zip = "7.2"
 flate2 = "1.1"
+tar = "0.4"
 
 # BSA/BA2 archives
 ba2 = "3.0.1"

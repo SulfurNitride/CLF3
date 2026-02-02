@@ -11,7 +11,7 @@ mod google_drive;
 mod http;
 mod mediafire;
 mod nexus;
-mod wabbajack_cdn;
+pub mod wabbajack_cdn;
 
 pub use google_drive::GoogleDriveDownloader;
 pub use http::{download_file, download_file_with_callback, download_file_with_progress, HttpClient, ProgressCallback};

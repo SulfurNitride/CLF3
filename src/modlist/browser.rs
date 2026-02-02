@@ -1,11 +1,11 @@
 //! Modlist browser for fetching and displaying available modlists from Wabbajack repositories.
 
+use crate::downloaders::wabbajack_cdn::WabbajackCdnDownloader;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
 
 const REPOSITORIES_URL: &str = "https://raw.githubusercontent.com/wabbajack-tools/mod-lists/master/repositories.json";
@@ -77,10 +77,10 @@ pub struct ModlistMetadata {
     pub download_metadata: Option<DownloadMetadata>,
     #[serde(default)]
     pub version: String,
-    // Fields we populate ourselves
-    #[serde(skip)]
+    // Fields we populate ourselves (included in cache for quick loading)
+    #[serde(default)]
     pub repository_name: String,
-    #[serde(skip)]
+    #[serde(default)]
     pub machine_name: String,
 }
 
@@ -278,12 +278,26 @@ impl ModlistBrowser {
         games
     }
 
-    /// Download a modlist .wabbajack file
+    /// Download a modlist .wabbajack file using chunked CDN downloads
     pub async fn download_modlist(
         &self,
         metadata: &ModlistMetadata,
         output_dir: &std::path::Path,
     ) -> Result<PathBuf> {
+        self.download_modlist_with_progress(metadata, output_dir, |_, _| {}).await
+    }
+
+    /// Download a modlist .wabbajack file with progress callback
+    /// Progress callback receives (bytes_downloaded, total_bytes)
+    pub async fn download_modlist_with_progress<F>(
+        &self,
+        metadata: &ModlistMetadata,
+        output_dir: &std::path::Path,
+        progress_callback: F,
+    ) -> Result<PathBuf>
+    where
+        F: Fn(u64, u64) + Send + Sync + 'static,
+    {
         let download_url = metadata
             .download_url()
             .context("Modlist has no download URL")?;
@@ -298,30 +312,23 @@ impl ModlistBrowser {
 
         info!("Downloading {} to {:?}", metadata.title, output_path);
 
-        let response = self
-            .client
-            .get(download_url)
-            .send()
-            .await
-            .with_context(|| format!("Failed to download modlist from {}", download_url))?;
+        // Get expected size from metadata (0 if unknown)
+        let expected_size = metadata
+            .download_metadata
+            .as_ref()
+            .map(|d| d.size)
+            .unwrap_or(0);
 
-        if !response.status().is_success() {
-            anyhow::bail!(
-                "Failed to download modlist: HTTP {}",
-                response.status()
-            );
-        }
-
-        let bytes = response.bytes().await?;
-
-        // Write to file
-        let mut file = tokio::fs::File::create(&output_path).await?;
-        file.write_all(&bytes).await?;
+        // Use the CDN downloader for chunked parallel downloads
+        let cdn_downloader = WabbajackCdnDownloader::new()?;
+        let bytes_downloaded = cdn_downloader
+            .download_with_progress(download_url, &output_path, expected_size, progress_callback)
+            .await?;
 
         info!(
             "Downloaded {} ({} bytes)",
             metadata.title,
-            bytes.len()
+            bytes_downloaded
         );
 
         Ok(output_path)
@@ -337,6 +344,66 @@ impl ModlistBrowser {
         self.modlists
             .iter()
             .find(|m| m.title.eq_ignore_ascii_case(title))
+    }
+
+    /// Get the cache directory for modlist metadata
+    fn cache_dir() -> Result<PathBuf> {
+        let cache_dir = dirs::cache_dir()
+            .context("Could not determine cache directory")?
+            .join("clf3")
+            .join("modlists");
+        std::fs::create_dir_all(&cache_dir)?;
+        Ok(cache_dir)
+    }
+
+    /// Save current modlists to cache
+    pub fn save_cache(&self) -> Result<()> {
+        let cache_path = Self::cache_dir()?.join("modlists.json");
+        let json = serde_json::to_string(&self.modlists)?;
+        std::fs::write(&cache_path, json)?;
+        info!("Saved {} modlists to cache", self.modlists.len());
+        Ok(())
+    }
+
+    /// Load modlists from cache (returns empty vec if no cache exists)
+    pub fn load_cache(&mut self) -> Result<bool> {
+        let cache_path = Self::cache_dir()?.join("modlists.json");
+        if !cache_path.exists() {
+            return Ok(false);
+        }
+
+        let json = std::fs::read_to_string(&cache_path)?;
+        self.modlists = serde_json::from_str(&json)?;
+        info!("Loaded {} modlists from cache", self.modlists.len());
+        Ok(true)
+    }
+
+    /// Check if cache exists and is recent (less than 1 hour old)
+    pub fn has_recent_cache() -> bool {
+        if let Ok(cache_dir) = Self::cache_dir() {
+            let cache_path = cache_dir.join("modlists.json");
+            if let Ok(metadata) = std::fs::metadata(&cache_path) {
+                if let Ok(modified) = metadata.modified() {
+                    let age = std::time::SystemTime::now()
+                        .duration_since(modified)
+                        .unwrap_or_default();
+                    return age.as_secs() < 3600; // 1 hour
+                }
+            }
+        }
+        false
+    }
+
+    /// Get cache age in seconds (or None if no cache)
+    pub fn cache_age_secs() -> Option<u64> {
+        let cache_dir = Self::cache_dir().ok()?;
+        let cache_path = cache_dir.join("modlists.json");
+        let metadata = std::fs::metadata(&cache_path).ok()?;
+        let modified = metadata.modified().ok()?;
+        let age = std::time::SystemTime::now()
+            .duration_since(modified)
+            .ok()?;
+        Some(age.as_secs())
     }
 }
 
