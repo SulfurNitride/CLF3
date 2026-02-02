@@ -394,6 +394,10 @@ pub struct ProgressReporter {
     callback: Option<super::ProgressCallback>,
     total_directives: usize,
     processed_count: AtomicUsize,
+    /// Current phase's total (for accurate per-phase progress reporting)
+    phase_total: AtomicUsize,
+    /// Current phase's processed count (reset per phase)
+    phase_count: AtomicUsize,
 }
 
 impl ProgressReporter {
@@ -402,11 +406,16 @@ impl ProgressReporter {
             callback,
             total_directives,
             processed_count: AtomicUsize::new(0),
+            phase_total: AtomicUsize::new(total_directives),
+            phase_count: AtomicUsize::new(0),
         }
     }
 
     /// Report that a directive phase is starting
     pub fn phase_started(&self, directive_type: &str, count: usize) {
+        // Set phase-specific totals and reset phase counter
+        self.phase_total.store(count, Ordering::Relaxed);
+        self.phase_count.store(0, Ordering::Relaxed);
         if let Some(ref callback) = self.callback {
             callback(super::ProgressEvent::DirectivePhaseStarted {
                 directive_type: directive_type.to_string(),
@@ -417,21 +426,24 @@ impl ProgressReporter {
 
     /// Report that a directive completed (increments internal counter)
     pub fn directive_completed(&self) {
-        let current = self.processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+        self.processed_count.fetch_add(1, Ordering::Relaxed);
+        let phase_current = self.phase_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let phase_total = self.phase_total.load(Ordering::Relaxed);
         if let Some(ref callback) = self.callback {
             callback(super::ProgressEvent::DirectiveComplete {
-                index: current,
-                total: self.total_directives,
+                index: phase_current,
+                total: phase_total,
             });
         }
     }
 
-    /// Report progress with a specific count (for batch updates)
+    /// Report progress with a specific count (for batch updates within current phase)
     pub fn report_count(&self, index: usize) {
+        let phase_total = self.phase_total.load(Ordering::Relaxed);
         if let Some(ref callback) = self.callback {
             callback(super::ProgressEvent::DirectiveComplete {
                 index,
-                total: self.total_directives,
+                total: phase_total,
             });
         }
     }
@@ -463,6 +475,11 @@ impl ProgressReporter {
     /// Get the total directive count
     pub fn get_total(&self) -> usize {
         self.total_directives
+    }
+
+    /// Get the current phase's total count
+    pub fn get_phase_total(&self) -> usize {
+        self.phase_total.load(Ordering::Relaxed)
     }
 }
 
@@ -842,8 +859,9 @@ pub fn process_directives_streaming(
     reporter.phase_started("FromArchive", from_archive_count);
 
     // Create progress callback for streaming - calls reporter for each written file
+    // Use phase_total (from_archive_count) not total_directives for accurate per-phase progress
     let progress_callback: Option<super::streaming::ProgressCallback> = if let Some(callback) = reporter.get_callback() {
-        let total = reporter.get_total();
+        let total = reporter.get_phase_total();
         Some(std::sync::Arc::new(move |written_count| {
             callback(super::ProgressEvent::DirectiveComplete {
                 index: written_count,
