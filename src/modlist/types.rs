@@ -296,25 +296,56 @@ pub struct BSAStateData {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct BA2StateData {
+    #[serde(alias = "HeaderMagic")]
     pub magic: String,
     pub version: u32,
     #[serde(rename = "Type")]
-    pub archive_type: String,
+    pub archive_type: BA2ArchiveType,
     pub has_name_table: bool,
+}
+
+/// BA2 archive type - can be string or integer depending on wabbajack version
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum BA2ArchiveType {
+    String(String),
+    Int(u32),
+}
+
+impl BA2ArchiveType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            BA2ArchiveType::String(s) => s,
+            BA2ArchiveType::Int(1) => "DX10",
+            BA2ArchiveType::Int(_) => "GNRL",
+        }
+    }
+
+    /// Check if this is a DX10 (texture) archive
+    pub fn is_dx10(&self) -> bool {
+        match self {
+            BA2ArchiveType::String(s) => s.to_uppercase().contains("DX10"),
+            BA2ArchiveType::Int(1) => true,
+            BA2ArchiveType::Int(_) => false,
+        }
+    }
 }
 
 /// File entry in a BSA
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "$type")]
 pub enum BSAFileState {
-    #[serde(rename = "BSAFileState, Compression.BSA")]
+    #[serde(rename = "BSAFileState, Compression.BSA", alias = "BSAFile")]
     BSA(BSAFileStateData),
 
-    #[serde(rename = "BA2FileState, Compression.BSA")]
+    #[serde(rename = "BA2FileState, Compression.BSA", alias = "BA2File")]
     BA2(BA2FileStateData),
 
-    #[serde(rename = "BA2DX10FileState, Compression.BSA")]
+    #[serde(rename = "BA2DX10FileState, Compression.BSA", alias = "BA2DX10FileState")]
     BA2DX10(BA2DX10FileStateData),
+
+    #[serde(rename = "BA2DX10Entry, Compression.BSA", alias = "BA2DX10Entry")]
+    BA2DX10Entry(BA2DX10FileStateData),
 }
 
 impl BSAFileState {
@@ -323,6 +354,7 @@ impl BSAFileState {
             BSAFileState::BSA(d) => &d.path,
             BSAFileState::BA2(d) => &d.path,
             BSAFileState::BA2DX10(d) => &d.path,
+            BSAFileState::BA2DX10Entry(d) => &d.path,
         }
     }
 
@@ -345,6 +377,18 @@ pub struct BSAFileStateData {
 pub struct BA2FileStateData {
     pub path: String,
     pub index: u32,
+    #[serde(default)]
+    pub dir_hash: u64,
+    #[serde(default)]
+    pub name_hash: u64,
+    #[serde(default)]
+    pub extension: String,
+    #[serde(default)]
+    pub flags: u64,
+    #[serde(default)]
+    pub align: u64,
+    #[serde(default)]
+    pub compressed: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -352,15 +396,43 @@ pub struct BA2FileStateData {
 pub struct BA2DX10FileStateData {
     pub path: String,
     pub index: u32,
+    #[serde(default)]
     pub chunks: Vec<BA2DX10Chunk>,
+    #[serde(default)]
+    pub dir_hash: u64,
+    #[serde(default)]
+    pub name_hash: u64,
+    #[serde(default)]
+    pub extension: String,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+    #[serde(default)]
+    pub num_mips: u32,
+    #[serde(default)]
+    pub pixel_format: u32,
+    #[serde(default)]
+    pub tile_mode: u32,
+    #[serde(default)]
+    pub is_cube_map: u32,
+    #[serde(default)]
+    pub chunk_hdr_len: u32,
+    #[serde(default)]
+    pub unk8: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct BA2DX10Chunk {
+    #[serde(default)]
     pub start_mip: u32,
+    #[serde(default)]
     pub end_mip: u32,
-    pub align: u32,
+    #[serde(default)]
+    pub align: u64,
+    #[serde(default)]
     pub compressed: bool,
+    #[serde(default)]
     pub full_sz: u64,
 }

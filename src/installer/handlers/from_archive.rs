@@ -107,7 +107,7 @@ pub fn handle_from_archive(ctx: &ProcessContext, directive: &FromArchiveDirectiv
             cached
         } else if let Some(bsa_disk_path) = ctx.get_cached_bsa_path(archive_hash, bsa_path_in_archive) {
             // BSA is in working folder - extract directly from it
-            bsa::extract_file(&bsa_disk_path, file_path_in_bsa)
+            bsa::extract_archive_file(&bsa_disk_path, file_path_in_bsa)
                 .with_context(|| format!("Failed to extract '{}' from BSA '{}'", file_path_in_bsa, bsa_path_in_archive))?
         } else {
             extract_nested_bsa(archive_path, bsa_path_in_archive, file_path_in_bsa, &ctx.config.downloads_dir)?
@@ -147,7 +147,7 @@ pub fn extract_from_archive_with_temp(archive_path: &Path, file_path: &str, temp
     match archive_type {
         ArchiveType::Bsa | ArchiveType::Ba2 => {
             // Direct BSA/BA2 extraction (uses ba2 crate)
-            bsa::extract_file(archive_path, file_path)
+            bsa::extract_archive_file(archive_path, file_path)
         }
         ArchiveType::Zip | ArchiveType::SevenZ | ArchiveType::Rar => {
             // Use 7z binary for all standard archives
@@ -162,7 +162,7 @@ pub fn extract_from_archive_with_temp(archive_path: &Path, file_path: &str, temp
                 .to_lowercase();
 
             match extension.as_str() {
-                "bsa" | "ba2" => bsa::extract_file(archive_path, file_path),
+                "bsa" | "ba2" => bsa::extract_archive_file(archive_path, file_path),
                 _ => {
                     // Try 7z - it handles most formats
                     extract_with_7z(archive_path, file_path, temp_base_dir)
@@ -260,7 +260,7 @@ fn extract_nested_bsa(
         .with_context(|| format!("Failed to write temp BSA: {}", temp_file.path().display()))?;
 
     // Extract from the BSA (temp_file auto-deleted when dropped)
-    bsa::extract_file(temp_file.path(), file_path_in_bsa)
+    bsa::extract_archive_file(temp_file.path(), file_path_in_bsa)
 }
 
 #[cfg(test)]

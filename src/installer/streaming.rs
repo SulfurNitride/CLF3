@@ -42,6 +42,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
+use tracing::{error, warn, info};
 
 /// Message sent from extractor to mover workers.
 struct MoveJob {
@@ -246,8 +247,17 @@ pub fn process_from_archive_streaming(
         eprintln!("Pre-filtered {} already-complete files", pre_skipped);
     }
     if parse_failures > 0 {
-        eprintln!("WARN: {} directives failed to parse", parse_failures);
+        warn!("WARN: {} directives failed to parse", parse_failures);
     }
+
+    // Create a wrapper callback that adds pre_skipped offset to the count
+    // This ensures the GUI sees the correct total progress including pre-filtered files
+    let adjusted_callback: Option<ProgressCallback> = progress_callback.map(|cb| {
+        let offset = pre_skipped;
+        Arc::new(move |count: usize| {
+            cb(offset + count);
+        }) as ProgressCallback
+    });
 
     // Group archives by size tier and type
     let archives: Vec<_> = by_archive.into_iter().collect();
@@ -352,7 +362,7 @@ pub fn process_from_archive_streaming(
             Some(ArchiveSizeTier::Small.threads_per_archive()),
             extractor_threads,
             mover_threads,
-            progress_callback.clone(),
+            adjusted_callback.clone(),
         );
     }
 
@@ -375,7 +385,7 @@ pub fn process_from_archive_streaming(
                 Some(ArchiveSizeTier::Medium.threads_per_archive()),
                 extractor_threads,
                 mover_threads,
-                progress_callback.clone(),
+                adjusted_callback.clone(),
             );
         }
     }
@@ -400,7 +410,7 @@ pub fn process_from_archive_streaming(
             None, // All threads for large archives
             extractor_threads,
             mover_threads,
-            progress_callback.clone(),
+            adjusted_callback.clone(),
         );
     }
 
@@ -422,7 +432,7 @@ pub fn process_from_archive_streaming(
             &skipped,
             &failed,
             &logged_failures,
-            progress_callback.clone(),
+            adjusted_callback.clone(),
         );
 
         pb.inc(1);
@@ -437,13 +447,14 @@ pub fn process_from_archive_streaming(
     let stats = StreamingStats {
         extracted: extracted.load(Ordering::Relaxed),
         written: written.load(Ordering::Relaxed),
-        skipped: skipped.load(Ordering::Relaxed) + parse_failures,
+        // Include pre_skipped in the skipped count for accurate totals
+        skipped: skipped.load(Ordering::Relaxed) + parse_failures + pre_skipped,
         failed: failed.load(Ordering::Relaxed),
     };
 
     eprintln!(
-        "Complete: {} extracted, {} written, {} skipped, {} failed",
-        stats.extracted, stats.written, stats.skipped, stats.failed
+        "Complete: {} extracted, {} written, {} skipped ({} pre-filtered), {} failed",
+        stats.extracted, stats.written, stats.skipped, pre_skipped, stats.failed
     );
 
     Ok(stats)
@@ -497,7 +508,7 @@ fn process_archives_with_pipeline(
                     Err(e) => {
                         let count = logged_failures_clone.fetch_add(1, Ordering::Relaxed);
                         if count < MAX_LOGGED_FAILURES {
-                            eprintln!("FAIL [{}]: metadata error: {}", job.directive_id, e);
+                            error!("FAIL [{}]: metadata error: {}", job.directive_id, e);
                         }
                         failed_clone.fetch_add(1, Ordering::Relaxed);
                         return;
@@ -507,7 +518,7 @@ fn process_archives_with_pipeline(
                 if src_size != job.expected_size {
                     let count = logged_failures_clone.fetch_add(1, Ordering::Relaxed);
                     if count < MAX_LOGGED_FAILURES {
-                        eprintln!("FAIL [{}]: size mismatch: expected {} got {}",
+                        error!("FAIL [{}]: size mismatch: expected {} got {}",
                                   job.directive_id, job.expected_size, src_size);
                     }
                     failed_clone.fetch_add(1, Ordering::Relaxed);
@@ -518,7 +529,7 @@ fn process_archives_with_pipeline(
                 if let Err(e) = paths::ensure_parent_dirs(&job.output_path) {
                     let count = logged_failures_clone.fetch_add(1, Ordering::Relaxed);
                     if count < MAX_LOGGED_FAILURES {
-                        eprintln!("FAIL [{}]: cannot create dirs: {}", job.directive_id, e);
+                        error!("FAIL [{}]: cannot create dirs: {}", job.directive_id, e);
                     }
                     failed_clone.fetch_add(1, Ordering::Relaxed);
                     return;
@@ -529,7 +540,7 @@ fn process_archives_with_pipeline(
                     if let Err(e) = reflink_copy::reflink_or_copy(&job.source_path, &job.output_path) {
                         let count = logged_failures_clone.fetch_add(1, Ordering::Relaxed);
                         if count < MAX_LOGGED_FAILURES {
-                            eprintln!("FAIL [{}]: reflink/copy error: {}", job.directive_id, e);
+                            error!("FAIL [{}]: reflink/copy error: {}", job.directive_id, e);
                         }
                         failed_clone.fetch_add(1, Ordering::Relaxed);
                         return;
@@ -541,7 +552,7 @@ fn process_archives_with_pipeline(
                         if let Err(e) = reflink_copy::reflink_or_copy(&job.source_path, &job.output_path) {
                             let count = logged_failures_clone.fetch_add(1, Ordering::Relaxed);
                             if count < MAX_LOGGED_FAILURES {
-                                eprintln!("FAIL [{}]: rename then reflink/copy failed: {}", job.directive_id, e);
+                                error!("FAIL [{}]: rename then reflink/copy failed: {}", job.directive_id, e);
                             }
                             failed_clone.fetch_add(1, Ordering::Relaxed);
                             return;
@@ -640,7 +651,7 @@ fn process_single_archive_with_channel(
     let temp_dir = match tempfile::tempdir_in(&ctx.config.output_dir) {
         Ok(d) => Arc::new(d),
         Err(e) => {
-            eprintln!("FAIL: Cannot create temp dir: {}", e);
+            error!("FAIL: Cannot create temp dir: {}", e);
             failed.fetch_add(to_process.len(), Ordering::Relaxed);
             return;
         }
@@ -664,7 +675,7 @@ fn process_single_archive_with_channel(
     if let Err(e) = sevenzip::extract_all_with_threads(archive_path, temp_dir.path(), threads) {
         let count = logged_failures.fetch_add(1, Ordering::Relaxed);
         if count < MAX_LOGGED_FAILURES {
-            eprintln!("FAIL: Cannot extract {}: {}", archive_path.display(), e);
+            error!("FAIL: Cannot extract {}: {}", archive_path.display(), e);
         }
         failed.fetch_add(to_process.len(), Ordering::Relaxed);
         return;
@@ -717,7 +728,7 @@ fn process_single_archive_with_channel(
             None => {
                 let count = logged_failures.fetch_add(1, Ordering::Relaxed);
                 if count < MAX_LOGGED_FAILURES {
-                    eprintln!("FAIL [{}]: not found in archive: {}", id, path_in_archive);
+                    error!("FAIL [{}]: not found in archive: {}", id, path_in_archive);
                 }
                 failed.fetch_add(1, Ordering::Relaxed);
                 continue;
@@ -781,7 +792,7 @@ fn process_nested_bsa_directives(
             None => {
                 let count = logged_failures.fetch_add(1, Ordering::Relaxed);
                 if count < MAX_LOGGED_FAILURES {
-                    eprintln!("FAIL: BSA not found in archive: {}", bsa_path_in_archive);
+                    error!("FAIL: BSA not found in archive: {}", bsa_path_in_archive);
                 }
                 failed.fetch_add(bsa_directives.len(), Ordering::Relaxed);
                 continue;
@@ -789,12 +800,12 @@ fn process_nested_bsa_directives(
         };
 
         bsa_directives.par_iter().for_each(|(id, directive, file_in_bsa)| {
-            let data = match bsa::extract_file(&bsa_disk_path, file_in_bsa) {
+            let data = match bsa::extract_archive_file(&bsa_disk_path, file_in_bsa) {
                 Ok(d) => d,
                 Err(e) => {
                     let count = logged_failures.fetch_add(1, Ordering::Relaxed);
                     if count < MAX_LOGGED_FAILURES {
-                        eprintln!("FAIL [{}]: BSA extract error: {}", id, e);
+                        error!("FAIL [{}]: BSA extract error: {}", id, e);
                     }
                     failed.fetch_add(1, Ordering::Relaxed);
                     return;
@@ -804,7 +815,7 @@ fn process_nested_bsa_directives(
             if data.len() as u64 != directive.size {
                 let count = logged_failures.fetch_add(1, Ordering::Relaxed);
                 if count < MAX_LOGGED_FAILURES {
-                    eprintln!("FAIL [{}]: BSA size mismatch: expected {} got {}", id, directive.size, data.len());
+                    error!("FAIL [{}]: BSA size mismatch: expected {} got {}", id, directive.size, data.len());
                 }
                 failed.fetch_add(1, Ordering::Relaxed);
                 return;
@@ -818,7 +829,7 @@ fn process_nested_bsa_directives(
 
             if let Err(e) = fs::write(&bsa_output_path, &data) {
                 failed.fetch_add(1, Ordering::Relaxed);
-                eprintln!("FAIL [{}]: write error: {}", id, e);
+                error!("FAIL [{}]: write error: {}", id, e);
                 return;
             }
 
@@ -867,7 +878,7 @@ fn process_whole_file_directives(
         if archive_size != directive.size {
             // Not actually a whole-file directive - size mismatch
             failed.fetch_add(1, Ordering::Relaxed);
-            eprintln!("FAIL [{}]: whole-file size mismatch {} vs {}", id, archive_size, directive.size);
+            error!("FAIL [{}]: whole-file size mismatch {} vs {}", id, archive_size, directive.size);
             return;
         }
 
@@ -875,13 +886,13 @@ fn process_whole_file_directives(
         let output_path = paths::join_windows_path(&ctx.config.output_dir, &directive.to);
         if let Err(e) = paths::ensure_parent_dirs(&output_path) {
             failed.fetch_add(1, Ordering::Relaxed);
-            eprintln!("FAIL [{}]: cannot create parent dirs: {}", id, e);
+            error!("FAIL [{}]: cannot create parent dirs: {}", id, e);
             return;
         }
 
         if let Err(e) = fs::copy(archive_path, &output_path) {
             failed.fetch_add(1, Ordering::Relaxed);
-            eprintln!("FAIL [{}]: copy failed: {}", id, e);
+            error!("FAIL [{}]: copy failed: {}", id, e);
             return;
         }
 
@@ -934,12 +945,12 @@ fn process_bsa_archive(
             .unwrap_or("");
 
         // Extract from BSA
-        let data = match bsa::extract_file(archive_path, file_path_in_bsa) {
+        let data = match bsa::extract_archive_file(archive_path, file_path_in_bsa) {
             Ok(d) => d,
             Err(e) => {
                 let count = logged_failures.fetch_add(1, Ordering::Relaxed);
                 if count < MAX_LOGGED_FAILURES {
-                    eprintln!("FAIL [{}]: BSA read error: {}", id, e);
+                    error!("FAIL [{}]: BSA read error: {}", id, e);
                 }
                 failed.fetch_add(1, Ordering::Relaxed);
                 return;
@@ -950,7 +961,7 @@ fn process_bsa_archive(
         if data.len() as u64 != directive.size {
             let count = logged_failures.fetch_add(1, Ordering::Relaxed);
             if count < MAX_LOGGED_FAILURES {
-                eprintln!("FAIL [{}]: BSA size mismatch: expected {} got {}", id, directive.size, data.len());
+                error!("FAIL [{}]: BSA size mismatch: expected {} got {}", id, directive.size, data.len());
             }
             failed.fetch_add(1, Ordering::Relaxed);
             return;
@@ -960,13 +971,13 @@ fn process_bsa_archive(
         let output_path = paths::join_windows_path(output_dir, &directive.to);
         if let Err(e) = paths::ensure_parent_dirs(&output_path) {
             failed.fetch_add(1, Ordering::Relaxed);
-            eprintln!("FAIL [{}]: cannot create dirs: {}", id, e);
+            error!("FAIL [{}]: cannot create dirs: {}", id, e);
             return;
         }
 
         if let Err(e) = fs::write(&output_path, &data) {
             failed.fetch_add(1, Ordering::Relaxed);
-            eprintln!("FAIL [{}]: write error: {}", id, e);
+            error!("FAIL [{}]: write error: {}", id, e);
             return;
         }
 

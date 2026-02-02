@@ -69,14 +69,14 @@ impl OutputFormat {
     /// Parse from string
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
-            "BC7" | "BC7_UNORM" => Some(OutputFormat::BC7),
-            "BC5" | "BC5_UNORM" => Some(OutputFormat::BC5),
-            "BC4" | "BC4_UNORM" => Some(OutputFormat::BC4),
-            "BC3" | "BC3_UNORM" | "DXT5" => Some(OutputFormat::BC3),
-            "BC2" | "BC2_UNORM" | "DXT3" => Some(OutputFormat::BC2),
-            "BC1" | "BC1_UNORM" | "DXT1" => Some(OutputFormat::BC1),
-            "RGBA" | "R8G8B8A8" | "R8G8B8A8_UNORM" | "ARGB_8888" => Some(OutputFormat::Rgba),
-            "BGRA" | "B8G8R8A8" | "B8G8R8A8_UNORM" => Some(OutputFormat::Bgra),
+            "BC7" | "BC7_UNORM" | "BC7_UNORM_SRGB" | "BC7_SRGB" => Some(OutputFormat::BC7),
+            "BC5" | "BC5_UNORM" | "BC5_SNORM" | "BC5_TYPELESS" => Some(OutputFormat::BC5),
+            "BC4" | "BC4_UNORM" | "BC4_SNORM" | "BC4_TYPELESS" => Some(OutputFormat::BC4),
+            "BC3" | "BC3_UNORM" | "BC3_UNORM_SRGB" | "BC3_SRGB" | "DXT5" => Some(OutputFormat::BC3),
+            "BC2" | "BC2_UNORM" | "BC2_UNORM_SRGB" | "BC2_SRGB" | "DXT3" => Some(OutputFormat::BC2),
+            "BC1" | "BC1_UNORM" | "BC1_UNORM_SRGB" | "BC1_SRGB" | "DXT1" => Some(OutputFormat::BC1),
+            "RGBA" | "R8G8B8A8" | "R8G8B8A8_UNORM" | "R8G8B8A8_UNORM_SRGB" | "ARGB_8888" => Some(OutputFormat::Rgba),
+            "BGRA" | "B8G8R8A8" | "B8G8R8A8_UNORM" | "B8G8R8A8_UNORM_SRGB" => Some(OutputFormat::Bgra),
             _ => None,
         }
     }

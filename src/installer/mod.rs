@@ -28,6 +28,7 @@ pub struct InstallStats {
     pub archives_failed: usize,
     pub archives_manual: usize,
     pub directives_completed: usize,
+    pub directives_skipped: usize,
     pub directives_failed: usize,
 }
 
@@ -136,6 +137,7 @@ impl Installer {
         println!("=== Phase 3: Process Directives ===\n");
         let process_stats = processor::process_directives(&self.db, &self.config)?;
         stats.directives_completed = process_stats.completed;
+        stats.directives_skipped = process_stats.skipped;
         stats.directives_failed = process_stats.failed;
 
         if stats.directives_failed > 0 {
@@ -297,6 +299,7 @@ impl Installer {
             mover_workers,
         )?;
         stats.directives_completed = process_stats.completed;
+        stats.directives_skipped = process_stats.skipped;
         stats.directives_failed = process_stats.failed;
 
         if stats.directives_failed > 0 {

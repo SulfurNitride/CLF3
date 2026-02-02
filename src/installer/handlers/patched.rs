@@ -53,7 +53,7 @@ pub fn handle_patched_from_archive(
             cached
         } else if let Some(bsa_disk_path) = ctx.get_cached_bsa_path(archive_hash, bsa_path) {
             // BSA is in working folder - extract directly from it
-            crate::bsa::extract_file(&bsa_disk_path, file_in_bsa)
+            crate::bsa::extract_archive_file(&bsa_disk_path, file_in_bsa)
                 .with_context(|| format!("Failed to extract {} from BSA {}", file_in_bsa, bsa_path))?
         } else {
             // Fall back to direct extraction: extract BSA from archive, then file from BSA
@@ -67,7 +67,7 @@ pub fn handle_patched_from_archive(
                 .context("Failed to create temp BSA file")?;
             std::fs::write(temp_bsa.path(), &bsa_data)?;
 
-            crate::bsa::extract_file(temp_bsa.path(), file_in_bsa)
+            crate::bsa::extract_archive_file(temp_bsa.path(), file_in_bsa)
                 .with_context(|| format!("Failed to extract {} from BSA {}", file_in_bsa, bsa_path))?
         }
     };

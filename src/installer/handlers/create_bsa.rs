@@ -1,8 +1,8 @@
 //! CreateBSA directive handler
 //!
-//! Builds BSA archives from files staged in TEMP_BSA_FILES folders.
+//! Builds BSA/BA2 archives from files staged in TEMP_BSA_FILES folders.
 
-use crate::bsa::BsaBuilder;
+use crate::bsa::{Ba2Builder, Ba2CompressionFormat, BsaBuilder};
 use crate::installer::processor::ProcessContext;
 use crate::modlist::{BSAState, CreateBSADirective};
 use crate::paths;
@@ -12,9 +12,23 @@ use ba2::tes4::{ArchiveFlags, ArchiveTypes, Version};
 use std::fs;
 use walkdir::WalkDir;
 
+/// Archive type to create
+enum ArchiveKind {
+    /// TES4 BSA (Oblivion, FO3, FNV, Skyrim)
+    Bsa {
+        version: Version,
+        flags: ArchiveFlags,
+        types: ArchiveTypes,
+    },
+    /// FO4 BA2 (Fallout 4, Fallout 76, Starfield)
+    Ba2 {
+        is_texture: bool,
+    },
+}
+
 /// Handle a CreateBSA directive
 ///
-/// Reads files from the staging directory and builds a BSA archive.
+/// Reads files from the staging directory and builds a BSA/BA2 archive.
 pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -> Result<()> {
     // Staging directory: {output_dir}/TEMP_BSA_FILES/{temp_id}/
     let staging_dir = ctx
@@ -30,9 +44,11 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
         );
     }
 
-    // Get BSA settings from state
-    let (version, flags, types) = match &directive.state {
+    // Get archive settings from state
+    let archive_kind = match &directive.state {
         BSAState::BSA(state) => {
+            tracing::info!("Creating TES4 BSA: {} (version {}, magic {})",
+                directive.to, state.version, state.magic);
             let version = match state.version {
                 103 => Version::v103,
                 104 => Version::v104,
@@ -41,11 +57,15 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
             };
             let flags = ArchiveFlags::from_bits_truncate(state.archive_flags);
             let types = ArchiveTypes::from_bits_truncate(state.file_flags as u16);
-            (version, flags, types)
+            ArchiveKind::Bsa { version, flags, types }
         }
-        BSAState::BA2(_state) => {
-            // BA2 not supported yet - would need different builder
-            anyhow::bail!("BA2 archive creation not yet supported");
+        BSAState::BA2(state) => {
+            // Detect if this is a texture archive based on archive_type or name
+            let is_texture = state.archive_type.is_dx10() ||
+                directive.to.to_lowercase().contains("textures");
+            tracing::info!("Creating FO4 BA2: {} (type {:?}, is_texture: {}, version {})",
+                directive.to, state.archive_type, is_texture, state.version);
+            ArchiveKind::Ba2 { is_texture }
         }
     };
 
@@ -68,10 +88,13 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
         let data = fs::read(file_path)
             .with_context(|| format!("Failed to read staged file: {}", file_path.display()))?;
 
-        // Convert path to BSA format (backslashes)
-        let bsa_path = rel_path.to_string_lossy().replace('/', "\\");
+        // Convert path to archive format (backslashes for BSA, forward slashes for BA2)
+        let archive_path = match &archive_kind {
+            ArchiveKind::Bsa { .. } => rel_path.to_string_lossy().replace('/', "\\"),
+            ArchiveKind::Ba2 { .. } => rel_path.to_string_lossy().replace('\\', "/"),
+        };
 
-        files.push((bsa_path, data));
+        files.push((archive_path, data));
     }
 
     if files.is_empty() {
@@ -81,37 +104,56 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
         );
     }
 
-    // Write the BSA
+    // Write the archive
     let output_path = ctx.resolve_output_path(&directive.to);
     paths::ensure_parent_dirs(&output_path)?;
 
-    // Try building with original flags first
-    let build_result = {
-        let mut builder = BsaBuilder::new()
-            .with_version(version)
-            .with_flags(flags)
-            .with_types(types);
+    match archive_kind {
+        ArchiveKind::Bsa { version, flags, types } => {
+            // Try building with original flags first
+            let build_result = {
+                let mut builder = BsaBuilder::new()
+                    .with_version(version)
+                    .with_flags(flags)
+                    .with_types(types);
 
-        for (path, data) in &files {
-            builder.add_file(path, data.clone());
+                for (path, data) in &files {
+                    builder.add_file(path, data.clone());
+                }
+
+                builder.build(&output_path)
+            };
+
+            // If it fails with overflow, try without compression
+            if let Err(e) = build_result {
+                let err_str = format!("{:?}", e);
+                if err_str.contains("overflow") {
+                    tracing::warn!("BSA build failed with overflow, retrying without compression");
+
+                    // Remove COMPRESSED flag
+                    let flags_no_compress = flags & !ArchiveFlags::COMPRESSED;
+
+                    let mut builder = BsaBuilder::new()
+                        .with_version(version)
+                        .with_flags(flags_no_compress)
+                        .with_types(types);
+
+                    for (path, data) in files {
+                        builder.add_file(&path, data);
+                    }
+
+                    builder
+                        .build(&output_path)
+                        .with_context(|| format!("Failed to build BSA (uncompressed): {}", output_path.display()))?;
+                } else {
+                    return Err(e).with_context(|| format!("Failed to build BSA: {}", output_path.display()));
+                }
+            }
         }
-
-        builder.build(&output_path)
-    };
-
-    // If it fails with overflow, try without compression
-    if let Err(e) = build_result {
-        let err_str = format!("{:?}", e);
-        if err_str.contains("overflow") {
-            tracing::warn!("BSA build failed with overflow, retrying without compression");
-
-            // Remove COMPRESSED flag
-            let flags_no_compress = flags & !ArchiveFlags::COMPRESSED;
-
-            let mut builder = BsaBuilder::new()
-                .with_version(version)
-                .with_flags(flags_no_compress)
-                .with_types(types);
+        ArchiveKind::Ba2 { is_texture: _ } => {
+            // Build BA2 archive
+            let mut builder = Ba2Builder::from_name(&directive.to)
+                .with_compression(Ba2CompressionFormat::Zlib);
 
             for (path, data) in files {
                 builder.add_file(&path, data);
@@ -119,9 +161,7 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
 
             builder
                 .build(&output_path)
-                .with_context(|| format!("Failed to build BSA (uncompressed): {}", output_path.display()))?;
-        } else {
-            return Err(e).with_context(|| format!("Failed to build BSA: {}", output_path.display()));
+                .with_context(|| format!("Failed to build BA2: {}", output_path.display()))?;
         }
     }
 
@@ -145,14 +185,14 @@ pub fn output_bsa_valid(ctx: &ProcessContext, directive: &CreateBSADirective) ->
         return false;
     }
 
-    // Check BSA magic bytes
+    // Check magic bytes - BSA or BA2
     if let Ok(file) = fs::File::open(&output_path) {
         use std::io::BufReader;
         let mut reader = BufReader::new(file);
         let mut magic = [0u8; 4];
         if std::io::Read::read_exact(&mut reader, &mut magic).is_ok() {
-            // BSA magic is "BSA\0"
-            return &magic == b"BSA\0";
+            // BSA magic is "BSA\0", BA2 magic is "BTDX"
+            return &magic == b"BSA\0" || &magic == b"BTDX";
         }
     }
 

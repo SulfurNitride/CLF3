@@ -220,6 +220,21 @@ fn collect_needed_files(
                     let rel_str = rel.to_string_lossy();
                     let normalized = paths::normalize_for_lookup(&rel_str);
 
+                    // Log BSA/BA2 files we find for debugging
+                    if normalized.ends_with(".bsa") || normalized.ends_with(".ba2") {
+                        if needed.contains(&normalized) {
+                            tracing::warn!("[DEBUG] Found and MATCHED BSA/BA2: '{}' -> '{}'", rel_str, normalized);
+                        } else {
+                            // Check if there's a similar path in needed set
+                            let similar: Vec<_> = needed.iter()
+                                .filter(|n| n.contains("textures.ba2") || n.contains("main.ba2"))
+                                .take(3)
+                                .collect();
+                            tracing::warn!("[DEBUG] Found BSA/BA2 NOT in needed: '{}' -> '{}', similar in needed: {:?}",
+                                rel_str, normalized, similar);
+                        }
+                    }
+
                     if needed.contains(&normalized) {
                         if let Ok(data) = fs::read(&path) {
                             results.insert(normalized, data);
@@ -848,36 +863,61 @@ pub fn process_directives_streaming(
     reporter.set_count(current_count);
     reporter.report_count(current_count);
 
+    // Hard stop if FromArchive phase had failures
+    if streaming_stats.failed > 0 {
+        anyhow::bail!(
+            "FromArchive phase failed: {} files failed to extract. Check logs for details.",
+            streaming_stats.failed
+        );
+    }
+
+    // Helper to check for failures after each phase
+    let check_failures = |phase: &str, failed: &AtomicUsize| -> Result<()> {
+        let fail_count = failed.load(Ordering::Relaxed);
+        if fail_count > 0 {
+            anyhow::bail!(
+                "{} phase failed: {} files failed. Check logs for details.",
+                phase, fail_count
+            );
+        }
+        Ok(())
+    };
+
     // Process other directives using standard methods
     pb.set_message("Processing InlineFile...");
     reporter.phase_started("InlineFile", inline_count);
     process_simple_directives(db, &ctx, "InlineFile", &pb, &completed, &skipped, &failed, &reporter)?;
     let current_count = completed.load(Ordering::Relaxed) + skipped.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
     reporter.set_count(current_count);
+    check_failures("InlineFile", &failed)?;
 
     pb.set_message("Processing RemappedInlineFile...");
     reporter.phase_started("RemappedInlineFile", remapped_count);
     process_simple_directives(db, &ctx, "RemappedInlineFile", &pb, &completed, &skipped, &failed, &reporter)?;
     let current_count = completed.load(Ordering::Relaxed) + skipped.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
     reporter.set_count(current_count);
+    check_failures("RemappedInlineFile", &failed)?;
 
     pb.set_message("Processing PatchedFromArchive...");
     reporter.phase_started("PatchedFromArchive", patched_count);
     process_patched_from_archive(db, &ctx, &pb, &completed, &skipped, &failed, &reporter)?;
     let current_count = completed.load(Ordering::Relaxed) + skipped.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
     reporter.set_count(current_count);
+    check_failures("PatchedFromArchive", &failed)?;
 
     pb.set_message("Processing TransformedTexture...");
     reporter.phase_started("TransformedTexture", texture_count);
     process_transformed_texture(db, &ctx, &pb, &completed, &skipped, &failed, &reporter)?;
     let current_count = completed.load(Ordering::Relaxed) + skipped.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
     reporter.set_count(current_count);
+    check_failures("TransformedTexture", &failed)?;
 
     pb.set_message("Processing CreateBSA...");
     reporter.phase_started("CreateBSA", bsa_count);
     process_create_bsa(db, &ctx, &pb, &completed, &skipped, &failed, &reporter)?;
     let current_count = completed.load(Ordering::Relaxed) + skipped.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
     reporter.set_count(current_count);
+    check_failures("CreateBSA", &failed)?;
 
     pb.finish_and_clear();
 
@@ -1449,7 +1489,7 @@ fn process_from_archive_fast(
                     }
 
                     // Extract from the BSA file
-                    bsa::extract_file(&bsa_temp_path, file_in_bsa)
+                    bsa::extract_archive_file(&bsa_temp_path, file_in_bsa)
                         .with_context(|| format!("Failed to extract '{}' from BSA", file_in_bsa))
                 })();
 
@@ -1568,7 +1608,7 @@ fn process_bsa_archive(
             continue;
         }
 
-        match bsa::extract_file(archive_path, file_path) {
+        match bsa::extract_archive_file(archive_path, file_path) {
             Ok(data) => {
                 if let Err(e) = write_output(ctx, directive, &data) {
                     let err_str = e.to_string();
@@ -1989,7 +2029,7 @@ fn extract_source_files_to_disk(
             ArchiveType::Bsa | ArchiveType::Ba2 => {
                 // BSA files: extract each needed file to disk
                 for (idx, (normalized, original)) in simple_paths.iter().enumerate() {
-                    if let Ok(data) = bsa::extract_file(archive_path, original) {
+                    if let Ok(data) = bsa::extract_archive_file(archive_path, original) {
                         let temp_file_path = temp_dir.join(format!("bsa_{}.tmp", idx));
                         if fs::write(&temp_file_path, &data).is_ok() {
                             extracted.insert(normalized.clone(), temp_file_path);
@@ -2003,6 +2043,12 @@ fn extract_source_files_to_disk(
                 let extract_dir = temp_dir.join("archive_extract");
                 let _ = fs::create_dir_all(&extract_dir);
 
+                // Build set of needed BSA/BA2 container files from nested_bsas
+                let needed_bsas: std::collections::HashSet<String> = nested_bsas
+                    .keys()
+                    .map(|k| paths::normalize_for_lookup(k))
+                    .collect();
+
                 if crate::archive::sevenzip::extract_all(archive_path, &extract_dir).is_ok() {
                     // Walk extracted files and find what we need
                     for entry in walkdir::WalkDir::new(&extract_dir)
@@ -2012,7 +2058,8 @@ fn extract_source_files_to_disk(
                     {
                         if let Ok(rel_path) = entry.path().strip_prefix(&extract_dir) {
                             let normalized = paths::normalize_for_lookup(&rel_path.to_string_lossy());
-                            if simple_paths.contains_key(&normalized) {
+                            // Collect both simple files AND BSA/BA2 container files
+                            if simple_paths.contains_key(&normalized) || needed_bsas.contains(&normalized) {
                                 extracted.insert(normalized, entry.path().to_path_buf());
                             }
                         }
@@ -2024,16 +2071,23 @@ fn extract_source_files_to_disk(
                 let extract_dir = temp_dir.join("archive_extract");
                 let _ = fs::create_dir_all(&extract_dir);
 
+                // Build set of needed BSA/BA2 container files from nested_bsas
+                let needed_bsas: std::collections::HashSet<String> = nested_bsas
+                    .keys()
+                    .map(|k| paths::normalize_for_lookup(k))
+                    .collect();
+
                 let extract_result = extract_zip_to_temp(archive_path, &extract_dir)
                     .or_else(|_| extract_7z_to_temp(archive_path, &extract_dir))
                     .or_else(|_| extract_rar_to_temp(archive_path, &extract_dir));
 
                 if extract_result.is_ok() {
-                    // Walk extracted files and collect paths for needed files
-                    collect_needed_file_paths(
+                    // Walk extracted files and collect paths for needed files AND BSA containers
+                    collect_needed_file_paths_with_bsas(
                         &extract_dir,
                         &extract_dir,
                         simple_paths,
+                        &needed_bsas,
                         &mut extracted,
                     );
                 }
@@ -2051,7 +2105,7 @@ fn extract_source_files_to_disk(
         };
         // Extract files from the BSA to disk
         for (idx, file_path) in files_in_bsa.iter().enumerate() {
-            if let Ok(file_data) = bsa::extract_file(&bsa_file_path, file_path) {
+            if let Ok(file_data) = bsa::extract_archive_file(&bsa_file_path, file_path) {
                 let key = format!("{}/{}", bsa_path, file_path);
                 let normalized_key = paths::normalize_for_lookup(&key);
                 let temp_file_path = temp_dir.join(format!("nested_{}_{}.tmp",
@@ -2073,6 +2127,18 @@ fn collect_needed_file_paths(
     needed: &HashMap<String, String>,
     results: &mut HashMap<String, PathBuf>,
 ) {
+    let empty_set = std::collections::HashSet::new();
+    collect_needed_file_paths_with_bsas(base, current, needed, &empty_set, results);
+}
+
+/// Recursively collect file paths from extracted archive, including BSA container files
+fn collect_needed_file_paths_with_bsas(
+    base: &Path,
+    current: &Path,
+    needed: &HashMap<String, String>,
+    needed_bsas: &std::collections::HashSet<String>,
+    results: &mut HashMap<String, PathBuf>,
+) {
     let needed_normalized: std::collections::HashSet<String> =
         needed.keys().cloned().collect();
 
@@ -2080,14 +2146,15 @@ fn collect_needed_file_paths(
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                collect_needed_file_paths(base, &path, needed, results);
+                collect_needed_file_paths_with_bsas(base, &path, needed, needed_bsas, results);
             } else if path.is_file() {
                 // Get relative path from base
                 if let Ok(rel) = path.strip_prefix(base) {
                     let rel_str = rel.to_string_lossy();
                     let normalized = paths::normalize_for_lookup(&rel_str);
 
-                    if needed_normalized.contains(&normalized) {
+                    // Collect both simple files AND BSA/BA2 container files
+                    if needed_normalized.contains(&normalized) || needed_bsas.contains(&normalized) {
                         results.insert(normalized, path.clone());
                     }
                 }
@@ -2329,12 +2396,27 @@ fn process_transformed_texture(
             let batch_result = match archive_type {
                 ArchiveType::Zip => {
                     let mut result = HashMap::new();
+                    // Log what BSA/BA2 we're looking for
+                    let bsa_keys: Vec<_> = simple_paths.keys()
+                        .filter(|k| k.ends_with(".ba2") || k.ends_with(".bsa"))
+                        .collect();
+                    if !bsa_keys.is_empty() {
+                        tracing::warn!("[DEBUG] ZIP extraction - looking for BSA/BA2: {:?}", bsa_keys);
+                    }
                     if let Ok(file) = File::open(&archive_path) {
                         if let Ok(mut archive) = zip::ZipArchive::new(BufReader::new(file)) {
                             for i in 0..archive.len() {
                                 if let Ok(mut entry) = archive.by_index(i) {
                                     let entry_name = entry.name().to_string();
                                     let normalized = paths::normalize_for_lookup(&entry_name);
+                                    // Debug log for BSA/BA2 files
+                                    if normalized.ends_with(".ba2") || normalized.ends_with(".bsa") {
+                                        if simple_paths.contains_key(&normalized) {
+                                            tracing::warn!("[DEBUG] ZIP: Found and MATCHED BSA/BA2: '{}' -> '{}'", entry_name, normalized);
+                                        } else {
+                                            tracing::warn!("[DEBUG] ZIP: Found BSA/BA2 NOT in simple_paths: '{}' -> '{}'", entry_name, normalized);
+                                        }
+                                    }
                                     if simple_paths.contains_key(&normalized) {
                                         let mut data = Vec::with_capacity(entry.size() as usize);
                                         if std::io::Read::read_to_end(&mut entry, &mut data).is_ok() {
@@ -2350,7 +2432,7 @@ fn process_transformed_texture(
                 ArchiveType::Bsa | ArchiveType::Ba2 => {
                     let mut result = HashMap::new();
                     for (normalized, original) in &simple_paths {
-                        if let Ok(data) = bsa::extract_file(&archive_path, original) {
+                        if let Ok(data) = bsa::extract_archive_file(&archive_path, original) {
                             result.insert(normalized.clone(), data);
                         }
                     }
@@ -2360,8 +2442,27 @@ fn process_transformed_texture(
                     // 7z/RAR/other: batch extract using pure Rust
                     if let Ok(temp_dir) = tempfile::tempdir_in(&ctx.config.output_dir) {
                         let paths_vec: Vec<&str> = simple_paths.values().map(|s| s.as_str()).collect();
-                        extract_batch_rust(&archive_path, &paths_vec, temp_dir.path())
-                            .unwrap_or_default()
+                        // Filter to show only BA2/BSA paths for debugging
+                        let bsa_paths: Vec<_> = paths_vec.iter()
+                            .filter(|p| p.to_lowercase().ends_with(".ba2") || p.to_lowercase().ends_with(".bsa"))
+                            .collect();
+                        if !bsa_paths.is_empty() {
+                            tracing::warn!("[DEBUG] Extracting from 7z/RAR, BSA/BA2 paths requested: {:?}", bsa_paths);
+                        }
+                        let result = match extract_batch_rust(&archive_path, &paths_vec, temp_dir.path()) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::warn!("[DEBUG] extract_batch_rust failed for {}: {}", archive_path.display(), e);
+                                HashMap::new()
+                            }
+                        };
+                        if !bsa_paths.is_empty() {
+                            let extracted_bsas: Vec<_> = result.keys()
+                                .filter(|k| k.ends_with(".ba2") || k.ends_with(".bsa"))
+                                .collect();
+                            tracing::warn!("[DEBUG] Extracted BSA/BA2 keys: {:?}", extracted_bsas);
+                        }
+                        result
                     } else {
                         HashMap::new()
                     }
@@ -2373,24 +2474,36 @@ fn process_transformed_texture(
         // For nested BSAs: extract files from BSAs we just extracted
         for (bsa_path, files_in_bsa) in &nested_bsas {
             let bsa_normalized = paths::normalize_for_lookup(bsa_path);
+            tracing::warn!("[DEBUG] Looking for BSA/BA2: original='{}', normalized='{}'", bsa_path, bsa_normalized);
             if let Some(bsa_data) = extracted.get(&bsa_normalized) {
-                // Write BSA to temp file and extract from it
+                tracing::warn!("[DEBUG] Found BSA/BA2 in cache, size={} bytes, extracting {} files", bsa_data.len(), files_in_bsa.len());
+                // Determine suffix from original path
+                let suffix = if bsa_path.to_lowercase().ends_with(".ba2") { ".ba2" } else { ".bsa" };
+                // Write BSA/BA2 to temp file and extract from it
                 if let Ok(temp_bsa) = tempfile::Builder::new()
                     .prefix(".clf3_bsa_")
-                    .suffix(".bsa")
+                    .suffix(suffix)
                     .tempfile_in(&ctx.config.downloads_dir)
                 {
                     if fs::write(temp_bsa.path(), bsa_data).is_ok() {
                         for file_path in files_in_bsa {
-                            if let Ok(file_data) = bsa::extract_file(temp_bsa.path(), file_path) {
-                                // Key: "bsa_path/file_path" normalized
-                                let key = format!("{}/{}", bsa_path, file_path);
-                                let normalized_key = paths::normalize_for_lookup(&key);
-                                extracted.insert(normalized_key, file_data);
+                            match bsa::extract_archive_file(temp_bsa.path(), file_path) {
+                                Ok(file_data) => {
+                                    // Key: "bsa_path/file_path" normalized
+                                    let key = format!("{}/{}", bsa_path, file_path);
+                                    let normalized_key = paths::normalize_for_lookup(&key);
+                                    extracted.insert(normalized_key, file_data);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to extract {} from {}: {}", file_path, bsa_path, e);
+                                }
                             }
                         }
                     }
                 }
+            } else {
+                tracing::warn!("BSA/BA2 not found in extracted archive: {} (normalized: {})", bsa_path, bsa_normalized);
+                tracing::debug!("Available keys: {:?}", extracted.keys().take(10).collect::<Vec<_>>());
             }
         }
 
@@ -2523,14 +2636,20 @@ fn process_create_bsa(
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| directive.to.clone());
 
+            // Determine archive type for display
+            let archive_type = match &directive.state {
+                crate::modlist::BSAState::BSA(_) => "BSA",
+                crate::modlist::BSAState::BA2(_) => "BA2",
+            };
+
             match handlers::handle_create_bsa(ctx, directive) {
                 Ok(()) => {
                     completed.fetch_add(1, Ordering::Relaxed);
-                    pb.println(format!("Created BSA: {}", bsa_name));
+                    pb.println(format!("Created {}: {}", archive_type, bsa_name));
                 }
                 Err(e) => {
                     failed.fetch_add(1, Ordering::Relaxed);
-                    pb.println(format!("FAIL [{}] create BSA {}: {:#}", id, bsa_name, e));
+                    pb.println(format!("FAIL [{}] create {} {}: {:#}", id, archive_type, bsa_name, e));
                 }
             }
             pb.inc(1);
@@ -2552,16 +2671,22 @@ fn process_create_bsa(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| directive.to.clone());
 
+        // Determine archive type for display
+        let archive_type = match &directive.state {
+            crate::modlist::BSAState::BSA(_) => "BSA",
+            crate::modlist::BSAState::BA2(_) => "BA2",
+        };
+
         pb.set_message(format!("{} ({} files) [LARGE]", bsa_name, directive.file_states.len()));
 
         match handlers::handle_create_bsa(ctx, &directive) {
             Ok(()) => {
                 completed.fetch_add(1, Ordering::Relaxed);
-                pb.println(format!("Created BSA: {}", bsa_name));
+                pb.println(format!("Created {}: {}", archive_type, bsa_name));
             }
             Err(e) => {
                 failed.fetch_add(1, Ordering::Relaxed);
-                pb.println(format!("FAIL [{}] create BSA {}: {:#}", id, bsa_name, e));
+                pb.println(format!("FAIL [{}] create {} {}: {:#}", id, archive_type, bsa_name, e));
             }
         }
         pb.inc(1);

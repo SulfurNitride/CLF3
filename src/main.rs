@@ -116,6 +116,22 @@ enum Commands {
         output: PathBuf,
     },
 
+    /// List files inside a BA2 archive (Fallout 4/Starfield)
+    ListBa2 {
+        /// Path to the BA2 file
+        ba2_file: PathBuf,
+    },
+
+    /// Extract a single file from a BA2 archive (Fallout 4/Starfield)
+    ExtractBa2 {
+        /// Path to the BA2 file
+        ba2_file: PathBuf,
+        /// Internal path of file to extract
+        file_path: String,
+        /// Output file path
+        output: PathBuf,
+    },
+
     /// Launch the graphical interface
     Gui {
         /// Nexus Mods API key
@@ -218,11 +234,12 @@ async fn main() -> Result<()> {
             // Processes archives in batches: ZIP (fastest) -> RAR -> 7z (slowest)
             let stats = installer.run_streaming(8, 8).await?;
 
+            let total_processed = stats.directives_completed + stats.directives_skipped + stats.directives_failed;
             println!("\n=== Installation Summary ===");
             println!("Downloads:  {} downloaded, {} skipped, {} manual, {} failed",
                 stats.archives_downloaded, stats.archives_skipped, stats.archives_manual, stats.archives_failed);
-            println!("Directives: {} completed, {} failed",
-                stats.directives_completed, stats.directives_failed);
+            println!("Directives: {} new, {} existing, {} failed ({} total)",
+                stats.directives_completed, stats.directives_skipped, stats.directives_failed, total_processed);
 
             if stats.archives_manual > 0 || stats.archives_failed > 0 {
                 println!("\nSome archives need manual download. Fix issues and run again.");
@@ -256,6 +273,25 @@ async fn main() -> Result<()> {
             output,
         }) => {
             let data = bsa::extract_file(&bsa_file, &file_path)?;
+            std::fs::write(&output, &data)?;
+            println!("Extracted {} bytes to {}", data.len(), output.display());
+        }
+
+        Some(Commands::ListBa2 { ba2_file }) => {
+            let files = bsa::list_ba2_files(&ba2_file)?;
+            for f in &files {
+                let tex_marker = if f.is_texture { " [DX10]" } else { "" };
+                println!("{}{}", f.path, tex_marker);
+            }
+            eprintln!("\nTotal: {} files", files.len());
+        }
+
+        Some(Commands::ExtractBa2 {
+            ba2_file,
+            file_path,
+            output,
+        }) => {
+            let data = bsa::extract_ba2_file(&ba2_file, &file_path)?;
             std::fs::write(&output, &data)?;
             println!("Extracted {} bytes to {}", data.len(), output.display());
         }

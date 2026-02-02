@@ -3387,6 +3387,11 @@ pub fn run() -> Result<(), slint::PlatformError> {
                                     ))).ok();
                                 }
                             }
+
+                            // Send final completion AFTER NaK finishes
+                            tx.send(ProgressUpdate::Status("Installation complete!".to_string())).ok();
+                            tx.send(ProgressUpdate::Log("[INFO] All done! You can now launch from Steam.".to_string())).ok();
+                            tx.send(ProgressUpdate::Complete).ok();
                         }
                         Err(e) => eprintln!("[GUI] Installation failed: {}", e),
                     }
@@ -3851,8 +3856,25 @@ pub fn run() -> Result<(), slint::PlatformError> {
                 let main_window_weak = window_weak.clone();
                 let modlist_data = modlist_data.clone();
                 move |index| {
+                    // Get the machine_name from the UI model by finding the item with matching index
+                    let machine_name = if let Some(dialog) = dialog_weak.upgrade() {
+                        let model = dialog.get_modlists();
+                        // Search through model for item with this index value
+                        (0..model.row_count()).find_map(|i| {
+                            model.row_data(i).and_then(|m| {
+                                if m.index == index { Some(m.machine_name.to_string()) } else { None }
+                            })
+                        })
+                    } else {
+                        None
+                    };
+
                     let data = modlist_data.lock().unwrap();
-                    if let Some(metadata) = data.get(index as usize) {
+                    // Look up by machine_name instead of index to avoid race conditions
+                    let metadata = machine_name.as_ref().and_then(|name| {
+                        data.iter().find(|m| &m.machine_name == name)
+                    });
+                    if let Some(metadata) = metadata {
                         let dialog_weak = dialog_weak.clone();
                         let main_window_weak = main_window_weak.clone();
                         let metadata = metadata.clone();
@@ -5319,17 +5341,18 @@ async fn run_wabbajack_install(
         stats.archives_downloaded, stats.archives_skipped,
         stats.archives_manual, stats.archives_failed
     ))).ok();
+    let total_processed = stats.directives_completed + stats.directives_skipped + stats.directives_failed;
     tx.send(ProgressUpdate::Log(format!(
-        "[INFO] Directives: {} completed, {} failed",
-        stats.directives_completed, stats.directives_failed
+        "[INFO] Directives: {} new, {} existing, {} failed ({} total)",
+        stats.directives_completed, stats.directives_skipped, stats.directives_failed, total_processed
     ))).ok();
 
     println!("[GUI] Installation Summary:");
     println!("[GUI]   Downloads: {} downloaded, {} skipped, {} manual, {} failed",
         stats.archives_downloaded, stats.archives_skipped,
         stats.archives_manual, stats.archives_failed);
-    println!("[GUI]   Directives: {} completed, {} failed",
-        stats.directives_completed, stats.directives_failed);
+    println!("[GUI]   Directives: {} new, {} existing, {} failed ({} total)",
+        stats.directives_completed, stats.directives_skipped, stats.directives_failed, total_processed);
 
     if stats.archives_manual > 0 || stats.archives_failed > 0 {
         let err = format!("Some archives need manual download. {} manual, {} failed.",
@@ -5344,8 +5367,7 @@ async fn run_wabbajack_install(
         anyhow::bail!(err);
     }
 
-    // Success!
-    tx.send(ProgressUpdate::Complete).ok();
+    // Success! (Complete will be sent by the caller after NaK finishes)
     tx.send(ProgressUpdate::Log("[INFO] Installation completed successfully!".to_string())).ok();
 
     Ok(())
