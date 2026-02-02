@@ -412,7 +412,7 @@ slint::slint! {
         in-out property <float> progress: 0.0;
         in-out property <string> status_message: "Ready to install";
         in-out property <string> log_text: "CLF3 - Modlist Installer initialized.\nSelect a modlist or collection to begin.";
-        in-out property <string> version: "0.0.1";
+        in-out property <string> version: "0.0.2";
 
         // Activity section properties
         in-out property <string> current_download_file: "";
