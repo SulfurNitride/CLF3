@@ -78,13 +78,16 @@ impl ModlistDb {
         );
 
         if wal_result.is_err() {
-            // WAL mode failed (likely network filesystem) - use DELETE mode instead
-            info!("WAL mode not supported (network filesystem?), using DELETE journal mode");
+            // WAL mode failed (likely network filesystem) - use DELETE mode with exclusive locking
+            // CIFS/NFS don't support proper file locking, so we use exclusive mode
+            info!("WAL mode not supported (network filesystem?), using DELETE journal mode with exclusive locking");
             conn.execute_batch(
-                "PRAGMA journal_mode = DELETE;
+                "PRAGMA locking_mode = EXCLUSIVE;
+                 PRAGMA journal_mode = DELETE;
                  PRAGMA synchronous = NORMAL;
                  PRAGMA cache_size = 10000;
-                 PRAGMA temp_store = MEMORY;"
+                 PRAGMA temp_store = MEMORY;
+                 PRAGMA busy_timeout = 5000;"
             ).with_context(|| format!("Failed to configure SQLite pragmas for {}", db_path.display()))?;
         }
 
