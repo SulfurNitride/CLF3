@@ -679,14 +679,9 @@ fn is_bsa_file(path: &str) -> bool {
 }
 
 /// Get the working folder for BSA files extracted from archives
-/// Uses local cache directory to avoid CIFS/NFS issues
-fn get_bsa_working_dir(_downloads_dir: &Path) -> PathBuf {
-    let cache_dir = dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("clf3")
-        .join("bsa_working");
-    let _ = std::fs::create_dir_all(&cache_dir);
-    cache_dir
+/// Stays in downloads_dir since BSA files can be very large (gigabytes)
+fn get_bsa_working_dir(downloads_dir: &Path) -> PathBuf {
+    downloads_dir.join(".clf3_bsa_working")
 }
 
 /// Generate a stable filename for a BSA in the working folder
