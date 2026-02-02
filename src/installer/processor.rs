@@ -863,61 +863,84 @@ pub fn process_directives_streaming(
     reporter.set_count(current_count);
     reporter.report_count(current_count);
 
-    // Hard stop if FromArchive phase had failures
+    // Log warning if FromArchive phase had failures, but continue to allow CreateBSA to run
+    // (CreateBSA needs TEMP_BSA_FILES which may still exist even if some FromArchive failed)
     if streaming_stats.failed > 0 {
-        anyhow::bail!(
-            "FromArchive phase failed: {} files failed to extract. Check logs for details.",
+        eprintln!(
+            "WARNING: FromArchive phase had {} failures. Continuing with remaining phases...",
             streaming_stats.failed
         );
     }
+    let from_archive_failed = streaming_stats.failed;
 
-    // Helper to check for failures after each phase
-    let check_failures = |phase: &str, failed: &AtomicUsize| -> Result<()> {
-        let fail_count = failed.load(Ordering::Relaxed);
-        if fail_count > 0 {
-            anyhow::bail!(
-                "{} phase failed: {} files failed. Check logs for details.",
-                phase, fail_count
-            );
-        }
-        Ok(())
-    };
+    // Track failures per phase for reporting
+    let mut phase_failures: Vec<(&str, usize)> = Vec::new();
+    if from_archive_failed > 0 {
+        phase_failures.push(("FromArchive", from_archive_failed));
+    }
 
     // Process other directives using standard methods
+    // Each phase logs warnings on failure but continues to allow subsequent phases to run
+
+    let failed_before = failed.load(Ordering::Relaxed);
     pb.set_message("Processing InlineFile...");
     reporter.phase_started("InlineFile", inline_count);
     process_simple_directives(db, &ctx, "InlineFile", &pb, &completed, &skipped, &failed, &reporter)?;
     let current_count = completed.load(Ordering::Relaxed) + skipped.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
     reporter.set_count(current_count);
-    check_failures("InlineFile", &failed)?;
+    let inline_failed = failed.load(Ordering::Relaxed) - failed_before;
+    if inline_failed > 0 {
+        eprintln!("WARNING: InlineFile phase had {} failures", inline_failed);
+        phase_failures.push(("InlineFile", inline_failed));
+    }
 
+    let failed_before = failed.load(Ordering::Relaxed);
     pb.set_message("Processing RemappedInlineFile...");
     reporter.phase_started("RemappedInlineFile", remapped_count);
     process_simple_directives(db, &ctx, "RemappedInlineFile", &pb, &completed, &skipped, &failed, &reporter)?;
     let current_count = completed.load(Ordering::Relaxed) + skipped.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
     reporter.set_count(current_count);
-    check_failures("RemappedInlineFile", &failed)?;
+    let remapped_failed = failed.load(Ordering::Relaxed) - failed_before;
+    if remapped_failed > 0 {
+        eprintln!("WARNING: RemappedInlineFile phase had {} failures", remapped_failed);
+        phase_failures.push(("RemappedInlineFile", remapped_failed));
+    }
 
+    let failed_before = failed.load(Ordering::Relaxed);
     pb.set_message("Processing PatchedFromArchive...");
     reporter.phase_started("PatchedFromArchive", patched_count);
     process_patched_from_archive(db, &ctx, &pb, &completed, &skipped, &failed, &reporter)?;
     let current_count = completed.load(Ordering::Relaxed) + skipped.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
     reporter.set_count(current_count);
-    check_failures("PatchedFromArchive", &failed)?;
+    let patched_failed = failed.load(Ordering::Relaxed) - failed_before;
+    if patched_failed > 0 {
+        eprintln!("WARNING: PatchedFromArchive phase had {} failures", patched_failed);
+        phase_failures.push(("PatchedFromArchive", patched_failed));
+    }
 
+    let failed_before = failed.load(Ordering::Relaxed);
     pb.set_message("Processing TransformedTexture...");
     reporter.phase_started("TransformedTexture", texture_count);
     process_transformed_texture(db, &ctx, &pb, &completed, &skipped, &failed, &reporter)?;
     let current_count = completed.load(Ordering::Relaxed) + skipped.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
     reporter.set_count(current_count);
-    check_failures("TransformedTexture", &failed)?;
+    let texture_failed = failed.load(Ordering::Relaxed) - failed_before;
+    if texture_failed > 0 {
+        eprintln!("WARNING: TransformedTexture phase had {} failures", texture_failed);
+        phase_failures.push(("TransformedTexture", texture_failed));
+    }
 
+    let failed_before = failed.load(Ordering::Relaxed);
     pb.set_message("Processing CreateBSA...");
     reporter.phase_started("CreateBSA", bsa_count);
     process_create_bsa(db, &ctx, &pb, &completed, &skipped, &failed, &reporter)?;
     let current_count = completed.load(Ordering::Relaxed) + skipped.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
     reporter.set_count(current_count);
-    check_failures("CreateBSA", &failed)?;
+    let bsa_failed = failed.load(Ordering::Relaxed) - failed_before;
+    if bsa_failed > 0 {
+        eprintln!("WARNING: CreateBSA phase had {} failures", bsa_failed);
+        phase_failures.push(("CreateBSA", bsa_failed));
+    }
 
     pb.finish_and_clear();
 
@@ -934,6 +957,15 @@ pub fn process_directives_streaming(
         stats.skipped,
         stats.failed
     );
+
+    // Report phase-specific failures for debugging
+    if !phase_failures.is_empty() {
+        eprintln!("\n=== FAILURE SUMMARY ===");
+        for (phase, count) in &phase_failures {
+            eprintln!("  {}: {} failures", phase, count);
+        }
+        eprintln!("=======================\n");
+    }
 
     // Phase 4: Clean up extra files
     println!("\n--- Phase 4: Cleanup extra files ---\n");
