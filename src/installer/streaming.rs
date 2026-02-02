@@ -487,6 +487,7 @@ fn process_archives_with_pipeline(
 
     // Shared state for mover workers
     let written_clone = Arc::clone(written);
+    let skipped_clone = Arc::clone(skipped);
     let failed_clone = Arc::clone(failed);
     let logged_failures_clone = Arc::clone(logged_failures);
     let progress_callback_clone = progress_callback.clone();
@@ -533,6 +534,17 @@ fn process_archives_with_pipeline(
                     }
                     failed_clone.fetch_add(1, Ordering::Relaxed);
                     return;
+                }
+
+                // Check if output already exists (race condition: another job may have created it)
+                if let Ok(meta) = fs::metadata(&job.output_path) {
+                    if meta.len() == job.expected_size {
+                        // Already exists with correct size - treat as skip/success
+                        skipped_clone.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    // Wrong size - remove and re-copy
+                    let _ = fs::remove_file(&job.output_path);
                 }
 
                 if job.is_shared_source {
