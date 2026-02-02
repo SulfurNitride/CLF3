@@ -58,13 +58,25 @@ impl ModlistDb {
             .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
 
         // Configure for performance
-        conn.execute_batch(
+        // Try WAL mode first (fastest), fall back to DELETE mode for network filesystems (CIFS/NFS)
+        let wal_result = conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA cache_size = 10000;
              PRAGMA temp_store = MEMORY;
              PRAGMA mmap_size = 268435456;"
-        ).with_context(|| format!("Failed to configure SQLite pragmas for {}", db_path.display()))?;
+        );
+
+        if wal_result.is_err() {
+            // WAL mode failed (likely network filesystem) - use DELETE mode instead
+            info!("WAL mode not supported (network filesystem?), using DELETE journal mode");
+            conn.execute_batch(
+                "PRAGMA journal_mode = DELETE;
+                 PRAGMA synchronous = NORMAL;
+                 PRAGMA cache_size = 10000;
+                 PRAGMA temp_store = MEMORY;"
+            ).with_context(|| format!("Failed to configure SQLite pragmas for {}", db_path.display()))?;
+        }
 
         let db = Self { conn };
         db.create_tables()?;
