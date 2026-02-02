@@ -636,8 +636,8 @@ fn process_single_archive_with_channel(
         return;
     }
 
-    // Create temp dir for extraction (wrapped in Arc so it stays alive until all jobs are done)
-    let temp_dir = match tempfile::tempdir_in(&ctx.config.downloads_dir) {
+    // Create temp dir for extraction in output_dir (faster if output is local, downloads on NAS)
+    let temp_dir = match tempfile::tempdir_in(&ctx.config.output_dir) {
         Ok(d) => Arc::new(d),
         Err(e) => {
             eprintln!("FAIL: Cannot create temp dir: {}", e);

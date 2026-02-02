@@ -1349,7 +1349,7 @@ fn process_from_archive_fast(
                 archive_pb.set_message(format!("{} (extracting {} files)", display_name, to_extract.len()));
 
                 // Create temp dir for batch extraction
-                let temp_dir = match tempfile::tempdir_in(&ctx.config.downloads_dir) {
+                let temp_dir = match tempfile::tempdir_in(&ctx.config.output_dir) {
                     Ok(d) => d,
                     Err(e) => {
                         for _ in &to_extract {
@@ -1895,7 +1895,7 @@ fn process_archive_patches(
     }
 
     // Extract source files to temp directory (disk-based, not RAM)
-    let temp_dir = match tempfile::tempdir_in(&ctx.config.downloads_dir) {
+    let temp_dir = match tempfile::tempdir_in(&ctx.config.output_dir) {
         Ok(dir) => dir,
         Err(e) => {
             for (_id, _) in &to_process {
@@ -2358,7 +2358,7 @@ fn process_transformed_texture(
                 }
                 _ => {
                     // 7z/RAR/other: batch extract using pure Rust
-                    if let Ok(temp_dir) = tempfile::tempdir_in(&ctx.config.downloads_dir) {
+                    if let Ok(temp_dir) = tempfile::tempdir_in(&ctx.config.output_dir) {
                         let paths_vec: Vec<&str> = simple_paths.values().map(|s| s.as_str()).collect();
                         extract_batch_rust(&archive_path, &paths_vec, temp_dir.path())
                             .unwrap_or_default()
