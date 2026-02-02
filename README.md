@@ -1,5 +1,15 @@
 # CLF3
 
+**DISCLAIMER** 
+
+CLF3 is a tool in early stages. Do note a few things, this does not use the original tools for creating BSA files, and transforming DDS files. As a result, the modlist install will not be identical to Wabbajack or Jackify. Its primary focus is on speed, as a result some things are bound to fail. Skyrim is the only game testing and I plan on testing other games in the future and adding support. On top of this, do not report and issue to Wabbajack, or to the modlist authors. Instead, please open an issue inside the CLF3 Support thread inside [NaK Discord](https://discord.gg/9JWQzSeUWt). Plans are too eventually add Windows support and OpenMW support with Linux. The GUI is a work in progress so please do expect bugs. 
+
+You can grab the latest version at the [release page](https://github.com/SulfurNitride/CLF3/releases). 
+
+If you want to support the things I put out, I do have a [Ko-Fi](https://ko-fi.com/sulfurnitride) I will never charge money for any of my content.
+
+---------------------------------------------------
+
 Modlist installer for Linux. Installs Wabbajack modlists and Nexus Collections without needing Windows.
 
 Named after Chlorine Trifluoride - burns through modlists like ClF3 burns through concrete.
@@ -8,13 +18,7 @@ Named after Chlorine Trifluoride - burns through modlists like ClF3 burns throug
 
 **Early development** - Testing welcome!
 
-- Wabbajack: Works with Tuxborn (Skyrim SE). Other modlists untested.
-- Collections: New feature - needs testing with various collections.
-
-## Requirements
-
-- Rust 1.70+
-- Nexus Mods API key (get from https://www.nexusmods.com/users/myaccount?tab=api - scroll to bottom)
+- Wabbajack: Works with Tuxborn and LoreRim (Skyrim SE). Other modlists untested.
 
 ## Build
 
@@ -26,49 +30,10 @@ cargo build --release
 
 Binary will be at `target/release/clf3`
 
-## Nexus Collection Installation
-
-Install a Nexus Collection directly from URL or local JSON file:
-
-```bash
-# From Nexus URL
-./clf3 collection https://www.nexusmods.com/skyrimspecialedition/mods/collections/COLLECTION_SLUG \
-    --output ~/Games/MyCollection \
-    --game ~/.steam/steam/steamapps/common/Skyrim\ Special\ Edition \
-    --nexus-key "YOUR_API_KEY"
-```
-
-This will:
-1. Download and set up MO2 portable instance
-2. Create Stock Game folder (copy of game files for root mods)
-3. Download all mods from Nexus
-4. Extract and process mods (including FOMOD installers)
-5. Generate modlist.txt and plugins.txt
-
 ## Wabbajack Modlist Installation
 
-```bash
-./clf3 install Tuxborn.wabbajack \
-    --output ~/Games/Tuxborn \
-    --downloads ~/Games/Tuxborn/downloads \
-    --game ~/.steam/steam/steamapps/common/Skyrim\ Special\ Edition \
-    --nexus-key "YOUR_API_KEY"
-```
+Run the GUI and use the Browse Modlist Gallery button. Fill in the rest of the paths, and pick a proton. Proton 10+ is required, you can obtain GE or Cachy from ProtonPlus/ProtonUp. Set the API Key in the settings, https://www.nexusmods.com/settings/api-keys at the very bottom for personal API key.
 
-## All Commands
-
-| Command | Description |
-|---------|-------------|
-| `clf3 collection` | Install a Nexus Collection |
-| `clf3 install` | Install a Wabbajack modlist |
-| `clf3 info` | Show Wabbajack modlist info |
-| `clf3 list-bsa` | List BSA archive contents |
-| `clf3 extract-bsa` | Extract file from BSA |
-
-## Environment Variables
-
-- `NEXUS_API_KEY` - Nexus API key (alternative to --nexus-key)
-- `RUST_LOG=clf3=debug` - Enable debug logging
 
 ## License
 
