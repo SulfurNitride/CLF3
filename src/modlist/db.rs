@@ -165,7 +165,10 @@ impl ModlistDb {
             CREATE INDEX IF NOT EXISTS idx_archive_files_hash ON archive_files(archive_hash);
             CREATE INDEX IF NOT EXISTS idx_archive_files_normalized ON archive_files(archive_hash, normalized_path);
             "#
-        ).with_context(|| "Failed to create tables")?;
+        ).map_err(|e| {
+            tracing::error!("SQLite create_tables error: {:?}", e);
+            anyhow::anyhow!("Failed to create tables: {}", e)
+        })?;
 
         Ok(())
     }
