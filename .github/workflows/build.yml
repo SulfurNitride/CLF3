@@ -35,10 +35,9 @@ jobs:
         run: |
           cp target/release/clf3 release/
           chmod +x release/clf3 release/7zz
-          tar -czvf clf3-linux-x64.tar.gz -C release .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: clf3-linux-x64
-          path: clf3-linux-x64.tar.gz
+          path: release
