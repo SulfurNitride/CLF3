@@ -286,9 +286,35 @@ fn index_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
     pb.enable_steady_tick(Duration::from_millis(100));
 
     for archive in to_index {
+        // Determine archive location based on type
         let archive_path = match &archive.local_path {
             Some(p) => PathBuf::from(p),
-            None => ctx.config.downloads_dir.join(&archive.name),
+            None => {
+                // Check if this is a GameFileSource archive (from game installation)
+                if archive.state_json.contains("GameFileSourceDownloader") {
+                    // Parse the state to get the game file path
+                    if let Ok(state) = serde_json::from_str::<crate::modlist::DownloadState>(&archive.state_json) {
+                        if let crate::modlist::DownloadState::GameFileSource(gf) = state {
+                            // Look in game directory with case-insensitive path resolution
+                            let game_file = &gf.game_file;
+                            if let Some(resolved) = crate::paths::resolve_case_insensitive(&ctx.config.game_dir, game_file) {
+                                resolved
+                            } else if let Some(resolved) = crate::paths::resolve_case_insensitive(&ctx.config.game_dir, &format!("Data/{}", game_file)) {
+                                resolved
+                            } else {
+                                // Fallback to downloads dir (will fail, but with proper error)
+                                ctx.config.downloads_dir.join(&archive.name)
+                            }
+                        } else {
+                            ctx.config.downloads_dir.join(&archive.name)
+                        }
+                    } else {
+                        ctx.config.downloads_dir.join(&archive.name)
+                    }
+                } else {
+                    ctx.config.downloads_dir.join(&archive.name)
+                }
+            }
         };
 
         pb.set_message(format!("Indexing {}...", archive.name));
