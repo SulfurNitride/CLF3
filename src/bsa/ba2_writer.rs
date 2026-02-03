@@ -7,7 +7,7 @@ use ba2::fo4::{
     Archive, ArchiveKey, ArchiveOptionsBuilder,
     Chunk, ChunkCompressionOptions, File as Ba2File,
     FileReadOptionsBuilder, Format, CompressionFormat as Ba2CrateCompression,
-    CompressionLevel,
+    CompressionLevel, Version,
 };
 use ba2::prelude::*;
 use ba2::{Copied, CompressionResult};
@@ -66,13 +66,13 @@ impl Ba2Builder {
     pub fn from_name(name: &str) -> Self {
         let name_lower = name.to_lowercase();
 
-        // TEMPORARILY: Use GNRL for all archives to avoid DX10 mipmap streaming issues
-        // TODO: Fix DX10 chunk structure to match what FO4 expects
-        // The issue is that DX10 archives split textures into mipmap chunks for streaming,
-        // but our chunk structure doesn't match FO4's expectations, causing corruption
-        // as the game streams in higher-detail mips while moving around.
-        let format = Ba2Format::General;
-        let _ = name_lower; // Suppress unused warning
+        // Texture archives need DX10 format for proper texture headers
+        // General archives (meshes, scripts, etc.) use GNRL format
+        let format = if name_lower.contains("texture") {
+            Ba2Format::DX10
+        } else {
+            Ba2Format::General
+        };
 
         // Default to zlib compression for FO4
         let compression = Ba2CompressionFormat::Zlib;
@@ -180,8 +180,9 @@ impl Ba2Builder {
         // Build archive from entries
         let archive: Archive = archive_entries.into_iter().collect();
 
-        // Configure options
+        // Configure options - use v7 for Fallout 4 compatibility
         let options = ArchiveOptionsBuilder::default()
+            .version(Version::v7)
             .strings(self.strings)
             .build();
 
@@ -245,8 +246,9 @@ impl Ba2Builder {
         let archive_entries = archive_entries?;
         let archive: Archive = archive_entries.into_iter().collect();
 
-        // DX10 format requires format flag set in archive options
+        // DX10 format requires format flag set in archive options - use v7 for FO4
         let options = ArchiveOptionsBuilder::default()
+            .version(Version::v7)
             .format(Format::DX10)
             .compression_format(Ba2CrateCompression::Zip)
             .strings(self.strings)
