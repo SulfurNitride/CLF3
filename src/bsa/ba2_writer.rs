@@ -68,7 +68,19 @@ impl Ba2Builder {
 
         // Texture archives need DX10 format for proper texture headers
         // General archives (meshes, scripts, etc.) use GNRL format
-        let format = if name_lower.contains("texture") {
+        // Check the archive suffix, not the full path - "Main.ba2" contains meshes,
+        // "Textures.ba2" contains DDS textures, even if mod folder has "texture" in name
+        let is_texture_archive = {
+            // Get just the filename part
+            let filename = name_lower.rsplit(['/', '\\']).next().unwrap_or(&name_lower);
+            // Check if it ends with texture patterns: "textures.ba2", "textures1.ba2", etc.
+            filename.contains(" - textures") ||
+            filename.starts_with("textures") ||
+            // Also catch patterns like "modname - textures.ba2" without space
+            (filename.contains("textures") && !filename.contains(" - main") && !filename.contains("_main"))
+        };
+
+        let format = if is_texture_archive {
             Ba2Format::DX10
         } else {
             Ba2Format::General
