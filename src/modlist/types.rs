@@ -83,13 +83,13 @@ pub struct NexusState {
     #[serde(rename = "FileID")]
     pub file_id: u64,
     #[serde(default)]
-    pub name: String,
+    pub name: Option<String>,
     #[serde(default)]
     pub author: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
-    pub version: String,
+    pub version: Option<String>,
     #[serde(rename = "ImageURL")]
     pub image_url: Option<String>,
     #[serde(rename = "IsNSFW")]

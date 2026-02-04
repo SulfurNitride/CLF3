@@ -435,7 +435,7 @@ slint::slint! {
         property <bool> can_install: source_path != "" && install_dir != "" &&
                                      downloads_dir != "" && nexus_api_key != "" &&
                                      selected_proton_index >= 0 &&
-                                     install_state == InstallState.Idle;
+                                     (install_state == InstallState.Idle || install_state == InstallState.Error);
         property <bool> is_running: install_state != InstallState.Idle &&
                                     install_state != InstallState.Complete &&
                                     install_state != InstallState.Error &&
@@ -1574,13 +1574,15 @@ slint::slint! {
                             }
                         }
 
-                        // Modlist cards with images
+                        // Modlist cards with images (only show visible ones based on filters)
                         for modlist[idx] in modlists: Rectangle {
-                            height: 220px;
+                            visible: modlist.visible;
+                            height: modlist.visible ? 220px : 0px;
                             background: selected_index == modlist.index ? #313244 : (card_touch.has-hover ? #252536 : #1e1e2e);
                             border-radius: 8px;
                             border-width: 1px;
                             border-color: selected_index == modlist.index ? #89b4fa : #313244;
+                            clip: true;
 
                             card_touch := TouchArea {
                                 enabled: !is_downloading && !game_dropdown_open;
@@ -1619,10 +1621,15 @@ slint::slint! {
                                 }
 
                                 // Middle: Title and info
-                                VerticalLayout {
+                                Rectangle {
                                     horizontal-stretch: 1;
-                                    spacing: 6px;
-                                    padding-top: 4px;
+                                    height: 200px;
+                                    clip: true;
+
+                                    VerticalLayout {
+                                        width: parent.width;
+                                        spacing: 6px;
+                                        padding-top: 4px;
 
                                     // Title row with badges
                                     HorizontalLayout {
@@ -1677,14 +1684,18 @@ slint::slint! {
                                         color: #a6adc8;
                                     }
 
-                                    // Description (2-3 lines)
-                                    Text {
-                                        text: modlist.description;
-                                        font-size: 12px;
-                                        color: #6c7086;
-                                        wrap: word-wrap;
-                                        overflow: elide;
-                                        vertical-stretch: 1;
+                                    // Description (limited height so bottom row stays visible)
+                                    Rectangle {
+                                        height: 90px;
+                                        clip: true;
+
+                                        Text {
+                                            width: parent.width;
+                                            text: modlist.description;
+                                            font-size: 12px;
+                                            color: #6c7086;
+                                            wrap: word-wrap;
+                                        }
                                     }
 
                                     // Bottom row: game tag and sizes
@@ -1742,6 +1753,7 @@ slint::slint! {
                                         }
 
                                         Rectangle { horizontal-stretch: 1; }
+                                    }
                                     }
                                 }
 
@@ -4916,6 +4928,8 @@ impl Default for InstallProgressViewHandle {
 
 /// Map game name from modlist to Steam App ID
 fn game_name_to_app_id(game: &str) -> Option<&'static str> {
+    // Returns the primary app ID for a game
+    // For games with multiple versions, use game_name_to_app_ids for fallbacks
     match game {
         "SkyrimSE" | "SkyrimSpecialEdition" | "Skyrim Special Edition" => Some("489830"),
         "Skyrim" | "SkyrimLE" => Some("72850"),
@@ -4923,13 +4937,22 @@ fn game_name_to_app_id(game: &str) -> Option<&'static str> {
         "Fallout4" | "Fallout4SE" | "Fallout 4" => Some("377160"),
         "Fallout4VR" => Some("611660"),
         "FalloutNV" | "FalloutNewVegas" | "Fallout New Vegas" => Some("22380"),
-        "Fallout3" | "FO3" => Some("22300"),
+        "Fallout3" | "FO3" => Some("22370"), // GOTY edition (most common)
         "Oblivion" => Some("22330"),
         "Morrowind" => Some("22320"),
         "Enderal" => Some("933480"),
         "EnderalSE" | "EnderalSpecialEdition" => Some("976620"),
         "Starfield" => Some("1716740"),
+        "BaldursGate3" | "Baldur's Gate 3" => Some("1086940"),
         _ => None,
+    }
+}
+
+/// Get all possible app IDs for a game (for games with multiple editions)
+fn game_name_to_app_ids(game: &str) -> Vec<&'static str> {
+    match game {
+        "Fallout3" | "FO3" => vec!["22370", "22300"], // GOTY first, then base
+        _ => game_name_to_app_id(game).map(|id| vec![id]).unwrap_or_default(),
     }
 }
 
@@ -4948,6 +4971,7 @@ fn game_name_to_display(game: &str) -> &str {
         "Enderal" => "Enderal",
         "EnderalSE" | "EnderalSpecialEdition" => "Enderal Special Edition",
         "Starfield" => "Starfield",
+        "BaldursGate3" => "Baldur's Gate 3",
         _ => game,
     }
 }
@@ -5031,17 +5055,26 @@ fn detect_game_from_wabbajack(path: &std::path::Path) -> anyhow::Result<String> 
         modlist.directives.len()
     ))).ok();
 
-    // Try to find the game installation with platform info
-    if let Some(app_id) = game_name_to_app_id(game_type) {
+    // Try to find the game installation with platform info (try all possible app IDs)
+    let app_ids = game_name_to_app_ids(game_type);
+    println!("[DEBUG] Looking for game_type={}, app_ids={:?}", game_type, app_ids);
+    if !app_ids.is_empty() {
         // Use detect_all_games to get full game info including launcher
         let scan_result = crate::game_finder::detect_all_games();
-        if let Some(game) = scan_result.find_by_app_id(app_id) {
-            let platform = game.launcher.display_name();
-            tx.send(ProgressUpdate::Log(format!(
-                "[INFO] Found game at: {}",
-                game.install_path.display()
-            ))).ok();
-            return Ok(format!("{} ({})", display_name, platform));
+        println!("[DEBUG] Found {} games total", scan_result.games.len());
+        for g in &scan_result.games {
+            println!("[DEBUG]   - {} (app_id={})", g.name, g.app_id);
+        }
+        for app_id in &app_ids {
+            println!("[DEBUG] Checking for app_id={}", app_id);
+            if let Some(game) = scan_result.find_by_app_id(app_id) {
+                let platform = game.launcher.display_name();
+                tx.send(ProgressUpdate::Log(format!(
+                    "[INFO] Found game at: {}",
+                    game.install_path.display()
+                ))).ok();
+                return Ok(format!("{} ({})", display_name, platform));
+            }
         }
     }
 
@@ -5126,23 +5159,29 @@ async fn run_wabbajack_install(
     tx.send(ProgressUpdate::Log(format!("[INFO] Detected game type: {}", game_type))).ok();
     tx.send(ProgressUpdate::Status(format!("Detected game: {}", game_type))).ok();
 
-    // Find the game installation path
-    let game_dir = if let Some(app_id) = game_name_to_app_id(game_type) {
-        match crate::game_finder::find_game_install_path(app_id) {
-            Some(path) => {
+    // Find the game installation path (try all possible app IDs for games with variants)
+    let app_ids = game_name_to_app_ids(game_type);
+    let game_dir = if app_ids.is_empty() {
+        let err = format!("Unknown game type: {}", game_type);
+        tx.send(ProgressUpdate::Error(err.clone())).ok();
+        anyhow::bail!(err);
+    } else {
+        let mut found_path = None;
+        for app_id in &app_ids {
+            if let Some(path) = crate::game_finder::find_game_install_path(app_id) {
                 tx.send(ProgressUpdate::Log(format!("[INFO] Found game at: {}", path.display()))).ok();
-                path
+                found_path = Some(path);
+                break;
             }
+        }
+        match found_path {
+            Some(path) => path,
             None => {
                 let err = format!("Game not found: {}. Please ensure the game is installed.", game_type);
                 tx.send(ProgressUpdate::Error(err.clone())).ok();
                 anyhow::bail!(err);
             }
         }
-    } else {
-        let err = format!("Unknown game type: {}", game_type);
-        tx.send(ProgressUpdate::Error(err.clone())).ok();
-        anyhow::bail!(err);
     };
 
     println!("[GUI] Detected game: {} at {}", game_type, game_dir.display());
@@ -5355,6 +5394,32 @@ async fn run_wabbajack_install(
         stats.directives_completed, stats.directives_skipped, stats.directives_failed, total_processed);
 
     if stats.archives_manual > 0 || stats.archives_failed > 0 {
+        // Log failed downloads with details
+        for fd in &stats.failed_downloads {
+            tx.send(ProgressUpdate::Log(format!(
+                "[FAILED] {}: {}",
+                fd.name, fd.error
+            ))).ok();
+            tx.send(ProgressUpdate::Log(format!(
+                "         URL: {}",
+                fd.url
+            ))).ok();
+        }
+
+        // Log manual downloads with details
+        for md in &stats.manual_downloads {
+            tx.send(ProgressUpdate::Log(format!(
+                "[MANUAL] {}: {}",
+                md.name, md.url
+            ))).ok();
+            if let Some(prompt) = &md.prompt {
+                tx.send(ProgressUpdate::Log(format!(
+                    "         Note: {}",
+                    prompt
+                ))).ok();
+            }
+        }
+
         let err = format!("Some archives need manual download. {} manual, {} failed.",
             stats.archives_manual, stats.archives_failed);
         tx.send(ProgressUpdate::Error(err.clone())).ok();

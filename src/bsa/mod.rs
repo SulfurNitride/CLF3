@@ -1,6 +1,7 @@
 //! BSA/BA2 (Bethesda Archive) handling
 //!
 //! Provides read/write support for:
+//! - TES3 format BSA files (Morrowind)
 //! - TES4 format BSA files (Oblivion, FO3, FNV, Skyrim)
 //! - FO4 format BA2 files (Fallout 4, Fallout 76, Starfield)
 //!
@@ -14,11 +15,19 @@ mod ba2_reader;
 mod ba2_writer;
 mod cache;
 mod reader;
+mod tes3_reader;
 mod writer;
 
 pub use cache::BsaCache;
 pub use reader::{BsaReader, BsaFileEntry, extract_file, extract_batch_parallel, list_files};
 pub use writer::{BsaBuilder, BsaWriterManager};
+
+// TES3 (Morrowind) support
+pub use tes3_reader::{
+    list_files as list_tes3_files,
+    extract_file as extract_tes3_file,
+    extract_batch_parallel as extract_tes3_batch_parallel,
+};
 
 // BA2 support for Fallout 4/Starfield
 pub use ba2_reader::{
@@ -31,36 +40,36 @@ pub use ba2_writer::{Ba2Builder, Ba2Format, Ba2CompressionFormat};
 
 use anyhow::{bail, Result};
 use ba2::tes4::{ArchiveFlags, ArchiveTypes, Version};
+use ba2::{FileFormat, guess_format};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, BufReader};
 use std::path::Path;
 use tracing::debug;
 
 /// Archive format type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveFormat {
+    /// TES3 BSA (Morrowind)
+    Tes3Bsa,
     /// TES4 BSA (Oblivion, FO3, FNV, Skyrim)
     Bsa,
     /// FO4 BA2 (Fallout 4, Fallout 76, Starfield)
     Ba2,
 }
 
-/// Detect archive format using magic bytes first, then extension as fallback
+/// Detect archive format using ba2 crate's guess_format
 pub fn detect_format(path: &Path) -> Option<ArchiveFormat> {
-    // Try magic bytes first (more reliable)
-    if let Ok(mut file) = File::open(path) {
-        let mut magic = [0u8; 4];
-        if file.read_exact(&mut magic).is_ok() {
-            // BSA: BSA\x00
-            if magic == [0x42, 0x53, 0x41, 0x00] {
-                debug!("Detected BSA by magic bytes: {}", path.display());
-                return Some(ArchiveFormat::Bsa);
-            }
-            // BA2: BTDX
-            if magic == [0x42, 0x54, 0x44, 0x58] {
-                debug!("Detected BA2 by magic bytes: {}", path.display());
-                return Some(ArchiveFormat::Ba2);
-            }
+    // Use ba2's built-in format detection
+    if let Ok(file) = File::open(path) {
+        let mut reader = BufReader::new(file);
+        if let Some(format) = guess_format(&mut reader) {
+            let result = match format {
+                FileFormat::TES3 => ArchiveFormat::Tes3Bsa,
+                FileFormat::TES4 => ArchiveFormat::Bsa,
+                FileFormat::FO4 => ArchiveFormat::Ba2,
+            };
+            debug!("Detected {:?} format for: {}", result, path.display());
+            return Some(result);
         }
     }
 
@@ -68,7 +77,7 @@ pub fn detect_format(path: &Path) -> Option<ArchiveFormat> {
     let ext = path.extension()?.to_str()?.to_lowercase();
     match ext.as_str() {
         "bsa" => {
-            debug!("Detected BSA by extension: {}", path.display());
+            debug!("Detected BSA by extension (assuming TES4): {}", path.display());
             Some(ArchiveFormat::Bsa)
         }
         "ba2" => {
@@ -89,9 +98,18 @@ pub struct ArchiveFileEntry {
     pub is_texture: bool,
 }
 
-/// List files from any Bethesda archive (BSA or BA2)
+/// List files from any Bethesda archive (TES3 BSA, TES4 BSA, or BA2)
 pub fn list_archive_files(archive_path: &Path) -> Result<Vec<ArchiveFileEntry>> {
     match detect_format(archive_path) {
+        Some(ArchiveFormat::Tes3Bsa) => {
+            let files = list_tes3_files(archive_path)?;
+            Ok(files.into_iter().map(|f| ArchiveFileEntry {
+                path: f.path,
+                size: f.size,
+                format: ArchiveFormat::Tes3Bsa,
+                is_texture: false,
+            }).collect())
+        }
         Some(ArchiveFormat::Bsa) => {
             let files = list_files(archive_path)?;
             Ok(files.into_iter().map(|f| ArchiveFileEntry {
@@ -114,7 +132,7 @@ pub fn list_archive_files(archive_path: &Path) -> Result<Vec<ArchiveFileEntry>> 
     }
 }
 
-/// Extract a file from any Bethesda archive (BSA or BA2)
+/// Extract a file from any Bethesda archive (TES3 BSA, TES4 BSA, or BA2)
 pub fn extract_archive_file(archive_path: &Path, file_path: &str) -> Result<Vec<u8>> {
     let format = detect_format(archive_path);
     debug!(
@@ -124,6 +142,7 @@ pub fn extract_archive_file(archive_path: &Path, file_path: &str) -> Result<Vec<
         format
     );
     match format {
+        Some(ArchiveFormat::Tes3Bsa) => extract_tes3_file(archive_path, file_path),
         Some(ArchiveFormat::Bsa) => extract_file(archive_path, file_path),
         Some(ArchiveFormat::Ba2) => extract_ba2_file(archive_path, file_path),
         None => bail!("Unknown archive format: {}", archive_path.display()),

@@ -66,6 +66,17 @@ pub const KNOWN_GAMES: &[KnownGame] = &[
         steam_folder: "Fallout 3",
     },
     KnownGame {
+        name: "Fallout 3 GOTY",
+        steam_app_id: "22370",
+        gog_app_id: None,
+        my_games_folder: Some("Fallout3"),
+        appdata_local_folder: Some("Fallout3"),
+        appdata_roaming_folder: None,
+        registry_path: r"Software\Bethesda Softworks\Fallout3",
+        registry_value: "Installed Path",
+        steam_folder: "Fallout 3 goty",
+    },
+    KnownGame {
         name: "Fallout 4",
         steam_app_id: "377160",
         gog_app_id: None,

@@ -21,7 +21,7 @@ use std::fs;
 use std::time::Duration;
 
 /// Installation statistics
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct InstallStats {
     pub archives_downloaded: usize,
     pub archives_skipped: usize,
@@ -30,6 +30,10 @@ pub struct InstallStats {
     pub directives_completed: usize,
     pub directives_skipped: usize,
     pub directives_failed: usize,
+    /// Details of failed downloads
+    pub failed_downloads: Vec<downloader::FailedDownloadInfo>,
+    /// Details of manual downloads needed
+    pub manual_downloads: Vec<downloader::ManualDownloadInfo>,
 }
 
 /// Main installer orchestrator
@@ -83,6 +87,8 @@ impl Installer {
         stats.archives_skipped = download_stats.skipped;
         stats.archives_failed = download_stats.failed;
         stats.archives_manual = download_stats.manual;
+        stats.failed_downloads = download_stats.failed_downloads;
+        stats.manual_downloads = download_stats.manual_downloads;
 
         // If there are manual downloads needed, stop here
         if stats.archives_manual > 0 || stats.archives_failed > 0 {
@@ -235,6 +241,8 @@ impl Installer {
         stats.archives_skipped = download_stats.skipped;
         stats.archives_failed = download_stats.failed;
         stats.archives_manual = download_stats.manual;
+        stats.failed_downloads = download_stats.failed_downloads;
+        stats.manual_downloads = download_stats.manual_downloads;
 
         // If there are manual downloads needed, stop here
         if stats.archives_manual > 0 || stats.archives_failed > 0 {

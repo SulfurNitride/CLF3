@@ -25,8 +25,9 @@
 //! Uses full archive extraction followed by fs::rename for instant file moves
 //! (no copying on same filesystem). Temp dir auto-deletes unneeded files.
 
-use crate::archive::sevenzip::{self, ArchiveType};
+use crate::archive::sevenzip;
 use crate::bsa;
+use crate::installer::handlers::from_archive::{detect_archive_type, ArchiveType as NestedArchiveType};
 use crate::modlist::{FromArchiveDirective, ModlistDb};
 use crate::paths;
 
@@ -272,11 +273,11 @@ pub fn process_from_archive_streaming(
             None => continue,
         };
 
-        let archive_type = sevenzip::detect_archive_type(&archive_path)
-            .unwrap_or(ArchiveType::Unknown);
+        let archive_type = detect_archive_type(&archive_path)
+            .unwrap_or(NestedArchiveType::Unknown);
 
         // BSA/BA2 handled separately (no extraction needed)
-        if matches!(archive_type, ArchiveType::Bsa | ArchiveType::Ba2) {
+        if matches!(archive_type, NestedArchiveType::Tes3Bsa | NestedArchiveType::Bsa | NestedArchiveType::Ba2) {
             bsa_archives.push((archive_hash, directives, archive_path));
             continue;
         }
@@ -770,7 +771,7 @@ fn process_single_archive_with_channel(
     }
 }
 
-/// Process nested BSA directives - extracts files from BSA archives.
+/// Process nested archive directives - extracts files from nested archives (BSA, ZIP, 7z, etc.).
 #[allow(clippy::too_many_arguments)]
 fn process_nested_bsa_directives(
     nested_bsa_directives: &[(i64, &FromArchiveDirective, Option<String>, String)],
@@ -786,38 +787,63 @@ fn process_nested_bsa_directives(
         return;
     }
 
-    // Group by BSA file
-    let mut by_bsa: HashMap<String, Vec<(i64, &FromArchiveDirective, String)>> = HashMap::new();
-    for (id, directive, resolved, file_in_bsa) in nested_bsa_directives {
-        let bsa_path = resolved.as_deref()
+    // Group by nested archive file
+    let mut by_archive: HashMap<String, Vec<(i64, &FromArchiveDirective, String)>> = HashMap::new();
+    for (id, directive, resolved, file_in_archive) in nested_bsa_directives {
+        let archive_path = resolved.as_deref()
             .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
             .unwrap_or("")
             .to_string();
-        by_bsa.entry(bsa_path).or_default().push((*id, *directive, file_in_bsa.clone()));
+        by_archive.entry(archive_path).or_default().push((*id, *directive, file_in_archive.clone()));
     }
 
-    for (bsa_path_in_archive, bsa_directives) in by_bsa {
-        let normalized_bsa = paths::normalize_for_lookup(&bsa_path_in_archive);
+    for (archive_path_in_outer, directives) in by_archive {
+        let normalized_archive = paths::normalize_for_lookup(&archive_path_in_outer);
 
-        let bsa_disk_path = match extracted_map.get(&normalized_bsa) {
+        let archive_disk_path = match extracted_map.get(&normalized_archive) {
             Some(p) => p.clone(),
             None => {
                 let count = logged_failures.fetch_add(1, Ordering::Relaxed);
                 if count < MAX_LOGGED_FAILURES {
-                    error!("FAIL: BSA not found in archive: {}", bsa_path_in_archive);
+                    error!("FAIL: Nested archive not found: {}", archive_path_in_outer);
                 }
-                failed.fetch_add(bsa_directives.len(), Ordering::Relaxed);
+                failed.fetch_add(directives.len(), Ordering::Relaxed);
                 continue;
             }
         };
 
-        bsa_directives.par_iter().for_each(|(id, directive, file_in_bsa)| {
-            let data = match bsa::extract_archive_file(&bsa_disk_path, file_in_bsa) {
+        // Detect archive type to use correct extraction method
+        let archive_type = match detect_archive_type(&archive_disk_path) {
+            Ok(t) => t,
+            Err(e) => {
+                let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                if count < MAX_LOGGED_FAILURES {
+                    error!("FAIL: Cannot detect archive type for {}: {}", archive_path_in_outer, e);
+                }
+                failed.fetch_add(directives.len(), Ordering::Relaxed);
+                continue;
+            }
+        };
+
+        directives.par_iter().for_each(|(id, directive, file_in_archive)| {
+            // Extract using appropriate method based on archive type
+            let data = match archive_type {
+                NestedArchiveType::Tes3Bsa | NestedArchiveType::Bsa | NestedArchiveType::Ba2 => {
+                    // BSA/BA2 extraction using bsa module
+                    bsa::extract_archive_file(&archive_disk_path, file_in_archive)
+                }
+                NestedArchiveType::Zip | NestedArchiveType::SevenZ | NestedArchiveType::Rar | NestedArchiveType::Unknown => {
+                    // Regular archive extraction using 7z
+                    sevenzip::extract_file_case_insensitive(&archive_disk_path, file_in_archive)
+                }
+            };
+
+            let data = match data {
                 Ok(d) => d,
                 Err(e) => {
                     let count = logged_failures.fetch_add(1, Ordering::Relaxed);
                     if count < MAX_LOGGED_FAILURES {
-                        error!("FAIL [{}]: BSA extract error: {}", id, e);
+                        error!("FAIL [{}]: Nested extract error from {:?} archive: {}", id, archive_type, e);
                     }
                     failed.fetch_add(1, Ordering::Relaxed);
                     return;
@@ -827,19 +853,19 @@ fn process_nested_bsa_directives(
             if data.len() as u64 != directive.size {
                 let count = logged_failures.fetch_add(1, Ordering::Relaxed);
                 if count < MAX_LOGGED_FAILURES {
-                    error!("FAIL [{}]: BSA size mismatch: expected {} got {}", id, directive.size, data.len());
+                    error!("FAIL [{}]: Size mismatch: expected {} got {}", id, directive.size, data.len());
                 }
                 failed.fetch_add(1, Ordering::Relaxed);
                 return;
             }
 
-            let bsa_output_path = paths::join_windows_path(output_dir, &directive.to);
-            if let Err(_e) = paths::ensure_parent_dirs(&bsa_output_path) {
+            let output_path = paths::join_windows_path(output_dir, &directive.to);
+            if let Err(_e) = paths::ensure_parent_dirs(&output_path) {
                 failed.fetch_add(1, Ordering::Relaxed);
                 return;
             }
 
-            if let Err(e) = fs::write(&bsa_output_path, &data) {
+            if let Err(e) = fs::write(&output_path, &data) {
                 failed.fetch_add(1, Ordering::Relaxed);
                 error!("FAIL [{}]: write error: {}", id, e);
                 return;

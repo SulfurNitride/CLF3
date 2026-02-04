@@ -15,8 +15,9 @@ use crate::modlist::FromArchiveDirective;
 use crate::paths;
 
 use anyhow::{bail, Context, Result};
+use ba2::{guess_format, FileFormat};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::Path;
 
 /// Archive type detected by magic bytes
@@ -25,7 +26,8 @@ pub enum ArchiveType {
     Zip,
     SevenZ,
     Rar,
-    Bsa,
+    Tes3Bsa,  // Morrowind BSA
+    Bsa,      // TES4+ BSA (Oblivion, FO3, FNV, Skyrim)
     Ba2,
     Unknown,
 }
@@ -58,14 +60,18 @@ pub fn detect_archive_type(path: &Path) -> Result<ArchiveType> {
         return Ok(ArchiveType::SevenZ);
     }
 
-    // BSA: BSA\x00 followed by version
-    if magic[0..4] == [0x42, 0x53, 0x41, 0x00] {
-        return Ok(ArchiveType::Bsa);
-    }
-
-    // BA2: BTDX
-    if magic[0..4] == [0x42, 0x54, 0x44, 0x58] {
-        return Ok(ArchiveType::Ba2);
+    // Use ba2 crate's guess_format for Bethesda archives (handles TES3, TES4, FO4)
+    // Need to re-read from start since we consumed magic bytes
+    drop(file);
+    if let Ok(file) = File::open(path) {
+        let mut reader = BufReader::new(file);
+        if let Some(format) = guess_format(&mut reader) {
+            return Ok(match format {
+                FileFormat::TES3 => ArchiveType::Tes3Bsa,
+                FileFormat::TES4 => ArchiveType::Bsa,
+                FileFormat::FO4 => ArchiveType::Ba2,
+            });
+        }
     }
 
     Ok(ArchiveType::Unknown)
@@ -145,8 +151,8 @@ pub fn extract_from_archive_with_temp(archive_path: &Path, file_path: &str, temp
     let archive_type = detect_archive_type(archive_path)?;
 
     match archive_type {
-        ArchiveType::Bsa | ArchiveType::Ba2 => {
-            // Direct BSA/BA2 extraction (uses ba2 crate)
+        ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2 => {
+            // Direct BSA/BA2 extraction (uses ba2 crate, handles TES3/TES4/FO4)
             bsa::extract_archive_file(archive_path, file_path)
         }
         ArchiveType::Zip | ArchiveType::SevenZ | ArchiveType::Rar => {
@@ -228,7 +234,7 @@ pub fn extract_archive_to_dir(archive_path: &Path, output_dir: &Path) -> Result<
     let archive_type = detect_archive_type(archive_path)?;
 
     match archive_type {
-        ArchiveType::Bsa | ArchiveType::Ba2 => {
+        ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2 => {
             bail!("BSA/BA2 archives should be handled by the bsa module")
         }
         _ => {
@@ -325,11 +331,29 @@ mod tests {
         let dir = tempdir()?;
         let bsa_path = dir.path().join("test.bsa");
 
-        // BSA files start with BSA\x00
+        // TES4 BSA files start with BSA\x00
         let bsa_data = [0x42, 0x53, 0x41, 0x00, 0x68, 0x00, 0x00, 0x00];
         fs::write(&bsa_path, &bsa_data)?;
 
         assert_eq!(detect_archive_type(&bsa_path)?, ArchiveType::Bsa);
+        Ok(())
+    }
+
+    #[test]
+    fn test_detect_archive_type_tes3_bsa() -> Result<()> {
+        let dir = tempdir()?;
+        let bsa_path = dir.path().join("morrowind.bsa");
+
+        // TES3 (Morrowind) BSA files start with version 0x100 (256)
+        // Header: version (4), hash_offset (4), file_count (4)
+        let bsa_data = [
+            0x00, 0x01, 0x00, 0x00,  // Version 0x100 (little-endian)
+            0x0C, 0x00, 0x00, 0x00,  // Hash offset (12 = header size for empty archive)
+            0x00, 0x00, 0x00, 0x00,  // File count (0)
+        ];
+        fs::write(&bsa_path, &bsa_data)?;
+
+        assert_eq!(detect_archive_type(&bsa_path)?, ArchiveType::Tes3Bsa);
         Ok(())
     }
 

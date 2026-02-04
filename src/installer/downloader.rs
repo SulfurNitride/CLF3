@@ -62,12 +62,16 @@ fn scan_existing_outputs(output_dir: &Path) -> Result<HashMap<String, u64>> {
 }
 
 /// Download statistics
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DownloadStats {
     pub downloaded: usize,
     pub skipped: usize,
     pub failed: usize,
     pub manual: usize,
+    /// Details of failed downloads
+    pub failed_downloads: Vec<FailedDownloadInfo>,
+    /// Details of manual downloads needed
+    pub manual_downloads: Vec<ManualDownloadInfo>,
 }
 
 /// Information about a manual download needed
@@ -236,6 +240,8 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
             skipped: already_downloaded,
             failed: 0,
             manual: 0,
+            failed_downloads: Vec::new(),
+            manual_downloads: Vec::new(),
         });
     }
 
@@ -321,21 +327,26 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
 
     ctx.overall_pb.finish_and_clear();
 
+    // Get the detailed lists for stats and printing
+    let manual_downloads_list = ctx.manual_downloads.lock().await.clone();
+    let failed_downloads_list = ctx.failed_downloads.lock().await.clone();
+
     // Collect stats (include pre-scan skipped count)
     let stats = DownloadStats {
         downloaded: ctx.downloaded.load(Ordering::Relaxed),
         skipped: ctx.skipped.load(Ordering::Relaxed) + already_downloaded,
         failed: ctx.failed.load(Ordering::Relaxed),
-        manual: ctx.manual_downloads.lock().await.len(),
+        manual: manual_downloads_list.len(),
+        failed_downloads: failed_downloads_list.clone(),
+        manual_downloads: manual_downloads_list.clone(),
     };
 
     // Print manual download instructions
-    let manual_downloads = ctx.manual_downloads.lock().await;
-    if !manual_downloads.is_empty() {
-        println!("\n=== Manual Downloads Required ({}) ===", manual_downloads.len());
+    if !manual_downloads_list.is_empty() {
+        println!("\n=== Manual Downloads Required ({}) ===", manual_downloads_list.len());
         println!("Please download the following files to: {}\n", config.downloads_dir.display());
 
-        for (i, md) in manual_downloads.iter().enumerate() {
+        for (i, md) in manual_downloads_list.iter().enumerate() {
             println!("{}. {}", i + 1, md.name);
             println!("   URL: {}", md.url);
             println!("   Expected size: {} bytes", md.expected_size);
@@ -349,12 +360,11 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
     }
 
     // Print failed download instructions
-    let failed_downloads = ctx.failed_downloads.lock().await;
-    if !failed_downloads.is_empty() {
-        println!("\n=== Failed Downloads ({}) ===", failed_downloads.len());
+    if !failed_downloads_list.is_empty() {
+        println!("\n=== Failed Downloads ({}) ===", failed_downloads_list.len());
         println!("These downloads failed. Try manually downloading to: {}\n", config.downloads_dir.display());
 
-        for (i, fd) in failed_downloads.iter().enumerate() {
+        for (i, fd) in failed_downloads_list.iter().enumerate() {
             println!("{}. {}", i + 1, fd.name);
             println!("   URL: {}", fd.url);
             println!("   Error: {}", fd.error);
@@ -1254,12 +1264,15 @@ async fn download_non_nexus_files(
 
     ctx.overall_pb.finish_and_clear();
 
-    let manual_count = ctx.manual_downloads.lock().await.len();
+    let manual_downloads_list = ctx.manual_downloads.lock().await.clone();
+    let failed_downloads_list = ctx.failed_downloads.lock().await.clone();
 
     Ok(DownloadStats {
         downloaded: ctx.downloaded.load(Ordering::Relaxed),
         skipped: ctx.skipped.load(Ordering::Relaxed),
         failed: ctx.failed.load(Ordering::Relaxed),
-        manual: manual_count,
+        manual: manual_downloads_list.len(),
+        failed_downloads: failed_downloads_list,
+        manual_downloads: manual_downloads_list,
     })
 }

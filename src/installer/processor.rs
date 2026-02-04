@@ -35,7 +35,7 @@ fn list_archive_files_rust(archive_path: &Path) -> Result<Vec<ArchiveFileEntry>>
         ArchiveType::Zip => list_zip_files(archive_path),
         ArchiveType::SevenZ => list_7z_files(archive_path),
         ArchiveType::Rar => list_rar_files(archive_path),
-        ArchiveType::Bsa | ArchiveType::Ba2 => {
+        ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2 => {
             list_bsa_files(archive_path).map(|entries| {
                 entries
                     .into_iter()
@@ -134,7 +134,7 @@ fn extract_batch_rust(
         ArchiveType::Zip => extract_zip_to_temp(archive_path, temp_dir.path())?,
         ArchiveType::SevenZ => extract_7z_to_temp(archive_path, temp_dir.path())?,
         ArchiveType::Rar => extract_rar_to_temp(archive_path, temp_dir.path())?,
-        ArchiveType::Bsa | ArchiveType::Ba2 => {
+        ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2 => {
             bail!("BSA/BA2 should not use batch extraction")
         }
         ArchiveType::Unknown => {
@@ -328,7 +328,7 @@ fn index_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
         // Skip non-archive files (game files like ESM, ESL, INI, BIK, etc.)
         let is_indexable = matches!(
             archive_type,
-            ArchiveType::Zip | ArchiveType::SevenZ | ArchiveType::Rar | ArchiveType::Bsa | ArchiveType::Ba2
+            ArchiveType::Zip | ArchiveType::SevenZ | ArchiveType::Rar | ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2
         );
         if !is_indexable {
             // Mark as indexed with empty file list (it's a single file, not a container)
@@ -1371,7 +1371,7 @@ fn process_from_archive_fast(
         // Separate BSA/BA2 files from others
         let archive_type = detect_archive_type(&archive_path).unwrap_or(ArchiveType::Unknown);
         match archive_type {
-            ArchiveType::Bsa | ArchiveType::Ba2 => bsa_archives.push((archive_hash, archive_path, directives)),
+            ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2 => bsa_archives.push((archive_hash, archive_path, directives)),
             _ => other_archives.push((archive_hash, archive_path, directives)),
         }
     }
@@ -2111,7 +2111,7 @@ fn extract_source_files_to_disk(
                     }
                 }
             }
-            ArchiveType::Bsa | ArchiveType::Ba2 => {
+            ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2 => {
                 // BSA files: extract each needed file to disk
                 for (idx, (normalized, original)) in simple_paths.iter().enumerate() {
                     if let Ok(data) = bsa::extract_archive_file(archive_path, original) {
@@ -2514,7 +2514,7 @@ fn process_transformed_texture(
                     }
                     result
                 }
-                ArchiveType::Bsa | ArchiveType::Ba2 => {
+                ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2 => {
                     let mut result = HashMap::new();
                     for (normalized, original) in &simple_paths {
                         if let Ok(data) = bsa::extract_archive_file(&archive_path, original) {
