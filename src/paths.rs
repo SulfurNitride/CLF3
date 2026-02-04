@@ -5,11 +5,44 @@
 //! - Converting `\` to `/` for Linux filesystem operations
 //! - Case-insensitive file lookups (Windows is case-insensitive, Linux is not)
 //! - Preserving intended case for output paths
+//! - Unicode normalization (NFC) for consistent path matching
+//! - CP437 to UTF-8 conversion for legacy Windows archives
 
 // Module not yet integrated into main installation pipeline
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+use unicode_normalization::UnicodeNormalization;
+
+/// CP437 to Unicode mapping for bytes 0x80-0xFF
+/// Used to convert legacy DOS/Windows filenames to UTF-8
+const CP437_TO_UNICODE: [char; 128] = [
+    'Ç', 'ü', 'é', 'â', 'ä', 'à', 'å', 'ç', 'ê', 'ë', 'è', 'ï', 'î', 'ì', 'Ä', 'Å',
+    'É', 'æ', 'Æ', 'ô', 'ö', 'ò', 'û', 'ù', 'ÿ', 'Ö', 'Ü', '¢', '£', '¥', '₧', 'ƒ',
+    'á', 'í', 'ó', 'ú', 'ñ', 'Ñ', 'ª', 'º', '¿', '⌐', '¬', '½', '¼', '¡', '«', '»',
+    '░', '▒', '▓', '│', '┤', '╡', '╢', '╖', '╕', '╣', '║', '╗', '╝', '╜', '╛', '┐',
+    '└', '┴', '┬', '├', '─', '┼', '╞', '╟', '╚', '╔', '╩', '╦', '╠', '═', '╬', '╧',
+    '╨', '╤', '╥', '╙', '╘', '╒', '╓', '╫', '╪', '┘', '┌', '█', '▄', '▌', '▐', '▀',
+    'α', 'ß', 'Γ', 'π', 'Σ', 'σ', 'µ', 'τ', 'Φ', 'Θ', 'Ω', 'δ', '∞', 'φ', 'ε', '∩',
+    '≡', '±', '≥', '≤', '⌠', '⌡', '÷', '≈', '°', '∙', '·', '√', 'ⁿ', '²', '■', ' ',
+];
+
+/// Convert a byte sequence that might contain CP437 characters to UTF-8
+///
+/// This handles the case where 7z extracts files with CP437-encoded filenames
+/// on Linux, resulting in raw bytes 0x80-0xFF that need conversion to UTF-8.
+pub fn cp437_to_utf8(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&b| {
+            if b < 0x80 {
+                b as char
+            } else {
+                CP437_TO_UNICODE[(b - 0x80) as usize]
+            }
+        })
+        .collect()
+}
 
 /// Convert Windows path separators to Linux
 /// `Data\Textures\armor.dds` -> `Data/Textures/armor.dds`
@@ -23,9 +56,14 @@ pub fn to_native_pathbuf(path: &str) -> PathBuf {
     PathBuf::from(to_linux_path(path))
 }
 
-/// Normalize a path for lookups and comparisons (lowercase, forward slashes, trimmed)
+/// Normalize a path for lookups and comparisons (NFC normalized, lowercase, forward slashes, trimmed)
+///
+/// Uses Unicode NFC normalization to handle accented characters consistently.
+/// e.g., "atúlg" stored as u+combining accent matches "atúlg" stored as single ú character.
 pub fn normalize_for_lookup(path: &str) -> String {
-    path.to_lowercase()
+    path.nfc()
+        .collect::<String>()
+        .to_lowercase()
         .replace('\\', "/")
         .trim_matches('/')
         .to_string()
@@ -54,15 +92,16 @@ pub fn resolve_case_insensitive(base: &Path, relative: &str) -> Option<PathBuf> 
     let mut current = base.to_path_buf();
 
     for component in components {
-        let target_lower = component.to_lowercase();
+        let target_lower = component.nfc().collect::<String>().to_lowercase();
 
         // Read directory and find matching entry
         let found = std::fs::read_dir(&current).ok()?.find_map(|entry| {
             let entry = entry.ok()?;
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
+            let name_normalized = name_str.nfc().collect::<String>().to_lowercase();
 
-            if name_str.to_lowercase() == target_lower {
+            if name_normalized == target_lower {
                 Some(entry.path())
             } else {
                 None
@@ -182,5 +221,44 @@ mod tests {
     fn test_parent_path() {
         assert_eq!(parent_path("Data\\Textures\\armor.dds"), Some("Data\\Textures"));
         assert_eq!(parent_path("armor.dds"), None);
+    }
+
+    #[test]
+    fn test_cp437_to_utf8() {
+        // CP437 byte 0xA3 = ú (lowercase u with acute)
+        let cp437_bytes = b"at\xa3lg gro-larg\xa3m";
+        let utf8_result = cp437_to_utf8(cp437_bytes);
+        assert_eq!(utf8_result, "atúlg gro-largúm");
+
+        // Test that the normalized versions match
+        let utf8_path = "atúlg gro-largúm/file.mp3";
+        let cp437_path_bytes = b"at\xa3lg gro-larg\xa3m/file.mp3";
+        let converted = cp437_to_utf8(cp437_path_bytes);
+
+        assert_eq!(
+            normalize_for_lookup(utf8_path),
+            normalize_for_lookup(&converted)
+        );
+    }
+
+    #[test]
+    fn test_unicode_normalization() {
+        // Precomposed ú (U+00FA) vs decomposed u + combining acute (U+0075 U+0301)
+        let precomposed = "atúlg gro-largúm";
+        let decomposed = "atu\u{0301}lg gro-largu\u{0301}m";
+
+        // These should match after NFC normalization
+        assert_eq!(
+            normalize_for_lookup(precomposed),
+            normalize_for_lookup(decomposed)
+        );
+
+        // Test in full path context
+        let path1 = "00 - Core/Sound/Vo/AIV/orc/m/atúlg gro-largúm/file.mp3";
+        let path2 = "00 - Core/Sound/Vo/AIV/orc/m/atu\u{0301}lg gro-largu\u{0301}m/file.mp3";
+        assert_eq!(
+            normalize_for_lookup(path1),
+            normalize_for_lookup(path2)
+        );
     }
 }

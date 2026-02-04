@@ -436,3 +436,50 @@ pub struct BA2DX10Chunk {
     #[serde(default)]
     pub full_sz: u64,
 }
+
+/// Tale of Two Wastelands (TTW) detection result
+#[derive(Debug, Clone, Default)]
+pub struct TtwRequirement {
+    /// Whether TTW is required
+    pub required: bool,
+    /// Found TTW marker files (for diagnostic purposes)
+    pub markers_found: Vec<String>,
+}
+
+impl Modlist {
+    /// Check if this modlist requires Tale of Two Wastelands (TTW)
+    ///
+    /// Detection is based on directive paths referencing TTW-specific ESM files:
+    /// - TaleOfTwoWastelands.esm (main TTW master file)
+    /// - YUPTTW.esm (Yukichigai Unofficial Patch for TTW)
+    pub fn requires_ttw(&self) -> TtwRequirement {
+        let mut markers_found = Vec::new();
+
+        // TTW marker files (checked case-insensitively)
+        const TTW_MARKERS: &[&str] = &[
+            "TaleOfTwoWastelands.esm",
+            "YUPTTW.esm",
+        ];
+
+        for directive in &self.directives {
+            let path_lower = directive.to_path().to_lowercase();
+
+            for marker in TTW_MARKERS {
+                let marker_lower = marker.to_lowercase();
+                if path_lower.contains(&marker_lower) && !markers_found.contains(&marker.to_string()) {
+                    markers_found.push(marker.to_string());
+                }
+            }
+
+            // Early exit if both markers found
+            if markers_found.len() == TTW_MARKERS.len() {
+                break;
+            }
+        }
+
+        TtwRequirement {
+            required: !markers_found.is_empty(),
+            markers_found,
+        }
+    }
+}

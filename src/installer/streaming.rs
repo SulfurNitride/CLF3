@@ -1029,6 +1029,9 @@ fn process_bsa_archive(
 }
 
 /// Build a map of all files in a directory: normalized path -> actual file path on disk.
+///
+/// Handles CP437-encoded filenames that 7z may extract from legacy Windows archives.
+/// Creates entries for both the original path and CP437-to-UTF8 converted path.
 fn build_extracted_file_map(dir: &std::path::Path) -> HashMap<String, PathBuf> {
     let entries: Vec<_> = walkdir::WalkDir::new(dir)
         .into_iter()
@@ -1036,16 +1039,38 @@ fn build_extracted_file_map(dir: &std::path::Path) -> HashMap<String, PathBuf> {
         .filter(|e| e.file_type().is_file())
         .collect();
 
-    entries.par_iter()
-        .map(|entry| {
-            let rel_path = entry.path()
-                .strip_prefix(dir)
-                .unwrap_or(entry.path())
-                .to_string_lossy();
-            let normalized = paths::normalize_for_lookup(&rel_path);
-            (normalized, entry.path().to_path_buf())
-        })
-        .collect()
+    let mut map: HashMap<String, PathBuf> = HashMap::new();
+
+    for entry in &entries {
+        let rel_path = entry.path()
+            .strip_prefix(dir)
+            .unwrap_or(entry.path());
+
+        // Get the path as bytes (OsStr -> bytes on Unix)
+        #[cfg(unix)]
+        let path_bytes: Vec<u8> = {
+            use std::os::unix::ffi::OsStrExt;
+            rel_path.as_os_str().as_bytes().to_vec()
+        };
+        #[cfg(not(unix))]
+        let path_bytes: Vec<u8> = rel_path.to_string_lossy().as_bytes().to_vec();
+
+        // Check if path contains non-ASCII bytes (potential CP437)
+        let has_high_bytes = path_bytes.iter().any(|&b| b >= 0x80);
+
+        // Add the regular normalized path
+        let normalized = paths::normalize_for_lookup(&rel_path.to_string_lossy());
+        map.insert(normalized, entry.path().to_path_buf());
+
+        // If path contains high bytes, also add CP437-converted version
+        if has_high_bytes {
+            let utf8_path = paths::cp437_to_utf8(&path_bytes);
+            let normalized_cp437 = paths::normalize_for_lookup(&utf8_path);
+            map.insert(normalized_cp437, entry.path().to_path_buf());
+        }
+    }
+
+    map
 }
 
 #[cfg(test)]

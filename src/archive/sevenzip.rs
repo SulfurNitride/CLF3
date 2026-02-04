@@ -228,6 +228,7 @@ pub fn list_archive(archive_path: &Path) -> Result<Vec<ArchiveEntry>> {
         .arg("l")           // List
         .arg("-slt")        // Technical listing format (key=value)
         .arg("-ba")         // Bare output (no headers)
+        .arg("-scsUTF-8")   // Force UTF-8 charset for filenames
         .arg(archive_path)
         .output()
         .with_context(|| format!("Failed to run 7z list on {}", archive_path.display()))?;
@@ -345,6 +346,7 @@ pub fn extract_file(archive_path: &Path, file_path: &str) -> Result<Vec<u8>> {
         .arg("-so")         // Output to stdout
         .arg("-y")          // Yes to all prompts
         .arg("-spd")        // Disable wildcard matching
+        .arg("-scsUTF-8")   // Force UTF-8 charset for filenames
         .arg(archive_path)
         .arg(&normalized_path)
         .output()
@@ -518,6 +520,7 @@ pub fn extract_files(archive_path: &Path, files: &[&str], output_dir: &Path) -> 
     cmd.arg("x")            // Extract with full paths
         .arg("-y")          // Yes to all prompts
         .arg("-aoa")        // Overwrite all existing files
+        .arg("-scsUTF-8")   // Force UTF-8 charset for filenames
         .arg(format!("-o{}", output_dir.display()))
         .arg(archive_path);
 
@@ -576,7 +579,8 @@ pub fn extract_all_with_threads(
     let mut cmd = Command::new(&sz_path);
     cmd.arg("x")             // Extract with full paths
         .arg("-y")           // Yes to all prompts
-        .arg("-aoa");        // Overwrite all existing files
+        .arg("-aoa")         // Overwrite all existing files
+        .arg("-scsUTF-8");   // Force UTF-8 charset for filenames
 
     // Add thread control
     match threads {

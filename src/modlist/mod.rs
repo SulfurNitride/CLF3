@@ -136,6 +136,28 @@ mod tests {
             assert_eq!(modlist.name, "Tuxborn");
             println!("Archives: {}", modlist.archives.len());
             println!("Directives: {}", modlist.directives.len());
+
+            // Tuxborn should NOT require TTW
+            let ttw = modlist.requires_ttw();
+            assert!(!ttw.required, "Tuxborn should not require TTW");
+        }
+    }
+
+    // Test TTW detection with Begin Again
+    #[test]
+    #[ignore] // Run with: cargo test -- --ignored
+    fn test_ttw_detection_begin_again() {
+        let path = Path::new("/home/luke/Downloads/beginagain.wabbajack");
+        if path.exists() {
+            let modlist = parse_wabbajack_file(path).unwrap();
+            let ttw = modlist.requires_ttw();
+
+            println!("Modlist: {}", modlist.name);
+            println!("TTW Required: {}", ttw.required);
+            println!("TTW Markers: {:?}", ttw.markers_found);
+
+            assert!(ttw.required, "Begin Again should require TTW");
+            assert!(!ttw.markers_found.is_empty());
         }
     }
 }

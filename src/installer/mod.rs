@@ -6,6 +6,7 @@
 //! 3. Process directives
 
 pub mod config;
+pub mod config_cache;
 pub mod downloader;
 pub mod handlers;
 pub mod processor;
@@ -13,6 +14,7 @@ pub mod streaming;
 pub mod verify;
 
 pub use config::{InstallConfig, ProgressCallback, ProgressEvent};
+pub use config_cache::{ConfigCache, ModlistConfig, ModlistPrecheck, precheck_modlist};
 
 use crate::modlist::{import_wabbajack_to_db, ModlistDb};
 use anyhow::{bail, Context, Result};

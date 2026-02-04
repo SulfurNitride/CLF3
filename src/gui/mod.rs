@@ -134,7 +134,7 @@ slint::slint! {
         }
     }
 
-    // Path input with browse button
+    // Path input with browse button (compact single-line with inline label)
     component PathInput inherits Rectangle {
         in property <string> label;
         in property <string> placeholder: "";
@@ -143,69 +143,67 @@ slint::slint! {
         callback browse-clicked();
         callback edited(string);
 
-        height: 50px;
+        height: 28px;
 
-        VerticalLayout {
-            spacing: 4px;
+        HorizontalLayout {
+            spacing: 6px;
 
             Text {
-                text: label;
-                font-size: 12px;
+                text: label + ":";
+                font-size: 11px;
                 font-weight: 500;
                 color: Theme.subtext1;
+                vertical-alignment: center;
+                width: 90px;
             }
 
-            HorizontalLayout {
-                spacing: 8px;
+            Rectangle {
+                horizontal-stretch: 1;
+                height: 26px;
+                background: Theme.crust;
+                border-radius: 4px;
 
-                Rectangle {
-                    horizontal-stretch: 1;
-                    height: 32px;
-                    background: Theme.crust;
-                    border-radius: 6px;
-
-                    // Placeholder text
-                    if value == "": Text {
-                        x: 10px;
-                        text: placeholder;
-                        font-size: 12px;
-                        color: Theme.overlay0;
-                        vertical-alignment: center;
-                    }
-
-                    path-input := TextInput {
-                        x: 10px;
-                        y: (parent.height - 16px) / 2;
-                        width: parent.width - 20px;
-                        height: 16px;
-                        text <=> value;
-                        font-size: 12px;
-                        color: Theme.text;
-                        enabled: enabled;
-                        single-line: true;
-                        vertical-alignment: center;
-                        edited => { edited(self.text); }
-                    }
+                // Placeholder text
+                if value == "": Text {
+                    x: 8px;
+                    text: placeholder;
+                    font-size: 11px;
+                    color: Theme.overlay0;
+                    vertical-alignment: center;
                 }
 
-                Rectangle {
-                    width: 70px;
-                    height: 32px;
-                    background: enabled ? (touch.has-hover ? Theme.surface1 : Theme.surface0) : Theme.mantle;
-                    border-radius: 6px;
+                path-input := TextInput {
+                    x: 8px;
+                    y: (parent.height - 14px) / 2;
+                    width: parent.width - 16px;
+                    height: 14px;
+                    text <=> value;
+                    font-size: 11px;
+                    color: Theme.text;
+                    enabled: enabled;
+                    single-line: true;
+                    vertical-alignment: center;
+                    edited => { edited(self.text); }
+                }
+            }
 
-                    touch := TouchArea {
-                        enabled: enabled;
-                        clicked => { browse-clicked(); }
-                    }
+            Rectangle {
+                width: 54px;
+                height: 26px;
+                background: enabled ? (touch.has-hover ? Theme.surface1 : Theme.surface0) : Theme.mantle;
+                border-radius: 4px;
 
-                    Text {
-                        text: "Browse";
-                        font-size: 12px;
-                        color: enabled ? Theme.text : Theme.overlay0;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
+                touch := TouchArea {
+                    enabled: enabled;
+                    clicked => { browse-clicked(); }
+                }
+
+                Text {
+                    text: "Browse";
+                    font-size: 11px;
+                    color: enabled ? Theme.text : Theme.overlay0;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
                 }
             }
         }
@@ -217,10 +215,10 @@ slint::slint! {
         in property <bool> active: false;
         callback clicked();
 
-        height: 44px;
+        height: 36px;
         horizontal-stretch: 1;
         background: active ? Theme.surface0 : transparent;
-        border-radius: 8px;
+        border-radius: 6px;
 
         states [
             hover when touch.has-hover && !active: {
@@ -256,9 +254,9 @@ slint::slint! {
         in property <bool> enabled: true;
         callback clicked();
 
-        height: 48px;
+        height: 36px;
         background: enabled ? (touch.has-hover ? #7aa2e8 : Theme.blue) : Theme.surface1;
-        border-radius: 8px;
+        border-radius: 6px;
 
         touch := TouchArea {
             enabled: enabled;
@@ -267,7 +265,7 @@ slint::slint! {
 
         Text {
             text: label;
-            font-size: 15px;
+            font-size: 13px;
             font-weight: 600;
             color: enabled ? Theme.crust : Theme.overlay0;
             horizontal-alignment: center;
@@ -281,9 +279,9 @@ slint::slint! {
         in property <bool> enabled: true;
         callback clicked();
 
-        height: 48px;
+        height: 36px;
         background: touch.has-hover && enabled ? Theme.surface1 : Theme.surface0;
-        border-radius: 8px;
+        border-radius: 6px;
         border-width: 1px;
         border-color: Theme.surface1;
 
@@ -294,7 +292,7 @@ slint::slint! {
 
         Text {
             text: label;
-            font-size: 15px;
+            font-size: 13px;
             font-weight: 500;
             color: enabled ? Theme.text : Theme.overlay0;
             horizontal-alignment: center;
@@ -308,7 +306,7 @@ slint::slint! {
         in property <bool> enabled: true;
         callback clicked();
 
-        height: 24px;
+        height: 20px;
         background: transparent;
 
         touch := TouchArea {
@@ -318,7 +316,7 @@ slint::slint! {
 
         Text {
             text: label;
-            font-size: 13px;
+            font-size: 11px;
             color: touch.has-hover && enabled ? Theme.lavender : Theme.blue;
             horizontal-alignment: center;
             vertical-alignment: center;
@@ -395,7 +393,7 @@ slint::slint! {
     export component MainWindow inherits Window {
         title: "CLF3 - Modlist Installer";
         min-width: 1200px;
-        min-height: 700px;
+        min-height: 640px;
         background: Theme.base;
 
         // Input properties
@@ -426,15 +424,24 @@ slint::slint! {
         // Detected game info (auto-populated when .wabbajack file is selected)
         in-out property <string> detected_game: "";
 
+        // TTW (Tale of Two Wastelands) properties
+        in-out property <bool> ttw_required: false;
+        in-out property <string> ttw_mpi_path: "";
+        in-out property <bool> ttw_fo3_found: false;
+        in-out property <bool> ttw_fnv_found: false;
+        in-out property <string> ttw_fo3_path: "";
+        in-out property <string> ttw_fnv_path: "";
+
         // Proton selection (required for installation)
         in-out property <[ProtonOption]> proton_options: [];
         in-out property <[string]> proton_names: [];  // String model for ComboBox
         in-out property <int> selected_proton_index: -1;  // -1 = none selected
 
         // Computed properties
+        property <bool> ttw_ready: !ttw_required || (ttw_mpi_path != "" && ttw_fo3_found && ttw_fnv_found);
         property <bool> can_install: source_path != "" && install_dir != "" &&
                                      downloads_dir != "" && nexus_api_key != "" &&
-                                     selected_proton_index >= 0 &&
+                                     selected_proton_index >= 0 && ttw_ready &&
                                      (install_state == InstallState.Idle || install_state == InstallState.Error);
         property <bool> is_running: install_state != InstallState.Idle &&
                                     install_state != InstallState.Complete &&
@@ -455,14 +462,16 @@ slint::slint! {
         callback install_edited(string);
         callback downloads_edited(string);
         callback api_key_edited(string);
+        callback browse_ttw_mpi();
+        callback ttw_mpi_edited(string);
 
         VerticalLayout {
             padding: 0;
 
             // Main content area with two panels
             HorizontalLayout {
-                padding: 20px;
-                spacing: 20px;
+                padding: 8px;
+                spacing: 12px;
 
                 // Left Panel - Configuration
                 Rectangle {
@@ -472,59 +481,55 @@ slint::slint! {
                     clip: true;
 
                     VerticalLayout {
-                        spacing: 8px;
+                        spacing: 4px;
 
-                        // Header
-                        Text {
-                            text: "CLF3";
-                            font-size: 28px;
-                            font-weight: 700;
-                            color: Theme.text;
+                        // Header (compact)
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Text {
+                                text: "CLF3";
+                                font-size: 16px;
+                                font-weight: 700;
+                                color: Theme.text;
+                            }
                         }
 
-                        Text {
-                            text: "Modlist Installer";
-                            font-size: 14px;
-                            color: Theme.subtext0;
-                        }
+                        // Proton Selection Dropdown (compact inline)
+                        HorizontalLayout {
+                            spacing: 6px;
 
-                        // Proton Selection Dropdown (at top as required)
-                        Rectangle {
-                            height: 50px;
-                            background: transparent;
+                            Text {
+                                text: "Proton:";
+                                font-size: 11px;
+                                font-weight: 500;
+                                color: Theme.subtext1;
+                                vertical-alignment: center;
+                                width: 90px;
+                            }
 
-                            VerticalLayout {
-                                spacing: 4px;
+                            if proton_names.length > 0: ComboBox {
+                                horizontal-stretch: 1;
+                                height: 26px;
+                                model: proton_names;
+                                current-index <=> selected_proton_index;
+                                enabled: !is_running;
+                            }
+
+                            // No Protons warning
+                            if proton_names.length == 0: Rectangle {
+                                horizontal-stretch: 1;
+                                height: 26px;
+                                background: #3b1f2b;
+                                border-radius: 4px;
+                                border-width: 1px;
+                                border-color: Theme.red;
 
                                 Text {
-                                    text: "Proton Version";
-                                    font-size: 12px;
-                                    font-weight: 500;
-                                    color: Theme.subtext1;
-                                }
-
-                                if proton_names.length > 0: ComboBox {
-                                    height: 32px;
-                                    model: proton_names;
-                                    current-index <=> selected_proton_index;
-                                    enabled: !is_running;
-                                }
-
-                                // No Protons warning
-                                if proton_names.length == 0: Rectangle {
-                                    height: 32px;
-                                    background: #3b1f2b;
-                                    border-radius: 6px;
-                                    border-width: 1px;
-                                    border-color: Theme.red;
-
-                                    Text {
-                                        text: "No Proton 10+ found - install via Steam or ProtonUp-Qt";
-                                        font-size: 11px;
-                                        color: Theme.red;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                    }
+                                    text: "No Proton 10+ found";
+                                    font-size: 10px;
+                                    color: Theme.red;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
                                 }
                             }
                         }
@@ -541,9 +546,9 @@ slint::slint! {
 
                         // Browse modlists gallery button
                         Rectangle {
-                            height: 36px;
+                            height: 26px;
                             background: gallery_btn.has-hover ? #45475a : #313244;
-                            border-radius: 6px;
+                            border-radius: 4px;
 
                             gallery_btn := TouchArea {
                                 enabled: !is_running;
@@ -551,13 +556,13 @@ slint::slint! {
                             }
 
                             HorizontalLayout {
-                                padding-left: 12px;
-                                padding-right: 12px;
-                                spacing: 8px;
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                spacing: 6px;
 
                                 Text {
                                     text: "Browse Modlist Gallery";
-                                    font-size: 13px;
+                                    font-size: 11px;
                                     color: #89b4fa;
                                     vertical-alignment: center;
                                     horizontal-stretch: 1;
@@ -565,7 +570,7 @@ slint::slint! {
 
                                 Text {
                                     text: ">";
-                                    font-size: 14px;
+                                    font-size: 12px;
                                     color: #6c7086;
                                     vertical-alignment: center;
                                 }
@@ -574,27 +579,134 @@ slint::slint! {
 
                         // Detected game indicator (shown when game is auto-detected)
                         if detected_game != "": Rectangle {
-                            height: 28px;
+                            height: 20px;
                             background: Theme.surface0;
-                            border-radius: 4px;
+                            border-radius: 3px;
 
                             HorizontalLayout {
-                                padding: 8px;
-                                spacing: 6px;
+                                padding-left: 6px;
+                                padding-right: 6px;
+                                spacing: 4px;
 
                                 Text {
                                     text: "Detected:";
                                     color: Theme.subtext0;
-                                    font-size: 12px;
+                                    font-size: 10px;
                                     vertical-alignment: center;
                                 }
 
                                 Text {
                                     text: detected_game;
                                     color: Theme.green;
-                                    font-size: 12px;
+                                    font-size: 10px;
                                     font-weight: 500;
                                     vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        // TTW Required notification (compact single-line when MPI set)
+                        if ttw_required: Rectangle {
+                            height: ttw_mpi_path == "" ? 44px : 20px;
+                            background: #2d1f1f;
+                            border-radius: 3px;
+                            border-width: 1px;
+                            border-color: Theme.peach;
+
+                            VerticalLayout {
+                                padding-left: 6px;
+                                padding-right: 6px;
+                                padding-top: 3px;
+                                padding-bottom: 3px;
+                                spacing: 2px;
+
+                                // Header + Status on one line
+                                HorizontalLayout {
+                                    spacing: 8px;
+
+                                    Text {
+                                        text: "⚠ TTW";
+                                        font-size: 10px;
+                                        font-weight: 600;
+                                        color: Theme.peach;
+                                        vertical-alignment: center;
+                                    }
+
+                                    Text {
+                                        text: (ttw_fo3_found ? "✓" : "✗") + "FO3";
+                                        font-size: 9px;
+                                        color: ttw_fo3_found ? Theme.green : Theme.red;
+                                        vertical-alignment: center;
+                                    }
+
+                                    Text {
+                                        text: (ttw_fnv_found ? "✓" : "✗") + "FNV";
+                                        font-size: 9px;
+                                        color: ttw_fnv_found ? Theme.green : Theme.red;
+                                        vertical-alignment: center;
+                                    }
+
+                                    Text {
+                                        text: (ttw_mpi_path != "" ? "✓" : "✗") + "MPI";
+                                        font-size: 9px;
+                                        color: ttw_mpi_path != "" ? Theme.green : Theme.red;
+                                        vertical-alignment: center;
+                                    }
+
+                                    // Show path when set
+                                    if ttw_mpi_path != "": Text {
+                                        text: ttw_mpi_path;
+                                        font-size: 8px;
+                                        color: Theme.subtext0;
+                                        overflow: elide;
+                                        horizontal-stretch: 1;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                // MPI input row (only when not set)
+                                if ttw_mpi_path == "": HorizontalLayout {
+                                    spacing: 4px;
+
+                                    Rectangle {
+                                        horizontal-stretch: 1;
+                                        height: 20px;
+                                        background: Theme.crust;
+                                        border-radius: 3px;
+
+                                        mpi_input := TextInput {
+                                            x: 5px;
+                                            y: (parent.height - 10px) / 2;
+                                            width: parent.width - 10px;
+                                            height: 10px;
+                                            text <=> ttw_mpi_path;
+                                            font-size: 9px;
+                                            color: Theme.text;
+                                            enabled: !is_running;
+                                            single-line: true;
+                                            edited => { ttw_mpi_edited(self.text); }
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        width: 44px;
+                                        height: 20px;
+                                        background: mpi_browse.has-hover ? Theme.surface1 : Theme.surface0;
+                                        border-radius: 3px;
+
+                                        mpi_browse := TouchArea {
+                                            enabled: !is_running;
+                                            clicked => { browse_ttw_mpi(); }
+                                        }
+
+                                        Text {
+                                            text: "Browse";
+                                            font-size: 9px;
+                                            color: Theme.text;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -607,10 +719,10 @@ slint::slint! {
 
                         // Path configuration section
                         Text {
-                            text: "Installation Paths";
-                            font-size: 15px;
+                            text: "Paths";
+                            font-size: 12px;
                             font-weight: 600;
-                            color: Theme.text;
+                            color: Theme.subtext0;
                         }
 
                         PathInput {
@@ -640,9 +752,9 @@ slint::slint! {
                         // Options section
                         Text {
                             text: "Options";
-                            font-size: 15px;
+                            font-size: 12px;
                             font-weight: 600;
-                            color: Theme.text;
+                            color: Theme.subtext0;
                         }
 
                         // API Key status (configured in Settings)
@@ -711,7 +823,7 @@ slint::slint! {
 
                         // Action buttons
                         HorizontalLayout {
-                            spacing: 12px;
+                            spacing: 8px;
 
                             SecondaryButton {
                                 horizontal-stretch: 1;
@@ -743,32 +855,32 @@ slint::slint! {
                     clip: true;
 
                     VerticalLayout {
-                        spacing: 10px;
+                        spacing: 6px;
 
                         // Header
                         Text {
                             text: "Activity";
-                            font-size: 18px;
+                            font-size: 14px;
                             font-weight: 600;
                             color: Theme.text;
                         }
 
                         // Unified Activity Progress section
                         Rectangle {
-                            height: 160px;
+                            height: 130px;
                             background: Theme.surface0;
-                            border-radius: 8px;
+                            border-radius: 6px;
 
                             VerticalLayout {
-                                padding: 12px;
-                                spacing: 8px;
+                                padding: 8px;
+                                spacing: 6px;
 
                                 // Header row: Phase status + File count badge
                                 HorizontalLayout {
                                     // Current phase/status
                                     Text {
                                         text: status_message;
-                                        font-size: 14px;
+                                        font-size: 12px;
                                         font-weight: 600;
                                         color: install_state == InstallState.Error ? Theme.red :
                                                install_state == InstallState.Complete ? Theme.green :
@@ -779,17 +891,17 @@ slint::slint! {
 
                                     // File count badge (dynamic width)
                                     Rectangle {
-                                        height: 24px;
+                                        height: 20px;
                                         background: Theme.surface1;
-                                        border-radius: 4px;
+                                        border-radius: 3px;
 
                                         HorizontalLayout {
-                                            padding-left: 10px;
-                                            padding-right: 10px;
+                                            padding-left: 8px;
+                                            padding-right: 8px;
 
                                             Text {
-                                                text: files_completed + "/" + files_total + " files";
-                                                font-size: 11px;
+                                                text: files_completed + "/" + files_total;
+                                                font-size: 10px;
                                                 font-weight: 500;
                                                 color: Theme.blue;
                                                 vertical-alignment: center;
@@ -800,9 +912,9 @@ slint::slint! {
 
                                 // Progress bar with percentage
                                 Rectangle {
-                                    height: 20px;
+                                    height: 16px;
                                     background: Theme.surface1;
-                                    border-radius: 6px;
+                                    border-radius: 4px;
 
                                     Rectangle {
                                         x: 0;
@@ -812,12 +924,12 @@ slint::slint! {
                                         background: install_state == InstallState.Error ? Theme.red :
                                                     install_state == InstallState.Complete ? Theme.green :
                                                     Theme.blue;
-                                        border-radius: 6px;
+                                        border-radius: 4px;
                                     }
 
                                     Text {
                                         text: round(progress * 100) + "%";
-                                        font-size: 11px;
+                                        font-size: 10px;
                                         font-weight: 600;
                                         color: Theme.text;
                                         horizontal-alignment: center;
@@ -827,44 +939,44 @@ slint::slint! {
 
                                 // Stats row: Speed, Size, and ETA
                                 HorizontalLayout {
-                                    spacing: 16px;
+                                    spacing: 12px;
 
                                     HorizontalLayout {
-                                        spacing: 4px;
+                                        spacing: 3px;
                                         Text {
                                             text: "Speed:";
-                                            font-size: 11px;
+                                            font-size: 10px;
                                             color: Theme.overlay0;
                                         }
                                         Text {
                                             text: download_speed;
-                                            font-size: 11px;
+                                            font-size: 10px;
                                             font-weight: 500;
                                             color: Theme.teal;
                                         }
                                     }
 
                                     HorizontalLayout {
-                                        spacing: 4px;
+                                        spacing: 3px;
                                         horizontal-stretch: 1;
                                         Text {
                                             text: size_progress;
-                                            font-size: 11px;
+                                            font-size: 10px;
                                             font-weight: 500;
                                             color: Theme.lavender;
                                         }
                                     }
 
                                     HorizontalLayout {
-                                        spacing: 4px;
+                                        spacing: 3px;
                                         Text {
                                             text: "ETA:";
-                                            font-size: 11px;
+                                            font-size: 10px;
                                             color: Theme.overlay0;
                                         }
                                         Text {
                                             text: download_eta;
-                                            font-size: 11px;
+                                            font-size: 10px;
                                             font-weight: 500;
                                             color: Theme.yellow;
                                         }
@@ -878,7 +990,7 @@ slint::slint! {
                         HorizontalLayout {
                             Text {
                                 text: "Log";
-                                font-size: 14px;
+                                font-size: 12px;
                                 font-weight: 500;
                                 color: Theme.subtext0;
                                 horizontal-stretch: 1;
@@ -896,17 +1008,17 @@ slint::slint! {
 
             // Footer
             Rectangle {
-                height: 44px;
+                height: 28px;
                 background: Theme.mantle;
 
                 HorizontalLayout {
-                    padding-left: 20px;
-                    padding-right: 20px;
+                    padding-left: 12px;
+                    padding-right: 12px;
                     spacing: 10px;
 
                     Text {
                         text: "CLF3 v" + version;
-                        font-size: 12px;
+                        font-size: 11px;
                         color: Theme.overlay0;
                         vertical-alignment: center;
                     }
@@ -3159,23 +3271,54 @@ pub fn run() -> Result<(), slint::PlatformError> {
                 if path.extension().map(|e| e == "wabbajack").unwrap_or(false) {
                     // Show loading state immediately
                     window.set_detected_game("Loading...".into());
+                    window.set_ttw_required(false);
+                    window.set_ttw_mpi_path("".into());
 
                     // Parse in background thread to keep UI responsive
                     let window_weak_bg = window.as_weak();
                     let path_clone = path.clone();
                     std::thread::spawn(move || {
-                        let result = detect_game_from_wabbajack(&path_clone);
+                        let result = detect_modlist_info(&path_clone);
 
                         // Update UI from main thread
                         slint::invoke_from_event_loop(move || {
                             if let Some(window) = window_weak_bg.upgrade() {
                                 match result {
-                                    Ok(game_info) => {
-                                        window.set_detected_game(game_info.into());
+                                    Ok(info) => {
+                                        window.set_detected_game(info.game_display.into());
+
+                                        // Set TTW properties
+                                        window.set_ttw_required(info.ttw_required);
+                                        window.set_ttw_fo3_found(info.fo3_path.is_some());
+                                        window.set_ttw_fnv_found(info.fnv_path.is_some());
+
+                                        if let Some(fo3) = info.fo3_path {
+                                            window.set_ttw_fo3_path(fo3.display().to_string().into());
+                                        } else {
+                                            window.set_ttw_fo3_path("".into());
+                                        }
+
+                                        if let Some(fnv) = info.fnv_path {
+                                            window.set_ttw_fnv_path(fnv.display().to_string().into());
+                                        } else {
+                                            window.set_ttw_fnv_path("".into());
+                                        }
+
+                                        // Apply cached configuration (always overwrite with saved values for this modlist)
+                                        if let Some(install_dir) = info.cached_install_dir {
+                                            window.set_install_dir(install_dir.into());
+                                        }
+                                        if let Some(downloads_dir) = info.cached_downloads_dir {
+                                            window.set_downloads_dir(downloads_dir.into());
+                                        }
+                                        if let Some(ttw_mpi) = info.cached_ttw_mpi_path {
+                                            window.set_ttw_mpi_path(ttw_mpi.into());
+                                        }
                                     }
                                     Err(e) => {
                                         eprintln!("Failed to detect game: {}", e);
                                         window.set_detected_game(format!("Error: {}", e).into());
+                                        window.set_ttw_required(false);
                                     }
                                 }
                             }
@@ -3184,6 +3327,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                 } else {
                     // Clear detected game for non-wabbajack files
                     window.set_detected_game("".into());
+                    window.set_ttw_required(false);
                 }
             }
         }
@@ -3214,6 +3358,31 @@ pub fn run() -> Result<(), slint::PlatformError> {
             {
                 window.set_downloads_dir(path.display().to_string().into());
             }
+        }
+    });
+
+    // Set up TTW MPI file browse callback
+    window.on_browse_ttw_mpi({
+        let window_weak = window.as_weak();
+        move || {
+            let window = window_weak.unwrap();
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("Select TTW MPI File")
+                .add_filter("MPI Files", &["mpi"])
+                .add_filter("All Files", &["*"])
+                .pick_file()
+            {
+                window.set_ttw_mpi_path(path.display().to_string().into());
+            }
+        }
+    });
+
+    // Set up TTW MPI path edited callback (manual entry)
+    window.on_ttw_mpi_edited({
+        let window_weak = window.as_weak();
+        move |text| {
+            let window = window_weak.unwrap();
+            window.set_ttw_mpi_path(text);
         }
     });
 
@@ -3304,12 +3473,52 @@ pub fn run() -> Result<(), slint::PlatformError> {
 
             let non_premium = window.get_non_premium_mode();
 
+            // Get TTW settings
+            let ttw_required = window.get_ttw_required();
+            let ttw_mpi_path = window.get_ttw_mpi_path().to_string();
+            let ttw_fo3_path = window.get_ttw_fo3_path().to_string();
+            let ttw_fnv_path = window.get_ttw_fnv_path().to_string();
+
+            // Validate TTW paths before starting (fail early with clear message)
+            if ttw_required && !ttw_mpi_path.is_empty() {
+                let mpi = std::path::Path::new(&ttw_mpi_path);
+                if !mpi.exists() {
+                    window.set_status_message(format!("Error: MPI file not found: {}", ttw_mpi_path).into());
+                    let current_log = window.get_log_text();
+                    window.set_log_text(format!("{}\n[ERROR] TTW MPI file not found. Please re-select the MPI file.", current_log).into());
+                    return;
+                }
+            }
+
+            // Save configuration to cache for future use
+            if let Ok(modlist) = crate::modlist::parse_wabbajack_file(std::path::Path::new(&source_path)) {
+                if let Ok(cache) = crate::installer::ConfigCache::open() {
+                    let config = crate::installer::ModlistConfig {
+                        install_dir: Some(install_dir.clone()),
+                        downloads_dir: Some(downloads_dir.clone()),
+                        ttw_mpi_path: if ttw_mpi_path.is_empty() { None } else { Some(ttw_mpi_path.clone()) },
+                        fo3_path: if ttw_fo3_path.is_empty() { None } else { Some(ttw_fo3_path.clone()) },
+                        fnv_path: if ttw_fnv_path.is_empty() { None } else { Some(ttw_fnv_path.clone()) },
+                        ttw_required: Some(ttw_required),
+                        ..Default::default()
+                    };
+                    if let Err(e) = cache.save_config(&modlist.name, &modlist.version, &modlist.game_type, None, &config) {
+                        eprintln!("[GUI] Failed to save config cache: {}", e);
+                    } else {
+                        println!("[GUI] Saved configuration for {} v{}", modlist.name, modlist.version);
+                    }
+                }
+            }
+
             // Clone values for the spawned thread
             let source_clone = source_path.clone();
             let install_clone = install_dir.clone();
             let downloads_clone = downloads_dir.clone();
             let api_key_clone = api_key.clone();
             let proton_name_clone = proton_name.clone();
+            let ttw_mpi_clone = ttw_mpi_path.clone();
+            let ttw_fo3_clone = ttw_fo3_path.clone();
+            let ttw_fnv_clone = ttw_fnv_path.clone();
 
             // Spawn installation in background thread
             println!("[GUI] Spawning installation thread (non_premium={}, proton={})...", non_premium, proton_name);
@@ -3342,10 +3551,73 @@ pub fn run() -> Result<(), slint::PlatformError> {
                     match &result {
                         Ok(_) => {
                             println!("[GUI] Installation complete!");
+                            let tx = get_progress_sender();
+
+                            // Run TTW installation if required
+                            let mut ttw_success = true;
+                            if ttw_required && !ttw_mpi_clone.is_empty() && !ttw_fo3_clone.is_empty() && !ttw_fnv_clone.is_empty() {
+                                tx.send(ProgressUpdate::Status("Installing TTW...".to_string())).ok();
+                                tx.send(ProgressUpdate::Log("[INFO] Starting TTW installation...".to_string())).ok();
+
+                                let install_path = std::path::Path::new(&install_clone);
+                                let mpi_path = std::path::Path::new(&ttw_mpi_clone);
+                                let fo3_path = std::path::Path::new(&ttw_fo3_clone);
+                                let fnv_path = std::path::Path::new(&ttw_fnv_clone);
+
+                                match crate::ttw::finalize_ttw_from_paths(install_path, mpi_path, fo3_path, fnv_path) {
+                                    Ok(ttw_output) => {
+                                        tx.send(ProgressUpdate::Log(format!(
+                                            "[INFO] TTW installation completed! Output: {}",
+                                            ttw_output.display()
+                                        ))).ok();
+                                    }
+                                    Err(e) => {
+                                        ttw_success = false;
+                                        tx.send(ProgressUpdate::Log(format!(
+                                            "[ERROR] TTW installation failed: {}",
+                                            e
+                                        ))).ok();
+                                        tx.send(ProgressUpdate::Log(
+                                            "[ERROR] Skipping Steam integration - please install TTW manually and re-run.".to_string()
+                                        )).ok();
+                                    }
+                                }
+                            } else if ttw_required {
+                                ttw_success = false;
+                                tx.send(ProgressUpdate::Log(
+                                    "[ERROR] TTW required but paths not configured. Please configure and re-run.".to_string()
+                                )).ok();
+                            }
+
+                            // Only run NaK if TTW succeeded (or wasn't required)
+                            if !ttw_success {
+                                tx.send(ProgressUpdate::Status("Installation incomplete - TTW failed".to_string())).ok();
+                                tx.send(ProgressUpdate::Error("TTW installation failed".to_string())).ok();
+                                return;
+                            }
+
+                            // Fix GPU settings in INI files (sD3DDevice)
+                            tx.send(ProgressUpdate::Status("Fixing GPU settings...".to_string())).ok();
+                            let install_path = std::path::Path::new(&install_clone);
+                            match crate::gpu::fix_ini_gpu_settings(install_path) {
+                                Ok(count) => {
+                                    if count > 0 {
+                                        tx.send(ProgressUpdate::Log(format!(
+                                            "[INFO] Fixed sD3DDevice in {} INI files",
+                                            count
+                                        ))).ok();
+                                    }
+                                }
+                                Err(e) => {
+                                    tx.send(ProgressUpdate::Log(format!(
+                                        "[WARN] Could not fix GPU settings: {}",
+                                        e
+                                    ))).ok();
+                                }
+                            }
 
                             // Run NaK for MO2 setup with Steam/Proton integration
-                            let tx = get_progress_sender();
-                            tx.send(ProgressUpdate::Status("Setting up MO2 with Steam...".to_string())).ok();
+                            tx.send(ProgressUpdate::Status("Setting up MO2...".to_string())).ok();
                             tx.send(ProgressUpdate::Log("[INFO] Running NaK for MO2/Steam integration...".to_string())).ok();
 
                             match crate::nak::NakManager::new() {
@@ -3947,19 +4219,50 @@ pub fn run() -> Result<(), slint::PlatformError> {
 
                                                 // Trigger game detection in background thread
                                                 main_window.set_detected_game("Loading...".into());
+                                                main_window.set_ttw_required(false);
+                                                main_window.set_ttw_mpi_path("".into());
                                                 let window_weak_detect = main_window.as_weak();
                                                 let path_clone = path.clone();
                                                 std::thread::spawn(move || {
-                                                    let result = detect_game_from_wabbajack(&path_clone);
+                                                    let result = detect_modlist_info(&path_clone);
                                                     slint::invoke_from_event_loop(move || {
                                                         if let Some(window) = window_weak_detect.upgrade() {
                                                             match result {
-                                                                Ok(game_info) => {
-                                                                    window.set_detected_game(game_info.into());
+                                                                Ok(info) => {
+                                                                    window.set_detected_game(info.game_display.into());
+
+                                                                    // Set TTW properties
+                                                                    window.set_ttw_required(info.ttw_required);
+                                                                    window.set_ttw_fo3_found(info.fo3_path.is_some());
+                                                                    window.set_ttw_fnv_found(info.fnv_path.is_some());
+
+                                                                    if let Some(fo3) = info.fo3_path {
+                                                                        window.set_ttw_fo3_path(fo3.display().to_string().into());
+                                                                    } else {
+                                                                        window.set_ttw_fo3_path("".into());
+                                                                    }
+
+                                                                    if let Some(fnv) = info.fnv_path {
+                                                                        window.set_ttw_fnv_path(fnv.display().to_string().into());
+                                                                    } else {
+                                                                        window.set_ttw_fnv_path("".into());
+                                                                    }
+
+                                                                    // Apply cached configuration (always overwrite)
+                                                                    if let Some(install_dir) = info.cached_install_dir {
+                                                                        window.set_install_dir(install_dir.into());
+                                                                    }
+                                                                    if let Some(downloads_dir) = info.cached_downloads_dir {
+                                                                        window.set_downloads_dir(downloads_dir.into());
+                                                                    }
+                                                                    if let Some(ttw_mpi) = info.cached_ttw_mpi_path {
+                                                                        window.set_ttw_mpi_path(ttw_mpi.into());
+                                                                    }
                                                                 }
                                                                 Err(e) => {
                                                                     eprintln!("Failed to detect game: {}", e);
                                                                     window.set_detected_game(format!("Error: {}", e).into());
+                                                                    window.set_ttw_required(false);
                                                                 }
                                                             }
                                                         }
@@ -5084,6 +5387,149 @@ fn detect_game_from_wabbajack(path: &std::path::Path) -> anyhow::Result<String> 
         display_name
     ))).ok();
     Ok(format!("{} (not found)", display_name))
+}
+
+/// Result of detecting game and TTW requirements from a wabbajack file
+struct ModlistDetectionResult {
+    /// Game display string (e.g., "Fallout New Vegas (Steam)")
+    game_display: String,
+    /// Whether TTW is required
+    ttw_required: bool,
+    /// Fallout 3 path if found
+    fo3_path: Option<std::path::PathBuf>,
+    /// Fallout New Vegas path if found
+    fnv_path: Option<std::path::PathBuf>,
+    /// Modlist name (for config cache)
+    modlist_name: String,
+    /// Modlist version (for config cache)
+    modlist_version: String,
+    /// Cached install directory
+    cached_install_dir: Option<String>,
+    /// Cached downloads directory
+    cached_downloads_dir: Option<String>,
+    /// Cached TTW MPI path
+    cached_ttw_mpi_path: Option<String>,
+}
+
+/// Detect game and TTW requirements from a wabbajack file
+fn detect_modlist_info(path: &std::path::Path) -> anyhow::Result<ModlistDetectionResult> {
+    use anyhow::Context;
+
+    // Parse the modlist
+    let modlist = crate::modlist::parse_wabbajack_file(path)
+        .context("Failed to parse wabbajack file")?;
+
+    // Calculate sizes
+    let download_size: u64 = modlist.archives.iter().map(|a| a.size).sum();
+    let install_size: u64 = modlist.directives.iter().map(|d| d.size()).sum();
+
+    // Log metadata
+    let tx = get_progress_sender();
+    tx.send(ProgressUpdate::Log(format!(
+        "[INFO] Modlist: {} v{}",
+        modlist.name, modlist.version
+    ))).ok();
+
+    if !modlist.author.is_empty() {
+        tx.send(ProgressUpdate::Log(format!(
+            "[INFO] Author: {}",
+            modlist.author
+        ))).ok();
+    }
+
+    let game_type = &modlist.game_type;
+    let display_name = game_name_to_display(game_type);
+
+    tx.send(ProgressUpdate::Log(format!("[INFO] Game: {}", display_name))).ok();
+    tx.send(ProgressUpdate::Log(format!("[INFO] Download Size: {}", format_bytes(download_size)))).ok();
+    tx.send(ProgressUpdate::Log(format!("[INFO] Install Size: {}", format_bytes(install_size)))).ok();
+    tx.send(ProgressUpdate::Log(format!(
+        "[INFO] Archives: {}, Directives: {}",
+        modlist.archives.len(),
+        modlist.directives.len()
+    ))).ok();
+
+    // Detect TTW requirement
+    let ttw_result = modlist.requires_ttw();
+    let ttw_required = ttw_result.required;
+
+    if ttw_required {
+        tx.send(ProgressUpdate::Log(format!(
+            "[INFO] TTW Required: Yes (detected: {})",
+            ttw_result.markers_found.join(", ")
+        ))).ok();
+    }
+
+    // Use detect_all_games for game detection
+    let scan_result = crate::game_finder::detect_all_games();
+
+    // Find Fallout 3 (for TTW)
+    let fo3_path = crate::ttw::find_fallout3(&scan_result);
+    if ttw_required {
+        if let Some(ref path) = fo3_path {
+            tx.send(ProgressUpdate::Log(format!("[INFO] Fallout 3 found: {}", path.display()))).ok();
+        } else {
+            tx.send(ProgressUpdate::Log("[WARN] Fallout 3 not found - required for TTW".to_string())).ok();
+        }
+    }
+
+    // Find Fallout New Vegas (for TTW)
+    let fnv_path = crate::ttw::find_fallout_nv(&scan_result);
+    if ttw_required {
+        if let Some(ref path) = fnv_path {
+            tx.send(ProgressUpdate::Log(format!("[INFO] Fallout NV found: {}", path.display()))).ok();
+        }
+    }
+
+    // Find the main game for display
+    let app_ids = game_name_to_app_ids(game_type);
+    let game_display = if !app_ids.is_empty() {
+        let mut found = None;
+        for app_id in &app_ids {
+            if let Some(game) = scan_result.find_by_app_id(app_id) {
+                let platform = game.launcher.display_name();
+                tx.send(ProgressUpdate::Log(format!(
+                    "[INFO] Found game at: {}",
+                    game.install_path.display()
+                ))).ok();
+                found = Some(format!("{} ({})", display_name, platform));
+                break;
+            }
+        }
+        found.unwrap_or_else(|| {
+            tx.send(ProgressUpdate::Log(format!("[WARN] Game not found: {}", display_name))).ok();
+            format!("{} (not found)", display_name)
+        })
+    } else {
+        format!("{} (unknown)", display_name)
+    };
+
+    // Load cached config for this modlist
+    let (cached_install_dir, cached_downloads_dir, cached_ttw_mpi_path) =
+        match crate::installer::ConfigCache::open() {
+            Ok(cache) => {
+                match cache.get_config(&modlist.name, &modlist.version) {
+                    Ok(Some(config)) => {
+                        tx.send(ProgressUpdate::Log("[INFO] Loaded cached configuration".to_string())).ok();
+                        (config.install_dir, config.downloads_dir, config.ttw_mpi_path)
+                    }
+                    _ => (None, None, None),
+                }
+            }
+            Err(_) => (None, None, None),
+        };
+
+    Ok(ModlistDetectionResult {
+        game_display,
+        ttw_required,
+        fo3_path,
+        fnv_path,
+        modlist_name: modlist.name,
+        modlist_version: modlist.version,
+        cached_install_dir,
+        cached_downloads_dir,
+        cached_ttw_mpi_path,
+    })
 }
 
 /// Format bytes into human-readable string (B, KiB, MiB, GiB)

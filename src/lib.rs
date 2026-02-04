@@ -9,6 +9,7 @@ pub mod downloaders;
 pub mod file_router;
 pub mod game_finder;
 pub mod games;
+pub mod gpu;
 pub mod gui;
 pub mod hash;
 pub mod installer;
@@ -20,6 +21,7 @@ pub mod nxm_handler;
 pub mod octodiff;
 pub mod paths;
 pub mod textures;
+pub mod ttw;
 
 // Re-export commonly used types
 pub use file_router::{FileRouter, ModType};
