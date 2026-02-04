@@ -18,7 +18,7 @@ Named after Chlorine Trifluoride - burns through modlists like ClF3 burns throug
 
 **Early development** - Testing welcome!
 
-- Wabbajack: Works with Tuxborn and LoreRim (Skyrim SE). Other modlists untested.
+Games/Modlist Tested: BG3EE, Tuxborn, LoreRim, Heartland Redux, Fallout Anomaly, Viva New Vegas, Outlander.
 
 ## Build
 
