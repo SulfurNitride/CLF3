@@ -1732,7 +1732,7 @@ slint::slint! {
 
                 // Status/count
                 Text {
-                    text: is_loading ? status_message : modlists.length + " modlists";
+                    text: is_loading ? status_message : visible_count + " modlists";
                     font-size: 12px;
                     color: #6c7086;
                     vertical-alignment: center;
