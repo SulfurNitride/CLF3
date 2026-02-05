@@ -2,11 +2,12 @@
 //!
 //! Stores user configurations (paths, settings) keyed by modlist identity,
 //! so when the user loads the same modlist again, paths are auto-filled.
+#![allow(dead_code)] // Used by lib crate (GUI), not by binary crate
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::info;
 
 /// Cached configuration for a modlist installation
@@ -350,7 +351,6 @@ pub fn precheck_modlist(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
 
     fn test_cache() -> ConfigCache {
         // Use in-memory database for tests

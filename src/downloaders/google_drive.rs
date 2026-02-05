@@ -145,8 +145,16 @@ impl Default for GoogleDriveDownloader {
 ///
 /// Based on gdown's approach - tries multiple extraction methods.
 fn parse_confirmation_page(html: &str, file_id: &str) -> Result<String> {
+    use std::sync::OnceLock;
+
+    static UUID_RE: OnceLock<Regex> = OnceLock::new();
+    static DOWNLOAD_RE: OnceLock<Regex> = OnceLock::new();
+    static JSON_RE: OnceLock<Regex> = OnceLock::new();
+    static CONFIRM_RE: OnceLock<Regex> = OnceLock::new();
+    static ERROR_RE: OnceLock<Regex> = OnceLock::new();
+
     // Method 1: Look for uuid parameter in the page (new Google Drive format)
-    let uuid_re = Regex::new(r#"uuid[&=]([a-f0-9-]+)"#).unwrap();
+    let uuid_re = UUID_RE.get_or_init(|| Regex::new(r#"uuid[&=]([a-f0-9-]+)"#).unwrap());
     if let Some(caps) = uuid_re.captures(html) {
         let uuid = caps.get(1).unwrap().as_str();
         let url = format!(
@@ -158,7 +166,7 @@ fn parse_confirmation_page(html: &str, file_id: &str) -> Result<String> {
     }
 
     // Method 2: Look for href="/uc?export=download..." pattern (old format)
-    let download_re = Regex::new(r#"href="(/uc\?export=download[^"]+)"#).unwrap();
+    let download_re = DOWNLOAD_RE.get_or_init(|| Regex::new(r#"href="(/uc\?export=download[^"]+)"#).unwrap());
     if let Some(caps) = download_re.captures(html) {
         let path = caps.get(1).unwrap().as_str();
         let url = format!("https://docs.google.com{}", path.replace("&amp;", "&"));
@@ -204,7 +212,7 @@ fn parse_confirmation_page(html: &str, file_id: &str) -> Result<String> {
     }
 
     // Method 4: Look for embedded JSON with downloadUrl
-    let json_re = Regex::new(r#""downloadUrl":"([^"]+)""#).unwrap();
+    let json_re = JSON_RE.get_or_init(|| Regex::new(r#""downloadUrl":"([^"]+)""#).unwrap());
     if let Some(caps) = json_re.captures(html) {
         let url = caps
             .get(1)
@@ -218,7 +226,7 @@ fn parse_confirmation_page(html: &str, file_id: &str) -> Result<String> {
     }
 
     // Method 5: Try confirm=t with the file ID directly
-    let confirm_re = Regex::new(r#"confirm=([a-zA-Z0-9_-]+)"#).unwrap();
+    let confirm_re = CONFIRM_RE.get_or_init(|| Regex::new(r#"confirm=([a-zA-Z0-9_-]+)"#).unwrap());
     if let Some(caps) = confirm_re.captures(html) {
         let confirm = caps.get(1).unwrap().as_str();
         let url = format!(
@@ -241,7 +249,7 @@ fn parse_confirmation_page(html: &str, file_id: &str) -> Result<String> {
         return Ok(url);
     }
 
-    let error_re = Regex::new(r#"<p class="uc-error-subcaption">(.*?)</p>"#).unwrap();
+    let error_re = ERROR_RE.get_or_init(|| Regex::new(r#"<p class="uc-error-subcaption">(.*?)</p>"#).unwrap());
     if let Some(caps) = error_re.captures(html) {
         let error_msg = caps.get(1).unwrap().as_str();
         bail!("Google Drive error: {}", error_msg);

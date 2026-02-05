@@ -295,7 +295,7 @@ impl BsaWriterManager {
             .get(&location_index)
             .ok_or_else(|| anyhow::anyhow!("Location {} is not a BSA target", location_index))?;
 
-        builder.lock().unwrap().add_file(path, data);
+        builder.lock().expect("BSA builder lock poisoned").add_file(path, data);
         Ok(())
     }
 
@@ -304,7 +304,7 @@ impl BsaWriterManager {
         let non_empty: Vec<_> = self
             .builders
             .iter()
-            .filter(|(_, (_, b))| !b.lock().unwrap().is_empty())
+            .filter(|(_, (_, b))| !b.lock().expect("BSA builder lock poisoned").is_empty())
             .collect();
 
         if non_empty.is_empty() {
@@ -319,7 +319,7 @@ impl BsaWriterManager {
             .map(|(_, (name, builder))| {
                 let output_path = dest_dir.join(name);
                 let builder_data = {
-                    let guard = builder.lock().unwrap();
+                    let guard = builder.lock().expect("BSA builder lock poisoned");
                     // Clone the data we need for building
                     BsaBuilder {
                         files: guard.files.clone(),
@@ -363,7 +363,7 @@ impl BsaWriterManager {
         let non_empty: Vec<_> = self
             .builders
             .iter()
-            .filter(|(_, (_, b))| !b.lock().unwrap().is_empty())
+            .filter(|(_, (_, b))| !b.lock().expect("BSA builder lock poisoned").is_empty())
             .collect();
 
         if non_empty.is_empty() {
@@ -378,7 +378,7 @@ impl BsaWriterManager {
             .map(|(_, (name, builder))| {
                 let output_path = dest_dir.join(name);
                 let builder_data = {
-                    let guard = builder.lock().unwrap();
+                    let guard = builder.lock().expect("BSA builder lock poisoned");
                     BsaBuilder {
                         files: guard.files.clone(),
                         flags: guard.flags,

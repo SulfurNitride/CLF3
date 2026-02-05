@@ -51,6 +51,7 @@ pub fn verify_file_hash(path: &Path, expected_hash: &str) -> Result<bool> {
 /// Verify a file's hash and return detailed result.
 ///
 /// Returns (matches, actual_hash) for logging/debugging.
+#[allow(dead_code)] // Part of hash API, not yet wired up
 pub fn verify_file_hash_detailed(path: &Path, expected_hash: &str) -> Result<(bool, String)> {
     let actual_hash = compute_file_hash(path)?;
     let matches = actual_hash == expected_hash;
@@ -60,6 +61,7 @@ pub fn verify_file_hash_detailed(path: &Path, expected_hash: &str) -> Result<(bo
 /// Batch verify multiple archives and return list of failures.
 ///
 /// Returns Vec of (path, expected_hash, actual_hash) for failed verifications.
+#[allow(dead_code)] // Part of hash API, not yet wired up
 pub fn verify_archives_batch<P: AsRef<Path>>(
     archives: &[(P, &str)], // (path, expected_hash)
     progress_callback: Option<&dyn Fn(usize, usize)>, // (current, total)

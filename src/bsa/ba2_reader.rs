@@ -11,6 +11,13 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{debug, info, warn};
 
+/// Normalize a file path to both forward-slash and backslash lowercase forms for BA2 lookup.
+fn normalize_ba2_path(path: &str) -> (String, String) {
+    let forward = path.replace('\\', "/").to_lowercase();
+    let back = path.replace('/', "\\").to_lowercase();
+    (forward, back)
+}
+
 /// Entry for a file in a BA2 archive
 #[derive(Debug, Clone)]
 pub struct Ba2FileEntry {
@@ -57,8 +64,7 @@ pub fn extract_file(ba2_path: &Path, file_path: &str) -> Result<Vec<u8>> {
     let write_options: FileWriteOptions = options.into();
 
     // Normalize path for comparison (BA2 uses forward slashes typically)
-    let normalized = file_path.replace('\\', "/").to_lowercase();
-    let normalized_backslash = file_path.replace('/', "\\").to_lowercase();
+    let (normalized, normalized_backslash) = normalize_ba2_path(file_path);
 
     for (key, file) in archive.iter() {
         let current_path = String::from_utf8_lossy(key.name().as_bytes()).to_lowercase();
@@ -96,24 +102,16 @@ pub fn extract_batch_parallel(
     let write_options: FileWriteOptions = options.into();
 
     // Build set of normalized paths we need (try both slash conventions)
-    let needed: std::collections::HashSet<String> = file_paths
-        .iter()
-        .flat_map(|p| {
-            let forward = p.replace('\\', "/").to_lowercase();
-            let back = p.replace('/', "\\").to_lowercase();
-            vec![forward, back]
-        })
-        .collect();
+    let mut needed = std::collections::HashSet::with_capacity(file_paths.len() * 2);
+    let mut path_lookup = std::collections::HashMap::with_capacity(file_paths.len() * 2);
 
-    // Build lookup for original casing
-    let path_lookup: std::collections::HashMap<String, &str> = file_paths
-        .iter()
-        .flat_map(|p| {
-            let forward = p.replace('\\', "/").to_lowercase();
-            let back = p.replace('/', "\\").to_lowercase();
-            vec![(forward, *p), (back, *p)]
-        })
-        .collect();
+    for p in file_paths {
+        let (forward, back) = normalize_ba2_path(p);
+        path_lookup.insert(forward.clone(), *p);
+        path_lookup.insert(back.clone(), *p);
+        needed.insert(forward);
+        needed.insert(back);
+    }
 
     // Memory tracking
     let bytes_extracted = AtomicUsize::new(0);
@@ -123,16 +121,15 @@ pub fn extract_batch_parallel(
     let mut matches: Vec<(String, &ba2::fo4::File)> = Vec::new();
 
     for (key, file) in archive.iter() {
-        let current_path = String::from_utf8_lossy(key.name().as_bytes()).to_lowercase();
-        let current_forward = current_path.replace('\\', "/");
-        let current_back = current_path.replace('/', "\\");
+        let raw_path = String::from_utf8_lossy(key.name().as_bytes());
+        let (current_forward, current_back) = normalize_ba2_path(&raw_path);
 
         if needed.contains(&current_forward) || needed.contains(&current_back) {
             let original = path_lookup
                 .get(&current_forward)
                 .or_else(|| path_lookup.get(&current_back))
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| current_path.clone());
+                .unwrap_or(current_forward.clone());
 
             matches.push((original, file));
         }

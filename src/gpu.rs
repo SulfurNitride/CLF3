@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
-use tracing::{info, warn};
+use tracing::info;
 use walkdir::WalkDir;
 
 /// Get the primary GPU device name as seen by Vulkan/DXVK

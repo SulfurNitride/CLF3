@@ -11,6 +11,7 @@ pub mod browser;
 
 pub use types::*;
 pub use db::*;
+#[allow(unused_imports)] // Used by lib crate (GUI)
 pub use browser::*;
 
 use anyhow::{Context, Result};

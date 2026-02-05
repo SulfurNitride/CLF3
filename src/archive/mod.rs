@@ -23,8 +23,8 @@
 pub mod sevenzip;
 
 // Re-export commonly used functions for convenience
+#[allow(unused_imports)] // Used by lib crate consumers
 pub use sevenzip::{
     extract_all, extract_all_with_threads, extract_file, extract_file_case_insensitive,
-    extract_file_streaming, extract_file_to_memory, get_7z_path, is_solid_archive, list_archive,
-    ArchiveEntry,
+    get_7z_path, is_solid_archive, list_archive,
 };

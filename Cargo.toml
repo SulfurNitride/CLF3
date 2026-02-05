@@ -1,6 +1,6 @@
 [package]
 name = "clf3"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2021"
 description = "Wabbajack modlist installer for Linux"
 license = "MIT"
@@ -86,10 +86,6 @@ memmap2 = "0.9"
 reflink-copy = "0.1.28"
 which = "8.0"
 
-# NXM handler server
-axum = "0.8.8"
-tokio-stream = "0.1.18"
-
 # Collection support (FOMOD/XML parsing)
 quick-xml = "0.39"
 encoding_rs = "0.8.35"
@@ -99,11 +95,6 @@ md5 = "0.7"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 base64 = "0.22"
 
-# Plugin sorting (LOOT)
-libloot = "0.28.4"
-
-# Graph algorithms (for mod ordering)
-petgraph = "0.8.3"
 dirs = "6.0.0"
 
 # GUI

@@ -407,6 +407,7 @@ pub fn extract_file_case_insensitive(archive_path: &Path, file_path: &str) -> Re
 /// Extract a single file from archive directly to a file using streaming (7z e -so).
 /// This avoids loading the entire archive into memory.
 /// Works with 7z, RAR, and ZIP formats.
+#[allow(dead_code)] // Part of sevenzip API, not yet wired up
 pub fn extract_file_streaming(
     archive_path: &Path,
     file_in_archive: &str,
@@ -467,6 +468,7 @@ pub fn extract_file_streaming(
 
 /// Extract a single file from archive to memory using streaming (7z e -so).
 /// Use this for small files or when you need the data in memory.
+#[allow(dead_code)] // Part of sevenzip API, not yet wired up
 pub fn extract_file_to_memory(archive_path: &Path, file_in_archive: &str) -> Result<Vec<u8>> {
     let bin = get_7z_path()?;
 
@@ -674,6 +676,7 @@ fn normalize_path(path: &str) -> String {
 /// Build a case-insensitive lookup map from archive entries.
 ///
 /// Returns a HashMap from normalized path to actual path in archive.
+#[allow(dead_code)] // Used in tests; part of sevenzip API
 pub fn build_path_lookup(entries: &[ArchiveEntry]) -> HashMap<String, String> {
     let mut lookup = HashMap::new();
     for entry in entries {

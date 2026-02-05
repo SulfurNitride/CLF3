@@ -10,12 +10,8 @@ pub type ProgressCallback = Arc<dyn Fn(ProgressEvent) + Send + Sync>;
 
 /// Events reported during installation for progress tracking
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields are read in the GUI (lib crate) but not by the binary crate
 pub enum ProgressEvent {
-    /// A download has started
-    DownloadStarted {
-        name: String,
-        size: u64,
-    },
     /// Download progress update
     DownloadProgress {
         name: String,
@@ -46,12 +42,6 @@ pub enum ProgressEvent {
     PhaseChange {
         phase: String,
     },
-    /// A directive processing started
-    DirectiveStarted {
-        index: usize,
-        total: usize,
-        name: String,
-    },
     /// A directive completed
     DirectiveComplete {
         index: usize,
@@ -59,10 +49,6 @@ pub enum ProgressEvent {
     },
     /// Status message update
     Status {
-        message: String,
-    },
-    /// Log message
-    Log {
         message: String,
     },
     /// Directive processing phase started (e.g., FromArchive, PatchedFromArchive)
@@ -98,9 +84,6 @@ pub struct InstallConfig {
     /// Use NXM browser mode instead of direct API
     pub nxm_mode: bool,
 
-    /// Port for NXM handler server
-    pub nxm_port: u16,
-
     /// Browser command to open Nexus pages
     pub browser: String,
 
@@ -118,7 +101,6 @@ impl std::fmt::Debug for InstallConfig {
             .field("nexus_api_key", &"[REDACTED]")
             .field("max_concurrent_downloads", &self.max_concurrent_downloads)
             .field("nxm_mode", &self.nxm_mode)
-            .field("nxm_port", &self.nxm_port)
             .field("browser", &self.browser)
             .field("progress_callback", &self.progress_callback.as_ref().map(|_| "<callback>"))
             .finish()

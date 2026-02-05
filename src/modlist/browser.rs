@@ -1,4 +1,5 @@
 //! Modlist browser for fetching and displaying available modlists from Wabbajack repositories.
+#![allow(dead_code)] // Used by lib crate (GUI), not by binary crate
 
 use crate::downloaders::wabbajack_cdn::WabbajackCdnDownloader;
 use anyhow::{Context, Result};
@@ -10,7 +11,6 @@ use tracing::{debug, info, warn};
 
 const REPOSITORIES_URL: &str = "https://raw.githubusercontent.com/wabbajack-tools/mod-lists/master/repositories.json";
 const FEATURED_URL: &str = "https://raw.githubusercontent.com/wabbajack-tools/mod-lists/master/featured_lists.json";
-const REPO_BASE_URL: &str = "https://raw.githubusercontent.com/wabbajack-tools/mod-lists/master";
 
 /// Download metadata for a modlist
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

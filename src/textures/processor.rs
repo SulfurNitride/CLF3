@@ -191,7 +191,7 @@ static GPU_ENCODER: std::sync::OnceLock<Arc<Mutex<Option<GpuEncoder>>>> = std::s
 /// Initialize the global GPU encoder
 pub fn init_gpu() -> Result<()> {
     let encoder = GPU_ENCODER.get_or_init(|| Arc::new(Mutex::new(None)));
-    let mut lock = encoder.lock().unwrap();
+    let mut lock = encoder.lock().expect("GPU encoder lock poisoned");
     if lock.is_none() {
         match GpuEncoder::new() {
             Ok(e) => {

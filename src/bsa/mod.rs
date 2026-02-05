@@ -36,7 +36,7 @@ pub use ba2_reader::{
     extract_file as extract_ba2_file,
     extract_batch_parallel as extract_ba2_batch_parallel,
 };
-pub use ba2_writer::{Ba2Builder, Ba2Format, Ba2CompressionFormat};
+pub use ba2_writer::{Ba2Builder, Ba2Format, Ba2CompressionFormat, Ba2Version};
 
 use anyhow::{bail, Result};
 use ba2::tes4::{ArchiveFlags, ArchiveTypes, Version};

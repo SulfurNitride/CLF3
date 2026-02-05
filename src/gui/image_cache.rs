@@ -363,25 +363,6 @@ pub async fn download_images_parallel(
     (succeeded, failed)
 }
 
-/// Result of a sync operation
-#[derive(Debug)]
-pub struct SyncResult {
-    pub downloaded: usize,
-    pub skipped: usize,
-    pub failed: usize,
-    pub removed: usize,
-}
-
-impl std::fmt::Display for SyncResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Downloaded: {}, Skipped: {}, Failed: {}, Removed: {}",
-            self.downloaded, self.skipped, self.failed, self.removed
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -40,6 +40,50 @@ pub enum Ba2Format {
     DX10,
 }
 
+/// BA2 archive version
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Ba2Version {
+    /// Version 1 - Old-gen Fallout 4, Fallout 76
+    V1,
+    /// Version 7 - Next-gen Fallout 4
+    #[default]
+    V7,
+    /// Version 8 - Next-gen Fallout 4
+    V8,
+    /// Version 2 - Starfield
+    V2,
+    /// Version 3 - Starfield
+    V3,
+}
+
+impl Ba2Version {
+    /// Create from numeric version in modlist
+    pub fn from_u32(v: u32) -> Self {
+        match v {
+            1 => Ba2Version::V1,
+            2 => Ba2Version::V2,
+            3 => Ba2Version::V3,
+            7 => Ba2Version::V7,
+            8 => Ba2Version::V8,
+            _ => {
+                tracing::warn!("Unknown BA2 version {}, defaulting to v7", v);
+                Ba2Version::V7
+            }
+        }
+    }
+
+    /// Convert to ba2 crate Version
+    fn to_crate_version(self) -> Version {
+        match self {
+            Ba2Version::V1 => Version::v1,
+            Ba2Version::V2 => Version::v2,
+            Ba2Version::V3 => Version::v3,
+            Ba2Version::V7 => Version::v7,
+            Ba2Version::V8 => Version::v8,
+        }
+    }
+}
+
 /// Builder for creating BA2 archives
 pub struct Ba2Builder {
     /// Files organized by path -> data
@@ -50,6 +94,8 @@ pub struct Ba2Builder {
     compression: Ba2CompressionFormat,
     /// Whether to include string table
     strings: bool,
+    /// BA2 version (v1 for OG FO4, v7/v8 for NG FO4, v2/v3 for Starfield)
+    version: Ba2Version,
 }
 
 impl Ba2Builder {
@@ -59,6 +105,7 @@ impl Ba2Builder {
             format: Ba2Format::General,
             compression: Ba2CompressionFormat::None,
             strings: true,
+            version: Ba2Version::V7,
         }
     }
 
@@ -94,7 +141,14 @@ impl Ba2Builder {
             format,
             compression,
             strings: true,
+            version: Ba2Version::V7,
         }
+    }
+
+    /// Set BA2 version (v1 for OG FO4, v7/v8 for NG FO4, v2/v3 for Starfield)
+    pub fn with_version(mut self, version: Ba2Version) -> Self {
+        self.version = version;
+        self
     }
 
     /// Set archive format
@@ -192,9 +246,9 @@ impl Ba2Builder {
         // Build archive from entries
         let archive: Archive = archive_entries.into_iter().collect();
 
-        // Configure options - use v7 for Fallout 4 compatibility
+        // Configure options with version from modlist
         let options = ArchiveOptionsBuilder::default()
-            .version(Version::v7)
+            .version(self.version.to_crate_version())
             .strings(self.strings)
             .build();
 
@@ -258,9 +312,9 @@ impl Ba2Builder {
         let archive_entries = archive_entries?;
         let archive: Archive = archive_entries.into_iter().collect();
 
-        // DX10 format requires format flag set in archive options - use v7 for FO4
+        // DX10 format requires format flag set in archive options
         let options = ArchiveOptionsBuilder::default()
-            .version(Version::v7)
+            .version(self.version.to_crate_version())
             .format(Format::DX10)
             .compression_format(Ba2CrateCompression::Zip)
             .strings(self.strings)

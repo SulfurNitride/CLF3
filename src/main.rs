@@ -6,12 +6,8 @@
 mod archive;
 mod bsa;
 mod downloaders;
-mod file_router;
-mod games;
 mod hash;
 mod installer;
-mod loot;
-mod mo2;
 mod modlist;
 mod nxm_handler;
 mod octodiff;
@@ -69,10 +65,6 @@ enum Commands {
         #[arg(long)]
         nxm_mode: bool,
 
-        /// Port for NXM handler server (default: 8007)
-        #[arg(long, default_value = "8007")]
-        nxm_port: u16,
-
         /// Browser command to open Nexus pages (default: xdg-open)
         #[arg(long, default_value = "xdg-open")]
         browser: String,
@@ -85,20 +77,12 @@ enum Commands {
     },
 
     /// Register CLF3 as the system handler for nxm:// links
-    NxmRegister {
-        /// Port for NXM handler server
-        #[arg(long, default_value = "8007")]
-        port: u16,
-    },
+    NxmRegister,
 
     /// Handle an nxm:// link (called by the system)
     NxmHandle {
         /// The nxm:// URL to handle
         url: String,
-
-        /// Port to send the link to
-        #[arg(long, default_value = "8007")]
-        port: u16,
     },
 
     /// List files inside a BSA archive
@@ -201,7 +185,6 @@ async fn main() -> Result<()> {
             nexus_key,
             concurrent,
             nxm_mode,
-            nxm_port,
             browser,
         }) => {
             // Default to CPU thread count
@@ -225,7 +208,6 @@ async fn main() -> Result<()> {
                 nexus_api_key: nexus_key,
                 max_concurrent_downloads: concurrent,
                 nxm_mode,
-                nxm_port,
                 browser,
                 progress_callback: None, // CLI doesn't need progress callback
             };
@@ -251,13 +233,13 @@ async fn main() -> Result<()> {
             }
         }
 
-        Some(Commands::NxmRegister { port }) => {
+        Some(Commands::NxmRegister) => {
             let exe = std::env::current_exe()?.to_string_lossy().to_string();
-            nxm_handler::register_handler(&exe, port)?;
+            nxm_handler::register_handler(&exe)?;
         }
 
-        Some(Commands::NxmHandle { url, port }) => {
-            nxm_handler::send_to_server(port, &url).await?;
+        Some(Commands::NxmHandle { url }) => {
+            nxm_handler::send_to_socket(&url)?;
         }
 
         Some(Commands::ListBsa { bsa_file }) => {
@@ -314,7 +296,7 @@ async fn main() -> Result<()> {
             println!("Directives:        {}", modlist.directives.len());
 
             // Count directives by type
-            let mut type_counts = std::collections::HashMap::new();
+            let mut type_counts = std::collections::HashMap::with_capacity(10);
             for directive in &modlist.directives {
                 *type_counts.entry(directive.directive_type()).or_insert(0) += 1;
             }
@@ -327,7 +309,7 @@ async fn main() -> Result<()> {
             }
 
             // Count download sources
-            let mut source_counts = std::collections::HashMap::new();
+            let mut source_counts = std::collections::HashMap::with_capacity(10);
             for archive in &modlist.archives {
                 let source_type = match &archive.state {
                     modlist::DownloadState::Nexus(_) => "Nexus",

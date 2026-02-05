@@ -370,7 +370,7 @@ impl NakManager {
         ];
 
         for path in &steam_paths {
-            if let Ok(mut child) = Command::new(path)
+            if let Ok(child) = Command::new(path)
                 .spawn()
             {
                 eprintln!("[NaK] Steam restarted via {}", path);
@@ -381,7 +381,7 @@ impl NakManager {
         }
 
         // Also try flatpak Steam
-        if let Ok(mut child) = Command::new("flatpak")
+        if let Ok(child) = Command::new("flatpak")
             .args(["run", "com.valvesoftware.Steam"])
             .spawn()
         {

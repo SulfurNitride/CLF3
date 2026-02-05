@@ -8,7 +8,7 @@
 //! - Parallel processing using rayon
 
 use crate::bsa::{self, BsaCache, list_files as list_bsa_files};
-use crate::modlist::{ArchiveFileEntry, Directive, FromArchiveDirective, ModlistDb};
+use crate::modlist::{ArchiveFileEntry, Directive, ModlistDb};
 use crate::paths;
 
 use super::config::InstallConfig;
@@ -16,11 +16,11 @@ use super::handlers;
 use super::handlers::from_archive::{ArchiveType, detect_archive_type, extract_from_archive_with_temp};
 
 use anyhow::{bail, Context, Result};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use zip::ZipArchive;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -103,15 +103,6 @@ fn list_rar_files(archive_path: &Path) -> Result<Vec<ArchiveFileEntry>> {
             file_size: e.size,
         })
         .collect())
-}
-
-/// Extract a single file from an archive (pure Rust implementation)
-fn extract_single_file(
-    archive_path: &Path,
-    file_path: &str,
-    temp_base_dir: &Path,
-) -> Result<Vec<u8>> {
-    extract_from_archive_with_temp(archive_path, file_path, temp_base_dir)
 }
 
 /// Extract multiple files from an archive (extracts whole archive, returns needed files)
@@ -419,7 +410,6 @@ pub struct ProcessStats {
 /// Helper for reporting progress to callback
 pub struct ProgressReporter {
     callback: Option<super::ProgressCallback>,
-    total_directives: usize,
     processed_count: AtomicUsize,
     /// Current phase's total (for accurate per-phase progress reporting)
     phase_total: AtomicUsize,
@@ -431,7 +421,6 @@ impl ProgressReporter {
     pub fn new(callback: Option<super::ProgressCallback>, total_directives: usize) -> Self {
         Self {
             callback,
-            total_directives,
             processed_count: AtomicUsize::new(0),
             phase_total: AtomicUsize::new(total_directives),
             phase_count: AtomicUsize::new(0),
@@ -475,20 +464,6 @@ impl ProgressReporter {
         }
     }
 
-    /// Report a status message
-    pub fn status(&self, message: &str) {
-        if let Some(ref callback) = self.callback {
-            callback(super::ProgressEvent::Status {
-                message: message.to_string(),
-            });
-        }
-    }
-
-    /// Get current processed count
-    pub fn get_count(&self) -> usize {
-        self.processed_count.load(Ordering::Relaxed)
-    }
-
     /// Set the processed count (for syncing with atomic counters)
     pub fn set_count(&self, count: usize) {
         self.processed_count.store(count, Ordering::Relaxed);
@@ -497,11 +472,6 @@ impl ProgressReporter {
     /// Get a clone of the callback (for passing to other threads)
     pub fn get_callback(&self) -> Option<super::ProgressCallback> {
         self.callback.clone()
-    }
-
-    /// Get the total directive count
-    pub fn get_total(&self) -> usize {
-        self.total_directives
     }
 
     /// Get the current phase's total count
@@ -592,7 +562,7 @@ impl<'a> ProcessContext<'a> {
     }
 
     pub fn read_wabbajack_file(&self, name: &str) -> Result<Vec<u8>> {
-        let mut archive = self.wabbajack.lock().unwrap();
+        let mut archive = self.wabbajack.lock().expect("wabbajack archive lock poisoned");
         let mut file = archive
             .by_name(name)
             .with_context(|| format!("File '{}' not found in wabbajack", name))?;
@@ -1032,136 +1002,6 @@ pub fn process_directives_streaming(
     Ok(stats)
 }
 
-/// Process all pending directives
-pub fn process_directives(db: &ModlistDb, config: &InstallConfig) -> Result<ProcessStats> {
-    let ctx = ProcessContext::new(config, db)?;
-
-    // Show directive counts
-    let type_counts = db.get_directive_type_counts()?;
-    println!("Directive types:");
-    for (dtype, count) in &type_counts {
-        println!("  {:>8}  {}", count, dtype);
-    }
-    println!();
-
-    // Pre-flight check: verify all needed archives are downloaded
-    println!("--- Pre-flight: Checking archives ---\n");
-    let missing_archives = check_missing_archives(db, &ctx)?;
-    if !missing_archives.is_empty() {
-        println!("ERROR: {} archives are missing! Re-run to download them:\n", missing_archives.len());
-        // Log to file for later reference
-        warn!("=== Missing Archives ({}) ===", missing_archives.len());
-        for (name, hash) in missing_archives.iter().take(20) {
-            println!("  - {} ({})", name, hash);
-            warn!("[MISSING] {} ({})", name, hash);
-        }
-        if missing_archives.len() > 20 {
-            println!("  ... and {} more", missing_archives.len() - 20);
-            // Log remaining archives too
-            for (name, hash) in missing_archives.iter().skip(20) {
-                warn!("[MISSING] {} ({})", name, hash);
-            }
-            warn!("... total {} missing archives", missing_archives.len());
-        }
-        bail!("Missing archives - re-run the installer to download them");
-    }
-    println!("All needed archives present\n");
-
-    // Phase 3a: Index archive contents for path lookup
-    println!("--- Phase 3a: Index archive contents ---\n");
-    index_archives(db, &ctx)?;
-
-    // Phase 3b: Process directives (on-demand extraction)
-    println!("\n--- Phase 3b: Process directives ---\n");
-
-    let stats = db.get_directive_stats()?;
-    let total_pending = stats.pending;
-
-    if total_pending == 0 {
-        println!("No directives to process");
-        return Ok(ProcessStats::default());
-    }
-
-    println!("Processing {} directives...\n", total_pending);
-
-    let pb = ProgressBar::new(total_pending as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {msg}",
-            )
-            .unwrap()
-            .progress_chars("=>-"),
-    );
-    pb.enable_steady_tick(Duration::from_millis(100));
-
-    let completed = AtomicUsize::new(0);
-    let skipped = AtomicUsize::new(0);
-    let failed = AtomicUsize::new(0);
-
-    // Create a dummy reporter (no callback for CLI mode)
-    let reporter = Arc::new(ProgressReporter::new(None, total_pending));
-
-    // Process FromArchive - grouped by archive for efficiency
-    pb.set_message("Processing FromArchive...");
-    process_from_archive_fast(db, &ctx, &pb, &completed, &skipped, &failed)?;
-
-    // Process InlineFile
-    pb.set_message("Processing InlineFile...");
-    process_simple_directives(db, &ctx, "InlineFile", &pb, &completed, &skipped, &failed, &reporter)?;
-
-    // Process RemappedInlineFile
-    pb.set_message("Processing RemappedInlineFile...");
-    process_simple_directives(
-        db,
-        &ctx,
-        "RemappedInlineFile",
-        &pb,
-        &completed,
-        &skipped,
-        &failed,
-        &reporter,
-    )?;
-
-    // PatchedFromArchive - with archive-level progress
-    pb.set_message("Processing PatchedFromArchive...");
-    process_patched_from_archive(db, &ctx, &pb, &completed, &skipped, &failed, &reporter)?;
-
-    // TransformedTexture - with archive-level progress
-    pb.set_message("Processing TransformedTexture...");
-    process_transformed_texture(db, &ctx, &pb, &completed, &skipped, &failed, &reporter)?;
-
-    // CreateBSA - must run LAST as it depends on staged files from other directives
-    pb.set_message("Processing CreateBSA...");
-    process_create_bsa(db, &ctx, &pb, &completed, &skipped, &failed, &reporter)?;
-
-    pb.finish_and_clear();
-
-    let stats = ProcessStats {
-        completed: completed.load(Ordering::Relaxed),
-        skipped: skipped.load(Ordering::Relaxed),
-        failed: failed.load(Ordering::Relaxed),
-    };
-
-    println!(
-        "Processed {} directives ({} completed, {} skipped, {} failed)",
-        stats.completed + stats.skipped + stats.failed,
-        stats.completed,
-        stats.skipped,
-        stats.failed
-    );
-
-    // Phase 4: Clean up files not in the modlist
-    println!("\n--- Phase 4: Cleanup extra files ---\n");
-    cleanup_extra_files(db, &ctx)?;
-
-    // Phase 5: Clean up BSA temp directories
-    println!("\n--- Phase 5: Cleanup BSA temp files ---\n");
-    cleanup_bsa_temp_dirs(&ctx.config)?;
-
-    Ok(stats)
-}
-
 /// Remove any files in the output directory that aren't part of the modlist
 fn cleanup_extra_files(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
     // Get all expected output paths from directives
@@ -1290,468 +1130,6 @@ fn cleanup_extra_files(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
     } else {
         println!("No extra files to clean up");
     }
-
-    Ok(())
-}
-
-/// Process FromArchive directives efficiently
-/// - Groups by archive
-/// - Uses direct access for ZIP/BSA (fast)
-/// - Uses cached extraction for 7z/RAR (slow but cached)
-fn process_from_archive_fast(
-    db: &ModlistDb,
-    ctx: &ProcessContext,
-    pb: &ProgressBar,
-    completed: &AtomicUsize,
-    skipped: &AtomicUsize,
-    failed: &AtomicUsize,
-) -> Result<()> {
-    let failure_tracker = Arc::new(FailureTracker::new());
-
-    pb.set_message("Loading FromArchive directives...");
-    let all_raw = db.get_all_pending_directives_of_type("FromArchive")?;
-
-    if all_raw.is_empty() {
-        return Ok(());
-    }
-
-    pb.set_message(format!("Parsing {} directives...", all_raw.len()));
-
-    // Parse and group by archive, resolving paths from index
-    let mut by_archive: HashMap<String, Vec<(i64, FromArchiveDirective, Option<String>)>> = HashMap::new();
-    let mut parse_failures = 0;
-    let mut path_lookups = 0;
-
-    for (id, json) in all_raw {
-        match serde_json::from_str::<Directive>(&json) {
-            Ok(Directive::FromArchive(d)) => {
-                if let Some(hash) = d.archive_hash_path.first() {
-                    // Look up the correct path from the archive index
-                    let resolved_path = if d.archive_hash_path.len() >= 2 {
-                        let requested_path = &d.archive_hash_path[1];
-                        match db.lookup_archive_file(hash, requested_path) {
-                            Ok(Some(actual_path)) => {
-                                path_lookups += 1;
-                                Some(actual_path)
-                            }
-                            _ => None, // Use original path if lookup fails
-                        }
-                    } else {
-                        None
-                    };
-                    by_archive.entry(hash.clone()).or_default().push((id, d, resolved_path));
-                }
-            }
-            _ => {
-                parse_failures += 1;
-                failed.fetch_add(1, Ordering::Relaxed);
-                pb.inc(1);
-            }
-        }
-    }
-
-    if parse_failures > 0 {
-        pb.println(format!("WARN: {} directives failed to parse", parse_failures));
-    }
-    if path_lookups > 0 {
-        pb.println(format!("Resolved {} paths from archive index", path_lookups));
-    }
-
-    pb.println("Using 7z binary for archive extraction (ZIP, 7z, RAR)");
-
-    // Separate BSA archives from others (BSA uses ba2 crate, everything else uses pure Rust)
-    let mut bsa_archives: Vec<_> = Vec::new();
-    let mut other_archives: Vec<_> = Vec::new();
-
-    for (archive_hash, directives) in by_archive {
-        let archive_path = match ctx.get_archive_path(&archive_hash) {
-            Some(p) => p.clone(),
-            None => {
-                // Archive not found - but check if outputs already exist first
-                let mut any_needed = false;
-                for (_, directive, _) in &directives {
-                    if output_exists(ctx, &directive.to, directive.size) {
-                        skipped.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                        any_needed = true;
-                    }
-                    pb.inc(1);
-                }
-                if any_needed {
-                    pb.println(format!("WARN: Archive not found: {}", archive_hash));
-                }
-                continue;
-            }
-        };
-
-        // Separate BSA/BA2 files from others
-        let archive_type = detect_archive_type(&archive_path).unwrap_or(ArchiveType::Unknown);
-        match archive_type {
-            ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2 => bsa_archives.push((archive_hash, archive_path, directives)),
-            _ => other_archives.push((archive_hash, archive_path, directives)),
-        }
-    }
-
-    let num_threads = rayon::current_num_threads();
-
-    // Phase 1: Process regular archives in parallel using pure Rust crates
-    if !other_archives.is_empty() {
-        // Hide main progress bar during multi-progress phase
-        pb.set_draw_target(indicatif::ProgressDrawTarget::hidden());
-
-        // Create multi-progress display like the downloader
-        let mp = MultiProgress::new();
-        let overall_pb = mp.add(ProgressBar::new(other_archives.len() as u64));
-        overall_pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} archives | {msg}")
-                .unwrap()
-                .progress_chars("=>-"),
-        );
-        overall_pb.enable_steady_tick(Duration::from_millis(100));
-        overall_pb.set_message(format!("OK:0 Skip:0 Fail:0 ({} threads)", num_threads));
-
-        // Wrap in Arc for sharing across threads
-        let mp = Arc::new(mp);
-        let overall_pb = Arc::new(overall_pb);
-        let failure_tracker = failure_tracker.clone();
-
-        other_archives.par_iter().for_each(|(archive_hash, archive_path, directives)| {
-            let archive_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            let display_name = if archive_name.len() > 50 {
-                format!("{}...", &archive_name[..47])
-            } else {
-                archive_name.clone()
-            };
-
-            // Create progress bar for this archive
-            let archive_pb = mp.insert_before(&overall_pb, ProgressBar::new(directives.len() as u64));
-            archive_pb.set_style(
-                ProgressStyle::default_bar()
-                    .template("  {spinner:.blue} {wide_msg} [{bar:30.white/dim}] {pos}/{len}")
-                    .unwrap()
-                    .progress_chars("=>-"),
-            );
-            archive_pb.enable_steady_tick(Duration::from_millis(100));
-            archive_pb.set_message(format!("{} (scanning)", display_name));
-
-            // Separate directives: skip existing, collect paths for batch extraction
-            let mut to_extract: Vec<(i64, &FromArchiveDirective, String)> = Vec::new();
-            let mut nested_bsa: Vec<(i64, &FromArchiveDirective, String, String)> = Vec::new();
-            let mut whole_file: Vec<(i64, &FromArchiveDirective)> = Vec::new();
-
-            for (id, directive, resolved_path) in directives {
-                if output_exists(ctx, &directive.to, directive.size) {
-                    skipped.fetch_add(1, Ordering::Relaxed);
-                    archive_pb.inc(1);
-                    pb.inc(1);
-                    continue;
-                }
-
-                if directive.archive_hash_path.len() == 1 {
-                    // Whole archive is the file
-                    whole_file.push((*id, directive));
-                } else if directive.archive_hash_path.len() == 2 {
-                    // Simple extraction from archive
-                    let path_in_archive = resolved_path.clone()
-                        .unwrap_or_else(|| directive.archive_hash_path[1].clone());
-                    to_extract.push((*id, directive, path_in_archive));
-                } else {
-                    // Nested BSA extraction
-                    let bsa_path = resolved_path.clone()
-                        .unwrap_or_else(|| directive.archive_hash_path[1].clone());
-                    let file_in_bsa = directive.archive_hash_path[2].clone();
-                    nested_bsa.push((*id, directive, bsa_path, file_in_bsa));
-                }
-            }
-
-            // Handle whole file directives (just copy the archive)
-            for (_id, directive) in &whole_file {
-                match fs::read(archive_path) {
-                    Ok(data) => {
-                        if let Err(e) = write_output(ctx, directive, &data) {
-                            failed.fetch_add(1, Ordering::Relaxed);
-                            failure_tracker.record_failure(&archive_name, &e.to_string());
-                        } else {
-                            completed.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    Err(e) => {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                        failure_tracker.record_failure(&archive_name, &format!("Read whole file: {}", e));
-                    }
-                }
-                archive_pb.inc(1);
-                pb.inc(1);
-            }
-
-            // Batch extract all needed files from this archive
-            if !to_extract.is_empty() {
-                archive_pb.set_message(format!("{} (extracting {} files)", display_name, to_extract.len()));
-
-                // Create temp dir for batch extraction
-                let temp_dir = match tempfile::tempdir_in(&ctx.config.output_dir) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        for _ in &to_extract {
-                            failed.fetch_add(1, Ordering::Relaxed);
-                            archive_pb.inc(1);
-                            pb.inc(1);
-                        }
-                        failure_tracker.record_failure(&archive_name, &format!("Create temp dir: {}", e));
-                        archive_pb.finish_and_clear();
-                        overall_pb.inc(1);
-                        return;
-                    }
-                };
-
-                // Collect unique paths for extraction
-                let paths: Vec<&str> = to_extract.iter().map(|(_, _, p)| p.as_str()).collect();
-
-                // Batch extract using pure Rust
-                let extracted = match extract_batch_rust(archive_path, &paths, temp_dir.path()) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        // Log the error and fall back to per-file extraction
-                        overall_pb.println(format!("BATCH FAIL {}: {}", archive_name, e));
-                        archive_pb.set_message(format!("{} (fallback mode)", display_name));
-                        let mut fallback_data = HashMap::new();
-                        let mut fallback_errors = 0;
-                        for (id, _, path) in &to_extract {
-                            match extract_single_file(archive_path, path, &ctx.config.downloads_dir) {
-                                Ok(data) => {
-                                    let key = paths::normalize_for_lookup(path);
-                                    fallback_data.insert(key, data);
-                                }
-                                Err(e) => {
-                                    fallback_errors += 1;
-                                    if fallback_errors <= 3 {
-                                        overall_pb.println(format!("FALLBACK ERR [{}]: {} - {:#}", id, path, e));
-                                    }
-                                }
-                            }
-                        }
-                        if fallback_errors > 3 {
-                            overall_pb.println(format!("... and {} more fallback errors", fallback_errors - 3));
-                        }
-                        fallback_data
-                    }
-                };
-
-                archive_pb.set_message(format!("{} (writing)", display_name));
-
-                // Process extracted files
-                for (id, directive, path) in &to_extract {
-                    let key = paths::normalize_for_lookup(path);
-
-                    match extracted.get(&key) {
-                        Some(data) => {
-                            if let Err(e) = write_output(ctx, directive, data) {
-                                failed.fetch_add(1, Ordering::Relaxed);
-                                failure_tracker.record_failure(&archive_name, &e.to_string());
-                                if failed.load(Ordering::Relaxed) <= 20 {
-                                    overall_pb.println(format!("FAIL [{}] write: {}", id, e));
-                                }
-                            } else {
-                                completed.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        None => {
-                            failed.fetch_add(1, Ordering::Relaxed);
-                            failure_tracker.record_failure(&archive_name, &format!("Not found: {}", path));
-                            if failed.load(Ordering::Relaxed) <= 20 {
-                                overall_pb.println(format!("FAIL [{}] not found in archive: {}", id, path));
-                            }
-                        }
-                    }
-                    archive_pb.inc(1);
-                    pb.inc(1);
-                }
-            }
-
-            // Handle nested BSA directives
-            for (id, directive, bsa_path, file_in_bsa) in &nested_bsa {
-                let result: Result<Vec<u8>> = (|| {
-                    // Extract BSA to working folder (too large for SQLite cache)
-                    let working_dir = ctx.config.downloads_dir.join("Working_BSA_Because_Its_Too_Big_For_SQL");
-                    fs::create_dir_all(&working_dir)?;
-
-                    let bsa_temp_name = format!("{}_{}.bsa",
-                        archive_hash.replace(['/', '\\', '=', '+'], "_"),
-                        bsa_path.replace(['/', '\\', ' '], "_"));
-                    let bsa_temp_path = working_dir.join(&bsa_temp_name);
-
-                    // Extract BSA if temp file doesn't exist
-                    if !bsa_temp_path.exists() {
-                        let data = extract_single_file(archive_path, bsa_path, &ctx.config.downloads_dir)
-                            .with_context(|| format!("Failed to extract BSA '{}' from archive", bsa_path))?;
-                        fs::write(&bsa_temp_path, &data)
-                            .with_context(|| format!("Failed to write BSA temp file: {}", bsa_temp_path.display()))?;
-                    }
-
-                    // Extract from the BSA file
-                    bsa::extract_archive_file(&bsa_temp_path, file_in_bsa)
-                        .with_context(|| format!("Failed to extract '{}' from BSA", file_in_bsa))
-                })();
-
-                match result {
-                    Ok(data) => {
-                        if let Err(e) = write_output(ctx, directive, &data) {
-                            failed.fetch_add(1, Ordering::Relaxed);
-                            failure_tracker.record_failure(&archive_name, &e.to_string());
-                        } else {
-                            completed.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    Err(e) => {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                        failure_tracker.record_failure(&archive_name, &format!("Nested BSA: {:?}", e));
-                        if failed.load(Ordering::Relaxed) <= 20 {
-                            // Use {:#} to show full error chain
-                            overall_pb.println(format!("FAIL [{}] nested BSA: {:#}", id, e));
-                        }
-                    }
-                }
-                archive_pb.inc(1);
-                pb.inc(1);
-            }
-
-            // Finish this archive's progress bar
-            archive_pb.finish_and_clear();
-            overall_pb.inc(1);
-            overall_pb.set_message(format!("OK:{} Skip:{} Fail:{} ({} threads)",
-                completed.load(Ordering::Relaxed),
-                skipped.load(Ordering::Relaxed),
-                failed.load(Ordering::Relaxed),
-                num_threads
-            ));
-        });
-
-        overall_pb.finish_and_clear();
-
-        // Print failure summary
-        failure_tracker.print_summary(pb);
-
-        // Restore main progress bar visibility
-        pb.set_draw_target(indicatif::ProgressDrawTarget::stderr());
-    }
-
-    // Phase 2: Process BSA archives serially (ba2 crate not thread-safe)
-    if !bsa_archives.is_empty() {
-        pb.set_message(format!("Processing {} BSA archives...", bsa_archives.len()));
-
-        for (i, (_archive_hash, archive_path, directives)) in bsa_archives.iter().enumerate() {
-            let archive_name = archive_path.file_name().unwrap_or_default().to_string_lossy();
-            pb.set_message(format!("[{}/{}] {} ({} files)", i + 1, bsa_archives.len(), archive_name, directives.len()));
-
-            if let Err(e) = process_bsa_archive(ctx, archive_path, directives, pb, completed, skipped, failed, &failure_tracker) {
-                pb.println(format!("ERROR: {}: {}", archive_name, e));
-                failure_tracker.record_failure(&archive_name, &e.to_string());
-            }
-        }
-    }
-
-    // Print summary of failures by archive
-    failure_tracker.print_summary(pb);
-
-    Ok(())
-}
-
-/// Process a BSA archive - uses ba2 crate random access
-#[allow(clippy::too_many_arguments)]
-fn process_bsa_archive(
-    ctx: &ProcessContext,
-    archive_path: &Path,
-    directives: &[(i64, FromArchiveDirective, Option<String>)],
-    pb: &ProgressBar,
-    completed: &AtomicUsize,
-    skipped: &AtomicUsize,
-    failed: &AtomicUsize,
-    failure_tracker: &FailureTracker,
-) -> Result<()> {
-    let archive_name = archive_path.file_name().unwrap_or_default().to_string_lossy();
-    for (id, directive, _resolved_path) in directives {
-        if output_exists(ctx, &directive.to, directive.size) {
-            skipped.fetch_add(1, Ordering::Relaxed);
-            pb.inc(1);
-            continue;
-        }
-
-        // Handle GameFileSource (single element = copy the BSA itself)
-        if directive.archive_hash_path.len() == 1 {
-            match fs::read(archive_path) {
-                Ok(data) => {
-                    if write_output(ctx, directive, &data).is_ok() {
-                        completed.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                Err(_) => {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            pb.inc(1);
-            continue;
-        }
-
-        let file_path = directive.archive_hash_path.get(1).map(|s| s.as_str()).unwrap_or("");
-
-        // Skip empty paths
-        if file_path.is_empty() {
-            let err_str = "Empty file path in BSA directive";
-            failed.fetch_add(1, Ordering::Relaxed);
-            failure_tracker.record_failure(&archive_name, err_str);
-            if failed.load(Ordering::Relaxed) <= 10 {
-                pb.println(format!("FAIL [{}] in '{}': {}", id, archive_name, err_str));
-            }
-            pb.inc(1);
-            continue;
-        }
-
-        match bsa::extract_archive_file(archive_path, file_path) {
-            Ok(data) => {
-                if let Err(e) = write_output(ctx, directive, &data) {
-                    let err_str = e.to_string();
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    failure_tracker.record_failure(&archive_name, &err_str);
-                    if failed.load(Ordering::Relaxed) <= 10 {
-                        pb.println(format!("FAIL [{}] in '{}': {}", id, archive_name, err_str));
-                    }
-                } else {
-                    completed.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                failed.fetch_add(1, Ordering::Relaxed);
-                failure_tracker.record_failure(&archive_name, &err_str);
-                if failed.load(Ordering::Relaxed) <= 10 {
-                    pb.println(format!("FAIL [{}] in '{}': {}", id, archive_name, err_str));
-                }
-            }
-        }
-        pb.inc(1);
-    }
-    Ok(())
-}
-
-/// Write data to output file
-fn write_output(ctx: &ProcessContext, directive: &FromArchiveDirective, data: &[u8]) -> Result<()> {
-    if data.len() as u64 != directive.size {
-        bail!(
-            "Size mismatch: expected {} bytes, got {}",
-            directive.size,
-            data.len()
-        );
-    }
-
-    let output_path = ctx.resolve_output_path(&directive.to);
-    paths::ensure_parent_dirs(&output_path)?;
-
-    let mut file = File::create(&output_path)?;
-    file.write_all(data)?;
 
     Ok(())
 }
@@ -2222,17 +1600,6 @@ fn extract_source_files_to_disk(
     }
 
     extracted
-}
-
-/// Recursively collect file paths from extracted archive (disk-based version)
-fn collect_needed_file_paths(
-    base: &Path,
-    current: &Path,
-    needed: &HashMap<String, String>,
-    results: &mut HashMap<String, PathBuf>,
-) {
-    let empty_set = std::collections::HashSet::new();
-    collect_needed_file_paths_with_bsas(base, current, needed, &empty_set, results);
 }
 
 /// Recursively collect file paths from extracted archive, including BSA container files

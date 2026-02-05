@@ -112,7 +112,7 @@ impl BsaCache {
     pub fn insert(&self, bsa_path: &Path, file_path: &str, data: &[u8]) -> Result<usize> {
         let bsa_str = bsa_path.to_string_lossy().to_string();
         let normalized = normalize_path(file_path);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().expect("BSA cache lock poisoned");
 
         conn.execute(
             "INSERT OR REPLACE INTO bsa_cache (bsa_path, file_path_normalized, file_path_original, data) VALUES (?1, ?2, ?3, ?4)",
@@ -128,7 +128,7 @@ impl BsaCache {
     /// Paths are normalized for case-insensitive lookup, original casing preserved
     pub fn insert_batch(&self, bsa_path: &Path, files: &[(&str, &[u8])]) -> Result<(usize, usize)> {
         let bsa_str = bsa_path.to_string_lossy().to_string();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().expect("BSA cache lock poisoned");
 
         let tx = conn.transaction().context("Failed to start transaction")?;
 
@@ -166,7 +166,7 @@ impl BsaCache {
         F: FnMut(&mut dyn FnMut(String, Vec<u8>) -> Result<()>) -> Result<()>,
     {
         let bsa_str = bsa_path.to_string_lossy().to_string();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().expect("BSA cache lock poisoned");
 
         let tx = conn.transaction().context("Failed to start transaction")?;
 
@@ -202,7 +202,7 @@ impl BsaCache {
     pub fn get(&self, bsa_path: &Path, file_path: &str) -> Result<Option<Vec<u8>>> {
         let bsa_str = bsa_path.to_string_lossy().to_string();
         let normalized = normalize_path(file_path);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().expect("BSA cache lock poisoned");
 
         let mut stmt = conn
             .prepare_cached("SELECT data FROM bsa_cache WHERE bsa_path = ?1 AND file_path_normalized = ?2")
@@ -237,7 +237,7 @@ impl BsaCache {
     pub fn contains(&self, bsa_path: &Path, file_path: &str) -> Result<bool> {
         let bsa_str = bsa_path.to_string_lossy().to_string();
         let normalized = normalize_path(file_path);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().expect("BSA cache lock poisoned");
 
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM bsa_cache WHERE bsa_path = ?1 AND file_path_normalized = ?2",
@@ -252,7 +252,7 @@ impl BsaCache {
     pub fn remove(&self, bsa_path: &Path, file_path: &str) -> Result<bool> {
         let bsa_str = bsa_path.to_string_lossy().to_string();
         let normalized = normalize_path(file_path);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().expect("BSA cache lock poisoned");
 
         let deleted = conn.execute(
             "DELETE FROM bsa_cache WHERE bsa_path = ?1 AND file_path_normalized = ?2",
@@ -264,7 +264,7 @@ impl BsaCache {
 
     /// Clear all cached data
     pub fn clear(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().expect("BSA cache lock poisoned");
         conn.execute("DELETE FROM bsa_cache", [])?;
         self.total_bytes.store(0, Ordering::Relaxed);
         Ok(())
@@ -277,7 +277,7 @@ impl BsaCache {
 
     /// Get number of cached files
     pub fn file_count(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().expect("BSA cache lock poisoned");
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM bsa_cache", [], |row| row.get(0))?;
         Ok(count as usize)
     }

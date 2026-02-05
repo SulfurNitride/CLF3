@@ -226,24 +226,6 @@ fn extract_with_7z(archive_path: &Path, file_path: &str, temp_base_dir: &Path) -
     )
 }
 
-/// Extract an entire archive to a directory using the 7z binary.
-///
-/// Detects archive type by magic bytes and extracts all contents.
-/// Returns the number of files extracted.
-pub fn extract_archive_to_dir(archive_path: &Path, output_dir: &Path) -> Result<usize> {
-    let archive_type = detect_archive_type(archive_path)?;
-
-    match archive_type {
-        ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2 => {
-            bail!("BSA/BA2 archives should be handled by the bsa module")
-        }
-        _ => {
-            // Use 7z for all other archive types
-            sevenzip::extract_all(archive_path, output_dir)
-        }
-    }
-}
-
 /// Extract a file that's inside a BSA within an archive
 fn extract_nested_bsa(
     archive_path: &Path,

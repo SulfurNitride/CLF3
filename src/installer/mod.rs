@@ -11,16 +11,17 @@ pub mod downloader;
 pub mod handlers;
 pub mod processor;
 pub mod streaming;
-pub mod verify;
 
 pub use config::{InstallConfig, ProgressCallback, ProgressEvent};
-pub use config_cache::{ConfigCache, ModlistConfig, ModlistPrecheck, precheck_modlist};
+#[allow(unused_imports)] // Used by lib crate (GUI)
+pub use config_cache::{ConfigCache, ModlistConfig};
 
 use crate::modlist::{import_wabbajack_to_db, ModlistDb};
 use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::fs;
 use std::time::Duration;
+use tracing::warn;
 
 /// Installation statistics
 #[derive(Debug, Default, Clone)]
@@ -76,85 +77,6 @@ impl Installer {
         if let Some(ref callback) = self.config.progress_callback {
             callback(event);
         }
-    }
-
-    /// Run the full installation
-    pub async fn run(&mut self) -> Result<InstallStats> {
-        let mut stats = InstallStats::default();
-
-        // Phase 1: Downloads
-        println!("=== Phase 1: Download Archives ===\n");
-        let download_stats = self.download_phase().await?;
-        stats.archives_downloaded = download_stats.downloaded;
-        stats.archives_skipped = download_stats.skipped;
-        stats.archives_failed = download_stats.failed;
-        stats.archives_manual = download_stats.manual;
-        stats.failed_downloads = download_stats.failed_downloads;
-        stats.manual_downloads = download_stats.manual_downloads;
-
-        // If there are manual downloads needed, stop here
-        if stats.archives_manual > 0 || stats.archives_failed > 0 {
-            return Ok(stats);
-        }
-
-        // Phase 2: Validate all downloaded archives (and auto-fix if needed)
-        println!("\n=== Phase 2: Validate Archives ===\n");
-        let mut validation_attempts = 0;
-        const MAX_VALIDATION_ATTEMPTS: usize = 3;
-
-        loop {
-            validation_attempts += 1;
-            let validation_errors = self.validate_archives()?;
-
-            if validation_errors.is_empty() {
-                println!("All archives validated successfully!\n");
-                break;
-            }
-
-            if validation_attempts >= MAX_VALIDATION_ATTEMPTS {
-                println!("\nValidation failed after {} attempts! {} archives still have issues:",
-                    MAX_VALIDATION_ATTEMPTS, validation_errors.len());
-                for (name, error) in &validation_errors {
-                    println!("  - {}: {}", name, error);
-                }
-                bail!("Archive validation failed");
-            }
-
-            // Auto-fix: delete bad files and re-download
-            println!("\nFound {} corrupted archives, auto-fixing...", validation_errors.len());
-            for (name, error) in &validation_errors {
-                println!("  - {}: {}", name, error);
-                let file_path = self.config.downloads_dir.join(name);
-                if file_path.exists() {
-                    let _ = fs::remove_file(&file_path);
-                }
-                // Reset download status in DB
-                let _ = self.db.reset_archive_download_status(name);
-            }
-
-            // Re-run download phase for the corrupted files
-            println!("\nRe-downloading {} files...\n", validation_errors.len());
-            let redownload_stats = self.download_phase().await?;
-
-            if redownload_stats.failed > 0 {
-                println!("Re-download had {} failures", redownload_stats.failed);
-            }
-        }
-
-        // Phase 3: Process directives
-        println!("=== Phase 3: Process Directives ===\n");
-        let process_stats = processor::process_directives(&self.db, &self.config)?;
-        stats.directives_completed = process_stats.completed;
-        stats.directives_skipped = process_stats.skipped;
-        stats.directives_failed = process_stats.failed;
-
-        if stats.directives_failed > 0 {
-            println!("\nDirective processing incomplete. {} failures.", stats.directives_failed);
-        } else {
-            println!("\nAll directives processed successfully!");
-        }
-
-        Ok(stats)
     }
 
     /// Download all required archives
@@ -280,9 +202,13 @@ impl Installer {
                 println!("  - {}: {}", name, error);
                 let file_path = self.config.downloads_dir.join(name);
                 if file_path.exists() {
-                    let _ = fs::remove_file(&file_path);
+                    if let Err(e) = fs::remove_file(&file_path) {
+                        warn!("Failed to remove corrupted file {}: {}", file_path.display(), e);
+                    }
                 }
-                let _ = self.db.reset_archive_download_status(name);
+                if let Err(e) = self.db.reset_archive_download_status(name) {
+                    warn!("Failed to reset download status for {}: {}", name, e);
+                }
             }
 
             println!("\nRe-downloading {} files...\n", validation_errors.len());

@@ -2,7 +2,7 @@
 //!
 //! Builds BSA/BA2 archives from files staged in TEMP_BSA_FILES folders.
 
-use crate::bsa::{Ba2Builder, Ba2CompressionFormat, BsaBuilder};
+use crate::bsa::{Ba2Builder, Ba2CompressionFormat, Ba2Version, BsaBuilder};
 use crate::installer::processor::ProcessContext;
 use crate::modlist::{BSAState, CreateBSADirective};
 use crate::paths;
@@ -22,7 +22,7 @@ enum ArchiveKind {
     },
     /// FO4 BA2 (Fallout 4, Fallout 76, Starfield)
     Ba2 {
-        is_texture: bool,
+        version: Ba2Version,
     },
 }
 
@@ -60,12 +60,10 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
             ArchiveKind::Bsa { version, flags, types }
         }
         BSAState::BA2(state) => {
-            // Detect if this is a texture archive based on archive_type or name
-            let is_texture = state.archive_type.is_dx10() ||
-                directive.to.to_lowercase().contains("textures");
-            tracing::info!("Creating FO4 BA2: {} (type {:?}, is_texture: {}, version {})",
-                directive.to, state.archive_type, is_texture, state.version);
-            ArchiveKind::Ba2 { is_texture }
+            let version = Ba2Version::from_u32(state.version);
+            tracing::info!("Creating FO4 BA2: {} (type {:?}, version {:?})",
+                directive.to, state.archive_type, version);
+            ArchiveKind::Ba2 { version }
         }
     };
 
@@ -150,9 +148,10 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
                 }
             }
         }
-        ArchiveKind::Ba2 { is_texture: _ } => {
-            // Build BA2 archive
+        ArchiveKind::Ba2 { version } => {
+            // Build BA2 archive with version from modlist
             let mut builder = Ba2Builder::from_name(&directive.to)
+                .with_version(version)
                 .with_compression(Ba2CompressionFormat::Zlib);
 
             for (path, data) in files {

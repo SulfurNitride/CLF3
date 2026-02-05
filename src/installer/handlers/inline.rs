@@ -76,28 +76,33 @@ pub fn handle_remapped_inline_file(
 
 /// Remap path placeholders in content
 fn remap_paths(content: &str, ctx: &ProcessContext) -> String {
+    // Early-out: if content has no magic tokens or legacy placeholders, skip all replacements
+    if !content.contains("{--||") && !content.contains("[Game Folder Files]")
+        && !content.contains("[MO2_PATH]") && !content.contains("[DOWNLOADS_PATH]")
+        && !content.contains("download_directory=")
+    {
+        return content.to_string();
+    }
+
     let mut result = content.to_string();
 
-    // Get paths and normalize (remove trailing slashes)
-    let mo2_path = ctx.config.output_dir.to_string_lossy().trim_end_matches('/').trim_end_matches('\\').to_string();
-    let game_path = ctx.config.game_dir.to_string_lossy().trim_end_matches('/').trim_end_matches('\\').to_string();
-    let downloads_path = ctx.config.downloads_dir.to_string_lossy().trim_end_matches('/').trim_end_matches('\\').to_string();
+    // Get base paths and normalize once (remove trailing slashes, ensure forward slashes)
+    let mo2_base = ctx.config.output_dir.to_string_lossy().trim_end_matches('/').trim_end_matches('\\').replace('\\', "/");
+    let game_base = ctx.config.game_dir.to_string_lossy().trim_end_matches('/').trim_end_matches('\\').replace('\\', "/");
+    let downloads_base = ctx.config.downloads_dir.to_string_lossy().trim_end_matches('/').trim_end_matches('\\').replace('\\', "/");
 
-    // Forward slash versions with Z: prefix for Wine (e.g., Z:/home/luke/Games/Tuxborn)
-    let mo2_forward = format!("Z:{}", mo2_path.replace('\\', "/"));
-    let game_forward = format!("Z:{}", game_path.replace('\\', "/"));
-    let downloads_forward = format!("Z:{}", downloads_path.replace('\\', "/"));
+    // Derive all variants from the base forward-slash path
+    let mo2_forward = format!("Z:{}", mo2_base);
+    let game_forward = format!("Z:{}", game_base);
+    let downloads_forward = format!("Z:{}", downloads_base);
 
-    // Double backslash versions with Z: prefix (for Windows paths in configs)
-    // e.g., Z:\\home\\luke\\Games\\Tuxborn
-    let mo2_double_back = format!("Z:{}", mo2_path.replace('\\', "/").replace('/', "\\\\"));
-    let game_double_back = format!("Z:{}", game_path.replace('\\', "/").replace('/', "\\\\"));
-    let downloads_double_back = format!("Z:{}", downloads_path.replace('\\', "/").replace('/', "\\\\"));
+    let mo2_double_back = format!("Z:{}", mo2_base.replace('/', "\\\\"));
+    let game_double_back = format!("Z:{}", game_base.replace('/', "\\\\"));
+    let downloads_double_back = format!("Z:{}", downloads_base.replace('/', "\\\\"));
 
-    // Single backslash versions with Z: prefix
-    let mo2_back = format!("Z:{}", mo2_path.replace('\\', "/").replace('/', "\\"));
-    let game_back = format!("Z:{}", game_path.replace('\\', "/").replace('/', "\\"));
-    let downloads_back = format!("Z:{}", downloads_path.replace('\\', "/").replace('/', "\\"));
+    let mo2_back = format!("Z:{}", mo2_base.replace('/', "\\"));
+    let game_back = format!("Z:{}", game_base.replace('/', "\\"));
+    let downloads_back = format!("Z:{}", downloads_base.replace('/', "\\"));
 
     // Replace Wabbajack magic tokens
     // Format: {--||PATH_TYPE_MAGIC_STYLE||--}

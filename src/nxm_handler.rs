@@ -1,22 +1,22 @@
 //! NXM protocol handler for Nexus Mods downloads
 //!
-//! Registers as a handler for nxm:// links and runs a local server
+//! Registers as a handler for nxm:// links and uses a Unix domain socket
 //! to receive download requests from browser clicks.
 
 use anyhow::{Context, Result, bail};
-use axum::{
-    Router,
-    extract::State,
-    response::{Html, IntoResponse},
-    routing::post,
-    Json,
-};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::path::PathBuf;
+use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
 
+/// Well-known socket path for NXM IPC
+fn socket_path() -> PathBuf {
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        PathBuf::from(runtime_dir).join("clf3-nxm.sock")
+    } else {
+        PathBuf::from("/tmp/clf3-nxm.sock")
+    }
+}
 
 /// Parsed NXM link with auth credentials
 #[derive(Debug, Clone)]
@@ -77,100 +77,105 @@ impl NxmLink {
     }
 }
 
-/// Message sent to the NXM server
-#[derive(Debug, Serialize, Deserialize)]
-pub struct NxmMessage {
-    pub url: String,
-}
-
-/// Shared state for the NXM handler
-pub struct NxmState {
-    /// Channel to send received NXM links
-    pub tx: mpsc::UnboundedSender<NxmLink>,
-}
-
-/// Start the NXM handler server
-pub async fn start_server(port: u16) -> Result<(mpsc::UnboundedReceiver<NxmLink>, Arc<NxmState>)> {
+/// Start the NXM Unix domain socket listener
+///
+/// Listens at the well-known socket path. Each connection reads one line
+/// (an nxm:// URL), parses it, and sends the result to the returned channel.
+pub async fn start_listener() -> Result<(mpsc::UnboundedReceiver<NxmLink>, PathBuf)> {
     let (tx, rx) = mpsc::unbounded_channel();
+    let path = socket_path();
 
-    let state = Arc::new(NxmState { tx });
+    // Remove stale socket file before binding
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("Failed to remove stale socket: {}", path.display()))?;
+    }
 
-    let app = Router::new()
-        .route("/", post(handle_nxm))
-        .with_state(state.clone());
+    let listener = tokio::net::UnixListener::bind(&path)
+        .with_context(|| format!("Failed to bind Unix socket: {}", path.display()))?;
 
-    let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
+    println!("NXM handler listening on {}", path.display());
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("Failed to bind to {}", addr))?;
-
-    println!("NXM handler listening on http://{}", addr);
-
-    // Spawn server in background
+    // Spawn accept loop in background
     tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
-            eprintln!("NXM server error: {}", e);
+        loop {
+            let (stream, _addr) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    eprintln!("NXM socket accept error: {}", e);
+                    continue;
+                }
+            };
+
+            let mut reader = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            if let Err(e) = reader.read_line(&mut line).await {
+                eprintln!("NXM socket read error: {}", e);
+                continue;
+            }
+
+            let url = line.trim();
+            if url.is_empty() {
+                continue;
+            }
+
+            match NxmLink::parse(url) {
+                Ok(link) => {
+                    println!("Received NXM link: {}:{}", link.mod_id, link.file_id);
+                    if tx.send(link).is_err() {
+                        // Receiver dropped, stop accepting
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Invalid NXM link received: {}", e);
+                }
+            }
         }
     });
 
-    Ok((rx, state))
+    Ok((rx, path))
 }
 
-/// Handle incoming NXM link
-async fn handle_nxm(
-    State(state): State<Arc<NxmState>>,
-    Json(msg): Json<NxmMessage>,
-) -> impl IntoResponse {
-    match NxmLink::parse(&msg.url) {
-        Ok(link) => {
-            println!("Received NXM link: {}:{}", link.mod_id, link.file_id);
-            if let Err(e) = state.tx.send(link) {
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    Html(format!("<h1>Error: {}</h1>", e)),
-                );
-            }
-            (
-                axum::http::StatusCode::OK,
-                Html("<h1>Download queued!</h1>".to_string()),
-            )
+/// Send an NXM link to a running listener (blocking, for fire-and-forget subprocess use)
+///
+/// Logs errors to `$XDG_RUNTIME_DIR/clf3-nxm.log` since this runs as a desktop-launched
+/// subprocess where stderr is invisible.
+pub fn send_to_socket(nxm_url: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    let path = socket_path();
+    let result = (|| -> Result<()> {
+        let mut stream = UnixStream::connect(&path)
+            .with_context(|| format!("Failed to connect to NXM socket at {}", path.display()))?;
+        writeln!(stream, "{}", nxm_url).context("Failed to write NXM URL to socket")?;
+        Ok(())
+    })();
+
+    if let Err(ref e) = result {
+        // Log to a file next to the socket so the user can debug
+        let log_path = path.with_extension("log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            let _ = writeln!(f, "[nxm-handle] Error sending '{}': {:#}", nxm_url, e);
         }
-        Err(e) => (
-            axum::http::StatusCode::BAD_REQUEST,
-            Html(format!("<h1>Invalid NXM link: {}</h1>", e)),
-        ),
     }
-}
 
-/// Send an NXM link to a running handler server
-pub async fn send_to_server(port: u16, nxm_url: &str) -> Result<()> {
-    let client = reqwest::Client::new();
-    let addr = format!("http://127.0.0.1:{}", port);
-
-    client
-        .post(&addr)
-        .json(&NxmMessage { url: nxm_url.to_string() })
-        .send()
-        .await
-        .context("Failed to send NXM link to server")?
-        .error_for_status()
-        .context("Server returned error")?;
-
-    Ok(())
+    result
 }
 
 /// Register as the system handler for nxm:// protocol (Linux only)
-pub fn register_handler(exe_path: &str, port: u16) -> Result<()> {
+pub fn register_handler(exe_path: &str) -> Result<()> {
+    // Quote the exe path in case it contains spaces (desktop entry spec requires this)
     let desktop_entry = format!(
         r#"[Desktop Entry]
 Type=Application
 Name=CLF3 NXM Handler
-Exec={} nxm-handle --port {} %u
+Exec="{}" nxm-handle %u
 MimeType=x-scheme-handler/nxm;
 NoDisplay=true
 "#,
-        exe_path, port
+        exe_path
     );
 
     // Write desktop file

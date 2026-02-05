@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tracing::{info, warn};
 
-use crate::game_finder::{detect_all_games, Game, GameScanResult};
+use crate::game_finder::{detect_all_games, GameScanResult};
 
 /// GitHub repo for TTW Linux Installer
 const TTW_INSTALLER_REPO: &str = "SulfurNitride/TTW_Linux_Installer";

@@ -172,7 +172,9 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
                     println!("  Truncated: {} ({}% complete)",
                         archive.name,
                         (meta.len() * 100) / (archive.size as u64).max(1));
-                    let _ = fs::remove_file(&output_path);
+                    if let Err(e) = fs::remove_file(&output_path) {
+                        warn!("Failed to remove truncated file {}: {}", output_path.display(), e);
+                    }
                     truncated_count += 1;
                 }
             }
@@ -201,14 +203,18 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
                 Ok(false) => {
                     // Hash mismatch - corrupted, delete and re-download
                     println!("\r  Corrupted (hash mismatch): {}                    ", archive.name);
-                    let _ = fs::remove_file(&output_path);
+                    if let Err(e) = fs::remove_file(&output_path) {
+                        warn!("Failed to remove corrupted file {}: {}", output_path.display(), e);
+                    }
                     corrupted_count += 1;
                     need_download.push(archive.clone());
                 }
                 Err(e) => {
                     // Error reading file - treat as corrupted
                     println!("\r  Verify error for {}: {}                    ", archive.name, e);
-                    let _ = fs::remove_file(&output_path);
+                    if let Err(e) = fs::remove_file(&output_path) {
+                        warn!("Failed to remove unreadable file {}: {}", output_path.display(), e);
+                    }
                     corrupted_count += 1;
                     need_download.push(archive.clone());
                 }
@@ -1027,11 +1033,20 @@ async fn download_archives_nxm(
 
     println!("\n--- Starting NXM server ---");
 
+    // Auto-register as nxm:// handler so browser clicks work
+    let exe = std::env::current_exe()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    if let Err(e) = nxm_handler::register_handler(&exe) {
+        warn!("Failed to register NXM handler (browser clicks may not work): {}", e);
+    }
+
     // Start NXM server
-    let (mut rx, _state) = nxm_handler::start_server(config.nxm_port).await?;
+    let (mut rx, _sock_path) = nxm_handler::start_listener().await?;
 
     // Create HTTP client for downloads
-    let http = HttpClient::new()?;
+    let http = Arc::new(HttpClient::new()?);
     let nexus = NexusDownloader::new(&config.nexus_api_key)?;
 
     // Build lookup map: "game:mod_id:file_id" -> pending info
@@ -1057,138 +1072,215 @@ async fn download_archives_nxm(
     overall_pb.enable_steady_tick(Duration::from_millis(100));
     overall_pb.set_message("Waiting for browser clicks...");
 
-    // Open browser tabs for each pending download
-    println!("Opening browser tabs...");
-    for pending in lookup.values() {
+    // Pipelined NXM download: open ONE tab at a time, wait for user to click
+    // "Download with Manager", start the download in background, then open the
+    // next tab. Concurrent downloads capped at CPU thread count.
+    let max_concurrent_downloads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
+    // Queue of keys still needing a tab opened
+    let mut tab_queue: Vec<String> = lookup.keys().cloned().collect();
+    let active_downloads = Arc::new(AtomicUsize::new(0));
+    let mut tab_open = false; // true when we have exactly one tab waiting for NXM click
+    let mut downloaded = 0usize;
+    let mut failed = 0usize;
+    let mut nxm_completed = 0usize; // tracks completed for progress callbacks
+
+    // Channel for background download tasks to report results: (hash, name, path, result)
+    let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel::<(String, String, PathBuf, Result<()>)>();
+
+    let open_tab = |pending: &NexusPending, browser: &str| {
         let domain = NexusDownloader::game_domain(&pending.nexus_state.game_name);
         let url = nxm_handler::nexus_mod_url(
             domain,
             pending.nexus_state.mod_id,
             pending.nexus_state.file_id,
         );
-
-        // Open in browser
-        let _ = std::process::Command::new(&config.browser)
+        let _ = std::process::Command::new(browser)
             .arg(&url)
             .spawn();
+    };
 
-        // Small delay to avoid overwhelming the browser
-        tokio::time::sleep(Duration::from_millis(500)).await;
+    // Open the first tab
+    if let Some(key) = tab_queue.pop() {
+        if let Some(pending) = lookup.get(&key) {
+            open_tab(pending, &config.browser);
+            tab_open = true;
+        }
     }
 
-    println!("\nClick 'Download with Manager' on each Nexus page.\n");
+    println!("Click 'Download with Manager' on each Nexus page.\n");
 
-    // Process incoming NXM links
-    let mut downloaded = 0;
-    let mut failed = 0;
-
-    while !lookup.is_empty() {
-        // Wait for next NXM link (with timeout)
-        let link = match tokio::time::timeout(Duration::from_secs(300), rx.recv()).await {
-            Ok(Some(link)) => link,
-            Ok(None) => {
-                println!("NXM server closed unexpectedly");
-                break;
-            }
-            Err(_) => {
-                println!("Timeout waiting for NXM links. {} remaining.", lookup.len());
-                break;
-            }
-        };
-
-        // Find matching pending download
-        let key = link.lookup_key();
-        let Some(pending) = lookup.remove(&key) else {
-            println!("Received NXM link for unknown file: {}", key);
-            continue;
-        };
-
-        overall_pb.set_message(format!("Downloading: {}", truncate_name(&pending.archive.name, 30)));
-
-        // Create progress bar for this download
-        let pb = multi_progress.insert_before(&overall_pb, ProgressBar::new(pending.archive.size as u64));
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("  {spinner:.blue} {wide_msg} [{bar:30.white/dim}] {bytes}/{total_bytes} {bytes_per_sec}")
-                .unwrap()
-                .progress_chars("=>-"),
-        );
-        pb.enable_steady_tick(Duration::from_millis(100));
-        pb.set_message(truncate_name(&pending.archive.name, 40));
-
-        // Create progress callback for GUI updates
-        let progress_callback = make_progress_callback(
-            pending.archive.name.clone(),
-            &config.progress_callback,
-        );
-        let callback_ref = progress_callback.as_ref();
-
-        // Get download URL using NXM key (bypasses rate limit)
-        let download_result = async {
-            // Call Nexus API with the NXM key
-            let api_url = link.api_url();
-            let response = reqwest::Client::new()
-                .get(&api_url)
-                .header("apikey", &config.nexus_api_key)
-                .send()
-                .await
-                .context("Failed to get download link")?;
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                bail!("Nexus API error {}: {}", status, body);
-            }
-
-            let links: Vec<serde_json::Value> = response.json().await?;
-            let url = links
-                .first()
-                .and_then(|l| l.get("URI"))
-                .and_then(|u| u.as_str())
-                .context("No download URL in response")?;
-
-            // Download the file with callback for GUI
-            download_file_with_callback(&http, url, &pending.output_path, Some(pending.archive.size as u64), Some(&pb), callback_ref).await?;
-
-            Ok::<_, anyhow::Error>(())
-        }.await;
-
-        pb.finish_and_clear();
-
-        match download_result {
-            Ok(()) => {
-                // Verify hash after download
-                overall_pb.set_message(format!("Verifying {}...", truncate_name(&pending.archive.name, 30)));
-                match verify_file_hash(&pending.output_path, &pending.archive.hash) {
-                    Ok(true) => {
-                        downloaded += 1;
-                        db.mark_archive_downloaded(
-                            &pending.archive.hash,
-                            pending.output_path.to_string_lossy().as_ref(),
-                        )?;
-                    }
-                    Ok(false) => {
-                        // Hash mismatch - corrupted download
-                        overall_pb.println(format!("FAIL {} - hash mismatch (corrupted download)", pending.archive.name));
-                        let _ = fs::remove_file(&pending.output_path);
-                        failed += 1;
-                    }
-                    Err(e) => {
-                        overall_pb.println(format!("FAIL {} - hash verify error: {}", pending.archive.name, e));
-                        let _ = fs::remove_file(&pending.output_path);
-                        failed += 1;
-                    }
-                }
-                overall_pb.inc(1);
-            }
-            Err(e) => {
-                failed += 1;
-                overall_pb.println(format!("FAIL {} - {}", pending.archive.name, e));
-                overall_pb.inc(1);
-            }
+    // Main event loop: process NXM links and download completions
+    loop {
+        if lookup.is_empty() && active_downloads.load(Ordering::Relaxed) == 0 {
+            break;
         }
 
-        overall_pb.set_message(format!("OK:{} Fail:{} Remaining:{}", downloaded, failed, lookup.len()));
+        tokio::select! {
+            // Handle incoming NXM links
+            nxm_result = rx.recv() => {
+                let link = match nxm_result {
+                    Some(link) => link,
+                    None => {
+                        println!("NXM server closed unexpectedly");
+                        break;
+                    }
+                };
+
+                let key = link.lookup_key();
+                let Some(pending) = lookup.remove(&key) else {
+                    println!("Received NXM link for unknown file: {}", key);
+                    continue;
+                };
+
+                tab_open = false;
+
+                // Open next tab immediately (user clicks while download runs)
+                if active_downloads.load(Ordering::Relaxed) < max_concurrent_downloads {
+                    if let Some(next_key) = tab_queue.pop() {
+                        if let Some(next_pending) = lookup.get(&next_key) {
+                            open_tab(next_pending, &config.browser);
+                            tab_open = true;
+                        }
+                    }
+                }
+
+                // Spawn download as background task
+                let http = Arc::clone(&http);
+                let api_key = config.nexus_api_key.clone();
+                let output_path = pending.output_path.clone();
+                let archive_size = pending.archive.size as u64;
+                let archive_name = pending.archive.name.clone();
+                let archive_hash = pending.archive.hash.clone();
+                let progress_callback = make_progress_callback(
+                    archive_name.clone(),
+                    &config.progress_callback,
+                );
+                let pb = multi_progress.insert_before(&overall_pb, ProgressBar::new(archive_size));
+                pb.set_style(
+                    ProgressStyle::default_bar()
+                        .template("  {spinner:.blue} {wide_msg} [{bar:30.white/dim}] {bytes}/{total_bytes} {bytes_per_sec}")
+                        .unwrap()
+                        .progress_chars("=>-"),
+                );
+                pb.enable_steady_tick(Duration::from_millis(100));
+                pb.set_message(truncate_name(&archive_name, 40));
+
+                let active = Arc::clone(&active_downloads);
+                active.fetch_add(1, Ordering::Relaxed);
+                let tx = result_tx.clone();
+
+                tokio::spawn(async move {
+                    let result = async {
+                        let api_url = link.api_url();
+                        let response = reqwest::Client::new()
+                            .get(&api_url)
+                            .header("apikey", &api_key)
+                            .send()
+                            .await
+                            .context("Failed to get download link")?;
+
+                        if !response.status().is_success() {
+                            let status = response.status();
+                            let body = response.text().await.unwrap_or_default();
+                            bail!("Nexus API error {}: {}", status, body);
+                        }
+
+                        let links: Vec<serde_json::Value> = response.json().await?;
+                        let url = links
+                            .first()
+                            .and_then(|l| l.get("URI"))
+                            .and_then(|u| u.as_str())
+                            .context("No download URL in response")?;
+
+                        download_file_with_callback(&http, url, &output_path, Some(archive_size), Some(&pb), progress_callback.as_ref()).await?;
+                        Ok::<_, anyhow::Error>(())
+                    }.await;
+
+                    pb.finish_and_clear();
+                    active.fetch_sub(1, Ordering::Relaxed);
+                    let _ = tx.send((archive_hash, archive_name, output_path, result));
+                });
+
+                overall_pb.set_message(format!(
+                    "OK:{} Fail:{} Active:{} Remaining:{}",
+                    downloaded, failed,
+                    active_downloads.load(Ordering::Relaxed),
+                    lookup.len()
+                ));
+            }
+
+            // Handle completed downloads
+            Some((hash, name, output_path, result)) = result_rx.recv() => {
+                match result {
+                    Ok(()) => {
+                        overall_pb.set_message(format!("Verifying {}...", truncate_name(&output_path.file_name().unwrap_or_default().to_string_lossy(), 30)));
+                        match verify_file_hash(&output_path, &hash) {
+                            Ok(true) => {
+                                downloaded += 1;
+                                db.mark_archive_downloaded(
+                                    &hash,
+                                    output_path.to_string_lossy().as_ref(),
+                                )?;
+                            }
+                            Ok(false) => {
+                                overall_pb.println(format!("FAIL {} - hash mismatch", output_path.display()));
+                                let _ = fs::remove_file(&output_path);
+                                failed += 1;
+                            }
+                            Err(e) => {
+                                overall_pb.println(format!("FAIL {} - verify error: {}", output_path.display(), e));
+                                let _ = fs::remove_file(&output_path);
+                                failed += 1;
+                            }
+                        }
+                        overall_pb.inc(1);
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        overall_pb.println(format!("FAIL {} - {}", output_path.display(), e));
+                        overall_pb.inc(1);
+                    }
+                }
+
+                // Report progress to GUI callback
+                nxm_completed += 1;
+                if let Some(ref callback) = config.progress_callback {
+                    callback(ProgressEvent::DownloadComplete { name });
+                    callback(ProgressEvent::ArchiveComplete {
+                        index: nxm_completed,
+                        total: total_nexus,
+                    });
+                }
+
+                // A download slot freed up - open next tab if we don't have one waiting
+                if !tab_open && active_downloads.load(Ordering::Relaxed) < max_concurrent_downloads {
+                    if let Some(next_key) = tab_queue.pop() {
+                        if let Some(next_pending) = lookup.get(&next_key) {
+                            open_tab(next_pending, &config.browser);
+                            tab_open = true;
+                        }
+                    }
+                }
+
+                overall_pb.set_message(format!(
+                    "OK:{} Fail:{} Active:{} Remaining:{}",
+                    downloaded, failed,
+                    active_downloads.load(Ordering::Relaxed),
+                    lookup.len()
+                ));
+            }
+
+            // Timeout if nothing happens for 5 minutes
+            _ = tokio::time::sleep(Duration::from_secs(300)) => {
+                if tab_open || !lookup.is_empty() {
+                    println!("Timeout waiting for NXM links. {} remaining.", lookup.len());
+                    break;
+                }
+            }
+        }
     }
 
     overall_pb.finish_and_clear();

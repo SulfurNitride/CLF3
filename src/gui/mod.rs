@@ -71,69 +71,6 @@ slint::slint! {
         is_experimental: bool,
     }
 
-    // Custom styled text input with label
-    component LabeledInput inherits Rectangle {
-        in property <string> label;
-        in property <string> placeholder: "";
-        in-out property <string> value;
-        in property <bool> is_password: false;
-        in property <bool> enabled: true;
-        callback edited(string);
-
-        height: 70px;
-
-        VerticalLayout {
-            spacing: 6px;
-
-            Text {
-                text: label;
-                font-size: 13px;
-                font-weight: 500;
-                color: Theme.subtext1;
-            }
-
-            Rectangle {
-                height: 36px;
-                background: Theme.crust;
-                border-radius: 6px;
-
-                // Placeholder text (shown when input is empty)
-                if value == "": Text {
-                    x: 12px;
-                    text: placeholder;
-                    font-size: 13px;
-                    color: Theme.overlay0;
-                    vertical-alignment: center;
-                }
-
-                // Masked display for password
-                if is_password && value != "": Text {
-                    x: 12px;
-                    text: "●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●";
-                    font-size: 13px;
-                    color: Theme.text;
-                    vertical-alignment: center;
-                    overflow: clip;
-                    width: parent.width - 24px;
-                }
-
-                input := TextInput {
-                    x: 12px;
-                    y: (parent.height - 18px) / 2;
-                    width: parent.width - 24px;
-                    height: 18px;
-                    text <=> value;
-                    font-size: 13px;
-                    color: is_password ? transparent : Theme.text;
-                    enabled: enabled;
-                    single-line: true;
-                    vertical-alignment: center;
-                    edited => { edited(self.text); }
-                }
-            }
-        }
-    }
-
     // Path input with browse button (compact single-line with inline label)
     component PathInput inherits Rectangle {
         in property <string> label;
@@ -206,45 +143,6 @@ slint::slint! {
                     vertical-alignment: center;
                 }
             }
-        }
-    }
-
-    // Tab button component
-    component TabButton inherits Rectangle {
-        in property <string> label;
-        in property <bool> active: false;
-        callback clicked();
-
-        height: 36px;
-        horizontal-stretch: 1;
-        background: active ? Theme.surface0 : transparent;
-        border-radius: 6px;
-
-        states [
-            hover when touch.has-hover && !active: {
-                background: Theme.mantle;
-            }
-        ]
-
-        touch := TouchArea {
-            clicked => { root.clicked(); }
-        }
-
-        Text {
-            text: label;
-            font-size: 14px;
-            font-weight: active ? 600 : 400;
-            color: active ? Theme.blue : Theme.subtext0;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-        }
-
-        // Active indicator line
-        if active: Rectangle {
-            y: parent.height - 3px;
-            height: 3px;
-            background: Theme.blue;
-            border-radius: 1.5px;
         }
     }
 
@@ -323,41 +221,6 @@ slint::slint! {
         }
     }
 
-    // API Key status indicator (clickable for help when state is Unknown)
-    component ApiKeyStatus inherits Rectangle {
-        in property <ApiKeyState> state: ApiKeyState.Unknown;
-        callback clicked();
-
-        width: 24px;
-        height: 24px;
-        border-radius: 12px;
-        background: state == ApiKeyState.Valid ? Theme.green :
-                    state == ApiKeyState.Invalid ? Theme.red :
-                    state == ApiKeyState.Validating ? Theme.yellow :
-                    (touch.has-hover ? Theme.surface2 : Theme.surface1);
-
-        Text {
-            text: state == ApiKeyState.Valid ? "OK" :
-                  state == ApiKeyState.Invalid ? "X" :
-                  state == ApiKeyState.Validating ? "..." :
-                  "?";
-            font-size: 10px;
-            font-weight: 700;
-            color: state == ApiKeyState.Unknown ? Theme.overlay0 : Theme.crust;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-        }
-
-        touch := TouchArea {
-            mouse-cursor: state == ApiKeyState.Unknown ? pointer : default;
-            clicked => {
-                if state == ApiKeyState.Unknown {
-                    clicked();
-                }
-            }
-        }
-    }
-
     // Log viewer component
     component LogViewer inherits Rectangle {
         in property <string> log_text;
@@ -410,7 +273,7 @@ slint::slint! {
         in-out property <float> progress: 0.0;
         in-out property <string> status_message: "Ready to install";
         in-out property <string> log_text: "CLF3 - Modlist Installer initialized.\nSelect a modlist or collection to begin.";
-        in-out property <string> version: "0.0.5";
+        in-out property <string> version: "0.0.6";
 
         // Activity section properties
         in-out property <string> current_download_file: "";
@@ -4231,6 +4094,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                             dialog.get_show_unavailable(),
                             &images,
                         );
+                        dialog.set_visible_count(filtered.len() as i32);
                         dialog.set_modlists(std::rc::Rc::new(slint::VecModel::from(filtered)).into());
                     }
                 }
@@ -4254,6 +4118,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                             dialog.get_show_unavailable(),
                             &images,
                         );
+                        dialog.set_visible_count(filtered.len() as i32);
                         dialog.set_modlists(std::rc::Rc::new(slint::VecModel::from(filtered)).into());
                     }
                 }
@@ -4277,6 +4142,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                             show_unavailable,
                             &images,
                         );
+                        dialog.set_visible_count(filtered.len() as i32);
                         dialog.set_modlists(std::rc::Rc::new(slint::VecModel::from(filtered)).into());
                     }
                 }
@@ -5399,6 +5265,7 @@ fn game_name_to_app_id(game: &str) -> Option<&'static str> {
         "Enderal" => Some("933480"),
         "EnderalSE" | "EnderalSpecialEdition" => Some("976620"),
         "Starfield" => Some("1716740"),
+        "Cyberpunk2077" | "Cyberpunk 2077" => Some("1091500"),
         "BaldursGate3" | "Baldur's Gate 3" => Some("1086940"),
         _ => None,
     }
@@ -5427,6 +5294,7 @@ fn game_name_to_display(game: &str) -> &str {
         "Enderal" => "Enderal",
         "EnderalSE" | "EnderalSpecialEdition" => "Enderal Special Edition",
         "Starfield" => "Starfield",
+        "Cyberpunk2077" => "Cyberpunk 2077",
         "BaldursGate3" => "Baldur's Gate 3",
         _ => game,
     }
@@ -5449,97 +5317,13 @@ fn validate_nexus_api_key(api_key: &str) -> bool {
     let response = client
         .get("https://api.nexusmods.com/v1/users/validate.json")
         .header("apikey", api_key)
-        .header("User-Agent", "CLF3/0.0.5")
+        .header("User-Agent", "CLF3/0.0.6")
         .send();
 
     match response {
         Ok(resp) => resp.status().is_success(),
         Err(_) => false,
     }
-}
-
-/// Detect game from a .wabbajack file and log modlist metadata
-///
-/// Parses the modlist, extracts the game type, looks up the Steam App ID,
-/// and attempts to find the game installation path. Also logs metadata
-/// (author, game, download size, install size) to the GUI log.
-///
-/// Returns a formatted string like "Skyrim SE (Steam)"
-fn detect_game_from_wabbajack(path: &std::path::Path) -> anyhow::Result<String> {
-    use anyhow::Context;
-
-    // Parse the modlist to get game type and metadata
-    let modlist = crate::modlist::parse_wabbajack_file(path)
-        .context("Failed to parse wabbajack file")?;
-
-    // Calculate sizes
-    let download_size: u64 = modlist.archives.iter().map(|a| a.size).sum();
-    let install_size: u64 = modlist.directives.iter().map(|d| d.size()).sum();
-
-    // Log metadata to GUI
-    let tx = get_progress_sender();
-    tx.send(ProgressUpdate::Log(format!(
-        "[INFO] Modlist: {} v{}",
-        modlist.name, modlist.version
-    ))).ok();
-
-    if !modlist.author.is_empty() {
-        tx.send(ProgressUpdate::Log(format!(
-            "[INFO] Author: {}",
-            modlist.author
-        ))).ok();
-    }
-
-    let game_type = &modlist.game_type;
-    let display_name = game_name_to_display(game_type);
-
-    tx.send(ProgressUpdate::Log(format!(
-        "[INFO] Game: {}",
-        display_name
-    ))).ok();
-    tx.send(ProgressUpdate::Log(format!(
-        "[INFO] Download Size: {}",
-        format_bytes(download_size)
-    ))).ok();
-    tx.send(ProgressUpdate::Log(format!(
-        "[INFO] Install Size: {}",
-        format_bytes(install_size)
-    ))).ok();
-    tx.send(ProgressUpdate::Log(format!(
-        "[INFO] Archives: {}, Directives: {}",
-        modlist.archives.len(),
-        modlist.directives.len()
-    ))).ok();
-
-    // Try to find the game installation with platform info (try all possible app IDs)
-    let app_ids = game_name_to_app_ids(game_type);
-    println!("[DEBUG] Looking for game_type={}, app_ids={:?}", game_type, app_ids);
-    if !app_ids.is_empty() {
-        // Use detect_all_games to get full game info including launcher
-        let scan_result = crate::game_finder::detect_all_games();
-        println!("[DEBUG] Found {} games total", scan_result.games.len());
-        for g in &scan_result.games {
-            println!("[DEBUG]   - {} (app_id={})", g.name, g.app_id);
-        }
-        for app_id in &app_ids {
-            println!("[DEBUG] Checking for app_id={}", app_id);
-            if let Some(game) = scan_result.find_by_app_id(app_id) {
-                let platform = game.launcher.display_name();
-                tx.send(ProgressUpdate::Log(format!(
-                    "[INFO] Found game at: {}",
-                    game.install_path.display()
-                ))).ok();
-                return Ok(format!("{} ({})", display_name, platform));
-            }
-        }
-    }
-
-    // Game type known but not installed
-    tx.send(ProgressUpdate::Log(format!(
-        "[WARN] Game not found: {}",
-        display_name
-    ))).ok();
-    Ok(format!("{} (not found)", display_name))
 }
 
 /// Result of detecting game and TTW requirements from a wabbajack file
@@ -5552,10 +5336,6 @@ struct ModlistDetectionResult {
     fo3_path: Option<std::path::PathBuf>,
     /// Fallout New Vegas path if found
     fnv_path: Option<std::path::PathBuf>,
-    /// Modlist name (for config cache)
-    modlist_name: String,
-    /// Modlist version (for config cache)
-    modlist_version: String,
     /// Cached install directory
     cached_install_dir: Option<String>,
     /// Cached downloads directory
@@ -5677,8 +5457,6 @@ fn detect_modlist_info(path: &std::path::Path) -> anyhow::Result<ModlistDetectio
         ttw_required,
         fo3_path,
         fnv_path,
-        modlist_name: modlist.name,
-        modlist_version: modlist.version,
         cached_install_dir,
         cached_downloads_dir,
         cached_ttw_mpi_path,
@@ -5815,16 +5593,6 @@ async fn run_wabbajack_install(
     let progress_callback: ProgressCallback = Arc::new(move |event| {
         match event {
             // Download events
-            ProgressEvent::DownloadStarted { name, size: _ } => {
-                // Register this download
-                if let Ok(mut map) = speeds.lock() {
-                    map.insert(name.clone(), 0.0);
-                }
-                if let Ok(mut map) = dl_progress.lock() {
-                    map.insert(name, 0);
-                }
-                progress_tx.send(ProgressUpdate::Status("Downloading...".to_string())).ok();
-            }
             ProgressEvent::DownloadProgress { name, downloaded, total: _, speed } => {
                 // Update this download's progress
                 if let Ok(mut map) = dl_progress.lock() {
@@ -5911,10 +5679,6 @@ async fn run_wabbajack_install(
                 progress_tx.send(ProgressUpdate::SizeProgress(format!("0 / {} {}", total, directive_type))).ok();
                 progress_tx.send(ProgressUpdate::FileCount(0, total as i32)).ok();
             }
-            ProgressEvent::DirectiveStarted { index, total, name } => {
-                progress_tx.send(ProgressUpdate::FileProgress(name, index as f32 / total as f32)).ok();
-                progress_tx.send(ProgressUpdate::SizeProgress(format!("{} / {} directives", index, total))).ok();
-            }
             ProgressEvent::DirectiveComplete { index, total } => {
                 progress_tx.send(ProgressUpdate::FileCount(index as i32, total as i32)).ok();
                 progress_tx.send(ProgressUpdate::OverallProgress(index as f32 / total as f32)).ok();
@@ -5922,9 +5686,6 @@ async fn run_wabbajack_install(
             }
             ProgressEvent::Status { message } => {
                 progress_tx.send(ProgressUpdate::Status(message)).ok();
-            }
-            ProgressEvent::Log { message } => {
-                progress_tx.send(ProgressUpdate::Log(format!("[INFO] {}", message))).ok();
             }
         }
     });
@@ -5938,7 +5699,6 @@ async fn run_wabbajack_install(
         nexus_api_key: api_key.to_string(),
         max_concurrent_downloads: thread_count,
         nxm_mode: non_premium,
-        nxm_port: 8007,
         browser: "xdg-open".to_string(),
         progress_callback: Some(progress_callback),
     };

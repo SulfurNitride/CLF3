@@ -43,7 +43,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use tracing::{error, warn, info};
+use tracing::{error, warn};
 
 /// Message sent from extractor to mover workers.
 struct MoveJob {
@@ -103,19 +103,8 @@ impl ArchiveSizeTier {
 }
 
 /// Configuration for extraction (simplified).
-#[derive(Debug, Clone)]
-pub struct StreamingConfig {
-    /// Number of parallel file operations (default: all CPUs)
-    pub parallelism: usize,
-}
-
-impl Default for StreamingConfig {
-    fn default() -> Self {
-        Self {
-            parallelism: rayon::current_num_threads(),
-        }
-    }
-}
+#[derive(Debug, Clone, Default)]
+pub struct StreamingConfig;
 
 /// Statistics from the extraction pipeline.
 #[derive(Debug, Default)]
@@ -128,6 +117,7 @@ pub struct StreamingStats {
 
 /// Get the large archive threshold based on system RAM.
 /// Returns 1GB if system has <16GB RAM, otherwise 2GB.
+#[allow(dead_code)] // Used in tests
 pub fn get_large_archive_threshold() -> u64 {
     use std::sync::OnceLock;
     static THRESHOLD: OnceLock<u64> = OnceLock::new();
@@ -262,10 +252,11 @@ pub fn process_from_archive_streaming(
 
     // Group archives by size tier and type
     let archives: Vec<_> = by_archive.into_iter().collect();
-    let mut small_archives = Vec::new();   // ≤512MB - full parallel (1 thread each)
-    let mut medium_archives = Vec::new();  // 512MB-2GB - half parallel (2 threads each)
-    let mut large_archives = Vec::new();   // ≥2GB - sequential (all threads)
-    let mut bsa_archives = Vec::new();     // BSA/BA2 handled separately
+    let archive_count = archives.len();
+    let mut small_archives = Vec::with_capacity(archive_count);   // ≤512MB - full parallel (1 thread each)
+    let mut medium_archives = Vec::with_capacity(archive_count / 4);  // 512MB-2GB - half parallel (2 threads each)
+    let mut large_archives = Vec::with_capacity(4);   // ≥2GB - sequential (all threads)
+    let mut bsa_archives = Vec::with_capacity(archive_count / 4);     // BSA/BA2 handled separately
 
     for (archive_hash, directives) in archives {
         let archive_path = match ctx.get_archive_path(&archive_hash) {
@@ -553,6 +544,14 @@ fn process_archives_with_pipeline(
                     // Remove any existing file first (reflink fails if dest exists)
                     let _ = fs::remove_file(&job.output_path);
                     if let Err(e) = reflink_copy::reflink_or_copy(&job.source_path, &job.output_path) {
+                        // Check if another thread created the file (race condition)
+                        // If file exists with correct size, treat as success
+                        if let Ok(meta) = fs::metadata(&job.output_path) {
+                            if meta.len() == job.expected_size {
+                                skipped_clone.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
+                        }
                         let count = logged_failures_clone.fetch_add(1, Ordering::Relaxed);
                         if count < MAX_LOGGED_FAILURES {
                             error!("FAIL [{}]: reflink/copy error: {}", job.directive_id, e);
@@ -567,6 +566,13 @@ fn process_archives_with_pipeline(
                     if fs::rename(&job.source_path, &job.output_path).is_err() {
                         // Fallback to reflink/copy if rename fails (cross-filesystem)
                         if let Err(e) = reflink_copy::reflink_or_copy(&job.source_path, &job.output_path) {
+                            // Check if another thread created the file (race condition)
+                            if let Ok(meta) = fs::metadata(&job.output_path) {
+                                if meta.len() == job.expected_size {
+                                    skipped_clone.fetch_add(1, Ordering::Relaxed);
+                                    return;
+                                }
+                            }
                             let count = logged_failures_clone.fetch_add(1, Ordering::Relaxed);
                             if count < MAX_LOGGED_FAILURES {
                                 error!("FAIL [{}]: rename then reflink/copy failed: {}", job.directive_id, e);
@@ -1080,12 +1086,6 @@ fn build_extracted_file_map(dir: &std::path::Path) -> HashMap<String, PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_streaming_config_default() {
-        let config = StreamingConfig::default();
-        assert!(config.parallelism > 0);
-    }
 
     #[test]
     fn test_large_archive_threshold() {
