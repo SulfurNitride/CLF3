@@ -211,8 +211,12 @@ impl ModlistDb {
     }
 
     /// Import a parsed modlist into the database
+    /// Note: This clears existing directives first to prevent duplicates
     pub fn import_modlist(&mut self, modlist: &Modlist) -> Result<()> {
         let tx = self.conn.transaction()?;
+
+        // Clear existing directives to prevent duplicates on re-import
+        tx.execute("DELETE FROM directives", [])?;
 
         // Store metadata
         tx.execute(

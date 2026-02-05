@@ -96,7 +96,16 @@ pub fn import_wabbajack_to_db(wabbajack_path: &Path, db_path: &Path) -> Result<M
                 stats.total == 0
             }
         }
-        _ => true, // No metadata stored, need to import
+        _ => {
+            // No metadata stored - clear any orphaned data to prevent duplicates
+            // This can happen if a previous import crashed before setting fingerprint
+            let stats = db.get_directive_stats()?;
+            if stats.total > 0 {
+                info!("Clearing orphaned data from incomplete previous import ({} directives)", stats.total);
+                db.clear_all_data()?;
+            }
+            true
+        }
     };
 
     if needs_reimport {
