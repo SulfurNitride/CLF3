@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+use tracing::warn;
 
 /// List files in an archive using pure Rust crates
 fn list_archive_files_rust(archive_path: &Path) -> Result<Vec<ArchiveFileEntry>> {
@@ -813,11 +814,19 @@ pub fn process_directives_streaming(
     let missing_archives = check_missing_archives(db, &ctx)?;
     if !missing_archives.is_empty() {
         println!("ERROR: {} archives are missing! Re-run to download them:\n", missing_archives.len());
+        // Log to file for later reference
+        warn!("=== Missing Archives ({}) ===", missing_archives.len());
         for (name, hash) in missing_archives.iter().take(20) {
             println!("  - {} ({})", name, hash);
+            warn!("[MISSING] {} ({})", name, hash);
         }
         if missing_archives.len() > 20 {
             println!("  ... and {} more", missing_archives.len() - 20);
+            // Log remaining archives too
+            for (name, hash) in missing_archives.iter().skip(20) {
+                warn!("[MISSING] {} ({})", name, hash);
+            }
+            warn!("... total {} missing archives", missing_archives.len());
         }
         bail!("Missing archives - re-run the installer to download them");
     }
@@ -1040,11 +1049,19 @@ pub fn process_directives(db: &ModlistDb, config: &InstallConfig) -> Result<Proc
     let missing_archives = check_missing_archives(db, &ctx)?;
     if !missing_archives.is_empty() {
         println!("ERROR: {} archives are missing! Re-run to download them:\n", missing_archives.len());
+        // Log to file for later reference
+        warn!("=== Missing Archives ({}) ===", missing_archives.len());
         for (name, hash) in missing_archives.iter().take(20) {
             println!("  - {} ({})", name, hash);
+            warn!("[MISSING] {} ({})", name, hash);
         }
         if missing_archives.len() > 20 {
             println!("  ... and {} more", missing_archives.len() - 20);
+            // Log remaining archives too
+            for (name, hash) in missing_archives.iter().skip(20) {
+                warn!("[MISSING] {} ({})", name, hash);
+            }
+            warn!("... total {} missing archives", missing_archives.len());
         }
         bail!("Missing archives - re-run the installer to download them");
     }
@@ -2180,21 +2197,23 @@ fn extract_source_files_to_disk(
         }
     }
 
-    // For nested BSAs: extract files from BSAs we just extracted to disk
-    for (bsa_path, files_in_bsa) in nested_bsas {
-        let bsa_normalized = paths::normalize_for_lookup(bsa_path);
+    // For nested archives: extract files from BSAs/ZIPs/etc we just extracted to disk
+    // Note: "nested_bsas" is a misnomer - these can be any archive type (BSA, BA2, ZIP, FOMOD, etc.)
+    for (nested_archive_path, files_in_archive) in nested_bsas {
+        let archive_normalized = paths::normalize_for_lookup(nested_archive_path);
         // Clone the path to avoid borrow conflict
-        let bsa_file_path = match extracted.get(&bsa_normalized) {
+        let archive_file_path = match extracted.get(&archive_normalized) {
             Some(p) => p.clone(),
             None => continue,
         };
-        // Extract files from the BSA to disk
-        for (idx, file_path) in files_in_bsa.iter().enumerate() {
-            if let Ok(file_data) = bsa::extract_archive_file(&bsa_file_path, file_path) {
-                let key = format!("{}/{}", bsa_path, file_path);
+        // Extract files from the nested archive using the generic extractor
+        // This handles BSA, BA2, ZIP (including .fomod), 7z, RAR, etc.
+        for (idx, file_path) in files_in_archive.iter().enumerate() {
+            if let Ok(file_data) = extract_from_archive_with_temp(&archive_file_path, file_path, temp_dir) {
+                let key = format!("{}/{}", nested_archive_path, file_path);
                 let normalized_key = paths::normalize_for_lookup(&key);
                 let temp_file_path = temp_dir.join(format!("nested_{}_{}.tmp",
-                    bsa_normalized.replace(['/', '\\'], "_"), idx));
+                    archive_normalized.replace(['/', '\\'], "_"), idx));
                 if fs::write(&temp_file_path, &file_data).is_ok() {
                     extracted.insert(normalized_key, temp_file_path);
                 }

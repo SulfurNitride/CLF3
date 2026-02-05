@@ -550,6 +550,8 @@ fn process_archives_with_pipeline(
 
                 if job.is_shared_source {
                     // Source has multiple destinations - use reflink (instant CoW) with copy fallback
+                    // Remove any existing file first (reflink fails if dest exists)
+                    let _ = fs::remove_file(&job.output_path);
                     if let Err(e) = reflink_copy::reflink_or_copy(&job.source_path, &job.output_path) {
                         let count = logged_failures_clone.fetch_add(1, Ordering::Relaxed);
                         if count < MAX_LOGGED_FAILURES {
@@ -560,6 +562,8 @@ fn process_archives_with_pipeline(
                     }
                 } else {
                     // Single destination - use rename (instant move)
+                    // Remove destination first if it exists (rename behavior varies by OS)
+                    let _ = fs::remove_file(&job.output_path);
                     if fs::rename(&job.source_path, &job.output_path).is_err() {
                         // Fallback to reflink/copy if rename fails (cross-filesystem)
                         if let Err(e) = reflink_copy::reflink_or_copy(&job.source_path, &job.output_path) {

@@ -437,6 +437,9 @@ slint::slint! {
         in-out property <[string]> proton_names: [];  // String model for ComboBox
         in-out property <int> selected_proton_index: -1;  // -1 = none selected
 
+        // Custom game name for Steam shortcut (optional - defaults to modlist name)
+        in-out property <string> custom_game_name: "";
+
         // Computed properties
         property <bool> ttw_ready: !ttw_required || (ttw_mpi_path != "" && ttw_fo3_found && ttw_fnv_found);
         property <bool> can_install: source_path != "" && install_dir != "" &&
@@ -494,7 +497,7 @@ slint::slint! {
                             }
                         }
 
-                        // Proton Selection Dropdown (compact inline)
+                        // Proton Selection
                         HorizontalLayout {
                             spacing: 6px;
 
@@ -515,7 +518,6 @@ slint::slint! {
                                 enabled: !is_running;
                             }
 
-                            // No Protons warning
                             if proton_names.length == 0: Rectangle {
                                 horizontal-stretch: 1;
                                 height: 26px;
@@ -530,6 +532,49 @@ slint::slint! {
                                     color: Theme.red;
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        // Custom game name (optional)
+                        HorizontalLayout {
+                            spacing: 6px;
+
+                            Text {
+                                text: "Game Name:";
+                                font-size: 11px;
+                                font-weight: 500;
+                                color: Theme.subtext1;
+                                vertical-alignment: center;
+                                width: 90px;
+                            }
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                height: 26px;
+                                background: #313244;
+                                border-radius: 4px;
+                                border-width: 1px;
+                                border-color: custom_name_input.has-focus ? Theme.lavender : #45475a;
+
+                                custom_name_input := TextInput {
+                                    x: 8px;
+                                    width: parent.width - 16px;
+                                    height: parent.height;
+                                    vertical-alignment: center;
+                                    font-size: 11px;
+                                    color: Theme.text;
+                                    text <=> custom_game_name;
+                                    enabled: !is_running;
+                                }
+
+                                Text {
+                                    x: 8px;
+                                    text: "Optional - defaults to modlist name";
+                                    font-size: 11px;
+                                    color: #6c7086;
+                                    vertical-alignment: center;
+                                    visible: custom_game_name == "";
                                 }
                             }
                         }
@@ -3479,6 +3524,9 @@ pub fn run() -> Result<(), slint::PlatformError> {
             let ttw_fo3_path = window.get_ttw_fo3_path().to_string();
             let ttw_fnv_path = window.get_ttw_fnv_path().to_string();
 
+            // Get custom game name for Steam shortcut (optional)
+            let custom_game_name = window.get_custom_game_name().to_string();
+
             // Validate TTW paths before starting (fail early with clear message)
             if ttw_required && !ttw_mpi_path.is_empty() {
                 let mpi = std::path::Path::new(&ttw_mpi_path);
@@ -3519,6 +3567,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
             let ttw_mpi_clone = ttw_mpi_path.clone();
             let ttw_fo3_clone = ttw_fo3_path.clone();
             let ttw_fnv_clone = ttw_fnv_path.clone();
+            let custom_game_name_clone = custom_game_name.clone();
 
             // Spawn installation in background thread
             println!("[GUI] Spawning installation thread (non_premium={}, proton={})...", non_premium, proton_name);
@@ -3556,15 +3605,26 @@ pub fn run() -> Result<(), slint::PlatformError> {
                             // Run TTW installation if required
                             let mut ttw_success = true;
                             if ttw_required && !ttw_mpi_clone.is_empty() && !ttw_fo3_clone.is_empty() && !ttw_fnv_clone.is_empty() {
-                                tx.send(ProgressUpdate::Status("Installing TTW...".to_string())).ok();
+                                tx.send(ProgressUpdate::Status("Installing TTW (this may take 5-20 minutes)...".to_string())).ok();
                                 tx.send(ProgressUpdate::Log("[INFO] Starting TTW installation...".to_string())).ok();
+                                tx.send(ProgressUpdate::Log("[INFO] TTW installation typically takes 5-20 minutes depending on hardware.".to_string())).ok();
 
                                 let install_path = std::path::Path::new(&install_clone);
                                 let mpi_path = std::path::Path::new(&ttw_mpi_clone);
                                 let fo3_path = std::path::Path::new(&ttw_fo3_clone);
                                 let fnv_path = std::path::Path::new(&ttw_fnv_clone);
 
-                                match crate::ttw::finalize_ttw_from_paths(install_path, mpi_path, fo3_path, fnv_path) {
+                                // Clone tx for the progress callback
+                                let tx_ttw = tx.clone();
+                                let progress_callback = move |msg: &str| {
+                                    // Update status with TTW progress
+                                    tx_ttw.send(ProgressUpdate::Status(format!("TTW: {}", msg))).ok();
+                                    tx_ttw.send(ProgressUpdate::Log(format!("[TTW] {}", msg))).ok();
+                                };
+
+                                match crate::ttw::finalize_ttw_from_paths_with_progress(
+                                    install_path, mpi_path, fo3_path, fnv_path, progress_callback
+                                ) {
                                     Ok(ttw_output) => {
                                         tx.send(ProgressUpdate::Log(format!(
                                             "[INFO] TTW installation completed! Output: {}",
@@ -3625,11 +3685,15 @@ pub fn run() -> Result<(), slint::PlatformError> {
                                     // MO2 is installed in install_dir
                                     let mo2_path = std::path::Path::new(&install_clone);
 
-                                    // Use modlist name for Steam shortcut
-                                    let shortcut_name = std::path::Path::new(&source_clone)
-                                        .file_stem()
-                                        .map(|s| s.to_string_lossy().to_string())
-                                        .unwrap_or_else(|| "Mod Organizer 2".to_string());
+                                    // Use custom name if provided, otherwise modlist filename
+                                    let shortcut_name = if !custom_game_name_clone.trim().is_empty() {
+                                        custom_game_name_clone.trim().to_string()
+                                    } else {
+                                        std::path::Path::new(&source_clone)
+                                            .file_stem()
+                                            .map(|s| s.to_string_lossy().to_string())
+                                            .unwrap_or_else(|| "Mod Organizer 2".to_string())
+                                    };
 
                                     tx.send(ProgressUpdate::Log(format!("[INFO] Creating Steam shortcut: {}", shortcut_name))).ok();
 

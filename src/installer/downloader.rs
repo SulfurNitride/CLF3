@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tracing::warn;
 
 /// Max retries for network operations
 const MAX_RETRIES: u32 = 3;
@@ -346,6 +347,10 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
         println!("\n=== Manual Downloads Required ({}) ===", manual_downloads_list.len());
         println!("Please download the following files to: {}\n", config.downloads_dir.display());
 
+        // Log to file for later reference
+        warn!("=== Manual Downloads Required ({}) ===", manual_downloads_list.len());
+        warn!("Download destination: {}", config.downloads_dir.display());
+
         for (i, md) in manual_downloads_list.iter().enumerate() {
             println!("{}. {}", i + 1, md.name);
             println!("   URL: {}", md.url);
@@ -354,6 +359,13 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
                 println!("   Note: {}", prompt);
             }
             println!();
+
+            // Log each manual download to file
+            if let Some(prompt) = &md.prompt {
+                warn!("[MANUAL] {}: {} (size: {} bytes, note: {})", md.name, md.url, md.expected_size, prompt);
+            } else {
+                warn!("[MANUAL] {}: {} (size: {} bytes)", md.name, md.url, md.expected_size);
+            }
         }
 
         println!("After downloading, run the command again to continue.\n");
@@ -364,12 +376,19 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
         println!("\n=== Failed Downloads ({}) ===", failed_downloads_list.len());
         println!("These downloads failed. Try manually downloading to: {}\n", config.downloads_dir.display());
 
+        // Log to file for later reference
+        warn!("=== Failed Downloads ({}) ===", failed_downloads_list.len());
+        warn!("Download destination: {}", config.downloads_dir.display());
+
         for (i, fd) in failed_downloads_list.iter().enumerate() {
             println!("{}. {}", i + 1, fd.name);
             println!("   URL: {}", fd.url);
             println!("   Error: {}", fd.error);
             println!("   Expected size: {} bytes ({:.2} MB)", fd.expected_size, fd.expected_size as f64 / 1024.0 / 1024.0);
             println!();
+
+            // Log each failed download to file
+            warn!("[FAILED] {}: {} (error: {}, size: {} bytes)", fd.name, fd.url, fd.error, fd.expected_size);
         }
 
         println!("After downloading, run the command again to continue.\n");

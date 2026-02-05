@@ -310,6 +310,152 @@ pub fn install_ttw(
     Ok(dest_path)
 }
 
+/// Run the TTW MPI installer with real-time progress streaming
+///
+/// Same as `install_ttw` but streams output line-by-line to a callback
+/// so the GUI can display progress during the long-running installation.
+///
+/// # Arguments
+/// * `mpi_path` - Path to the TTW .mpi file
+/// * `fo3_path` - Path to Fallout 3 installation
+/// * `fnv_path` - Path to Fallout New Vegas installation
+/// * `install_dir` - Modlist installation directory
+/// * `installer_path` - Path to TTW installer binary (optional, auto-detects if None)
+/// * `progress_callback` - Called for each line of output (for GUI updates)
+pub fn install_ttw_with_progress<F>(
+    mpi_path: &Path,
+    fo3_path: &Path,
+    fnv_path: &Path,
+    install_dir: &Path,
+    installer_path: Option<&Path>,
+    mut progress_callback: F,
+) -> Result<PathBuf>
+where
+    F: FnMut(&str),
+{
+    let dest_path = ttw_mod_path(install_dir);
+
+    // Check if already installed
+    if verify_ttw_output(&dest_path) {
+        info!("TTW already installed at {}", dest_path.display());
+        progress_callback("TTW already installed, skipping...");
+        return Ok(dest_path);
+    }
+
+    info!("Installing TTW...");
+    info!("  MPI: {}", mpi_path.display());
+    info!("  FO3: {}", fo3_path.display());
+    info!("  FNV: {}", fnv_path.display());
+    info!("  Dest: {}", dest_path.display());
+
+    progress_callback("Starting TTW installation (this may take 5-20 minutes)...");
+
+    // Verify MPI file exists
+    if !mpi_path.exists() {
+        bail!("TTW MPI file not found: {}", mpi_path.display());
+    }
+
+    // Verify game paths exist
+    if !fo3_path.exists() {
+        bail!("Fallout 3 path not found: {}", fo3_path.display());
+    }
+    if !fnv_path.exists() {
+        bail!("Fallout New Vegas path not found: {}", fnv_path.display());
+    }
+
+    // Create destination directory
+    fs::create_dir_all(&dest_path)
+        .with_context(|| format!("Failed to create TTW output directory: {}", dest_path.display()))?;
+
+    // Find installer binary
+    let installer = find_ttw_installer(installer_path)?;
+    info!("  Installer: {}", installer.display());
+
+    progress_callback(&format!("Using TTW installer: {}", installer.display()));
+
+    // Run the installer with piped stdout/stderr for real-time streaming
+    info!("Running TTW installer:");
+    info!("  {} install --mpi {} --fo3 {} --fnv {} --dest {}",
+        installer.display(), mpi_path.display(), fo3_path.display(), fnv_path.display(), dest_path.display());
+
+    let mut child = Command::new(&installer)
+        .arg("install")
+        .arg("--mpi")
+        .arg(mpi_path)
+        .arg("--fo3")
+        .arg(fo3_path)
+        .arg("--fnv")
+        .arg(fnv_path)
+        .arg("--dest")
+        .arg(&dest_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("Failed to execute TTW installer: {}", installer.display()))?;
+
+    // Stream stdout in real-time
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    // Read stdout line by line
+    if let Some(stdout) = stdout {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            if let Ok(line) = line {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    info!("[TTW] {}", trimmed);
+                    // Parse progress from TTW installer output
+                    // Format: "[HH:MM:SS] Assets: X/Y - BSA N/M: ..."
+                    if trimmed.contains("Assets:") || trimmed.contains("Writing BSA")
+                        || trimmed.contains("Installation complete") || trimmed.contains("Processing")
+                        || trimmed.contains("Extracting") || trimmed.contains("checks passed")
+                    {
+                        // Extract just the message part (after timestamp)
+                        let msg = if trimmed.starts_with('[') {
+                            trimmed.find(']').map(|i| &trimmed[i+1..]).unwrap_or(trimmed).trim()
+                        } else {
+                            trimmed
+                        };
+                        progress_callback(msg);
+                    }
+                }
+            }
+        }
+    }
+
+    // Read any remaining stderr
+    if let Some(stderr) = stderr {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            if let Ok(line) = line {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    warn!("[TTW] {}", trimmed);
+                    progress_callback(&format!("Warning: {}", trimmed));
+                }
+            }
+        }
+    }
+
+    // Wait for process to complete
+    let status = child.wait()
+        .context("Failed to wait for TTW installer")?;
+
+    if !status.success() {
+        bail!("TTW installer failed with exit code {:?}", status.code());
+    }
+
+    // Verify installation
+    if !verify_ttw_output(&dest_path) {
+        bail!("TTW installation completed but output verification failed");
+    }
+
+    info!("TTW installation completed successfully");
+    progress_callback("TTW installation completed successfully!");
+    Ok(dest_path)
+}
+
 /// Get the path where we cache the TTW installer
 fn ttw_installer_cache_path() -> PathBuf {
     dirs::data_dir()
@@ -702,6 +848,64 @@ pub fn finalize_ttw_from_paths(
 
     // Install TTW (no external installer, uses Wine/Proton internally if needed)
     let ttw_path = install_ttw(mpi_path, fo3_path, fnv_path, install_dir, None)?;
+
+    // Add to modlist - find the first profile with a modlist.txt
+    let profiles_dir = install_dir.join("profiles");
+    if profiles_dir.exists() {
+        if let Ok(entries) = fs::read_dir(&profiles_dir) {
+            for entry in entries.flatten() {
+                let profile_path = entry.path();
+                if profile_path.is_dir() {
+                    let modlist_file = profile_path.join("modlist.txt");
+                    if modlist_file.exists() {
+                        if let Some(profile_name) = profile_path.file_name() {
+                            let profile_name = profile_name.to_string_lossy();
+                            info!("Found profile: {}", profile_name);
+                            if let Err(e) = add_ttw_to_modlist(install_dir, &profile_name) {
+                                warn!("Failed to add TTW to profile {}: {}", profile_name, e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(ttw_path)
+}
+
+/// Simplified TTW finalization with progress callback for GUI
+///
+/// Same as `finalize_ttw_from_paths` but streams progress updates.
+pub fn finalize_ttw_from_paths_with_progress<F>(
+    install_dir: &Path,
+    mpi_path: &Path,
+    fo3_path: &Path,
+    fnv_path: &Path,
+    progress_callback: F,
+) -> Result<PathBuf>
+where
+    F: FnMut(&str),
+{
+    info!("Installing TTW from paths:");
+    info!("  MPI: {}", mpi_path.display());
+    info!("  FO3: {}", fo3_path.display());
+    info!("  FNV: {}", fnv_path.display());
+    info!("  Install dir: {}", install_dir.display());
+
+    // Validate paths exist
+    if !mpi_path.exists() {
+        bail!("MPI file not found: {}", mpi_path.display());
+    }
+    if !fo3_path.exists() {
+        bail!("Fallout 3 path not found: {}", fo3_path.display());
+    }
+    if !fnv_path.exists() {
+        bail!("Fallout New Vegas path not found: {}", fnv_path.display());
+    }
+
+    // Install TTW with progress streaming
+    let ttw_path = install_ttw_with_progress(mpi_path, fo3_path, fnv_path, install_dir, None, progress_callback)?;
 
     // Add to modlist - find the first profile with a modlist.txt
     let profiles_dir = install_dir.join("profiles");
