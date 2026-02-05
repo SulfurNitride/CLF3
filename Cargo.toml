@@ -1,6 +1,6 @@
 [package]
 name = "clf3"
-version = "0.0.2"
+version = "0.0.5"
 edition = "2021"
 description = "Wabbajack modlist installer for Linux"
 license = "MIT"
