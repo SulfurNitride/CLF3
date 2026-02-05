@@ -218,10 +218,11 @@ impl ModlistBrowser {
             }
         }
 
-        // Filter out force_down modlists
-        all_modlists.retain(|m| !m.force_down);
-
-        info!("Total modlists available: {}", all_modlists.len());
+        // Count available vs unavailable for logging (but keep all in list)
+        let available_count = all_modlists.iter().filter(|m| m.is_available()).count();
+        let unavailable_count = all_modlists.len() - available_count;
+        info!("Total modlists: {} ({} available, {} unavailable)",
+              all_modlists.len(), available_count, unavailable_count);
         self.modlists = all_modlists;
 
         // Fetch featured list

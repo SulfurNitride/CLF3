@@ -1458,6 +1458,7 @@ slint::slint! {
         description: string,
         is_nsfw: bool,
         is_official: bool,
+        is_available: bool,     // false if force_down or no download URL
         image: image,
         has_image: bool,
         visible: bool,
@@ -1485,13 +1486,14 @@ slint::slint! {
         in-out property <float> download_progress: 0.0;
         in-out property <bool> show_unofficial: true;
         in-out property <bool> show_nsfw: false;
+        in-out property <bool> show_unavailable: false;  // Hide unavailable by default
         in-out property <bool> game_dropdown_open: false;
         in-out property <int> visible_count: 0;  // Count of visible modlists for viewport height
 
         // Callbacks
         callback search_changed(string);
         callback game_filter_changed(string);
-        callback filter_changed(bool, bool);
+        callback filter_changed(bool, bool, bool);  // show_unofficial, show_nsfw, show_unavailable
         callback select_modlist(int);
         callback cancel();
         callback refresh();
@@ -1630,7 +1632,7 @@ slint::slint! {
                         unofficial_check := TouchArea {
                             clicked => {
                                 show_unofficial = !show_unofficial;
-                                filter_changed(show_unofficial, show_nsfw);
+                                filter_changed(show_unofficial, show_nsfw, show_unavailable);
                             }
                         }
 
@@ -1667,7 +1669,7 @@ slint::slint! {
                         nsfw_check := TouchArea {
                             clicked => {
                                 show_nsfw = !show_nsfw;
-                                filter_changed(show_unofficial, show_nsfw);
+                                filter_changed(show_unofficial, show_nsfw, show_unavailable);
                             }
                         }
 
@@ -1683,6 +1685,43 @@ slint::slint! {
 
                     Text {
                         text: "Show NSFW";
+                        font-size: 13px;
+                        color: #cdd6f4;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // Show Unavailable checkbox
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    Rectangle {
+                        width: 20px;
+                        height: 20px;
+                        background: show_unavailable ? #fab387 : #313244;
+                        border-radius: 4px;
+                        border-width: 1px;
+                        border-color: #45475a;
+
+                        unavailable_check := TouchArea {
+                            clicked => {
+                                show_unavailable = !show_unavailable;
+                                filter_changed(show_unofficial, show_nsfw, show_unavailable);
+                            }
+                        }
+
+                        if show_unavailable: Text {
+                            text: "✓";
+                            font-size: 14px;
+                            font-weight: 700;
+                            color: #1e1e2e;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Text {
+                        text: "Show Unavailable";
                         font-size: 13px;
                         color: #cdd6f4;
                         vertical-alignment: center;
@@ -1775,6 +1814,22 @@ slint::slint! {
                                         horizontal-alignment: center;
                                         vertical-alignment: center;
                                     }
+
+                                    // Unavailable overlay with X
+                                    if !modlist.is_available: Rectangle {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        background: #00000080;  // Semi-transparent black
+
+                                        Text {
+                                            text: "✕";
+                                            font-size: 72px;
+                                            font-weight: 700;
+                                            color: #f38ba8;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
                                 }
 
                                 // Middle: Title and info
@@ -1825,6 +1880,22 @@ slint::slint! {
 
                                             Text {
                                                 text: "NSFW";
+                                                font-size: 10px;
+                                                font-weight: 600;
+                                                color: #1e1e2e;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+
+                                        if !modlist.is_available: Rectangle {
+                                            width: 75px;
+                                            height: 18px;
+                                            background: #f9e2af;
+                                            border-radius: 4px;
+
+                                            Text {
+                                                text: "Unavailable";
                                                 font-size: 10px;
                                                 font-weight: 600;
                                                 color: #1e1e2e;
@@ -3860,6 +3931,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                 modlists: &[crate::modlist::ModlistMetadata],
                 show_unofficial: bool,
                 show_nsfw: bool,
+                show_unavailable: bool,
             ) -> (Vec<ModlistInfo>, Vec<String>) {
                 // Build game list
                 let mut games: Vec<String> = vec!["All Games".to_string()];
@@ -3885,7 +3957,10 @@ pub fn run() -> Result<(), slint::PlatformError> {
                         let inst_size = m.download_metadata.as_ref()
                             .map(|d| format_size(d.size_of_installed_files))
                             .unwrap_or_else(|| "Unknown".into());
-                        let visible = (show_unofficial || m.official) && (show_nsfw || !m.nsfw);
+                        let is_available = m.is_available();
+                        let visible = (show_unofficial || m.official)
+                            && (show_nsfw || !m.nsfw)
+                            && (show_unavailable || is_available);
 
                         ModlistInfo {
                             index: idx as i32,
@@ -3899,6 +3974,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                             description: m.description.clone().into(),
                             is_nsfw: m.nsfw,
                             is_official: m.official,
+                            is_available,
                             image: slint::Image::default(),
                             has_image: false,
                             visible,
@@ -3937,7 +4013,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
                             if let Some(dialog) = dialog_weak_cache.upgrade() {
                                 let show_unofficial = dialog.get_show_unofficial();
                                 let show_nsfw = dialog.get_show_nsfw();
-                                let (ui_modlists, games) = modlists_to_ui(&cached_modlists_for_ui, show_unofficial, show_nsfw);
+                                let show_unavailable = dialog.get_show_unavailable();
+                                let (ui_modlists, games) = modlists_to_ui(&cached_modlists_for_ui, show_unofficial, show_nsfw, show_unavailable);
                                 let visible_count = ui_modlists.iter().filter(|m| m.visible).count() as i32;
 
                                 *modlist_data_for_cache.lock().unwrap() = cached_modlists_for_ui;
@@ -3981,7 +4058,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
                                 if !had_cache {
                                     let show_unofficial = dialog.get_show_unofficial();
                                     let show_nsfw = dialog.get_show_nsfw();
-                                    let (ui_modlists, games) = modlists_to_ui(&modlists, show_unofficial, show_nsfw);
+                                    let show_unavailable = dialog.get_show_unavailable();
+                                    let (ui_modlists, games) = modlists_to_ui(&modlists, show_unofficial, show_nsfw, show_unavailable);
                                     let visible_count = ui_modlists.iter().filter(|m| m.visible).count() as i32;
 
                                     let game_model: Vec<slint::SharedString> = games.iter().map(|g| g.clone().into()).collect();
@@ -4074,6 +4152,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                 game: &str,
                 show_unofficial: bool,
                 show_nsfw: bool,
+                show_unavailable: bool,
                 loaded_images: &std::collections::HashMap<String, (u32, u32, Vec<u8>)>,
             ) -> Vec<ModlistInfo> {
                 let query_lower = query.to_lowercase();
@@ -4092,7 +4171,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
                             game_internal == game_filter_internal;
                         let matches_unofficial = show_unofficial || m.official;
                         let matches_nsfw = show_nsfw || !m.nsfw;
-                        matches_query && matches_game && matches_unofficial && matches_nsfw
+                        let matches_available = show_unavailable || m.is_available();
+                        matches_query && matches_game && matches_unofficial && matches_nsfw && matches_available
                     })
                     .map(|(idx, m)| {
                         let dl_size = m.download_metadata.as_ref()
@@ -4124,6 +4204,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                             description: m.description.clone().into(),
                             is_nsfw: m.nsfw,
                             is_official: m.official,
+                            is_available: m.is_available(),
                             image,
                             has_image,
                             visible: true,
@@ -4147,6 +4228,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                             &dialog.get_selected_game().to_string(),
                             dialog.get_show_unofficial(),
                             dialog.get_show_nsfw(),
+                            dialog.get_show_unavailable(),
                             &images,
                         );
                         dialog.set_modlists(std::rc::Rc::new(slint::VecModel::from(filtered)).into());
@@ -4169,6 +4251,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                             &game.to_string(),
                             dialog.get_show_unofficial(),
                             dialog.get_show_nsfw(),
+                            dialog.get_show_unavailable(),
                             &images,
                         );
                         dialog.set_modlists(std::rc::Rc::new(slint::VecModel::from(filtered)).into());
@@ -4176,12 +4259,12 @@ pub fn run() -> Result<(), slint::PlatformError> {
                 }
             });
 
-            // Filter changed callback (unofficial/nsfw checkboxes)
+            // Filter changed callback (unofficial/nsfw/unavailable checkboxes)
             dialog.on_filter_changed({
                 let dialog_weak = dialog.as_weak();
                 let modlist_data = modlist_data.clone();
                 let loaded_images = loaded_images.clone();
-                move |show_unofficial, show_nsfw| {
+                move |show_unofficial, show_nsfw, show_unavailable| {
                     if let Some(dialog) = dialog_weak.upgrade() {
                         let all_modlists = modlist_data.lock().unwrap();
                         let images = loaded_images.lock().unwrap();
@@ -4191,6 +4274,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                             &dialog.get_selected_game().to_string(),
                             show_unofficial,
                             show_nsfw,
+                            show_unavailable,
                             &images,
                         );
                         dialog.set_modlists(std::rc::Rc::new(slint::VecModel::from(filtered)).into());
@@ -4404,7 +4488,11 @@ pub fn run() -> Result<(), slint::PlatformError> {
                                                         .unwrap_or_else(|| "Unknown".into());
 
                                                     // Determine visibility based on current filters
-                                                    let visible = (show_unofficial || m.official) && (show_nsfw || !m.nsfw);
+                                                    let is_available = m.is_available();
+                                                    let show_unavailable = dialog.get_show_unavailable();
+                                                    let visible = (show_unofficial || m.official)
+                                                        && (show_nsfw || !m.nsfw)
+                                                        && (show_unavailable || is_available);
 
                                                     ModlistInfo {
                                                         index: idx as i32,
@@ -4418,6 +4506,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                                                         description: m.description.clone().into(),
                                                         is_nsfw: m.nsfw,
                                                         is_official: m.official,
+                                                        is_available,
                                                         image: slint::Image::default(),
                                                         has_image: false,
                                                         visible,
