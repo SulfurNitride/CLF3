@@ -294,6 +294,30 @@ fn parse_7z_list(output: &[u8]) -> Result<Vec<ArchiveEntry>> {
     Ok(entries)
 }
 
+/// Parse "Incorrect reparse stream" paths from 7z stderr output.
+///
+/// Example line:
+/// `ERROR: Incorrect reparse stream : errno=2 : No such file or directory : path/in/archive.txt`
+fn parse_incorrect_reparse_paths(stderr: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for line in stderr.lines() {
+        if !line.contains("Incorrect reparse stream") {
+            continue;
+        }
+
+        if let Some(path) = line.rsplit(" : ").next() {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+                paths.push(trimmed.to_string());
+            }
+        }
+    }
+
+    paths
+}
+
 /// Check if an archive is a solid 7z archive.
 ///
 /// Solid archives store files as a single compressed stream, requiring
@@ -537,6 +561,46 @@ pub fn extract_files(archive_path: &Path, files: &[&str], output_dir: &Path) -> 
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let reparse_paths = parse_incorrect_reparse_paths(&stderr);
+
+        if !reparse_paths.is_empty() {
+            let mut retry = Command::new(&sz_path);
+            retry.arg("x")
+                .arg("-y")
+                .arg("-aoa")
+                .arg("-scsUTF-8")
+                .arg(format!("-o{}", output_dir.display()));
+
+            for path in &reparse_paths {
+                retry.arg(format!("-x!{}", path));
+            }
+
+            retry.arg(archive_path);
+            for file in files {
+                retry.arg(file);
+            }
+
+            let retry_output = retry.output().with_context(|| {
+                format!(
+                    "Failed retry extraction (excluding reparse paths) from {}",
+                    archive_path.display()
+                )
+            })?;
+
+            if retry_output.status.success() {
+                return Ok(());
+            }
+
+            let retry_stderr = String::from_utf8_lossy(&retry_output.stderr);
+            bail!(
+                "7z extract failed for {}: {}; retry excluding reparse paths {:?} also failed: {}",
+                archive_path.display(),
+                stderr,
+                reparse_paths,
+                retry_stderr
+            );
+        }
+
         bail!(
             "7z extract failed for {}: {}",
             archive_path.display(),
@@ -645,6 +709,60 @@ pub fn extract_all_with_threads(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let reparse_paths = parse_incorrect_reparse_paths(&stderr);
+
+        if !reparse_paths.is_empty() {
+            let mut retry = Command::new(&sz_path);
+            retry.arg("x")
+                .arg("-y")
+                .arg("-aoa")
+                .arg("-scsUTF-8");
+
+            match threads {
+                Some(1) => {
+                    retry.arg("-mmt=1");
+                }
+                Some(n) if n > 1 => {
+                    retry.arg(format!("-mmt={}", n));
+                }
+                _ => {
+                    retry.arg("-mmt=on");
+                }
+            }
+
+            retry.arg(format!("-o{}", output_dir.display()));
+            for path in &reparse_paths {
+                retry.arg(format!("-x!{}", path));
+            }
+            retry.arg(archive_path);
+
+            let retry_output = retry.output().with_context(|| {
+                format!(
+                    "Failed retry extraction (excluding reparse paths) for {}",
+                    archive_path.display()
+                )
+            })?;
+
+            if retry_output.status.success() {
+                // Count extracted files
+                let count = walkdir::WalkDir::new(output_dir)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().is_file())
+                    .count();
+                return Ok(count);
+            }
+
+            let retry_stderr = String::from_utf8_lossy(&retry_output.stderr);
+            bail!(
+                "7z extract all failed for {}: {}; retry excluding reparse paths {:?} also failed: {}",
+                archive_path.display(),
+                stderr,
+                reparse_paths,
+                retry_stderr
+            );
+        }
+
         bail!(
             "7z extract all failed for {}: {}",
             archive_path.display(),
@@ -878,6 +996,20 @@ Attributes = D....
         assert!(!entries[0].is_dir);
         assert_eq!(entries[1].path, "subdir/file.bin");
         assert_eq!(entries[1].size, 5678);
+    }
+
+    #[test]
+    fn test_parse_incorrect_reparse_paths() {
+        let stderr = "\
+ERROR: Incorrect reparse stream : errno=2 : No such file or directory : Race-Based Textures (RBT)/HowToMakeItWork.txt
+ERROR: Some other line
+ERROR: Incorrect reparse stream : errno=17 : File exists : Foo/Bar.txt
+ERROR: Incorrect reparse stream : errno=17 : File exists : Foo/Bar.txt";
+
+        let paths = parse_incorrect_reparse_paths(stderr);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0], "Race-Based Textures (RBT)/HowToMakeItWork.txt");
+        assert_eq!(paths[1], "Foo/Bar.txt");
     }
 
     #[test]
