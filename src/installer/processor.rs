@@ -23,10 +23,34 @@ use std::fs::{self, File};
 use std::io::BufReader;
 use zip::ZipArchive;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tracing::warn;
+
+fn selective_extract_threshold() -> usize {
+    static THRESHOLD: OnceLock<usize> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("CLF3_SELECTIVE_EXTRACT_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(25)
+    })
+}
+
+fn should_use_selective_extraction(archive_path: &Path, needed_files: usize) -> bool {
+    if needed_files == 0 || needed_files > selective_extract_threshold() {
+        return false;
+    }
+
+    match detect_archive_type(archive_path).unwrap_or(ArchiveType::Unknown) {
+        ArchiveType::SevenZ => matches!(crate::archive::sevenzip::is_solid_archive(archive_path), Ok(false)),
+        ArchiveType::Zip | ArchiveType::Rar | ArchiveType::Unknown => true,
+        ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2 => false,
+    }
+}
 
 /// List files in an archive using pure Rust crates
 fn list_archive_files_rust(archive_path: &Path) -> Result<Vec<ArchiveFileEntry>> {
@@ -1437,14 +1461,27 @@ fn process_archive_patches(
     );
 
     let archive_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let preloaded_patches = preload_patch_blobs(&ctx.config.wabbajack_path, &to_process)
+        .unwrap_or_else(|e| {
+            tracing::debug!(
+                "Patch preload failed for archive {} (falling back to shared reader): {}",
+                archive_name,
+                e
+            );
+            HashMap::new()
+        });
 
     // Process each patch sequentially (to limit memory), write directly to disk
     for (id, directive) in &to_process {
+        let patch_name = directive.patch_id.to_string();
+        let preloaded_delta = preloaded_patches.get(&patch_name).map(|v| v.as_slice());
         let result = apply_patch_streaming(
             ctx,
             &archive_path,
             directive,
             &extracted_paths,
+            &patch_name,
+            preloaded_delta,
         );
 
         match result {
@@ -1466,6 +1503,40 @@ fn process_archive_patches(
     }
 
     // temp_dir is dropped here, cleaning up extracted files
+}
+
+/// Preload patch blobs for an archive using a local ZIP reader.
+///
+/// This avoids contention on the shared mutex-protected wabbajack reader.
+fn preload_patch_blobs(
+    wabbajack_path: &Path,
+    directives: &[&(i64, crate::modlist::PatchedFromArchiveDirective)],
+) -> Result<HashMap<String, Vec<u8>>> {
+    let mut unique_patch_names = std::collections::HashSet::new();
+    for (_, directive) in directives {
+        unique_patch_names.insert(directive.patch_id.to_string());
+    }
+
+    if unique_patch_names.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let file = File::open(wabbajack_path)
+        .with_context(|| format!("Failed to open {}", wabbajack_path.display()))?;
+    let reader = BufReader::new(file);
+    let mut archive = ZipArchive::new(reader).context("Failed to read wabbajack as ZIP")?;
+
+    let mut blobs = HashMap::with_capacity(unique_patch_names.len());
+    for patch_name in unique_patch_names {
+        let mut patch_file = archive
+            .by_name(&patch_name)
+            .with_context(|| format!("Patch '{}' not found in wabbajack", patch_name))?;
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(&mut patch_file, &mut data)?;
+        blobs.insert(patch_name, data);
+    }
+
+    Ok(blobs)
 }
 
 /// Extract source files needed for patching to disk (memory-optimized).
@@ -1518,8 +1589,7 @@ fn extract_source_files_to_disk(
                 }
             }
             ArchiveType::SevenZ | ArchiveType::Rar => {
-                // Extract entire archive to temp (one fast 7z call)
-                // This is much faster than streaming individual files (one 7z call per file)
+                // Extract only needed files when the request set is small.
                 let extract_dir = temp_dir.join("archive_extract");
                 let _ = fs::create_dir_all(&extract_dir);
 
@@ -1529,7 +1599,21 @@ fn extract_source_files_to_disk(
                     .map(|k| paths::normalize_for_lookup(k))
                     .collect();
 
-                if crate::archive::sevenzip::extract_all(archive_path, &extract_dir).is_ok() {
+                let needed_paths: Vec<String> = simple_paths.values().cloned().collect();
+                let selective = should_use_selective_extraction(archive_path, needed_paths.len());
+                let extract_result = if selective {
+                    crate::archive::sevenzip::extract_files_case_insensitive(
+                        archive_path,
+                        &needed_paths,
+                        &extract_dir,
+                    )
+                    .map(|_| ())
+                    .or_else(|_| crate::archive::sevenzip::extract_all(archive_path, &extract_dir).map(|_| ()))
+                } else {
+                    crate::archive::sevenzip::extract_all(archive_path, &extract_dir).map(|_| ())
+                };
+
+                if extract_result.is_ok() {
                     // Walk extracted files and find what we need
                     for entry in walkdir::WalkDir::new(&extract_dir)
                         .into_iter()
@@ -1645,6 +1729,8 @@ fn apply_patch_streaming(
     archive_path: &Path,
     directive: &crate::modlist::PatchedFromArchiveDirective,
     extracted_paths: &HashMap<String, PathBuf>,
+    patch_name: &str,
+    preloaded_delta: Option<&[u8]>,
 ) -> Result<()> {
     use memmap2::Mmap;
     use std::io::{BufWriter, Cursor};
@@ -1682,9 +1768,14 @@ fn apply_patch_streaming(
             .with_context(|| format!("Failed to mmap source file: {}", source_path.display()))?
     };
 
-    // Load delta patch from wabbajack (deltas are small, typically KB)
-    let patch_name = directive.patch_id.to_string();
-    let delta_data = ctx.read_wabbajack_file(&patch_name)?;
+    // Use preloaded delta when available; fall back to shared reader if needed.
+    let owned_delta;
+    let delta_data: &[u8] = if let Some(data) = preloaded_delta {
+        data
+    } else {
+        owned_delta = ctx.read_wabbajack_file(patch_name)?;
+        owned_delta.as_slice()
+    };
 
     // Create DeltaReader with mmap'd source
     let basis = Cursor::new(&source_mmap[..]);
@@ -1872,7 +1963,7 @@ fn process_transformed_texture(
                         .filter(|k| k.ends_with(".ba2") || k.ends_with(".bsa"))
                         .collect();
                     if !bsa_keys.is_empty() {
-                        tracing::warn!("[DEBUG] ZIP extraction - looking for BSA/BA2: {:?}", bsa_keys);
+                        tracing::debug!("[DEBUG] ZIP extraction - looking for BSA/BA2: {:?}", bsa_keys);
                     }
                     if let Ok(file) = File::open(&archive_path) {
                         if let Ok(mut archive) = zip::ZipArchive::new(BufReader::new(file)) {
@@ -1883,9 +1974,9 @@ fn process_transformed_texture(
                                     // Debug log for BSA/BA2 files
                                     if normalized.ends_with(".ba2") || normalized.ends_with(".bsa") {
                                         if simple_paths.contains_key(&normalized) {
-                                            tracing::warn!("[DEBUG] ZIP: Found and MATCHED BSA/BA2: '{}' -> '{}'", entry_name, normalized);
+                                            tracing::debug!("[DEBUG] ZIP: Found and MATCHED BSA/BA2: '{}' -> '{}'", entry_name, normalized);
                                         } else {
-                                            tracing::warn!("[DEBUG] ZIP: Found BSA/BA2 NOT in simple_paths: '{}' -> '{}'", entry_name, normalized);
+                                            tracing::debug!("[DEBUG] ZIP: Found BSA/BA2 NOT in simple_paths: '{}' -> '{}'", entry_name, normalized);
                                         }
                                     }
                                     if simple_paths.contains_key(&normalized) {
@@ -1918,12 +2009,12 @@ fn process_transformed_texture(
                             .filter(|p| p.to_lowercase().ends_with(".ba2") || p.to_lowercase().ends_with(".bsa"))
                             .collect();
                         if !bsa_paths.is_empty() {
-                            tracing::warn!("[DEBUG] Extracting from 7z/RAR, BSA/BA2 paths requested: {:?}", bsa_paths);
+                            tracing::debug!("[DEBUG] Extracting from 7z/RAR, BSA/BA2 paths requested: {:?}", bsa_paths);
                         }
                         let result = match extract_batch_rust(&archive_path, &paths_vec, temp_dir.path()) {
                             Ok(r) => r,
                             Err(e) => {
-                                tracing::warn!("[DEBUG] extract_batch_rust failed for {}: {}", archive_path.display(), e);
+                                tracing::debug!("[DEBUG] extract_batch_rust failed for {}: {}", archive_path.display(), e);
                                 HashMap::new()
                             }
                         };
@@ -1931,7 +2022,7 @@ fn process_transformed_texture(
                             let extracted_bsas: Vec<_> = result.keys()
                                 .filter(|k| k.ends_with(".ba2") || k.ends_with(".bsa"))
                                 .collect();
-                            tracing::warn!("[DEBUG] Extracted BSA/BA2 keys: {:?}", extracted_bsas);
+                            tracing::debug!("[DEBUG] Extracted BSA/BA2 keys: {:?}", extracted_bsas);
                         }
                         result
                     } else {
@@ -1945,9 +2036,9 @@ fn process_transformed_texture(
         // For nested BSAs: extract files from BSAs we just extracted
         for (bsa_path, files_in_bsa) in &nested_bsas {
             let bsa_normalized = paths::normalize_for_lookup(bsa_path);
-            tracing::warn!("[DEBUG] Looking for BSA/BA2: original='{}', normalized='{}'", bsa_path, bsa_normalized);
+            tracing::debug!("[DEBUG] Looking for BSA/BA2: original='{}', normalized='{}'", bsa_path, bsa_normalized);
             if let Some(bsa_data) = extracted.get(&bsa_normalized) {
-                tracing::warn!("[DEBUG] Found BSA/BA2 in cache, size={} bytes, extracting {} files", bsa_data.len(), files_in_bsa.len());
+                tracing::debug!("[DEBUG] Found BSA/BA2 in cache, size={} bytes, extracting {} files", bsa_data.len(), files_in_bsa.len());
                 // Determine suffix from original path
                 let suffix = if bsa_path.to_lowercase().ends_with(".ba2") { ".ba2" } else { ".bsa" };
                 // Write BSA/BA2 to temp file and extract from it
@@ -1966,14 +2057,14 @@ fn process_transformed_texture(
                                     extracted.insert(normalized_key, file_data);
                                 }
                                 Err(e) => {
-                                    tracing::warn!("Failed to extract {} from {}: {}", file_path, bsa_path, e);
+                                    tracing::debug!("Failed to extract {} from {}: {}", file_path, bsa_path, e);
                                 }
                             }
                         }
                     }
                 }
             } else {
-                tracing::warn!("BSA/BA2 not found in extracted archive: {} (normalized: {})", bsa_path, bsa_normalized);
+                tracing::debug!("BSA/BA2 not found in extracted archive: {} (normalized: {})", bsa_path, bsa_normalized);
                 tracing::debug!("Available keys: {:?}", extracted.keys().take(10).collect::<Vec<_>>());
             }
         }

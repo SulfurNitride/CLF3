@@ -547,6 +547,45 @@ pub fn extract_files(archive_path: &Path, files: &[&str], output_dir: &Path) -> 
     Ok(())
 }
 
+/// Extract multiple files using case-insensitive matching.
+///
+/// This resolves archive paths once via `list_archive`, then performs a single
+/// multi-file extraction call. This avoids repeated list+extract subprocesses.
+pub fn extract_files_case_insensitive(
+    archive_path: &Path,
+    files: &[String],
+    output_dir: &Path,
+) -> Result<usize> {
+    if files.is_empty() {
+        return Ok(0);
+    }
+
+    let entries = list_archive(archive_path)?;
+    let lookup = build_path_lookup(&entries);
+
+    let mut resolved = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for file in files {
+        let normalized = normalize_path(file);
+        let actual = lookup.get(&normalized).with_context(|| {
+            format!(
+                "File '{}' not found in archive '{}'",
+                file,
+                archive_path.display()
+            )
+        })?;
+
+        if seen.insert(actual.clone()) {
+            resolved.push(actual.clone());
+        }
+    }
+
+    let resolved_refs: Vec<&str> = resolved.iter().map(|s| s.as_str()).collect();
+    extract_files(archive_path, &resolved_refs, output_dir)?;
+    Ok(resolved_refs.len())
+}
+
 /// Extract all files from an archive to a directory.
 ///
 /// This is the most efficient method for solid archives.

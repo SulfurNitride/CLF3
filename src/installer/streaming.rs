@@ -37,9 +37,11 @@ use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use indicatif::ProgressBar;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -452,6 +454,33 @@ pub fn process_from_archive_streaming(
     Ok(stats)
 }
 
+fn selective_extract_threshold() -> usize {
+    static THRESHOLD: OnceLock<usize> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("CLF3_SELECTIVE_EXTRACT_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(25)
+    })
+}
+
+fn should_use_selective_extraction(archive_path: &Path, needed_files: usize) -> bool {
+    if needed_files == 0 || needed_files > selective_extract_threshold() {
+        return false;
+    }
+
+    match detect_archive_type(archive_path).unwrap_or(NestedArchiveType::Unknown) {
+        NestedArchiveType::SevenZ => {
+            // Solid 7z archives require sequential decompression, so full extraction
+            // remains better in most cases.
+            matches!(sevenzip::is_solid_archive(archive_path), Ok(false))
+        }
+        NestedArchiveType::Zip | NestedArchiveType::Rar | NestedArchiveType::Unknown => true,
+        NestedArchiveType::Tes3Bsa | NestedArchiveType::Bsa | NestedArchiveType::Ba2 => false,
+    }
+}
+
 /// Process archives using the producer-consumer pipeline.
 ///
 /// Extractor workers extract files to temp dirs and send paths to channel.
@@ -693,9 +722,71 @@ fn process_single_archive_with_channel(
         }
     }
 
-    // FULL EXTRACTION: Extract entire archive to temp dir (one fast 7z x call)
-    // This is faster than streaming individual files with separate 7z calls
-    if let Err(e) = sevenzip::extract_all_with_threads(archive_path, temp_dir.path(), threads) {
+    // Build unique list of needed paths (simple files + nested archive containers).
+    let mut needed_paths = Vec::new();
+    let mut seen_needed = HashSet::new();
+
+    for (_, directive, resolved) in &simple_directives {
+        let path_in_archive = resolved
+            .as_deref()
+            .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
+            .unwrap_or("");
+        if !path_in_archive.is_empty() && seen_needed.insert(paths::normalize_for_lookup(path_in_archive)) {
+            needed_paths.push(path_in_archive.to_string());
+        }
+    }
+    for (_, directive, resolved, _) in &nested_bsa_directives {
+        let path_in_archive = resolved
+            .as_deref()
+            .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
+            .unwrap_or("");
+        if !path_in_archive.is_empty() && seen_needed.insert(paths::normalize_for_lookup(path_in_archive)) {
+            needed_paths.push(path_in_archive.to_string());
+        }
+    }
+
+    let selective = should_use_selective_extraction(archive_path, needed_paths.len());
+    let extract_result = if selective {
+        sevenzip::extract_files_case_insensitive(archive_path, &needed_paths, temp_dir.path())
+            .map(|_| ())
+            .or_else(|e| {
+                warn!(
+                    "Selective extraction failed for {}, falling back to full extraction: {}",
+                    archive_path.display(),
+                    e
+                );
+                sevenzip::extract_all_with_threads(archive_path, temp_dir.path(), threads).map(|_| ())
+            })
+    } else {
+        // Full extraction remains best for large file sets and solid 7z archives.
+        // If full extraction fails (often due to problematic reparse/symlink entries),
+        // retry with just the files we actually need.
+        sevenzip::extract_all_with_threads(archive_path, temp_dir.path(), threads)
+            .map(|_| ())
+            .or_else(|full_err| {
+                if needed_paths.is_empty() {
+                    return Err(full_err);
+                }
+
+                warn!(
+                    "Full extraction failed for {}, retrying selective extraction of {} needed files: {}",
+                    archive_path.display(),
+                    needed_paths.len(),
+                    full_err
+                );
+                sevenzip::extract_files_case_insensitive(archive_path, &needed_paths, temp_dir.path())
+                    .map(|_| ())
+                    .map_err(|selective_err| {
+                        anyhow::anyhow!(
+                            "full extraction failed: {}; selective fallback failed: {}",
+                            full_err,
+                            selective_err
+                        )
+                    })
+            })
+    };
+
+    if let Err(e) = extract_result {
         let count = logged_failures.fetch_add(1, Ordering::Relaxed);
         if count < MAX_LOGGED_FAILURES {
             error!("FAIL: Cannot extract {}: {}", archive_path.display(), e);
@@ -835,20 +926,127 @@ fn process_nested_bsa_directives(
             }
         };
 
-        directives.par_iter().for_each(|(id, directive, file_in_archive)| {
-            // Extract using appropriate method based on archive type
-            let data = match archive_type {
-                NestedArchiveType::Tes3Bsa | NestedArchiveType::Bsa | NestedArchiveType::Ba2 => {
-                    // BSA/BA2 extraction using bsa module
-                    bsa::extract_archive_file(&archive_disk_path, file_in_archive)
+        // For non-BSA nested archives, extract all needed files in one batched call.
+        let mut nested_extracted_map: Option<HashMap<String, PathBuf>> = None;
+        let mut nested_extract_failed = false;
+        if matches!(
+            archive_type,
+            NestedArchiveType::Zip | NestedArchiveType::SevenZ | NestedArchiveType::Rar | NestedArchiveType::Unknown
+        ) {
+            let mut unique_files = Vec::new();
+            let mut seen = HashSet::new();
+            for (_, _, file_in_archive) in &directives {
+                let normalized = paths::normalize_for_lookup(file_in_archive);
+                if seen.insert(normalized) {
+                    unique_files.push(file_in_archive.clone());
                 }
-                NestedArchiveType::Zip | NestedArchiveType::SevenZ | NestedArchiveType::Rar | NestedArchiveType::Unknown => {
-                    // Regular archive extraction using 7z
-                    sevenzip::extract_file_case_insensitive(&archive_disk_path, file_in_archive)
-                }
-            };
+            }
 
-            let data = match data {
+            match tempfile::tempdir_in(output_dir) {
+                Ok(nested_tmp_dir) => {
+                    let batch_result = sevenzip::extract_files_case_insensitive(
+                        &archive_disk_path,
+                        &unique_files,
+                        nested_tmp_dir.path(),
+                    );
+                    match batch_result {
+                        Ok(_) => {
+                            nested_extracted_map = Some(build_extracted_file_map(nested_tmp_dir.path()));
+                            // Keep tempdir alive through per-file processing.
+                            let _keep_alive = nested_tmp_dir;
+                            directives.par_iter().for_each(|(id, directive, file_in_archive)| {
+                                let map = match &nested_extracted_map {
+                                    Some(m) => m,
+                                    None => {
+                                        failed.fetch_add(1, Ordering::Relaxed);
+                                        return;
+                                    }
+                                };
+                                let normalized_file = paths::normalize_for_lookup(file_in_archive);
+                                let extracted_path = match map.get(&normalized_file) {
+                                    Some(p) => p,
+                                    None => {
+                                        let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                                        if count < MAX_LOGGED_FAILURES {
+                                            error!("FAIL [{}]: Nested file not found after batch extract: {}", id, file_in_archive);
+                                        }
+                                        failed.fetch_add(1, Ordering::Relaxed);
+                                        return;
+                                    }
+                                };
+
+                                let data = match fs::read(extracted_path) {
+                                    Ok(d) => d,
+                                    Err(e) => {
+                                        let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                                        if count < MAX_LOGGED_FAILURES {
+                                            error!("FAIL [{}]: Nested read error: {}", id, e);
+                                        }
+                                        failed.fetch_add(1, Ordering::Relaxed);
+                                        return;
+                                    }
+                                };
+
+                                if data.len() as u64 != directive.size {
+                                    let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                                    if count < MAX_LOGGED_FAILURES {
+                                        error!("FAIL [{}]: Size mismatch: expected {} got {}", id, directive.size, data.len());
+                                    }
+                                    failed.fetch_add(1, Ordering::Relaxed);
+                                    return;
+                                }
+
+                                let output_path = paths::join_windows_path(output_dir, &directive.to);
+                                if let Err(_e) = paths::ensure_parent_dirs(&output_path) {
+                                    failed.fetch_add(1, Ordering::Relaxed);
+                                    return;
+                                }
+
+                                if let Err(e) = fs::write(&output_path, &data) {
+                                    failed.fetch_add(1, Ordering::Relaxed);
+                                    error!("FAIL [{}]: write error: {}", id, e);
+                                    return;
+                                }
+
+                                extracted.fetch_add(1, Ordering::Relaxed);
+                            });
+                        }
+                        Err(e) => {
+                            let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                            if count < MAX_LOGGED_FAILURES {
+                                error!(
+                                    "FAIL: Nested batch extract error from {:?} archive {}: {}",
+                                    archive_type,
+                                    archive_disk_path.display(),
+                                    e
+                                );
+                            }
+                            nested_extract_failed = true;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                    if count < MAX_LOGGED_FAILURES {
+                        error!("FAIL: Cannot create temp dir for nested extraction: {}", e);
+                    }
+                    nested_extract_failed = true;
+                }
+            }
+        }
+
+        if nested_extract_failed {
+            failed.fetch_add(directives.len(), Ordering::Relaxed);
+            continue;
+        }
+
+        if nested_extracted_map.is_some() {
+            continue;
+        }
+
+        directives.par_iter().for_each(|(id, directive, file_in_archive)| {
+            // BSA/BA2 extraction using bsa module
+            let data = match bsa::extract_archive_file(&archive_disk_path, file_in_archive) {
                 Ok(d) => d,
                 Err(e) => {
                     let count = logged_failures.fetch_add(1, Ordering::Relaxed);
