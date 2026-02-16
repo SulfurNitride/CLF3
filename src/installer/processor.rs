@@ -7,28 +7,107 @@
 //! - Nested BSA: Extract BSA from archive, then extract file from BSA
 //! - Parallel processing using rayon
 
-use crate::bsa::{self, BsaCache, list_files as list_bsa_files};
+use crate::bsa::{self, list_files as list_bsa_files, BsaCache};
 use crate::modlist::{ArchiveFileEntry, Directive, ModlistDb};
 use crate::paths;
 
 use super::config::InstallConfig;
 use super::extract_strategy::should_use_selective_extraction;
 use super::handlers;
-use super::handlers::from_archive::{ArchiveType, detect_archive_type, extract_from_archive_with_temp};
+use super::handlers::from_archive::{
+    detect_archive_type, extract_from_archive_with_temp, ArchiveType,
+};
 
 use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::BufReader;
-use zip::ZipArchive;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
+use zip::ZipArchive;
+
+#[derive(Debug, Clone)]
+struct PatchBasisRecord {
+    local_path: PathBuf,
+    size: u64,
+    quick_hash: u64,
+}
+
+/// Build a stable key for patch basis lookup:
+/// `archive_hash|normalized_path_in_archive|normalized_nested_path`.
+pub(crate) fn build_patch_basis_key(
+    archive_hash: &str,
+    path_in_archive: Option<&str>,
+    nested_path: Option<&str>,
+) -> String {
+    let mut key = archive_hash.to_string();
+    if let Some(path) = path_in_archive {
+        key.push('|');
+        key.push_str(&paths::normalize_for_lookup(path));
+    }
+    if let Some(path) = nested_path {
+        key.push('|');
+        key.push_str(&paths::normalize_for_lookup(path));
+    }
+    key
+}
+
+pub(crate) fn build_patch_basis_key_from_archive_hash_path(parts: &[String]) -> Option<String> {
+    let archive_hash = parts.first()?;
+    let path_in_archive = parts.get(1).map(|s| s.as_str());
+    let nested_path = parts.get(2).map(|s| s.as_str());
+    Some(build_patch_basis_key(
+        archive_hash,
+        path_in_archive,
+        nested_path,
+    ))
+}
+
+fn quick_file_hash(path: &Path) -> Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = File::open(path)
+        .with_context(|| format!("Failed to open file for quick hash: {}", path.display()))?;
+    let len = file.metadata()?.len();
+    const SAMPLE: usize = 64 * 1024;
+    let mut hasher = xxhash_rust::xxh64::Xxh64::new(0);
+
+    let mut head = vec![0u8; SAMPLE.min(len as usize)];
+    if !head.is_empty() {
+        file.read_exact(&mut head)?;
+        hasher.update(&head);
+    }
+
+    if len > SAMPLE as u64 {
+        let tail_len = SAMPLE.min(len as usize - head.len());
+        if tail_len > 0 {
+            file.seek(SeekFrom::End(-(tail_len as i64)))?;
+            let mut tail = vec![0u8; tail_len];
+            file.read_exact(&mut tail)?;
+            hasher.update(&tail);
+        }
+    }
+
+    Ok(hasher.digest())
+}
+
+fn quick_hash_bytes(data: &[u8]) -> u64 {
+    const SAMPLE: usize = 64 * 1024;
+    let mut hasher = xxhash_rust::xxh64::Xxh64::new(0);
+    let head_len = data.len().min(SAMPLE);
+    hasher.update(&data[..head_len]);
+    if data.len() > SAMPLE {
+        let tail_len = (data.len() - head_len).min(SAMPLE);
+        hasher.update(&data[data.len() - tail_len..]);
+    }
+    hasher.digest()
+}
 
 fn total_ram_bytes() -> u64 {
     static TOTAL_RAM: OnceLock<u64> = OnceLock::new();
@@ -105,8 +184,8 @@ fn list_archive_files_rust(archive_path: &Path) -> Result<Vec<ArchiveFileEntry>>
         ArchiveType::Zip => list_zip_files(archive_path),
         ArchiveType::SevenZ => list_7z_files(archive_path),
         ArchiveType::Rar => list_rar_files(archive_path),
-        ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2 => {
-            list_bsa_files(archive_path).map(|entries| {
+        ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2 => list_bsa_files(archive_path)
+            .map(|entries| {
                 entries
                     .into_iter()
                     .map(|e| ArchiveFileEntry {
@@ -114,14 +193,11 @@ fn list_archive_files_rust(archive_path: &Path) -> Result<Vec<ArchiveFileEntry>>
                         file_size: e.size,
                     })
                     .collect()
-            })
-        }
-        ArchiveType::Unknown => {
-            list_zip_files(archive_path)
-                .or_else(|_| list_7z_files(archive_path))
-                .or_else(|_| list_rar_files(archive_path))
-                .with_context(|| format!("Failed to list archive: {}", archive_path.display()))
-        }
+            }),
+        ArchiveType::Unknown => list_zip_files(archive_path)
+            .or_else(|_| list_7z_files(archive_path))
+            .or_else(|_| list_rar_files(archive_path))
+            .with_context(|| format!("Failed to list archive: {}", archive_path.display())),
     }
 }
 
@@ -187,8 +263,8 @@ fn extract_batch_rust(
     let archive_type = detect_archive_type(archive_path)?;
 
     // Create temp dir for extraction
-    let temp_dir = tempfile::tempdir_in(temp_base_dir)
-        .context("Failed to create temp directory")?;
+    let temp_dir =
+        tempfile::tempdir_in(temp_base_dir).context("Failed to create temp directory")?;
 
     // Extract entire archive based on type
     match archive_type {
@@ -198,12 +274,10 @@ fn extract_batch_rust(
         ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2 => {
             bail!("BSA/BA2 should not use batch extraction")
         }
-        ArchiveType::Unknown => {
-            extract_zip_to_temp(archive_path, temp_dir.path())
-                .or_else(|_| extract_7z_to_temp(archive_path, temp_dir.path()))
-                .or_else(|_| extract_rar_to_temp(archive_path, temp_dir.path()))
-                .with_context(|| format!("Failed to extract: {}", archive_path.display()))?
-        }
+        ArchiveType::Unknown => extract_zip_to_temp(archive_path, temp_dir.path())
+            .or_else(|_| extract_7z_to_temp(archive_path, temp_dir.path()))
+            .or_else(|_| extract_rar_to_temp(archive_path, temp_dir.path()))
+            .with_context(|| format!("Failed to extract: {}", archive_path.display()))?,
     }
 
     // Build set of normalized paths we need
@@ -284,10 +358,15 @@ fn collect_needed_files(
                     // Log BSA/BA2 files we find for debugging
                     if normalized.ends_with(".bsa") || normalized.ends_with(".ba2") {
                         if needed.contains(&normalized) {
-                            tracing::warn!("[DEBUG] Found and MATCHED BSA/BA2: '{}' -> '{}'", rel_str, normalized);
+                            tracing::warn!(
+                                "[DEBUG] Found and MATCHED BSA/BA2: '{}' -> '{}'",
+                                rel_str,
+                                normalized
+                            );
                         } else {
                             // Check if there's a similar path in needed set
-                            let similar: Vec<_> = needed.iter()
+                            let similar: Vec<_> = needed
+                                .iter()
                                 .filter(|n| n.contains("textures.ba2") || n.contains("main.ba2"))
                                 .take(3)
                                 .collect();
@@ -310,7 +389,6 @@ fn collect_needed_files(
 
 /// Index all archives that need indexing
 fn index_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
-
     // Get all archives
     let archives = db.get_all_archives()?;
 
@@ -340,7 +418,9 @@ fn index_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
     let pb = ProgressBar::new(to_index.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} | {msg}")
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} | {msg}",
+            )
             .unwrap()
             .progress_chars("=>-"),
     );
@@ -354,13 +434,21 @@ fn index_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
                 // Check if this is a GameFileSource archive (from game installation)
                 if archive.state_json.contains("GameFileSourceDownloader") {
                     // Parse the state to get the game file path
-                    if let Ok(state) = serde_json::from_str::<crate::modlist::DownloadState>(&archive.state_json) {
+                    if let Ok(state) =
+                        serde_json::from_str::<crate::modlist::DownloadState>(&archive.state_json)
+                    {
                         if let crate::modlist::DownloadState::GameFileSource(gf) = state {
                             // Look in game directory with case-insensitive path resolution
                             let game_file = &gf.game_file;
-                            if let Some(resolved) = crate::paths::resolve_case_insensitive(&ctx.config.game_dir, game_file) {
+                            if let Some(resolved) = crate::paths::resolve_case_insensitive(
+                                &ctx.config.game_dir,
+                                game_file,
+                            ) {
                                 resolved
-                            } else if let Some(resolved) = crate::paths::resolve_case_insensitive(&ctx.config.game_dir, &format!("Data/{}", game_file)) {
+                            } else if let Some(resolved) = crate::paths::resolve_case_insensitive(
+                                &ctx.config.game_dir,
+                                &format!("Data/{}", game_file),
+                            ) {
                                 resolved
                             } else {
                                 // Fallback to downloads dir (will fail, but with proper error)
@@ -389,7 +477,12 @@ fn index_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
         // Skip non-archive files (game files like ESM, ESL, INI, BIK, etc.)
         let is_indexable = matches!(
             archive_type,
-            ArchiveType::Zip | ArchiveType::SevenZ | ArchiveType::Rar | ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2
+            ArchiveType::Zip
+                | ArchiveType::SevenZ
+                | ArchiveType::Rar
+                | ArchiveType::Tes3Bsa
+                | ArchiveType::Bsa
+                | ArchiveType::Ba2
         );
         if !is_indexable {
             // Mark as indexed with empty file list (it's a single file, not a container)
@@ -466,7 +559,6 @@ impl FailureTracker {
         }
     }
 }
-
 
 /// Statistics from directive processing
 #[derive(Debug, Default)]
@@ -561,6 +653,12 @@ pub struct ProcessContext<'a> {
     pub extraction_cache: BsaCache,
     /// Cache of existing output files: normalized_path -> size (built once at start)
     pub existing_files: HashMap<String, u64>,
+    /// Patch basis keys that are actually needed for this run.
+    needed_patch_basis_keys: RwLock<HashSet<String>>,
+    /// Basis key -> local output path + quick verification metadata.
+    patch_basis_db: RwLock<HashMap<String, PatchBasisRecord>>,
+    /// Cache of expensive full file hashes by `path|size|mtime`.
+    patch_basis_full_hash_cache: Mutex<HashMap<String, String>>,
 }
 
 impl<'a> ProcessContext<'a> {
@@ -619,6 +717,9 @@ impl<'a> ProcessContext<'a> {
             archive_paths,
             extraction_cache,
             existing_files,
+            needed_patch_basis_keys: RwLock::new(HashSet::new()),
+            patch_basis_db: RwLock::new(HashMap::new()),
+            patch_basis_full_hash_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -631,7 +732,10 @@ impl<'a> ProcessContext<'a> {
     }
 
     pub fn read_wabbajack_file(&self, name: &str) -> Result<Vec<u8>> {
-        let mut archive = self.wabbajack.lock().expect("wabbajack archive lock poisoned");
+        let mut archive = self
+            .wabbajack
+            .lock()
+            .expect("wabbajack archive lock poisoned");
         let mut file = archive
             .by_name(name)
             .with_context(|| format!("File '{}' not found in wabbajack", name))?;
@@ -640,12 +744,158 @@ impl<'a> ProcessContext<'a> {
         Ok(data)
     }
 
+    pub fn set_needed_patch_basis_keys(&self, keys: HashSet<String>) {
+        let mut needed = self
+            .needed_patch_basis_keys
+            .write()
+            .expect("needed_patch_basis_keys lock poisoned");
+        *needed = keys;
+    }
+
+    pub fn needed_patch_basis_count(&self) -> usize {
+        self.needed_patch_basis_keys
+            .read()
+            .expect("needed_patch_basis_keys lock poisoned")
+            .len()
+    }
+
+    pub fn patch_basis_db_count(&self) -> usize {
+        self.patch_basis_db
+            .read()
+            .expect("patch_basis_db lock poisoned")
+            .len()
+    }
+
+    fn is_needed_patch_basis_key(&self, key: &str) -> bool {
+        self.needed_patch_basis_keys
+            .read()
+            .expect("needed_patch_basis_keys lock poisoned")
+            .contains(key)
+    }
+
+    pub fn record_patch_basis_candidate_path(
+        &self,
+        key: &str,
+        source_path: &Path,
+        local_output_path: &Path,
+        expected_size: u64,
+    ) {
+        if !self.is_needed_patch_basis_key(key) {
+            return;
+        }
+
+        let src_size = match fs::metadata(source_path).map(|m| m.len()) {
+            Ok(size) => size,
+            Err(_) => return,
+        };
+        if src_size != expected_size {
+            return;
+        }
+
+        let quick_hash = match quick_file_hash(source_path) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        let record = PatchBasisRecord {
+            local_path: local_output_path.to_path_buf(),
+            size: expected_size,
+            quick_hash,
+        };
+
+        self.patch_basis_db
+            .write()
+            .expect("patch_basis_db lock poisoned")
+            .insert(key.to_string(), record);
+    }
+
+    pub fn record_patch_basis_candidate_bytes(
+        &self,
+        key: &str,
+        local_output_path: &Path,
+        data: &[u8],
+    ) {
+        if !self.is_needed_patch_basis_key(key) {
+            return;
+        }
+
+        let record = PatchBasisRecord {
+            local_path: local_output_path.to_path_buf(),
+            size: data.len() as u64,
+            quick_hash: quick_hash_bytes(data),
+        };
+
+        self.patch_basis_db
+            .write()
+            .expect("patch_basis_db lock poisoned")
+            .insert(key.to_string(), record);
+    }
+
+    pub fn resolve_verified_patch_basis_path(
+        &self,
+        key: &str,
+        expected_full_hash: Option<&str>,
+    ) -> Option<PathBuf> {
+        let record = self
+            .patch_basis_db
+            .read()
+            .expect("patch_basis_db lock poisoned")
+            .get(key)
+            .cloned()?;
+
+        let meta = fs::metadata(&record.local_path).ok()?;
+        if meta.len() != record.size {
+            return None;
+        }
+
+        let quick_hash = quick_file_hash(&record.local_path).ok()?;
+        if quick_hash != record.quick_hash {
+            return None;
+        }
+
+        if let Some(expected_hash) = expected_full_hash.filter(|h| !h.is_empty()) {
+            let modified_ns = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let cache_key = format!(
+                "{}|{}|{}",
+                record.local_path.display(),
+                record.size,
+                modified_ns
+            );
+
+            let mut cache = self
+                .patch_basis_full_hash_cache
+                .lock()
+                .expect("patch_basis_full_hash_cache lock poisoned");
+            let actual_hash = if let Some(v) = cache.get(&cache_key) {
+                v.clone()
+            } else {
+                let computed = match crate::hash::compute_file_hash(&record.local_path) {
+                    Ok(v) => v,
+                    Err(_) => return None,
+                };
+                cache.insert(cache_key, computed.clone());
+                computed
+            };
+            if actual_hash != expected_hash {
+                return None;
+            }
+        }
+
+        Some(record.local_path)
+    }
+
     /// Get a file from the extraction cache (for pre-extracted 7z/RAR files)
     /// BSA files are stored in the working folder, regular files in SQLite
     pub fn get_cached_file(&self, archive_hash: &str, file_path: &str) -> Option<Vec<u8>> {
         // Check if this is a BSA file - if so, check working folder
         if is_bsa_file(file_path) {
-            let bsa_working_path = get_bsa_working_path(&self.config.downloads_dir, archive_hash, file_path);
+            let bsa_working_path =
+                get_bsa_working_path(&self.config.downloads_dir, archive_hash, file_path);
             if bsa_working_path.exists() {
                 return fs::read(&bsa_working_path).ok();
             }
@@ -653,13 +903,17 @@ impl<'a> ProcessContext<'a> {
 
         // Regular files are in SQLite cache
         let cache_key = Path::new(archive_hash);
-        self.extraction_cache.get(cache_key, file_path).ok().flatten()
+        self.extraction_cache
+            .get(cache_key, file_path)
+            .ok()
+            .flatten()
     }
 
     /// Get a BSA file from the working folder (for BSAs extracted from 7z/RAR)
     /// Returns the path to the BSA file on disk, if it exists
     pub fn get_cached_bsa_path(&self, archive_hash: &str, bsa_path: &str) -> Option<PathBuf> {
-        let bsa_working_path = get_bsa_working_path(&self.config.downloads_dir, archive_hash, bsa_path);
+        let bsa_working_path =
+            get_bsa_working_path(&self.config.downloads_dir, archive_hash, bsa_path);
         if bsa_working_path.exists() {
             Some(bsa_working_path)
         } else {
@@ -669,10 +923,18 @@ impl<'a> ProcessContext<'a> {
 
     /// Get a nested BSA file from the extraction cache
     /// For files inside BSAs inside 7z/RAR archives
-    pub fn get_cached_nested_bsa_file(&self, archive_hash: &str, bsa_path: &str, file_in_bsa: &str) -> Option<Vec<u8>> {
+    pub fn get_cached_nested_bsa_file(
+        &self,
+        archive_hash: &str,
+        bsa_path: &str,
+        file_in_bsa: &str,
+    ) -> Option<Vec<u8>> {
         let cache_key = Path::new(archive_hash);
         let combined_path = format!("{}/{}", bsa_path, file_in_bsa);
-        self.extraction_cache.get(cache_key, &combined_path).ok().flatten()
+        self.extraction_cache
+            .get(cache_key, &combined_path)
+            .ok()
+            .flatten()
     }
 }
 
@@ -743,7 +1005,10 @@ fn check_missing_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<Vec<(S
         }
     }
 
-    println!("Need {} unique archives for pending directives", needed_hashes.len());
+    println!(
+        "Need {} unique archives for pending directives",
+        needed_hashes.len()
+    );
 
     // Check which of those archives are missing
     let mut missing = Vec::new();
@@ -751,7 +1016,8 @@ fn check_missing_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<Vec<(S
     let archives = db.get_archives_by_hashes(&needed_list)?;
 
     // Build a set of hashes we found in the DB
-    let found_hashes: std::collections::HashSet<_> = archives.iter().map(|a| a.hash.clone()).collect();
+    let found_hashes: std::collections::HashSet<_> =
+        archives.iter().map(|a| a.hash.clone()).collect();
 
     // Check archives that exist in DB but not on disk
     for archive in &archives {
@@ -844,7 +1110,10 @@ impl<'a> DirectiveProcessor<'a> {
         println!();
 
         let stats = db.get_directive_stats()?;
-        let reporter = Arc::new(ProgressReporter::new(config.progress_callback.clone(), stats.pending));
+        let reporter = Arc::new(ProgressReporter::new(
+            config.progress_callback.clone(),
+            stats.pending,
+        ));
 
         Ok(Self {
             ctx,
@@ -860,7 +1129,8 @@ impl<'a> DirectiveProcessor<'a> {
     /// Get count of a directive type
     fn get_type_count(&self, name: &str) -> Result<usize> {
         let type_counts = self.db.get_directive_type_counts()?;
-        Ok(type_counts.iter()
+        Ok(type_counts
+            .iter()
             .find(|(dtype, _)| dtype == name)
             .map(|(_, count)| *count)
             .unwrap_or(0))
@@ -885,7 +1155,9 @@ impl<'a> DirectiveProcessor<'a> {
     fn record_phase_failures(&self, phase: &str, count: usize) {
         if count > 0 {
             eprintln!("WARNING: {} phase had {} failures", phase, count);
-            self.phase_failures.lock().expect("phase_failures lock poisoned")
+            self.phase_failures
+                .lock()
+                .expect("phase_failures lock poisoned")
                 .push((phase.to_string(), count));
         }
     }
@@ -894,7 +1166,10 @@ impl<'a> DirectiveProcessor<'a> {
     pub fn preflight_check(&self) -> Result<()> {
         let missing_archives = check_missing_archives(self.db, &self.ctx)?;
         if !missing_archives.is_empty() {
-            println!("ERROR: {} archives are missing! Re-run to download them:\n", missing_archives.len());
+            println!(
+                "ERROR: {} archives are missing! Re-run to download them:\n",
+                missing_archives.len()
+            );
             warn!("=== Missing Archives ({}) ===", missing_archives.len());
             for (name, hash) in missing_archives.iter().take(20) {
                 println!("  - {} ({})", name, hash);
@@ -916,6 +1191,63 @@ impl<'a> DirectiveProcessor<'a> {
     /// Index archive contents
     pub fn index_archives(&self) -> Result<()> {
         index_archives(self.db, &self.ctx)
+    }
+
+    /// Build the set of patch basis keys needed later in phase 5.
+    /// This lets phase 4 record reusable local basis paths while files are written.
+    pub fn prepare_patch_basis_db(&self) -> Result<()> {
+        let all_raw = self
+            .db
+            .get_all_pending_directives_of_type("PatchedFromArchive")?;
+        if all_raw.is_empty() {
+            self.ctx.set_needed_patch_basis_keys(HashSet::new());
+            return Ok(());
+        }
+
+        let mut keys: HashSet<String> = HashSet::new();
+        let mut parse_failures = 0usize;
+        for (_id, json) in all_raw {
+            match serde_json::from_str::<Directive>(&json) {
+                Ok(Directive::PatchedFromArchive(d)) => {
+                    let Some(archive_hash) = d.archive_hash_path.first() else {
+                        continue;
+                    };
+                    let resolved_path = if d.archive_hash_path.len() >= 2 {
+                        self.db
+                            .lookup_archive_file(archive_hash, &d.archive_hash_path[1])?
+                            .unwrap_or_else(|| d.archive_hash_path[1].clone())
+                    } else {
+                        String::new()
+                    };
+                    let key = if d.archive_hash_path.len() >= 2 {
+                        build_patch_basis_key(
+                            archive_hash,
+                            Some(&resolved_path),
+                            d.archive_hash_path.get(2).map(|s| s.as_str()),
+                        )
+                    } else {
+                        build_patch_basis_key(archive_hash, None, None)
+                    };
+                    keys.insert(key);
+
+                    // Keep a fallback key based on raw path from directive too.
+                    if let Some(raw_key) =
+                        build_patch_basis_key_from_archive_hash_path(&d.archive_hash_path)
+                    {
+                        keys.insert(raw_key);
+                    }
+                }
+                _ => parse_failures += 1,
+            }
+        }
+
+        self.ctx.set_needed_patch_basis_keys(keys);
+        println!(
+            "Patch basis prep: tracking {} basis keys ({} parse failures)",
+            self.ctx.needed_patch_basis_count(),
+            parse_failures
+        );
+        Ok(())
     }
 
     /// Install phase: FromArchive + InlineFile + RemappedInlineFile
@@ -947,26 +1279,35 @@ impl<'a> DirectiveProcessor<'a> {
         // FromArchive (streaming)
         let streaming_config = super::streaming::StreamingConfig::default();
         pb.set_message("Processing FromArchive (streaming)...");
-        self.reporter.phase_started("FromArchive", from_archive_count);
+        self.reporter
+            .phase_started("FromArchive", from_archive_count);
 
-        let progress_callback: Option<super::streaming::ProgressCallback> = if let Some(callback) = self.reporter.get_callback() {
-            let total = self.reporter.get_phase_total();
-            Some(std::sync::Arc::new(move |written_count| {
-                callback(super::ProgressEvent::DirectiveComplete {
-                    index: written_count,
-                    total,
-                });
-            }))
-        } else {
-            None
-        };
+        let progress_callback: Option<super::streaming::ProgressCallback> =
+            if let Some(callback) = self.reporter.get_callback() {
+                let total = self.reporter.get_phase_total();
+                Some(std::sync::Arc::new(move |written_count| {
+                    callback(super::ProgressEvent::DirectiveComplete {
+                        index: written_count,
+                        total,
+                    });
+                }))
+            } else {
+                None
+            };
 
         let streaming_stats = super::streaming::process_from_archive_streaming(
-            self.db, &self.ctx, streaming_config, &pb, progress_callback,
+            self.db,
+            &self.ctx,
+            streaming_config,
+            &pb,
+            progress_callback,
         )?;
-        self.completed.fetch_add(streaming_stats.extracted, Ordering::Relaxed);
-        self.skipped.fetch_add(streaming_stats.skipped, Ordering::Relaxed);
-        self.failed.fetch_add(streaming_stats.failed, Ordering::Relaxed);
+        self.completed
+            .fetch_add(streaming_stats.extracted, Ordering::Relaxed);
+        self.skipped
+            .fetch_add(streaming_stats.skipped, Ordering::Relaxed);
+        self.failed
+            .fetch_add(streaming_stats.failed, Ordering::Relaxed);
         self.sync_reporter();
         self.record_phase_failures("FromArchive", streaming_stats.failed);
 
@@ -974,17 +1315,42 @@ impl<'a> DirectiveProcessor<'a> {
         let failed_before = self.failed.load(Ordering::Relaxed);
         pb.set_message("Processing InlineFile...");
         self.reporter.phase_started("InlineFile", inline_count);
-        process_simple_directives(self.db, &self.ctx, "InlineFile", &pb, &self.completed, &self.skipped, &self.failed, &self.reporter)?;
+        process_simple_directives(
+            self.db,
+            &self.ctx,
+            "InlineFile",
+            &pb,
+            &self.completed,
+            &self.skipped,
+            &self.failed,
+            &self.reporter,
+        )?;
         self.sync_reporter();
-        self.record_phase_failures("InlineFile", self.failed.load(Ordering::Relaxed) - failed_before);
+        self.record_phase_failures(
+            "InlineFile",
+            self.failed.load(Ordering::Relaxed) - failed_before,
+        );
 
         // RemappedInlineFile
         let failed_before = self.failed.load(Ordering::Relaxed);
         pb.set_message("Processing RemappedInlineFile...");
-        self.reporter.phase_started("RemappedInlineFile", remapped_count);
-        process_simple_directives(self.db, &self.ctx, "RemappedInlineFile", &pb, &self.completed, &self.skipped, &self.failed, &self.reporter)?;
+        self.reporter
+            .phase_started("RemappedInlineFile", remapped_count);
+        process_simple_directives(
+            self.db,
+            &self.ctx,
+            "RemappedInlineFile",
+            &pb,
+            &self.completed,
+            &self.skipped,
+            &self.failed,
+            &self.reporter,
+        )?;
         self.sync_reporter();
-        self.record_phase_failures("RemappedInlineFile", self.failed.load(Ordering::Relaxed) - failed_before);
+        self.record_phase_failures(
+            "RemappedInlineFile",
+            self.failed.load(Ordering::Relaxed) - failed_before,
+        );
 
         pb.finish_and_clear();
         Ok(())
@@ -994,13 +1360,30 @@ impl<'a> DirectiveProcessor<'a> {
     pub fn patch_phase(&self) -> Result<()> {
         let patched_count = self.get_type_count("PatchedFromArchive")?;
         let pb = self.make_progress_bar(patched_count as u64);
+        println!(
+            "Patch basis DB: {} candidate local files for {} patch directives",
+            self.ctx.patch_basis_db_count(),
+            patched_count
+        );
 
         let failed_before = self.failed.load(Ordering::Relaxed);
         pb.set_message("Processing PatchedFromArchive...");
-        self.reporter.phase_started("PatchedFromArchive", patched_count);
-        process_patched_from_archive(self.db, &self.ctx, &pb, &self.completed, &self.skipped, &self.failed, &self.reporter)?;
+        self.reporter
+            .phase_started("PatchedFromArchive", patched_count);
+        process_patched_from_archive(
+            self.db,
+            &self.ctx,
+            &pb,
+            &self.completed,
+            &self.skipped,
+            &self.failed,
+            &self.reporter,
+        )?;
         self.sync_reporter();
-        self.record_phase_failures("PatchedFromArchive", self.failed.load(Ordering::Relaxed) - failed_before);
+        self.record_phase_failures(
+            "PatchedFromArchive",
+            self.failed.load(Ordering::Relaxed) - failed_before,
+        );
 
         pb.finish_and_clear();
         Ok(())
@@ -1013,10 +1396,22 @@ impl<'a> DirectiveProcessor<'a> {
 
         let failed_before = self.failed.load(Ordering::Relaxed);
         pb.set_message("Processing TransformedTexture...");
-        self.reporter.phase_started("TransformedTexture", texture_count);
-        process_transformed_texture(self.db, &self.ctx, &pb, &self.completed, &self.skipped, &self.failed, &self.reporter)?;
+        self.reporter
+            .phase_started("TransformedTexture", texture_count);
+        process_transformed_texture(
+            self.db,
+            &self.ctx,
+            &pb,
+            &self.completed,
+            &self.skipped,
+            &self.failed,
+            &self.reporter,
+        )?;
         self.sync_reporter();
-        self.record_phase_failures("TransformedTexture", self.failed.load(Ordering::Relaxed) - failed_before);
+        self.record_phase_failures(
+            "TransformedTexture",
+            self.failed.load(Ordering::Relaxed) - failed_before,
+        );
 
         pb.finish_and_clear();
         Ok(())
@@ -1030,9 +1425,20 @@ impl<'a> DirectiveProcessor<'a> {
         let failed_before = self.failed.load(Ordering::Relaxed);
         pb.set_message("Processing CreateBSA...");
         self.reporter.phase_started("CreateBSA", bsa_count);
-        process_create_bsa(self.db, &self.ctx, &pb, &self.completed, &self.skipped, &self.failed, &self.reporter)?;
+        process_create_bsa(
+            self.db,
+            &self.ctx,
+            &pb,
+            &self.completed,
+            &self.skipped,
+            &self.failed,
+            &self.reporter,
+        )?;
         self.sync_reporter();
-        self.record_phase_failures("CreateBSA", self.failed.load(Ordering::Relaxed) - failed_before);
+        self.record_phase_failures(
+            "CreateBSA",
+            self.failed.load(Ordering::Relaxed) - failed_before,
+        );
 
         pb.finish_and_clear();
         Ok(())
@@ -1070,7 +1476,10 @@ impl<'a> DirectiveProcessor<'a> {
             stats.failed
         );
 
-        let phase_failures = self.phase_failures.lock().expect("phase_failures lock poisoned");
+        let phase_failures = self
+            .phase_failures
+            .lock()
+            .expect("phase_failures lock poisoned");
         if !phase_failures.is_empty() {
             eprintln!("\n=== FAILURE SUMMARY ===");
             for (phase, count) in phase_failures.iter() {
@@ -1292,7 +1701,10 @@ fn process_patched_from_archive(
         }
     }
     if parse_failures > 0 {
-        pb.println(format!("WARN: {} PatchedFromArchive directives failed to parse", parse_failures));
+        pb.println(format!(
+            "WARN: {} PatchedFromArchive directives failed to parse",
+            parse_failures
+        ));
         // Report parse failures to GUI
         for _ in 0..parse_failures {
             reporter.directive_completed();
@@ -1300,16 +1712,18 @@ fn process_patched_from_archive(
     }
 
     // Build archive list with sizes for sorting
-    let mut archives_with_size: Vec<(String, Vec<(i64, PatchedFromArchiveDirective)>, u64)> = by_archive
-        .into_iter()
-        .map(|(hash, directives)| {
-            let size = ctx.get_archive_path(&hash)
-                .and_then(|p| fs::metadata(p).ok())
-                .map(|m| m.len())
-                .unwrap_or(0);
-            (hash, directives, size)
-        })
-        .collect();
+    let mut archives_with_size: Vec<(String, Vec<(i64, PatchedFromArchiveDirective)>, u64)> =
+        by_archive
+            .into_iter()
+            .map(|(hash, directives)| {
+                let size = ctx
+                    .get_archive_path(&hash)
+                    .and_then(|p| fs::metadata(p).ok())
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                (hash, directives, size)
+            })
+            .collect();
 
     // Sort archives smallest to largest for better throughput
     archives_with_size.sort_by_key(|(_, _, size)| *size);
@@ -1342,9 +1756,9 @@ fn process_patched_from_archive(
     const HALF_GB: u64 = 512 * 1024 * 1024;
     const TWO_GB: u64 = 2 * 1024 * 1024 * 1024;
 
-    let mut small_archives = Vec::new();  // ≤512MB - full parallel
+    let mut small_archives = Vec::new(); // ≤512MB - full parallel
     let mut medium_archives = Vec::new(); // 512MB-2GB - limited parallel
-    let mut large_archives = Vec::new();  // ≥2GB - sequential
+    let mut large_archives = Vec::new(); // ≥2GB - sequential
 
     for (hash, directives, size) in archives_with_size {
         if size <= HALF_GB {
@@ -1358,7 +1772,9 @@ fn process_patched_from_archive(
 
     eprintln!(
         "Patching: {} small + {} medium + {} large archives",
-        small_archives.len(), medium_archives.len(), large_archives.len()
+        small_archives.len(),
+        medium_archives.len(),
+        large_archives.len()
     );
     let archive_parallelism = patch_archive_parallelism();
     debug!(
@@ -1370,40 +1786,44 @@ fn process_patched_from_archive(
 
     // Process SMALL archives in full parallel
     for chunk in small_archives.chunks(archive_parallelism) {
-        chunk.par_iter().for_each(|(archive_hash, directives, _size)| {
-            process_archive_patches(
-                ctx,
-                archive_hash,
-                directives,
-                Some(1),
-                pb,
-                &skipped,
-                &failed,
-                &failure_tracker,
-                &completed,
-                reporter,
-            );
-        });
+        chunk
+            .par_iter()
+            .for_each(|(archive_hash, directives, _size)| {
+                process_archive_patches(
+                    ctx,
+                    archive_hash,
+                    directives,
+                    Some(1),
+                    pb,
+                    &skipped,
+                    &failed,
+                    &failure_tracker,
+                    &completed,
+                    reporter,
+                );
+            });
     }
 
     // Process MEDIUM archives with limited parallelism (half threads)
     let half_threads = (rayon::current_num_threads() / 2).max(1);
     let medium_parallelism = half_threads.min(archive_parallelism.max(1));
     for chunk in medium_archives.chunks(medium_parallelism) {
-        chunk.par_iter().for_each(|(archive_hash, directives, _size)| {
-            process_archive_patches(
-                ctx,
-                archive_hash,
-                directives,
-                Some(2),
-                pb,
-                &skipped,
-                &failed,
-                &failure_tracker,
-                &completed,
-                reporter,
-            );
-        });
+        chunk
+            .par_iter()
+            .for_each(|(archive_hash, directives, _size)| {
+                process_archive_patches(
+                    ctx,
+                    archive_hash,
+                    directives,
+                    Some(2),
+                    pb,
+                    &skipped,
+                    &failed,
+                    &failure_tracker,
+                    &completed,
+                    reporter,
+                );
+            });
     }
 
     // Process LARGE archives sequentially (one at a time, all threads for extraction)
@@ -1461,7 +1881,10 @@ fn process_archive_patches(
                 reporter.directive_completed();
             }
             if any_needed {
-                pb.println(format!("WARN: Archive not found for patching: {}", archive_hash));
+                pb.println(format!(
+                    "WARN: Archive not found for patching: {}",
+                    archive_hash
+                ));
             }
             return;
         }
@@ -1487,11 +1910,24 @@ fn process_archive_patches(
         return;
     }
 
-    // Collect unique source paths needed from this archive
+    // Prefer already-installed local basis files when they verify.
+    let mut verified_local_basis: HashMap<String, PathBuf> = HashMap::new();
+
+    // Collect unique source paths that still need extraction from archive.
     let mut simple_paths: HashMap<String, String> = HashMap::new();
     let mut nested_bsas: HashMap<String, Vec<String>> = HashMap::new();
 
     for (_, directive) in &to_process {
+        let basis_key = build_patch_basis_key_from_archive_hash_path(&directive.archive_hash_path);
+        if let Some(key) = basis_key.as_deref() {
+            if let Some(local_path) =
+                ctx.resolve_verified_patch_basis_path(key, Some(&directive.from_hash))
+            {
+                verified_local_basis.insert(key.to_string(), local_path);
+                continue;
+            }
+        }
+
         if directive.archive_hash_path.len() == 2 {
             let path = &directive.archive_hash_path[1];
             let normalized = paths::normalize_for_lookup(path);
@@ -1499,7 +1935,10 @@ fn process_archive_patches(
         } else if directive.archive_hash_path.len() >= 3 {
             let bsa_path = &directive.archive_hash_path[1];
             let file_in_bsa = &directive.archive_hash_path[2];
-            nested_bsas.entry(bsa_path.clone()).or_default().push(file_in_bsa.clone());
+            nested_bsas
+                .entry(bsa_path.clone())
+                .or_default()
+                .push(file_in_bsa.clone());
             let normalized = paths::normalize_for_lookup(bsa_path);
             simple_paths.insert(normalized, bsa_path.clone());
         }
@@ -1520,31 +1959,42 @@ fn process_archive_patches(
     };
 
     let extraction_start = Instant::now();
-    let extracted_paths = extract_source_files_to_disk(
-        ctx,
-        &archive_path,
-        &simple_paths,
-        &nested_bsas,
-        threads_per_archive,
-        temp_dir.path(),
-    );
+    let extracted_paths = if simple_paths.is_empty() && nested_bsas.is_empty() {
+        HashMap::new()
+    } else {
+        extract_source_files_to_disk(
+            ctx,
+            &archive_path,
+            &simple_paths,
+            &nested_bsas,
+            threads_per_archive,
+            temp_dir.path(),
+        )
+    };
     let extraction_ms = extraction_start.elapsed().as_millis();
     // Stage 1 complete for all directives in this archive.
     pb.inc(to_process.len() as u64);
 
-    let archive_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-    pb.set_message(format!("Patching archive {} ({} directives)", archive_name, to_process.len()));
+    let archive_name = archive_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    pb.set_message(format!(
+        "Patching archive {} ({} directives)",
+        archive_name,
+        to_process.len()
+    ));
     let preload_enabled = should_preload_patch_blobs();
     let preloaded_patches = if preload_enabled {
-        preload_patch_blobs(&ctx.config.wabbajack_path, &to_process)
-            .unwrap_or_else(|e| {
-                tracing::debug!(
-                    "Patch preload failed for archive {} (falling back to shared reader): {}",
-                    archive_name,
-                    e
-                );
-                HashMap::new()
-            })
+        preload_patch_blobs(&ctx.config.wabbajack_path, &to_process).unwrap_or_else(|e| {
+            tracing::debug!(
+                "Patch preload failed for archive {} (falling back to shared reader): {}",
+                archive_name,
+                e
+            );
+            HashMap::new()
+        })
     } else {
         HashMap::new()
     };
@@ -1561,6 +2011,7 @@ fn process_archive_patches(
                 &archive_path,
                 directive,
                 &extracted_paths,
+                &verified_local_basis,
                 &patch_name,
                 preloaded_delta,
             );
@@ -1592,6 +2043,7 @@ fn process_archive_patches(
                     &archive_path,
                     directive,
                     &extracted_paths,
+                    &verified_local_basis,
                     &patch_name,
                     preloaded_delta,
                 );
@@ -1741,17 +2193,21 @@ fn extract_source_files_to_disk(
                         &extract_dir,
                     )
                     .map(|_| ())
-                    .or_else(|_| crate::archive::sevenzip::extract_all_with_threads(
-                        archive_path,
-                        &extract_dir,
-                        threads_per_archive,
-                    ).map(|_| ()))
+                    .or_else(|_| {
+                        crate::archive::sevenzip::extract_all_with_threads(
+                            archive_path,
+                            &extract_dir,
+                            threads_per_archive,
+                        )
+                        .map(|_| ())
+                    })
                 } else {
                     crate::archive::sevenzip::extract_all_with_threads(
                         archive_path,
                         &extract_dir,
                         threads_per_archive,
-                    ).map(|_| ())
+                    )
+                    .map(|_| ())
                 };
 
                 if extract_result.is_ok() {
@@ -1762,9 +2218,12 @@ fn extract_source_files_to_disk(
                         .filter(|e| e.file_type().is_file())
                     {
                         if let Ok(rel_path) = entry.path().strip_prefix(&extract_dir) {
-                            let normalized = paths::normalize_for_lookup(&rel_path.to_string_lossy());
+                            let normalized =
+                                paths::normalize_for_lookup(&rel_path.to_string_lossy());
                             // Collect both simple files AND BSA/BA2 container files
-                            if simple_paths.contains_key(&normalized) || needed_bsas.contains(&normalized) {
+                            if simple_paths.contains_key(&normalized)
+                                || needed_bsas.contains(&normalized)
+                            {
                                 extracted.insert(normalized, entry.path().to_path_buf());
                             }
                         }
@@ -1812,11 +2271,16 @@ fn extract_source_files_to_disk(
         // Extract files from the nested archive using the generic extractor
         // This handles BSA, BA2, ZIP (including .fomod), 7z, RAR, etc.
         for (idx, file_path) in files_in_archive.iter().enumerate() {
-            if let Ok(file_data) = extract_from_archive_with_temp(&archive_file_path, file_path, temp_dir) {
+            if let Ok(file_data) =
+                extract_from_archive_with_temp(&archive_file_path, file_path, temp_dir)
+            {
                 let key = format!("{}/{}", nested_archive_path, file_path);
                 let normalized_key = paths::normalize_for_lookup(&key);
-                let temp_file_path = temp_dir.join(format!("nested_{}_{}.tmp",
-                    archive_normalized.replace(['/', '\\'], "_"), idx));
+                let temp_file_path = temp_dir.join(format!(
+                    "nested_{}_{}.tmp",
+                    archive_normalized.replace(['/', '\\'], "_"),
+                    idx
+                ));
                 if fs::write(&temp_file_path, &file_data).is_ok() {
                     extracted.insert(normalized_key, temp_file_path);
                 }
@@ -1835,8 +2299,7 @@ fn collect_needed_file_paths_with_bsas(
     needed_bsas: &std::collections::HashSet<String>,
     results: &mut HashMap<String, PathBuf>,
 ) {
-    let needed_normalized: std::collections::HashSet<String> =
-        needed.keys().cloned().collect();
+    let needed_normalized: std::collections::HashSet<String> = needed.keys().cloned().collect();
 
     if let Ok(entries) = fs::read_dir(current) {
         for entry in entries.flatten() {
@@ -1850,7 +2313,8 @@ fn collect_needed_file_paths_with_bsas(
                     let normalized = paths::normalize_for_lookup(&rel_str);
 
                     // Collect both simple files AND BSA/BA2 container files
-                    if needed_normalized.contains(&normalized) || needed_bsas.contains(&normalized) {
+                    if needed_normalized.contains(&normalized) || needed_bsas.contains(&normalized)
+                    {
                         results.insert(normalized, path.clone());
                     }
                 }
@@ -1870,33 +2334,45 @@ fn apply_patch_streaming(
     archive_path: &Path,
     directive: &crate::modlist::PatchedFromArchiveDirective,
     extracted_paths: &HashMap<String, PathBuf>,
+    verified_local_basis: &HashMap<String, PathBuf>,
     patch_name: &str,
     preloaded_delta: Option<&[u8]>,
 ) -> Result<()> {
+    use crate::octodiff::DeltaReader;
     use memmap2::Mmap;
     use std::io::{BufWriter, Cursor};
-    use crate::octodiff::DeltaReader;
 
-    // Get source file path from extracted cache
-    let source_path = if directive.archive_hash_path.len() == 1 {
-        // Whole archive file is the source
-        archive_path.to_path_buf()
-    } else if directive.archive_hash_path.len() == 2 {
-        // Simple: file directly in archive
-        let path = &directive.archive_hash_path[1];
-        let normalized = paths::normalize_for_lookup(path);
-        extracted_paths.get(&normalized)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Source file not found in extracted cache: {}", path))?
-    } else if directive.archive_hash_path.len() >= 3 {
-        // Nested BSA: file inside BSA inside archive
-        let bsa_path = &directive.archive_hash_path[1];
-        let file_in_bsa = &directive.archive_hash_path[2];
-        let key = format!("{}/{}", bsa_path, file_in_bsa);
-        let normalized = paths::normalize_for_lookup(&key);
-        extracted_paths.get(&normalized)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Source file not found in BSA cache: {} / {}", bsa_path, file_in_bsa))?
+    // Get source file path:
+    // 1) verified local basis from phase-4 output map
+    // 2) extracted cache for this archive
+    let source_path = if let Some(basis_key) =
+        build_patch_basis_key_from_archive_hash_path(&directive.archive_hash_path)
+    {
+        if let Some(path) = verified_local_basis.get(&basis_key) {
+            path.clone()
+        } else if directive.archive_hash_path.len() == 1 {
+            archive_path.to_path_buf()
+        } else if directive.archive_hash_path.len() == 2 {
+            let path = &directive.archive_hash_path[1];
+            let normalized = paths::normalize_for_lookup(path);
+            extracted_paths.get(&normalized).cloned().ok_or_else(|| {
+                anyhow::anyhow!("Source file not found in extracted cache: {}", path)
+            })?
+        } else if directive.archive_hash_path.len() >= 3 {
+            let bsa_path = &directive.archive_hash_path[1];
+            let file_in_bsa = &directive.archive_hash_path[2];
+            let key = format!("{}/{}", bsa_path, file_in_bsa);
+            let normalized = paths::normalize_for_lookup(&key);
+            extracted_paths.get(&normalized).cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Source file not found in BSA cache: {} / {}",
+                    bsa_path,
+                    file_in_bsa
+                )
+            })?
+        } else {
+            anyhow::bail!("Invalid archive_hash_path");
+        }
     } else {
         anyhow::bail!("Invalid archive_hash_path");
     };
@@ -1937,7 +2413,11 @@ fn apply_patch_streaming(
     if written != directive.size {
         // Remove incomplete file
         let _ = fs::remove_file(&output_path);
-        anyhow::bail!("Size mismatch: expected {}, got {}", directive.size, written);
+        anyhow::bail!(
+            "Size mismatch: expected {}, got {}",
+            directive.size,
+            written
+        );
     }
 
     Ok(())
@@ -1964,7 +2444,10 @@ fn process_transformed_texture(
         return Ok(());
     }
 
-    pb.set_message(format!("Parsing {} TransformedTexture directives...", all_raw.len()));
+    pb.set_message(format!(
+        "Parsing {} TransformedTexture directives...",
+        all_raw.len()
+    ));
 
     // Parse and group by archive
     let mut by_archive: HashMap<String, Vec<(i64, TransformedTextureDirective)>> = HashMap::new();
@@ -1986,7 +2469,10 @@ fn process_transformed_texture(
     }
 
     if parse_failures > 0 {
-        pb.println(format!("WARN: {} TransformedTexture directives failed to parse", parse_failures));
+        pb.println(format!(
+            "WARN: {} TransformedTexture directives failed to parse",
+            parse_failures
+        ));
     }
 
     // Pre-scan for unsupported texture formats
@@ -2000,7 +2486,9 @@ fn process_transformed_texture(
                 handlers::texture::enable_fallback_mode();
                 println!("Continuing with BC1 fallback for unsupported formats...\n");
             } else {
-                println!("\nAborting installation. Please report unsupported formats to developers.");
+                println!(
+                    "\nAborting installation. Please report unsupported formats to developers."
+                );
                 std::process::exit(1);
             }
         });
@@ -2008,7 +2496,10 @@ fn process_transformed_texture(
 
     let total_archives = by_archive.len();
     let total_directives: usize = by_archive.values().map(|v| v.len()).sum();
-    eprintln!("Processing {} textures across {} archives...", total_directives, total_archives);
+    eprintln!(
+        "Processing {} textures across {} archives...",
+        total_directives, total_archives
+    );
 
     // Reset progress bar for texture phase
     pb.finish_and_clear();
@@ -2292,16 +2783,16 @@ fn process_create_bsa(
     // Parse all directives
     let mut directives: Vec<(i64, CreateBSADirective)> = all_raw
         .into_iter()
-        .filter_map(|(id, json)| {
-            match serde_json::from_str::<Directive>(&json) {
+        .filter_map(
+            |(id, json)| match serde_json::from_str::<Directive>(&json) {
                 Ok(Directive::CreateBSA(d)) => Some((id, d)),
                 _ => {
                     failed.fetch_add(1, Ordering::Relaxed);
                     pb.inc(1);
                     None
                 }
-            }
-        })
+            },
+        )
         .collect();
 
     // Sort by file count (smallest first) for faster progress feedback
@@ -2317,8 +2808,10 @@ fn process_create_bsa(
     eprintln!(
         "Processing {} BSAs: {} small (≤{} files, 4 at a time), {} large (>{} files, sequential)",
         small.len() + large.len(),
-        small.len(), PARALLEL_THRESHOLD,
-        large.len(), PARALLEL_THRESHOLD
+        small.len(),
+        PARALLEL_THRESHOLD,
+        large.len(),
+        PARALLEL_THRESHOLD
     );
 
     // Clone reporter for use in parallel iteration
@@ -2352,7 +2845,10 @@ fn process_create_bsa(
                 }
                 Err(e) => {
                     failed.fetch_add(1, Ordering::Relaxed);
-                    pb.println(format!("FAIL [{}] create {} {}: {:#}", id, archive_type, bsa_name, e));
+                    pb.println(format!(
+                        "FAIL [{}] create {} {}: {:#}",
+                        id, archive_type, bsa_name, e
+                    ));
                 }
             }
             pb.inc(1);
@@ -2380,7 +2876,11 @@ fn process_create_bsa(
             crate::modlist::BSAState::BA2(_) => "BA2",
         };
 
-        pb.set_message(format!("{} ({} files) [LARGE]", bsa_name, directive.file_states.len()));
+        pb.set_message(format!(
+            "{} ({} files) [LARGE]",
+            bsa_name,
+            directive.file_states.len()
+        ));
 
         match handlers::handle_create_bsa(ctx, &directive) {
             Ok(()) => {
@@ -2389,7 +2889,10 @@ fn process_create_bsa(
             }
             Err(e) => {
                 failed.fetch_add(1, Ordering::Relaxed);
-                pb.println(format!("FAIL [{}] create {} {}: {:#}", id, archive_type, bsa_name, e));
+                pb.println(format!(
+                    "FAIL [{}] create {} {}: {:#}",
+                    id, archive_type, bsa_name, e
+                ));
             }
         }
         pb.inc(1);

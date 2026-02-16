@@ -80,22 +80,34 @@ impl Installer {
         config.validate()?;
 
         // Create output and downloads directories if needed
-        fs::create_dir_all(&config.output_dir)
-            .with_context(|| format!("Failed to create output directory: {}", config.output_dir.display()))?;
-        fs::create_dir_all(&config.downloads_dir)
-            .with_context(|| format!("Failed to create downloads directory: {}", config.downloads_dir.display()))?;
+        fs::create_dir_all(&config.output_dir).with_context(|| {
+            format!(
+                "Failed to create output directory: {}",
+                config.output_dir.display()
+            )
+        })?;
+        fs::create_dir_all(&config.downloads_dir).with_context(|| {
+            format!(
+                "Failed to create downloads directory: {}",
+                config.downloads_dir.display()
+            )
+        })?;
 
         // Parse wabbajack and import to database
         println!("Parsing: {}", config.wabbajack_path.display());
         let db = import_wabbajack_to_db(&config.wabbajack_path, &config.db_path())?;
 
         // Show modlist info
-        if let (Some(name), Some(version)) = (db.get_metadata("name")?, db.get_metadata("version")?) {
+        if let (Some(name), Some(version)) = (db.get_metadata("name")?, db.get_metadata("version")?)
+        {
             println!("Modlist: {} v{}", name, version);
         }
 
         let stats = db.get_directive_stats()?;
-        println!("Directives: {} total ({} pending)\n", stats.total, stats.pending);
+        println!(
+            "Directives: {} total ({} pending)\n",
+            stats.total, stats.pending
+        );
 
         Ok(Self { config, db })
     }
@@ -133,7 +145,9 @@ impl Installer {
         let pb = ProgressBar::new(archives_to_check.len() as u64);
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} | {msg}")
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} | {msg}",
+                )
                 .unwrap()
                 .progress_chars("=>-"),
         );
@@ -150,9 +164,12 @@ impl Installer {
                     if actual_size != expected_size {
                         errors.push((
                             archive.name.clone(),
-                            format!("Size mismatch: expected {} bytes, got {} ({}%)",
-                                expected_size, actual_size,
-                                (actual_size * 100) / expected_size.max(1)),
+                            format!(
+                                "Size mismatch: expected {} bytes, got {} ({}%)",
+                                expected_size,
+                                actual_size,
+                                (actual_size * 100) / expected_size.max(1)
+                            ),
                         ));
                     }
                 }
@@ -190,7 +207,10 @@ impl Installer {
         });
         println!("Game directory: {}", self.config.game_dir.display());
         if !self.config.game_dir.exists() {
-            bail!("Game directory does not exist: {}", self.config.game_dir.display());
+            bail!(
+                "Game directory does not exist: {}",
+                self.config.game_dir.display()
+            );
         }
         println!("Game directory validated\n");
         log_phase_metrics("Game Check", game_check_start);
@@ -234,21 +254,31 @@ impl Installer {
             }
 
             if validation_attempts >= MAX_VALIDATION_ATTEMPTS {
-                println!("\nValidation failed after {} attempts! {} archives still have issues:",
-                    MAX_VALIDATION_ATTEMPTS, validation_errors.len());
+                println!(
+                    "\nValidation failed after {} attempts! {} archives still have issues:",
+                    MAX_VALIDATION_ATTEMPTS,
+                    validation_errors.len()
+                );
                 for (name, error) in &validation_errors {
                     println!("  - {}: {}", name, error);
                 }
                 bail!("Archive validation failed");
             }
 
-            println!("\nFound {} corrupted archives, auto-fixing...", validation_errors.len());
+            println!(
+                "\nFound {} corrupted archives, auto-fixing...",
+                validation_errors.len()
+            );
             for (name, error) in &validation_errors {
                 println!("  - {}: {}", name, error);
                 let file_path = self.config.downloads_dir.join(name);
                 if file_path.exists() {
                     if let Err(e) = fs::remove_file(&file_path) {
-                        warn!("Failed to remove corrupted file {}: {}", file_path.display(), e);
+                        warn!(
+                            "Failed to remove corrupted file {}: {}",
+                            file_path.display(),
+                            e
+                        );
                     }
                 }
                 if let Err(e) = self.db.reset_archive_download_status(name) {
@@ -272,6 +302,7 @@ impl Installer {
         let preflight_start = Instant::now();
         dp.preflight_check()?;
         dp.index_archives()?;
+        dp.prepare_patch_basis_db()?;
         log_phase_metrics("Preflight/Index", preflight_start);
 
         // === Phase 4: Install Files ===
@@ -328,7 +359,10 @@ impl Installer {
         stats.directives_failed = process_stats.failed;
 
         if stats.directives_failed > 0 {
-            println!("\nDirective processing incomplete. {} failures.", stats.directives_failed);
+            println!(
+                "\nDirective processing incomplete. {} failures.",
+                stats.directives_failed
+            );
         } else {
             println!("\nInstallation complete!");
         }

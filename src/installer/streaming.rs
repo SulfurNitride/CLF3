@@ -27,12 +27,14 @@
 
 use crate::archive::sevenzip;
 use crate::bsa;
-use crate::installer::handlers::from_archive::{detect_archive_type, ArchiveType as NestedArchiveType};
+use crate::installer::handlers::from_archive::{
+    detect_archive_type, ArchiveType as NestedArchiveType,
+};
 use crate::modlist::{FromArchiveDirective, ModlistDb};
 use crate::paths;
 
-use super::processor::ProcessContext;
 use super::extract_strategy::should_use_selective_extraction;
+use super::processor::{build_patch_basis_key, ProcessContext};
 
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -97,9 +99,9 @@ impl ArchiveSizeTier {
     /// Total threads stay constant, distributed across fewer archives for larger files.
     fn threads_per_archive(&self) -> usize {
         match self {
-            ArchiveSizeTier::Small => 1,   // Many archives, 1 thread each
-            ArchiveSizeTier::Medium => 2,  // Fewer archives, 2 threads each
-            ArchiveSizeTier::Large => 0,   // 0 = all threads (sequential processing)
+            ArchiveSizeTier::Small => 1,  // Many archives, 1 thread each
+            ArchiveSizeTier::Medium => 2, // Fewer archives, 2 threads each
+            ArchiveSizeTier::Large => 0,  // 0 = all threads (sequential processing)
         }
     }
 }
@@ -191,7 +193,10 @@ pub fn process_from_archive_streaming(
     // Parse, pre-filter against existing files, and group by archive
     // This avoids checking each file during extraction
     // Tuple: (directive_id, directive, resolved_path, file_in_bsa_if_nested)
-    let mut by_archive: HashMap<String, Vec<(i64, FromArchiveDirective, Option<String>, Option<String>)>> = HashMap::new();
+    let mut by_archive: HashMap<
+        String,
+        Vec<(i64, FromArchiveDirective, Option<String>, Option<String>)>,
+    > = HashMap::new();
     let mut whole_file_directives: Vec<(i64, FromArchiveDirective)> = Vec::new();
     let mut parse_failures = 0;
     let mut pre_skipped = 0usize;
@@ -227,7 +232,12 @@ pub fn process_from_archive_streaming(
                         None
                     };
 
-                    by_archive.entry(hash.clone()).or_default().push((id, d, resolved_path, file_in_bsa));
+                    by_archive.entry(hash.clone()).or_default().push((
+                        id,
+                        d,
+                        resolved_path,
+                        file_in_bsa,
+                    ));
                 }
             }
             _ => {
@@ -255,10 +265,10 @@ pub fn process_from_archive_streaming(
     // Group archives by size tier and type
     let archives: Vec<_> = by_archive.into_iter().collect();
     let archive_count = archives.len();
-    let mut small_archives = Vec::with_capacity(archive_count);   // ≤512MB - full parallel (1 thread each)
-    let mut medium_archives = Vec::with_capacity(archive_count / 4);  // 512MB-2GB - half parallel (2 threads each)
-    let mut large_archives = Vec::with_capacity(4);   // ≥2GB - sequential (all threads)
-    let mut bsa_archives = Vec::with_capacity(archive_count / 4);     // BSA/BA2 handled separately
+    let mut small_archives = Vec::with_capacity(archive_count); // ≤512MB - full parallel (1 thread each)
+    let mut medium_archives = Vec::with_capacity(archive_count / 4); // 512MB-2GB - half parallel (2 threads each)
+    let mut large_archives = Vec::with_capacity(4); // ≥2GB - sequential (all threads)
+    let mut bsa_archives = Vec::with_capacity(archive_count / 4); // BSA/BA2 handled separately
 
     for (archive_hash, directives) in archives {
         let archive_path = match ctx.get_archive_path(&archive_hash) {
@@ -266,24 +276,30 @@ pub fn process_from_archive_streaming(
             None => continue,
         };
 
-        let archive_type = detect_archive_type(&archive_path)
-            .unwrap_or(NestedArchiveType::Unknown);
+        let archive_type = detect_archive_type(&archive_path).unwrap_or(NestedArchiveType::Unknown);
 
         // BSA/BA2 handled separately (no extraction needed)
-        if matches!(archive_type, NestedArchiveType::Tes3Bsa | NestedArchiveType::Bsa | NestedArchiveType::Ba2) {
+        if matches!(
+            archive_type,
+            NestedArchiveType::Tes3Bsa | NestedArchiveType::Bsa | NestedArchiveType::Ba2
+        ) {
             bsa_archives.push((archive_hash, directives, archive_path));
             continue;
         }
 
         // Categorize by size tier
-        let archive_size = fs::metadata(&archive_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let archive_size = fs::metadata(&archive_path).map(|m| m.len()).unwrap_or(0);
 
         match ArchiveSizeTier::from_size(archive_size) {
-            ArchiveSizeTier::Small => small_archives.push((archive_hash, directives, archive_path, archive_size)),
-            ArchiveSizeTier::Medium => medium_archives.push((archive_hash, directives, archive_path, archive_size)),
-            ArchiveSizeTier::Large => large_archives.push((archive_hash, directives, archive_path, archive_size)),
+            ArchiveSizeTier::Small => {
+                small_archives.push((archive_hash, directives, archive_path, archive_size))
+            }
+            ArchiveSizeTier::Medium => {
+                medium_archives.push((archive_hash, directives, archive_path, archive_size))
+            }
+            ArchiveSizeTier::Large => {
+                large_archives.push((archive_hash, directives, archive_path, archive_size))
+            }
         }
     }
 
@@ -292,8 +308,10 @@ pub fn process_from_archive_streaming(
     medium_archives.sort_by_key(|(_, _, _, size)| *size);
     large_archives.sort_by_key(|(_, _, _, size)| *size);
 
-    let total_archives = small_archives.len() + medium_archives.len() + large_archives.len() + bsa_archives.len();
-    let total_files: usize = small_archives.iter()
+    let total_archives =
+        small_archives.len() + medium_archives.len() + large_archives.len() + bsa_archives.len();
+    let total_files: usize = small_archives
+        .iter()
         .map(|(_, d, _, _)| d.len())
         .chain(medium_archives.iter().map(|(_, d, _, _)| d.len()))
         .chain(large_archives.iter().map(|(_, d, _, _)| d.len()))
@@ -302,8 +320,12 @@ pub fn process_from_archive_streaming(
 
     eprintln!(
         "Processing {} archives ({} files): {} small + {} medium + {} large + {} BSA",
-        total_archives, total_files,
-        small_archives.len(), medium_archives.len(), large_archives.len(), bsa_archives.len()
+        total_archives,
+        total_files,
+        small_archives.len(),
+        medium_archives.len(),
+        large_archives.len(),
+        bsa_archives.len()
     );
 
     // Stats
@@ -322,14 +344,11 @@ pub fn process_from_archive_streaming(
 
     // Process whole-file directives first (simple copy)
     if !whole_file_directives.is_empty() {
-        pb.set_message(format!("Copying {} whole-file directives...", whole_file_directives.len()));
-        process_whole_file_directives(
-            &whole_file_directives,
-            ctx,
-            &extracted,
-            &skipped,
-            &failed,
-        );
+        pb.set_message(format!(
+            "Copying {} whole-file directives...",
+            whole_file_directives.len()
+        ));
+        process_whole_file_directives(&whole_file_directives, ctx, &extracted, &skipped, &failed);
     }
 
     // Calculate thread distribution for producer-consumer pipeline
@@ -337,12 +356,17 @@ pub fn process_from_archive_streaming(
     let extractor_threads = (total_threads / 2).max(1);
     let mover_threads = (total_threads - extractor_threads).max(1);
 
-    eprintln!("Using producer-consumer pipeline: {} extractor + {} mover threads",
-              extractor_threads, mover_threads);
+    eprintln!(
+        "Using producer-consumer pipeline: {} extractor + {} mover threads",
+        extractor_threads, mover_threads
+    );
 
     // Process SMALL archives using producer-consumer pipeline
     if !small_archives.is_empty() {
-        pb.set_message(format!("Processing {} small archives (producer-consumer)...", small_archives.len()));
+        pb.set_message(format!(
+            "Processing {} small archives (producer-consumer)...",
+            small_archives.len()
+        ));
 
         process_archives_with_pipeline(
             small_archives,
@@ -363,7 +387,11 @@ pub fn process_from_archive_streaming(
     // Process MEDIUM archives with pipeline
     if !medium_archives.is_empty() {
         let half_threads = (rayon::current_num_threads() / 2).max(1);
-        pb.set_message(format!("Processing {} medium archives ({} at a time)...", medium_archives.len(), half_threads));
+        pb.set_message(format!(
+            "Processing {} medium archives ({} at a time)...",
+            medium_archives.len(),
+            half_threads
+        ));
 
         // Process medium archives in chunks with pipeline
         for chunk in medium_archives.chunks(half_threads) {
@@ -386,11 +414,17 @@ pub fn process_from_archive_streaming(
 
     // Process LARGE archives SEQUENTIALLY with pipeline (all threads)
     for archive in large_archives {
-        let archive_name = archive.2.file_name()
+        let archive_name = archive
+            .2
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "large".to_string());
 
-        pb.set_message(format!("{} ({} files) [LARGE]", archive_name, archive.1.len()));
+        pb.set_message(format!(
+            "{} ({} files) [LARGE]",
+            archive_name,
+            archive.1.len()
+        ));
 
         process_archives_with_pipeline(
             vec![archive],
@@ -410,11 +444,16 @@ pub fn process_from_archive_streaming(
 
     // Process BSA/BA2 archives (read directly, no extraction needed)
     for (_archive_hash, directives, archive_path) in bsa_archives {
-        let archive_name = archive_path.file_name()
+        let archive_name = archive_path
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "bsa".to_string());
 
-        pb.set_message(format!("{} ({} files) [BSA]", archive_name, directives.len()));
+        pb.set_message(format!(
+            "{} ({} files) [BSA]",
+            archive_name,
+            directives.len()
+        ));
 
         // Process BSA directly (no extraction to temp needed)
         process_bsa_archive(
@@ -464,7 +503,12 @@ fn update_max(target: &AtomicUsize, value: usize) {
 /// Mover workers receive paths and copy files to final destinations.
 #[allow(clippy::too_many_arguments)]
 fn process_archives_with_pipeline(
-    archives: Vec<(String, Vec<(i64, FromArchiveDirective, Option<String>, Option<String>)>, PathBuf, u64)>,
+    archives: Vec<(
+        String,
+        Vec<(i64, FromArchiveDirective, Option<String>, Option<String>)>,
+        PathBuf,
+        u64,
+    )>,
     ctx: &ProcessContext,
     extracted: &Arc<AtomicUsize>,
     written: &Arc<AtomicUsize>,
@@ -518,8 +562,10 @@ fn process_archives_with_pipeline(
                 if src_size != job.expected_size {
                     let count = logged_failures_clone.fetch_add(1, Ordering::Relaxed);
                     if count < MAX_LOGGED_FAILURES {
-                        error!("FAIL [{}]: size mismatch: expected {} got {}",
-                                  job.directive_id, job.expected_size, src_size);
+                        error!(
+                            "FAIL [{}]: size mismatch: expected {} got {}",
+                            job.directive_id, job.expected_size, src_size
+                        );
                     }
                     failed_clone.fetch_add(1, Ordering::Relaxed);
                     return;
@@ -529,7 +575,12 @@ fn process_archives_with_pipeline(
                 if let Err(e) = paths::ensure_parent_dirs(&job.output_path) {
                     let count = logged_failures_clone.fetch_add(1, Ordering::Relaxed);
                     if count < MAX_LOGGED_FAILURES {
-                        error!("FAIL [{}]: cannot create dirs for {}: {}", job.directive_id, job.output_path.display(), e);
+                        error!(
+                            "FAIL [{}]: cannot create dirs for {}: {}",
+                            job.directive_id,
+                            job.output_path.display(),
+                            e
+                        );
                     }
                     failed_clone.fetch_add(1, Ordering::Relaxed);
                     return;
@@ -550,7 +601,9 @@ fn process_archives_with_pipeline(
                     // Source has multiple destinations - use reflink (instant CoW) with copy fallback
                     // Remove any existing file first (reflink fails if dest exists)
                     let _ = fs::remove_file(&job.output_path);
-                    if let Err(e) = reflink_copy::reflink_or_copy(&job.source_path, &job.output_path) {
+                    if let Err(e) =
+                        reflink_copy::reflink_or_copy(&job.source_path, &job.output_path)
+                    {
                         // Check if another thread created the file (race condition)
                         // If file exists with correct size, treat as success
                         if let Ok(meta) = fs::metadata(&job.output_path) {
@@ -572,7 +625,9 @@ fn process_archives_with_pipeline(
                     let _ = fs::remove_file(&job.output_path);
                     if fs::rename(&job.source_path, &job.output_path).is_err() {
                         // Fallback to reflink/copy if rename fails (cross-filesystem)
-                        if let Err(e) = reflink_copy::reflink_or_copy(&job.source_path, &job.output_path) {
+                        if let Err(e) =
+                            reflink_copy::reflink_or_copy(&job.source_path, &job.output_path)
+                        {
                             // Check if another thread created the file (race condition)
                             if let Ok(meta) = fs::metadata(&job.output_path) {
                                 if meta.len() == job.expected_size {
@@ -582,7 +637,10 @@ fn process_archives_with_pipeline(
                             }
                             let count = logged_failures_clone.fetch_add(1, Ordering::Relaxed);
                             if count < MAX_LOGGED_FAILURES {
-                                error!("FAIL [{}]: rename then reflink/copy failed: {}", job.directive_id, e);
+                                error!(
+                                    "FAIL [{}]: rename then reflink/copy failed: {}",
+                                    job.directive_id, e
+                                );
                             }
                             failed_clone.fetch_add(1, Ordering::Relaxed);
                             return;
@@ -609,29 +667,31 @@ fn process_archives_with_pipeline(
     let logged_failures_ref = logged_failures;
     let output_dir = ctx.config.output_dir.clone();
 
-    archives.par_iter().for_each(|(_archive_hash, directives, archive_path, _size)| {
-        process_single_archive_with_channel(
-            archive_path,
-            directives,
-            ctx_ref,
-            extracted_ref,
-            skipped_ref,
-            failed_ref,
-            logged_failures_ref,
-            threads_per_archive,
-            &tx,
-            &channel_hwm,
-            &output_dir,
-        );
+    archives
+        .par_iter()
+        .for_each(|(_archive_hash, directives, archive_path, _size)| {
+            process_single_archive_with_channel(
+                archive_path,
+                directives,
+                ctx_ref,
+                extracted_ref,
+                skipped_ref,
+                failed_ref,
+                logged_failures_ref,
+                threads_per_archive,
+                &tx,
+                &channel_hwm,
+                &output_dir,
+            );
 
-        pb_ref.inc(1);
-        pb_ref.set_message(format!(
-            "OK:{} Skip:{} Fail:{}",
-            written.load(Ordering::Relaxed),
-            skipped_ref.load(Ordering::Relaxed),
-            failed_ref.load(Ordering::Relaxed)
-        ));
-    });
+            pb_ref.inc(1);
+            pb_ref.set_message(format!(
+                "OK:{} Skip:{} Fail:{}",
+                written.load(Ordering::Relaxed),
+                skipped_ref.load(Ordering::Relaxed),
+                failed_ref.load(Ordering::Relaxed)
+            ));
+        });
 
     // Drop sender to signal movers to finish
     drop(tx);
@@ -700,7 +760,12 @@ fn process_single_archive_with_channel(
     for item in &to_process {
         let (id, directive, resolved, file_in_bsa) = item;
         if file_in_bsa.is_some() {
-            nested_bsa_directives.push((*id, directive, resolved.clone(), file_in_bsa.clone().unwrap()));
+            nested_bsa_directives.push((
+                *id,
+                directive,
+                resolved.clone(),
+                file_in_bsa.clone().unwrap(),
+            ));
         } else {
             simple_directives.push((*id, directive, resolved.clone()));
         }
@@ -715,7 +780,9 @@ fn process_single_archive_with_channel(
             .as_deref()
             .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
             .unwrap_or("");
-        if !path_in_archive.is_empty() && seen_needed.insert(paths::normalize_for_lookup(path_in_archive)) {
+        if !path_in_archive.is_empty()
+            && seen_needed.insert(paths::normalize_for_lookup(path_in_archive))
+        {
             needed_paths.push(path_in_archive.to_string());
         }
     }
@@ -724,7 +791,9 @@ fn process_single_archive_with_channel(
             .as_deref()
             .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
             .unwrap_or("");
-        if !path_in_archive.is_empty() && seen_needed.insert(paths::normalize_for_lookup(path_in_archive)) {
+        if !path_in_archive.is_empty()
+            && seen_needed.insert(paths::normalize_for_lookup(path_in_archive))
+        {
             needed_paths.push(path_in_archive.to_string());
         }
     }
@@ -746,7 +815,8 @@ fn process_single_archive_with_channel(
                     archive_path.display(),
                     e
                 );
-                sevenzip::extract_all_with_threads(archive_path, temp_dir.path(), threads).map(|_| ())
+                sevenzip::extract_all_with_threads(archive_path, temp_dir.path(), threads)
+                    .map(|_| ())
             })
     } else {
         // Full extraction remains best for large file sets and solid 7z archives.
@@ -794,7 +864,8 @@ fn process_single_archive_with_channel(
     // Files with multiple destinations need reflink/copy instead of rename
     let mut source_use_count: HashMap<String, usize> = HashMap::new();
     for (_, directive, resolved) in &simple_directives {
-        let path_in_archive = resolved.as_deref()
+        let path_in_archive = resolved
+            .as_deref()
             .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
             .unwrap_or("");
         let normalized = paths::normalize_for_lookup(path_in_archive);
@@ -804,7 +875,8 @@ fn process_single_archive_with_channel(
     // Also count BSA files used by nested directives - they must not be renamed
     // until all nested extractions are done
     for (_, directive, resolved, _) in &nested_bsa_directives {
-        let bsa_path = resolved.as_deref()
+        let bsa_path = resolved
+            .as_deref()
             .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
             .unwrap_or("");
         let normalized = paths::normalize_for_lookup(bsa_path);
@@ -816,6 +888,7 @@ fn process_single_archive_with_channel(
     process_nested_bsa_directives(
         &nested_bsa_directives,
         &extracted_map,
+        ctx,
         tx,
         channel_hwm,
         output_dir,
@@ -826,7 +899,8 @@ fn process_single_archive_with_channel(
 
     // Send simple directives to mover workers via channel
     for (id, directive, resolved) in simple_directives {
-        let path_in_archive = resolved.as_deref()
+        let path_in_archive = resolved
+            .as_deref()
             .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
             .unwrap_or("");
         let normalized = paths::normalize_for_lookup(path_in_archive);
@@ -844,6 +918,17 @@ fn process_single_archive_with_channel(
         };
 
         let final_output_path = paths::join_windows_path(output_dir, &directive.to);
+        if !path_in_archive.is_empty() {
+            if let Some(archive_hash) = directive.archive_hash_path.first() {
+                let basis_key = build_patch_basis_key(archive_hash, Some(path_in_archive), None);
+                ctx.record_patch_basis_candidate_path(
+                    &basis_key,
+                    &src_path,
+                    &final_output_path,
+                    directive.size,
+                );
+            }
+        }
 
         // If this source has multiple destinations, use reflink/copy
         let is_shared_source = source_use_count.get(&normalized).copied().unwrap_or(0) > 1;
@@ -878,6 +963,7 @@ fn process_single_archive_with_channel(
 fn process_nested_bsa_directives(
     nested_bsa_directives: &[(i64, &FromArchiveDirective, Option<String>, String)],
     extracted_map: &HashMap<String, PathBuf>,
+    ctx: &ProcessContext,
     tx: &Sender<MoveJob>,
     channel_hwm: &Arc<AtomicUsize>,
     output_dir: &PathBuf,
@@ -894,11 +980,16 @@ fn process_nested_bsa_directives(
     // Group by nested archive file
     let mut by_archive: HashMap<String, Vec<(i64, &FromArchiveDirective, String)>> = HashMap::new();
     for (id, directive, resolved, file_in_archive) in nested_bsa_directives {
-        let archive_path = resolved.as_deref()
+        let archive_path = resolved
+            .as_deref()
             .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
             .unwrap_or("")
             .to_string();
-        by_archive.entry(archive_path).or_default().push((*id, *directive, file_in_archive.clone()));
+        by_archive.entry(archive_path).or_default().push((
+            *id,
+            *directive,
+            file_in_archive.clone(),
+        ));
     }
 
     for (archive_path_in_outer, directives) in by_archive {
@@ -922,7 +1013,10 @@ fn process_nested_bsa_directives(
             Err(e) => {
                 let count = logged_failures.fetch_add(1, Ordering::Relaxed);
                 if count < MAX_LOGGED_FAILURES {
-                    error!("FAIL: Cannot detect archive type for {}: {}", archive_path_in_outer, e);
+                    error!(
+                        "FAIL: Cannot detect archive type for {}: {}",
+                        archive_path_in_outer, e
+                    );
                 }
                 failed.fetch_add(directives.len(), Ordering::Relaxed);
                 continue;
@@ -934,7 +1028,10 @@ fn process_nested_bsa_directives(
         let mut nested_extract_failed = false;
         if matches!(
             archive_type,
-            NestedArchiveType::Zip | NestedArchiveType::SevenZ | NestedArchiveType::Rar | NestedArchiveType::Unknown
+            NestedArchiveType::Zip
+                | NestedArchiveType::SevenZ
+                | NestedArchiveType::Rar
+                | NestedArchiveType::Unknown
         ) {
             let mut unique_files = Vec::new();
             let mut seen = HashSet::new();
@@ -955,7 +1052,8 @@ fn process_nested_bsa_directives(
                     );
                     match batch_result {
                         Ok(_) => {
-                            nested_extracted_map = Some(build_extracted_file_map(nested_tmp_dir.path()));
+                            nested_extracted_map =
+                                Some(build_extracted_file_map(nested_tmp_dir.path()));
                             directives.par_iter().for_each(|(id, directive, file_in_archive)| {
                                 let map = match &nested_extracted_map {
                                     Some(m) => m,
@@ -1006,6 +1104,19 @@ fn process_nested_bsa_directives(
                                     _temp_dir: Arc::clone(&nested_tmp_dir),
                                     is_shared_source: false,
                                 };
+                                if let Some(archive_hash) = directive.archive_hash_path.first() {
+                                    let basis_key = build_patch_basis_key(
+                                        archive_hash,
+                                        Some(&archive_path_in_outer),
+                                        Some(file_in_archive),
+                                    );
+                                    ctx.record_patch_basis_candidate_path(
+                                        &basis_key,
+                                        extracted_path,
+                                        &job.output_path,
+                                        directive.size,
+                                    );
+                                }
                                 if tx.send(job).is_err() {
                                     failed.fetch_add(1, Ordering::Relaxed);
                                     return;
@@ -1047,45 +1158,63 @@ fn process_nested_bsa_directives(
             continue;
         }
 
-        directives.par_iter().for_each(|(id, directive, file_in_archive)| {
-            // BSA/BA2 extraction using bsa module
-            let data = match bsa::extract_archive_file(&archive_disk_path, file_in_archive) {
-                Ok(d) => d,
-                Err(e) => {
+        directives
+            .par_iter()
+            .for_each(|(id, directive, file_in_archive)| {
+                // BSA/BA2 extraction using bsa module
+                let data = match bsa::extract_archive_file(&archive_disk_path, file_in_archive) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                        if count < MAX_LOGGED_FAILURES {
+                            error!(
+                                "FAIL [{}]: Nested extract error from {:?} archive: {}",
+                                id, archive_type, e
+                            );
+                        }
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                };
+
+                if data.len() as u64 != directive.size {
                     let count = logged_failures.fetch_add(1, Ordering::Relaxed);
                     if count < MAX_LOGGED_FAILURES {
-                        error!("FAIL [{}]: Nested extract error from {:?} archive: {}", id, archive_type, e);
+                        error!(
+                            "FAIL [{}]: Size mismatch: expected {} got {}",
+                            id,
+                            directive.size,
+                            data.len()
+                        );
                     }
                     failed.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
-            };
 
-            if data.len() as u64 != directive.size {
-                let count = logged_failures.fetch_add(1, Ordering::Relaxed);
-                if count < MAX_LOGGED_FAILURES {
-                    error!("FAIL [{}]: Size mismatch: expected {} got {}", id, directive.size, data.len());
+                // For BSA/BA2 nested extraction, write directly to destination.
+                // This avoids extra temp-file churn in the hot path.
+                let output_path = paths::join_windows_path(output_dir, &directive.to);
+                if let Err(_e) = paths::ensure_parent_dirs(&output_path) {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    return;
                 }
-                failed.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
 
-            // For BSA/BA2 nested extraction, write directly to destination.
-            // This avoids extra temp-file churn in the hot path.
-            let output_path = paths::join_windows_path(output_dir, &directive.to);
-            if let Err(_e) = paths::ensure_parent_dirs(&output_path) {
-                failed.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
+                if let Err(e) = fs::write(&output_path, &data) {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    error!("FAIL [{}]: write error: {}", id, e);
+                    return;
+                }
+                if let Some(archive_hash) = directive.archive_hash_path.first() {
+                    let basis_key = build_patch_basis_key(
+                        archive_hash,
+                        Some(&archive_path_in_outer),
+                        Some(file_in_archive),
+                    );
+                    ctx.record_patch_basis_candidate_bytes(&basis_key, &output_path, &data);
+                }
 
-            if let Err(e) = fs::write(&output_path, &data) {
-                failed.fetch_add(1, Ordering::Relaxed);
-                error!("FAIL [{}]: write error: {}", id, e);
-                return;
-            }
-
-            extracted.fetch_add(1, Ordering::Relaxed);
-        });
+                extracted.fetch_add(1, Ordering::Relaxed);
+            });
     }
 }
 
@@ -1129,7 +1258,10 @@ fn process_whole_file_directives(
         if archive_size != directive.size {
             // Not actually a whole-file directive - size mismatch
             failed.fetch_add(1, Ordering::Relaxed);
-            error!("FAIL [{}]: whole-file size mismatch {} vs {}", id, archive_size, directive.size);
+            error!(
+                "FAIL [{}]: whole-file size mismatch {} vs {}",
+                id, archive_size, directive.size
+            );
             return;
         }
 
@@ -1146,6 +1278,13 @@ fn process_whole_file_directives(
             error!("FAIL [{}]: copy failed: {}", id, e);
             return;
         }
+        let basis_key = build_patch_basis_key(archive_hash, None, None);
+        ctx.record_patch_basis_candidate_path(
+            &basis_key,
+            archive_path,
+            &output_path,
+            directive.size,
+        );
 
         extracted.fetch_add(1, Ordering::Relaxed);
     });
@@ -1189,56 +1328,73 @@ fn process_bsa_archive(
     let output_dir = &ctx.config.output_dir;
 
     // Process files from BSA in parallel
-    to_process.par_iter().for_each(|(id, directive, resolved, _file_in_bsa)| {
-        // For BSA archives, the file path is in archive_hash_path[1]
-        let file_path_in_bsa = resolved.as_deref()
-            .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
-            .unwrap_or("");
+    to_process
+        .par_iter()
+        .for_each(|(id, directive, resolved, _file_in_bsa)| {
+            // For BSA archives, the file path is in archive_hash_path[1]
+            let file_path_in_bsa = resolved
+                .as_deref()
+                .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
+                .unwrap_or("");
 
-        // Extract from BSA
-        let data = match bsa::extract_archive_file(archive_path, file_path_in_bsa) {
-            Ok(d) => d,
-            Err(e) => {
+            // Extract from BSA
+            let data = match bsa::extract_archive_file(archive_path, file_path_in_bsa) {
+                Ok(d) => d,
+                Err(e) => {
+                    let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                    if count < MAX_LOGGED_FAILURES {
+                        error!("FAIL [{}]: BSA read error: {}", id, e);
+                    }
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            };
+
+            // Verify size
+            if data.len() as u64 != directive.size {
                 let count = logged_failures.fetch_add(1, Ordering::Relaxed);
                 if count < MAX_LOGGED_FAILURES {
-                    error!("FAIL [{}]: BSA read error: {}", id, e);
+                    error!(
+                        "FAIL [{}]: BSA size mismatch: expected {} got {}",
+                        id,
+                        directive.size,
+                        data.len()
+                    );
                 }
                 failed.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-        };
 
-        // Verify size
-        if data.len() as u64 != directive.size {
-            let count = logged_failures.fetch_add(1, Ordering::Relaxed);
-            if count < MAX_LOGGED_FAILURES {
-                error!("FAIL [{}]: BSA size mismatch: expected {} got {}", id, directive.size, data.len());
+            // Write to output
+            let output_path = paths::join_windows_path(output_dir, &directive.to);
+            if let Err(e) = paths::ensure_parent_dirs(&output_path) {
+                failed.fetch_add(1, Ordering::Relaxed);
+                error!(
+                    "FAIL [{}]: cannot create dirs for {}: {}",
+                    id,
+                    output_path.display(),
+                    e
+                );
+                return;
             }
-            failed.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
 
-        // Write to output
-        let output_path = paths::join_windows_path(output_dir, &directive.to);
-        if let Err(e) = paths::ensure_parent_dirs(&output_path) {
-            failed.fetch_add(1, Ordering::Relaxed);
-            error!("FAIL [{}]: cannot create dirs for {}: {}", id, output_path.display(), e);
-            return;
-        }
+            if let Err(e) = fs::write(&output_path, &data) {
+                failed.fetch_add(1, Ordering::Relaxed);
+                error!("FAIL [{}]: write error: {}", id, e);
+                return;
+            }
+            if let Some(archive_hash) = directive.archive_hash_path.first() {
+                let basis_key = build_patch_basis_key(archive_hash, Some(file_path_in_bsa), None);
+                ctx.record_patch_basis_candidate_bytes(&basis_key, &output_path, &data);
+            }
 
-        if let Err(e) = fs::write(&output_path, &data) {
-            failed.fetch_add(1, Ordering::Relaxed);
-            error!("FAIL [{}]: write error: {}", id, e);
-            return;
-        }
-
-        extracted.fetch_add(1, Ordering::Relaxed);
-        let new_count = written.fetch_add(1, Ordering::Relaxed) + 1;
-        // Call progress callback if provided
-        if let Some(ref callback) = progress_callback {
-            callback(new_count);
-        }
-    });
+            extracted.fetch_add(1, Ordering::Relaxed);
+            let new_count = written.fetch_add(1, Ordering::Relaxed) + 1;
+            // Call progress callback if provided
+            if let Some(ref callback) = progress_callback {
+                callback(new_count);
+            }
+        });
 }
 
 /// Build a map of all files in a directory: normalized path -> actual file path on disk.
@@ -1255,9 +1411,7 @@ fn build_extracted_file_map(dir: &std::path::Path) -> HashMap<String, PathBuf> {
     let mut map: HashMap<String, PathBuf> = HashMap::new();
 
     for entry in &entries {
-        let rel_path = entry.path()
-            .strip_prefix(dir)
-            .unwrap_or(entry.path());
+        let rel_path = entry.path().strip_prefix(dir).unwrap_or(entry.path());
 
         // Get the path as bytes (OsStr -> bytes on Unix)
         #[cfg(unix)]
@@ -1296,8 +1450,11 @@ mod tests {
         // Should be either 1GB or 2GB depending on system RAM
         let one_gb = 1024 * 1024 * 1024;
         let two_gb = 2048 * 1024 * 1024;
-        assert!(threshold == one_gb || threshold == two_gb,
-            "Threshold should be 1GB or 2GB, got {}", threshold);
+        assert!(
+            threshold == one_gb || threshold == two_gb,
+            "Threshold should be 1GB or 2GB, got {}",
+            threshold
+        );
     }
 
     #[test]
@@ -1318,12 +1475,21 @@ mod tests {
         assert_eq!(ArchiveSizeTier::from_size(HALF_GB), ArchiveSizeTier::Small);
 
         // Medium: 512MB-2GB
-        assert_eq!(ArchiveSizeTier::from_size(HALF_GB + 1), ArchiveSizeTier::Medium);
-        assert_eq!(ArchiveSizeTier::from_size(TWO_GB - 1), ArchiveSizeTier::Medium);
+        assert_eq!(
+            ArchiveSizeTier::from_size(HALF_GB + 1),
+            ArchiveSizeTier::Medium
+        );
+        assert_eq!(
+            ArchiveSizeTier::from_size(TWO_GB - 1),
+            ArchiveSizeTier::Medium
+        );
 
         // Large: >=2GB
         assert_eq!(ArchiveSizeTier::from_size(TWO_GB), ArchiveSizeTier::Large);
-        assert_eq!(ArchiveSizeTier::from_size(TWO_GB + 1), ArchiveSizeTier::Large);
+        assert_eq!(
+            ArchiveSizeTier::from_size(TWO_GB + 1),
+            ArchiveSizeTier::Large
+        );
     }
 
     #[test]

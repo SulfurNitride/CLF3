@@ -15,6 +15,7 @@ Last updated: 2026-02-16
 - [x] Route nested non-BSA extracted files through mover queue (`MoveJob`) instead of read-into-RAM + direct write.
 - [x] Add mover queue high-water mark metric.
 - [x] Add phase timing + RSS logging at installer orchestration boundaries.
+- [x] Add patch basis-key DB + local verified basis reuse (size + quick hash + full hash fallback check), with archive extraction fallback only when missing/unverified.
 
 ## Next follow-up improvements
 - [ ] Make nested BSA/BA2 extraction path stream-to-temp file (avoid keeping extracted blob in memory before queueing move jobs).
@@ -28,3 +29,4 @@ Last updated: 2026-02-16
 - [ ] Compare patch-phase wall clock before/after on a patch-heavy modlist.
 - [ ] Verify no temp-dir lifetime regressions with nested archive extraction.
 - [ ] Validate output parity on a known modlist install (file count + size checks).
+- [ ] Validate patch basis DB hit rate and patch extraction reduction on a patch-heavy modlist.
