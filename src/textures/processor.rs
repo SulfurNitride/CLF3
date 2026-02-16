@@ -705,6 +705,26 @@ fn get_format_info(dds: &Dds) -> String {
     info
 }
 
+/// Estimate the size of a DDS file for memory-aware batching.
+///
+/// Returns estimated bytes for the output DDS at the given dimensions and format.
+/// Useful for planning batch sizes to avoid OOM.
+pub fn estimate_dds_size(width: u32, height: u32, format: OutputFormat) -> u64 {
+    let pixels = width as u64 * height as u64;
+    let base_size = match format {
+        // BCn formats: 4x4 block compression
+        OutputFormat::BC1 => pixels / 2,        // 0.5 bytes/pixel (8 bytes per 4x4 block)
+        OutputFormat::BC2 | OutputFormat::BC3 => pixels,  // 1 byte/pixel (16 bytes per 4x4 block)
+        OutputFormat::BC4 => pixels / 2,        // 0.5 bytes/pixel
+        OutputFormat::BC5 => pixels,            // 1 byte/pixel
+        OutputFormat::BC7 => pixels,            // 1 byte/pixel
+        // Uncompressed
+        OutputFormat::Rgba | OutputFormat::Bgra => pixels * 4,  // 4 bytes/pixel
+    };
+    // Add ~33% for mipmaps + 148 bytes for DDS header
+    base_size * 4 / 3 + 148
+}
+
 /// Process a texture file from disk
 pub fn process_texture_file(
     input_path: &Path,

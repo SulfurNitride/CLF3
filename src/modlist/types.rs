@@ -50,27 +50,43 @@ pub struct Archive {
 #[serde(tag = "$type")]
 pub enum DownloadState {
     #[serde(rename = "NexusDownloader, Wabbajack.Lib")]
+    #[serde(alias = "NexusDownloader")]
+    #[serde(alias = "NexusDownloader+State, Wabbajack.Lib")]
     Nexus(NexusState),
 
     #[serde(rename = "HttpDownloader, Wabbajack.Lib")]
+    #[serde(alias = "HttpDownloader")]
+    #[serde(alias = "HttpDownloader+State, Wabbajack.Lib")]
     Http(HttpState),
 
     #[serde(rename = "GoogleDriveDownloader, Wabbajack.Lib")]
+    #[serde(alias = "GoogleDriveDownloader")]
+    #[serde(alias = "GoogleDriveDownloader+State, Wabbajack.Lib")]
     GoogleDrive(GoogleDriveState),
 
     #[serde(rename = "MegaDownloader, Wabbajack.Lib")]
+    #[serde(alias = "MegaDownloader")]
+    #[serde(alias = "MegaDownloader+State, Wabbajack.Lib")]
     Mega(MegaState),
 
     #[serde(rename = "MediaFireDownloader+State, Wabbajack.Lib")]
+    #[serde(alias = "MediaFireDownloader, Wabbajack.Lib")]
+    #[serde(alias = "MediaFireDownloader")]
     MediaFire(MediaFireState),
 
     #[serde(rename = "ManualDownloader, Wabbajack.Lib")]
+    #[serde(alias = "ManualDownloader")]
+    #[serde(alias = "ManualDownloader+State, Wabbajack.Lib")]
     Manual(ManualState),
 
     #[serde(rename = "WabbajackCDNDownloader+State, Wabbajack.Lib")]
+    #[serde(alias = "WabbajackCDNDownloader, Wabbajack.Lib")]
+    #[serde(alias = "WabbajackCDNDownloader")]
     WabbajackCDN(WabbajackCDNState),
 
     #[serde(rename = "GameFileSourceDownloader, Wabbajack.Lib")]
+    #[serde(alias = "GameFileSourceDownloader")]
+    #[serde(alias = "GameFileSourceDownloader+State, Wabbajack.Lib")]
     GameFileSource(GameFileSourceState),
 }
 
@@ -148,11 +164,23 @@ pub struct GameFileSourceState {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "$type")]
 pub enum Directive {
+    #[serde(alias = "FromArchive, Compression.BSA")]
+    #[serde(alias = "FromArchive, Wabbajack.Lib")]
     FromArchive(FromArchiveDirective),
+    #[serde(alias = "PatchedFromArchive, Compression.BSA")]
+    #[serde(alias = "PatchedFromArchive, Wabbajack.Lib")]
     PatchedFromArchive(PatchedFromArchiveDirective),
+    #[serde(alias = "InlineFile, Compression.BSA")]
+    #[serde(alias = "InlineFile, Wabbajack.Lib")]
     InlineFile(InlineFileDirective),
+    #[serde(alias = "RemappedInlineFile, Compression.BSA")]
+    #[serde(alias = "RemappedInlineFile, Wabbajack.Lib")]
     RemappedInlineFile(RemappedInlineFileDirective),
+    #[serde(alias = "TransformedTexture, Compression.BSA")]
+    #[serde(alias = "TransformedTexture, Wabbajack.Lib")]
     TransformedTexture(TransformedTextureDirective),
+    #[serde(alias = "CreateBSA, Compression.BSA")]
+    #[serde(alias = "CreateBSA, Wabbajack.Lib")]
     CreateBSA(CreateBSADirective),
 }
 

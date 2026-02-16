@@ -548,7 +548,8 @@ pub fn extract_files(archive_path: &Path, files: &[&str], output_dir: &Path) -> 
         .arg("-aoa")        // Overwrite all existing files
         .arg("-scsUTF-8")   // Force UTF-8 charset for filenames
         .arg(format!("-o{}", output_dir.display()))
-        .arg(archive_path);
+        .arg(archive_path)
+        .arg("--");         // Stop switch parsing (file paths may start with -)
 
     // Add each file to extract
     for file in files {
@@ -575,7 +576,8 @@ pub fn extract_files(archive_path: &Path, files: &[&str], output_dir: &Path) -> 
                 retry.arg(format!("-x!{}", path));
             }
 
-            retry.arg(archive_path);
+            retry.arg(archive_path)
+                .arg("--");  // Stop switch parsing
             for file in files {
                 retry.arg(file);
             }

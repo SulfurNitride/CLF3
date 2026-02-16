@@ -144,14 +144,70 @@ pub fn find_in_archive_entries<'a>(entries: &'a [String], target: &str) -> Optio
         .map(|s| s.as_str())
 }
 
-/// Create parent directories for a path if they don't exist
+/// Create parent directories for a path if they don't exist.
+/// Safe to call concurrently from multiple threads.
+///
+/// If a non-directory entry (file, symlink, etc.) blocks directory creation,
+/// it is removed and creation is retried.
 pub fn ensure_parent_dirs(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)?;
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                // Something non-directory exists where a directory is needed.
+                // Walk path components to find the blocker (file, symlink, etc.)
+                if let Some(blocker) = find_blocking_entry(parent) {
+                    // Use symlink_metadata so we can identify broken symlinks too
+                    let kind = match std::fs::symlink_metadata(&blocker) {
+                        Ok(m) => {
+                            if m.is_symlink() { "symlink" }
+                            else if m.is_file() { "file" }
+                            else { "other" }
+                        }
+                        Err(_) => "unknown",
+                    };
+                    tracing::warn!(
+                        "Removing {} blocking directory creation: {}",
+                        kind,
+                        blocker.display()
+                    );
+                    // remove_file works on symlinks too.
+                    // Ignore NotFound - another thread may have already removed it.
+                    match std::fs::remove_file(&blocker) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e),
+                    }
+                    std::fs::create_dir_all(parent)?;
+                } else if parent.is_dir() {
+                    // Directory exists now (concurrent creation) - that's fine
+                } else {
+                    return Err(e);
+                }
+            } else {
+                return Err(e);
+            }
         }
     }
     Ok(())
+}
+
+/// Walk path components to find a non-directory entry blocking directory creation.
+/// Uses symlink_metadata (lstat) to detect broken symlinks that stat/is_file miss.
+fn find_blocking_entry(dir_path: &Path) -> Option<std::path::PathBuf> {
+    let mut current = std::path::PathBuf::new();
+    for component in dir_path.components() {
+        current.push(component);
+        // symlink_metadata doesn't follow symlinks, so it detects:
+        // - regular files
+        // - symlinks (broken or valid)
+        // - any other non-directory entry
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if !meta.is_dir() => return Some(current),
+            Err(_) => return None, // path doesn't exist yet, nothing blocking
+            _ => {} // is a directory, keep going
+        }
+    }
+    None
 }
 
 /// Join a base path with a Windows-style relative path

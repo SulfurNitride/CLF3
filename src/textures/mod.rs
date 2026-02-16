@@ -12,6 +12,7 @@ mod processor;
 
 pub use gpu_encoder::{is_gpu_available, list_gpus, GpuEncoder, GpuInfo};
 pub use processor::{
-    init_gpu, process_texture, process_texture_batch, process_texture_with_fallback,
-    resize_texture, OutputFormat, ProcessedTexture, TextureInfo, TextureJob,
+    estimate_dds_size, init_gpu, process_texture, process_texture_batch,
+    process_texture_with_fallback, resize_texture, OutputFormat, ProcessedTexture, TextureInfo,
+    TextureJob,
 };

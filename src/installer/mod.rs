@@ -1,13 +1,19 @@
 //! Installation orchestrator
 //!
 //! Coordinates the phases of modlist installation:
-//! 1. Download all archives
-//! 2. Validate downloaded archives (size check)
-//! 3. Process directives
+//! 1. Game Check    — validate game dir, detect game type
+//! 2. Download      — fetch all required archives
+//! 3. Validate      — verify archive sizes match expected
+//! 4. Install       — FromArchive + InlineFile + RemappedInlineFile
+//! 5. Patch         — PatchedFromArchive directives
+//! 6. DDS Transform — TransformedTexture directives
+//! 7. BSA Build     — CreateBSA directives
+//! 8. Cleanup       — extra files + BSA temp dirs
 
 pub mod config;
 pub mod config_cache;
 pub mod downloader;
+pub mod extract_strategy;
 pub mod handlers;
 pub mod processor;
 pub mod streaming;
@@ -20,8 +26,30 @@ use crate::modlist::{import_wabbajack_to_db, ModlistDb};
 use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::fs;
-use std::time::Duration;
-use tracing::warn;
+use std::time::{Duration, Instant};
+use tracing::{info, warn};
+
+fn current_rss_kb() -> Option<u64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if line.starts_with("VmRSS:") {
+            return line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u64>().ok());
+        }
+    }
+    None
+}
+
+fn log_phase_metrics(phase: &str, started: Instant) {
+    let elapsed_ms = started.elapsed().as_millis();
+    let rss_kb = current_rss_kb().unwrap_or(0);
+    info!(
+        "Phase done: phase='{}' elapsed_ms={} rss_kb={}",
+        phase, elapsed_ms, rss_kb
+    );
+}
 
 /// Installation statistics
 #[derive(Debug, Default, Clone)]
@@ -144,22 +172,35 @@ impl Installer {
 
     /// Run the full installation using streaming pipeline.
     ///
-    /// This is an alternative to `run()` that uses a streaming architecture
-    /// with separate extraction and mover worker pools for better performance
-    /// on large modlists.
-    ///
-    /// Arguments:
-    /// - `extraction_workers`: Number of workers for extracting files from archives (default: 8)
-    /// - `mover_workers`: Number of workers for writing files to disk (default: 8)
+    /// Phases:
+    /// 1. Game Check → 2. Download → 3. Validate → 4. Install →
+    /// 5. Patch → 6. DDS Transform → 7. BSA Build → 8. Cleanup
     pub async fn run_streaming(
         &mut self,
-        extraction_workers: usize,
-        mover_workers: usize,
+        _extraction_workers: usize,
+        _mover_workers: usize,
     ) -> Result<InstallStats> {
         let mut stats = InstallStats::default();
 
-        // Phase 1: Downloads (same as regular mode)
-        println!("=== Phase 1: Download Archives ===\n");
+        // === Phase 1: Game Check ===
+        let game_check_start = Instant::now();
+        println!("=== Phase 1: Game Check ===\n");
+        self.report_progress(ProgressEvent::PhaseChange {
+            phase: "Game Check".to_string(),
+        });
+        println!("Game directory: {}", self.config.game_dir.display());
+        if !self.config.game_dir.exists() {
+            bail!("Game directory does not exist: {}", self.config.game_dir.display());
+        }
+        println!("Game directory validated\n");
+        log_phase_metrics("Game Check", game_check_start);
+
+        // === Phase 2: Download Archives ===
+        let download_start = Instant::now();
+        println!("=== Phase 2: Download Archives ===\n");
+        self.report_progress(ProgressEvent::PhaseChange {
+            phase: "Downloading".to_string(),
+        });
         let download_stats = self.download_phase().await?;
         stats.archives_downloaded = download_stats.downloaded;
         stats.archives_skipped = download_stats.skipped;
@@ -168,13 +209,18 @@ impl Installer {
         stats.failed_downloads = download_stats.failed_downloads;
         stats.manual_downloads = download_stats.manual_downloads;
 
-        // If there are manual downloads needed, stop here
         if stats.archives_manual > 0 || stats.archives_failed > 0 {
+            log_phase_metrics("Downloading", download_start);
             return Ok(stats);
         }
+        log_phase_metrics("Downloading", download_start);
 
-        // Phase 2: Validate all downloaded archives (same as regular mode)
-        println!("\n=== Phase 2: Validate Archives ===\n");
+        // === Phase 3: Validate Archives ===
+        let validate_start = Instant::now();
+        println!("\n=== Phase 3: Validate Archives ===\n");
+        self.report_progress(ProgressEvent::PhaseChange {
+            phase: "Validating".to_string(),
+        });
         let mut validation_attempts = 0;
         const MAX_VALIDATION_ATTEMPTS: usize = 3;
 
@@ -196,7 +242,6 @@ impl Installer {
                 bail!("Archive validation failed");
             }
 
-            // Auto-fix: delete bad files and re-download
             println!("\nFound {} corrupted archives, auto-fixing...", validation_errors.len());
             for (name, error) in &validation_errors {
                 println!("  - {}: {}", name, error);
@@ -218,22 +263,66 @@ impl Installer {
                 println!("Re-download had {} failures", redownload_stats.failed);
             }
         }
+        log_phase_metrics("Validating", validate_start);
 
-        // Phase 3: Process directives using STREAMING pipeline
-        println!("=== Phase 3: Process Directives (Streaming) ===\n");
+        // Create the directive processor for phases 4-8
+        let dp = processor::DirectiveProcessor::new(&self.db, &self.config)?;
+
+        // Pre-flight: check archives and index
+        let preflight_start = Instant::now();
+        dp.preflight_check()?;
+        dp.index_archives()?;
+        log_phase_metrics("Preflight/Index", preflight_start);
+
+        // === Phase 4: Install Files ===
+        let install_start = Instant::now();
+        println!("\n=== Phase 4: Install Files ===\n");
         self.report_progress(ProgressEvent::PhaseChange {
-            phase: "Extracting".to_string(),
+            phase: "Installing".to_string(),
         });
         self.report_progress(ProgressEvent::Status {
-            message: "Processing directives...".to_string(),
+            message: "Installing files...".to_string(),
         });
+        dp.install_phase()?;
+        log_phase_metrics("Installing", install_start);
 
-        let process_stats = processor::process_directives_streaming(
-            &self.db,
-            &self.config,
-            extraction_workers,
-            mover_workers,
-        )?;
+        // === Phase 5: Apply Patches ===
+        let patch_start = Instant::now();
+        println!("\n=== Phase 5: Apply Patches ===\n");
+        self.report_progress(ProgressEvent::PhaseChange {
+            phase: "Patching".to_string(),
+        });
+        dp.patch_phase()?;
+        log_phase_metrics("Patching", patch_start);
+
+        // === Phase 6: DDS Transformations ===
+        let dds_start = Instant::now();
+        println!("\n=== Phase 6: DDS Transformations ===\n");
+        self.report_progress(ProgressEvent::PhaseChange {
+            phase: "DDS Transform".to_string(),
+        });
+        dp.texture_phase()?;
+        log_phase_metrics("DDS Transform", dds_start);
+
+        // === Phase 7: BSA Building ===
+        let bsa_start = Instant::now();
+        println!("\n=== Phase 7: BSA Building ===\n");
+        self.report_progress(ProgressEvent::PhaseChange {
+            phase: "BSA Build".to_string(),
+        });
+        dp.bsa_phase()?;
+        log_phase_metrics("BSA Build", bsa_start);
+
+        // === Phase 8: Cleanup ===
+        let cleanup_start = Instant::now();
+        println!("\n=== Phase 8: Cleanup ===\n");
+        self.report_progress(ProgressEvent::PhaseChange {
+            phase: "Cleanup".to_string(),
+        });
+        dp.cleanup_phase()?;
+        log_phase_metrics("Cleanup", cleanup_start);
+
+        let process_stats = dp.finish();
         stats.directives_completed = process_stats.completed;
         stats.directives_skipped = process_stats.skipped;
         stats.directives_failed = process_stats.failed;
@@ -241,7 +330,7 @@ impl Installer {
         if stats.directives_failed > 0 {
             println!("\nDirective processing incomplete. {} failures.", stats.directives_failed);
         } else {
-            println!("\nAll directives processed successfully!");
+            println!("\nInstallation complete!");
         }
 
         Ok(stats)

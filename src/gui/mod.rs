@@ -3201,7 +3201,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
         });
     }
 
-    // Load available Protons (Proton 10+ required for NaK)
+    // Load available Protons (Proton 10+ for Steam integration)
     let protons = crate::game_finder::find_steam_protons();
     let proton_options: Vec<ProtonOption> = protons
         .iter()
@@ -3221,7 +3221,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
         .collect();
     window.set_proton_names(std::rc::Rc::new(slint::VecModel::from(proton_names)).into());
 
-    // Store proton info for later use (when starting installation with NaK)
+    // Store proton info for later use
     let _protons = std::rc::Rc::new(protons);
 
     // Store settings in a shared cell for access in callbacks
@@ -3391,7 +3391,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                 window.set_status_message("Error: Please select a Proton version".into());
                 return;
             }
-            let proton_name = proton_name.unwrap();
+            let _proton_name = proton_name.unwrap();
 
             if source_path.is_empty() {
                 window.set_status_message("Error: Please select a source file".into());
@@ -3458,8 +3458,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
             let ttw_fo3_path = window.get_ttw_fo3_path().to_string();
             let ttw_fnv_path = window.get_ttw_fnv_path().to_string();
 
-            // Get custom game name for Steam shortcut (optional)
-            let custom_game_name = window.get_custom_game_name().to_string();
+            // Get custom game name (optional)
+            let _custom_game_name = window.get_custom_game_name().to_string();
 
             // Validate TTW paths before starting (fail early with clear message)
             if ttw_required && !ttw_mpi_path.is_empty() {
@@ -3497,14 +3497,12 @@ pub fn run() -> Result<(), slint::PlatformError> {
             let install_clone = install_dir.clone();
             let downloads_clone = downloads_dir.clone();
             let api_key_clone = api_key.clone();
-            let proton_name_clone = proton_name.clone();
             let ttw_mpi_clone = ttw_mpi_path.clone();
             let ttw_fo3_clone = ttw_fo3_path.clone();
             let ttw_fnv_clone = ttw_fnv_path.clone();
-            let custom_game_name_clone = custom_game_name.clone();
 
             // Spawn installation in background thread
-            println!("[GUI] Spawning installation thread (non_premium={}, proton={})...", non_premium, proton_name);
+            println!("[GUI] Spawning installation thread (non_premium={})...", non_premium);
             std::thread::spawn(move || {
                 println!("[GUI] Background thread started");
 
@@ -3610,69 +3608,9 @@ pub fn run() -> Result<(), slint::PlatformError> {
                                 }
                             }
 
-                            // Run NaK for MO2 setup with Steam/Proton integration
-                            tx.send(ProgressUpdate::Status("Setting up MO2...".to_string())).ok();
-                            tx.send(ProgressUpdate::Log("[INFO] Running NaK for MO2/Steam integration...".to_string())).ok();
-
-                            match crate::nak::NakManager::new() {
-                                Ok(nak) => {
-                                    // MO2 is installed in install_dir
-                                    let mo2_path = std::path::Path::new(&install_clone);
-
-                                    // Use custom name if provided, otherwise modlist filename
-                                    let shortcut_name = if !custom_game_name_clone.trim().is_empty() {
-                                        custom_game_name_clone.trim().to_string()
-                                    } else {
-                                        std::path::Path::new(&source_clone)
-                                            .file_stem()
-                                            .map(|s| s.to_string_lossy().to_string())
-                                            .unwrap_or_else(|| "Mod Organizer 2".to_string())
-                                    };
-
-                                    tx.send(ProgressUpdate::Log(format!("[INFO] Creating Steam shortcut: {}", shortcut_name))).ok();
-
-                                    match nak.setup_mo2(mo2_path, &shortcut_name, &proton_name_clone) {
-                                        Ok(result) => {
-                                            tx.send(ProgressUpdate::Log(format!(
-                                                "[INFO] NaK setup complete! Steam AppID: {}",
-                                                result.app_id
-                                            ))).ok();
-
-                                            // Restart Steam to pick up the new shortcut
-                                            tx.send(ProgressUpdate::Status("Restarting Steam...".to_string())).ok();
-                                            match nak.restart_steam() {
-                                                Ok(_) => {
-                                                    tx.send(ProgressUpdate::Log(
-                                                        "[INFO] Steam restarted successfully!".to_string()
-                                                    )).ok();
-                                                }
-                                                Err(e) => {
-                                                    tx.send(ProgressUpdate::Log(format!(
-                                                        "[WARN] Could not restart Steam: {} - please restart manually",
-                                                        e
-                                                    ))).ok();
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tx.send(ProgressUpdate::Log(format!(
-                                                "[WARN] NaK setup failed: {}. You can run NaK manually later.",
-                                                e
-                                            ))).ok();
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    tx.send(ProgressUpdate::Log(format!(
-                                        "[WARN] Failed to initialize NaK: {}. You can run NaK manually later.",
-                                        e
-                                    ))).ok();
-                                }
-                            }
-
-                            // Send final completion AFTER NaK finishes
+                            // Send completion
                             tx.send(ProgressUpdate::Status("Installation complete!".to_string())).ok();
-                            tx.send(ProgressUpdate::Log("[INFO] All done! You can now launch from Steam.".to_string())).ok();
+                            tx.send(ProgressUpdate::Log("[INFO] All done!".to_string())).ok();
                             tx.send(ProgressUpdate::Complete).ok();
                         }
                         Err(e) => eprintln!("[GUI] Installation failed: {}", e),
@@ -5791,7 +5729,7 @@ async fn run_wabbajack_install(
         anyhow::bail!(err);
     }
 
-    // Success! (Complete will be sent by the caller after NaK finishes)
+    // Success!
     tx.send(ProgressUpdate::Log("[INFO] Installation completed successfully!".to_string())).ok();
 
     Ok(())

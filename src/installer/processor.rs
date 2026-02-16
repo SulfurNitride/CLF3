@@ -12,6 +12,7 @@ use crate::modlist::{ArchiveFileEntry, Directive, ModlistDb};
 use crate::paths;
 
 use super::config::InstallConfig;
+use super::extract_strategy::should_use_selective_extraction;
 use super::handlers;
 use super::handlers::from_archive::{ArchiveType, detect_archive_type, extract_from_archive_with_temp};
 
@@ -23,34 +24,10 @@ use std::fs::{self, File};
 use std::io::BufReader;
 use zip::ZipArchive;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
-use tracing::warn;
-
-fn selective_extract_threshold() -> usize {
-    static THRESHOLD: OnceLock<usize> = OnceLock::new();
-    *THRESHOLD.get_or_init(|| {
-        std::env::var("CLF3_SELECTIVE_EXTRACT_THRESHOLD")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(25)
-    })
-}
-
-fn should_use_selective_extraction(archive_path: &Path, needed_files: usize) -> bool {
-    if needed_files == 0 || needed_files > selective_extract_threshold() {
-        return false;
-    }
-
-    match detect_archive_type(archive_path).unwrap_or(ArchiveType::Unknown) {
-        ArchiveType::SevenZ => matches!(crate::archive::sevenzip::is_solid_archive(archive_path), Ok(false)),
-        ArchiveType::Zip | ArchiveType::Rar | ArchiveType::Unknown => true,
-        ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2 => false,
-    }
-}
+use std::time::{Duration, Instant};
+use tracing::{debug, warn};
 
 /// List files in an archive using pure Rust crates
 fn list_archive_files_rust(archive_path: &Path) -> Result<Vec<ArchiveFileEntry>> {
@@ -774,256 +751,268 @@ pub fn cleanup_bsa_temp_dirs(config: &InstallConfig) -> Result<()> {
     Ok(())
 }
 
-/// Process all pending directives using streaming pipeline.
-///
-/// This is an alternative to `process_directives` that uses a streaming
-/// architecture with separate extraction and mover worker pools.
-///
-/// Benefits:
-/// - Configurable worker pools (default 8+8 workers)
-/// - Memory-aware backpressure to prevent OOM
-/// - Better I/O pipelining for large modlists
-///
-/// Use this when installing large modlists or on systems with limited RAM.
-pub fn process_directives_streaming(
-    db: &ModlistDb,
-    config: &InstallConfig,
-    _extraction_workers: usize,
-    _mover_workers: usize,
-) -> Result<ProcessStats> {
-    use super::ProgressEvent;
-    let ctx = ProcessContext::new(config, db)?;
-    let progress_callback = &config.progress_callback;
+/// Holds shared state for phased directive processing.
+pub struct DirectiveProcessor<'a> {
+    pub ctx: ProcessContext<'a>,
+    pub db: &'a ModlistDb,
+    pub reporter: Arc<ProgressReporter>,
+    completed: AtomicUsize,
+    skipped: AtomicUsize,
+    failed: AtomicUsize,
+    phase_failures: Mutex<Vec<(String, usize)>>,
+}
 
-    // Show directive counts
-    let type_counts = db.get_directive_type_counts()?;
-    println!("Directive types:");
-    for (dtype, count) in &type_counts {
-        println!("  {:>8}  {}", count, dtype);
-    }
-    println!();
+impl<'a> DirectiveProcessor<'a> {
+    /// Create a new directive processor, printing directive counts.
+    pub fn new(db: &'a ModlistDb, config: &'a InstallConfig) -> Result<Self> {
+        let ctx = ProcessContext::new(config, db)?;
 
-    // Pre-flight check
-    println!("--- Pre-flight: Checking archives ---\n");
-    let missing_archives = check_missing_archives(db, &ctx)?;
-    if !missing_archives.is_empty() {
-        println!("ERROR: {} archives are missing! Re-run to download them:\n", missing_archives.len());
-        // Log to file for later reference
-        warn!("=== Missing Archives ({}) ===", missing_archives.len());
-        for (name, hash) in missing_archives.iter().take(20) {
-            println!("  - {} ({})", name, hash);
-            warn!("[MISSING] {} ({})", name, hash);
+        // Show directive counts
+        let type_counts = db.get_directive_type_counts()?;
+        println!("Directive types:");
+        for (dtype, count) in &type_counts {
+            println!("  {:>8}  {}", count, dtype);
         }
-        if missing_archives.len() > 20 {
-            println!("  ... and {} more", missing_archives.len() - 20);
-            // Log remaining archives too
-            for (name, hash) in missing_archives.iter().skip(20) {
-                warn!("[MISSING] {} ({})", name, hash);
-            }
-            warn!("... total {} missing archives", missing_archives.len());
-        }
-        bail!("Missing archives - re-run the installer to download them");
-    }
-    println!("All needed archives present\n");
+        println!();
 
-    // Phase 3a: Index archive contents
-    println!("--- Phase 3a: Index archive contents ---\n");
-    index_archives(db, &ctx)?;
+        let stats = db.get_directive_stats()?;
+        let reporter = Arc::new(ProgressReporter::new(config.progress_callback.clone(), stats.pending));
 
-    // Phase 3b: Process directives using streaming pipeline
-    println!("\n--- Phase 3b: Process directives (streaming) ---\n");
-
-    let stats = db.get_directive_stats()?;
-    let total_pending = stats.pending;
-
-    if total_pending == 0 {
-        println!("No directives to process");
-        return Ok(ProcessStats::default());
+        Ok(Self {
+            ctx,
+            db,
+            reporter,
+            completed: AtomicUsize::new(0),
+            skipped: AtomicUsize::new(0),
+            failed: AtomicUsize::new(0),
+            phase_failures: Mutex::new(Vec::new()),
+        })
     }
 
-    println!("Processing {} directives...\n", total_pending);
-
-    let pb = ProgressBar::new(total_pending as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {msg}",
-            )
-            .unwrap()
-            .progress_chars("=>-"),
-    );
-    pb.enable_steady_tick(Duration::from_millis(100));
-
-    let completed = AtomicUsize::new(0);
-    let skipped = AtomicUsize::new(0);
-    let failed = AtomicUsize::new(0);
-
-    // Create progress reporter for GUI updates
-    let reporter = Arc::new(ProgressReporter::new(progress_callback.clone(), total_pending));
-
-    // Signal phase change to Installing
-    if let Some(ref callback) = progress_callback {
-        callback(ProgressEvent::PhaseChange {
-            phase: "Installing".to_string(),
-        });
-    }
-
-    // Get directive counts by type for more accurate progress (type_counts is Vec<(String, usize)>)
-    let get_count = |name: &str| -> usize {
-        type_counts.iter()
+    /// Get count of a directive type
+    fn get_type_count(&self, name: &str) -> Result<usize> {
+        let type_counts = self.db.get_directive_type_counts()?;
+        Ok(type_counts.iter()
             .find(|(dtype, _)| dtype == name)
             .map(|(_, count)| *count)
-            .unwrap_or(0)
-    };
-    let from_archive_count = get_count("FromArchive");
-    let inline_count = get_count("InlineFile");
-    let remapped_count = get_count("RemappedInlineFile");
-    let patched_count = get_count("PatchedFromArchive");
-    let texture_count = get_count("TransformedTexture");
-    let bsa_count = get_count("CreateBSA");
+            .unwrap_or(0))
+    }
 
-    // Use streaming pipeline for FromArchive directives
-    let streaming_config = super::streaming::StreamingConfig::default();
-    pb.set_message("Processing FromArchive (streaming)...");
-    reporter.phase_started("FromArchive", from_archive_count);
-
-    // Create progress callback for streaming - calls reporter for each written file
-    // Use phase_total (from_archive_count) not total_directives for accurate per-phase progress
-    let progress_callback: Option<super::streaming::ProgressCallback> = if let Some(callback) = reporter.get_callback() {
-        let total = reporter.get_phase_total();
-        Some(std::sync::Arc::new(move |written_count| {
-            callback(super::ProgressEvent::DirectiveComplete {
-                index: written_count,
-                total,
-            });
-        }))
-    } else {
-        None
-    };
-
-    let streaming_stats = super::streaming::process_from_archive_streaming(db, &ctx, streaming_config, &pb, progress_callback)?;
-    // Use 'extracted' not 'written' - BSA direct writes and whole-file copies only increment extracted
-    completed.fetch_add(streaming_stats.extracted, Ordering::Relaxed);
-    skipped.fetch_add(streaming_stats.skipped, Ordering::Relaxed);
-    failed.fetch_add(streaming_stats.failed, Ordering::Relaxed);
-
-    let current_count = completed.load(Ordering::Relaxed) + skipped.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
-    reporter.set_count(current_count);
-    reporter.report_count(current_count);
-
-    // Log warning if FromArchive phase had failures, but continue to allow CreateBSA to run
-    // (CreateBSA needs TEMP_BSA_FILES which may still exist even if some FromArchive failed)
-    if streaming_stats.failed > 0 {
-        eprintln!(
-            "WARNING: FromArchive phase had {} failures. Continuing with remaining phases...",
-            streaming_stats.failed
+    /// Create a progress bar
+    fn make_progress_bar(&self, total: u64) -> ProgressBar {
+        let pb = ProgressBar::new(total);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {msg}",
+                )
+                .unwrap()
+                .progress_chars("=>-"),
         );
-    }
-    let from_archive_failed = streaming_stats.failed;
-
-    // Track failures per phase for reporting
-    let mut phase_failures: Vec<(&str, usize)> = Vec::new();
-    if from_archive_failed > 0 {
-        phase_failures.push(("FromArchive", from_archive_failed));
+        pb.enable_steady_tick(Duration::from_millis(100));
+        pb
     }
 
-    // Process other directives using standard methods
-    // Each phase logs warnings on failure but continues to allow subsequent phases to run
-
-    let failed_before = failed.load(Ordering::Relaxed);
-    pb.set_message("Processing InlineFile...");
-    reporter.phase_started("InlineFile", inline_count);
-    process_simple_directives(db, &ctx, "InlineFile", &pb, &completed, &skipped, &failed, &reporter)?;
-    let current_count = completed.load(Ordering::Relaxed) + skipped.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
-    reporter.set_count(current_count);
-    let inline_failed = failed.load(Ordering::Relaxed) - failed_before;
-    if inline_failed > 0 {
-        eprintln!("WARNING: InlineFile phase had {} failures", inline_failed);
-        phase_failures.push(("InlineFile", inline_failed));
-    }
-
-    let failed_before = failed.load(Ordering::Relaxed);
-    pb.set_message("Processing RemappedInlineFile...");
-    reporter.phase_started("RemappedInlineFile", remapped_count);
-    process_simple_directives(db, &ctx, "RemappedInlineFile", &pb, &completed, &skipped, &failed, &reporter)?;
-    let current_count = completed.load(Ordering::Relaxed) + skipped.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
-    reporter.set_count(current_count);
-    let remapped_failed = failed.load(Ordering::Relaxed) - failed_before;
-    if remapped_failed > 0 {
-        eprintln!("WARNING: RemappedInlineFile phase had {} failures", remapped_failed);
-        phase_failures.push(("RemappedInlineFile", remapped_failed));
-    }
-
-    let failed_before = failed.load(Ordering::Relaxed);
-    pb.set_message("Processing PatchedFromArchive...");
-    reporter.phase_started("PatchedFromArchive", patched_count);
-    process_patched_from_archive(db, &ctx, &pb, &completed, &skipped, &failed, &reporter)?;
-    let current_count = completed.load(Ordering::Relaxed) + skipped.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
-    reporter.set_count(current_count);
-    let patched_failed = failed.load(Ordering::Relaxed) - failed_before;
-    if patched_failed > 0 {
-        eprintln!("WARNING: PatchedFromArchive phase had {} failures", patched_failed);
-        phase_failures.push(("PatchedFromArchive", patched_failed));
-    }
-
-    let failed_before = failed.load(Ordering::Relaxed);
-    pb.set_message("Processing TransformedTexture...");
-    reporter.phase_started("TransformedTexture", texture_count);
-    process_transformed_texture(db, &ctx, &pb, &completed, &skipped, &failed, &reporter)?;
-    let current_count = completed.load(Ordering::Relaxed) + skipped.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
-    reporter.set_count(current_count);
-    let texture_failed = failed.load(Ordering::Relaxed) - failed_before;
-    if texture_failed > 0 {
-        eprintln!("WARNING: TransformedTexture phase had {} failures", texture_failed);
-        phase_failures.push(("TransformedTexture", texture_failed));
-    }
-
-    let failed_before = failed.load(Ordering::Relaxed);
-    pb.set_message("Processing CreateBSA...");
-    reporter.phase_started("CreateBSA", bsa_count);
-    process_create_bsa(db, &ctx, &pb, &completed, &skipped, &failed, &reporter)?;
-    let current_count = completed.load(Ordering::Relaxed) + skipped.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
-    reporter.set_count(current_count);
-    let bsa_failed = failed.load(Ordering::Relaxed) - failed_before;
-    if bsa_failed > 0 {
-        eprintln!("WARNING: CreateBSA phase had {} failures", bsa_failed);
-        phase_failures.push(("CreateBSA", bsa_failed));
-    }
-
-    pb.finish_and_clear();
-
-    let stats = ProcessStats {
-        completed: completed.load(Ordering::Relaxed),
-        skipped: skipped.load(Ordering::Relaxed),
-        failed: failed.load(Ordering::Relaxed),
-    };
-
-    println!(
-        "Processed {} directives ({} completed, {} skipped, {} failed)",
-        stats.completed + stats.skipped + stats.failed,
-        stats.completed,
-        stats.skipped,
-        stats.failed
-    );
-
-    // Report phase-specific failures for debugging
-    if !phase_failures.is_empty() {
-        eprintln!("\n=== FAILURE SUMMARY ===");
-        for (phase, count) in &phase_failures {
-            eprintln!("  {}: {} failures", phase, count);
+    /// Record failures from a phase
+    fn record_phase_failures(&self, phase: &str, count: usize) {
+        if count > 0 {
+            eprintln!("WARNING: {} phase had {} failures", phase, count);
+            self.phase_failures.lock().expect("phase_failures lock poisoned")
+                .push((phase.to_string(), count));
         }
-        eprintln!("=======================\n");
     }
 
-    // Phase 4: Clean up extra files
-    println!("\n--- Phase 4: Cleanup extra files ---\n");
-    cleanup_extra_files(db, &ctx)?;
+    /// Pre-flight check: verify all archives needed for pending directives are present
+    pub fn preflight_check(&self) -> Result<()> {
+        let missing_archives = check_missing_archives(self.db, &self.ctx)?;
+        if !missing_archives.is_empty() {
+            println!("ERROR: {} archives are missing! Re-run to download them:\n", missing_archives.len());
+            warn!("=== Missing Archives ({}) ===", missing_archives.len());
+            for (name, hash) in missing_archives.iter().take(20) {
+                println!("  - {} ({})", name, hash);
+                warn!("[MISSING] {} ({})", name, hash);
+            }
+            if missing_archives.len() > 20 {
+                println!("  ... and {} more", missing_archives.len() - 20);
+                for (name, hash) in missing_archives.iter().skip(20) {
+                    warn!("[MISSING] {} ({})", name, hash);
+                }
+                warn!("... total {} missing archives", missing_archives.len());
+            }
+            bail!("Missing archives - re-run the installer to download them");
+        }
+        println!("All needed archives present\n");
+        Ok(())
+    }
 
-    // Phase 5: Clean up BSA temp directories
-    println!("\n--- Phase 5: Cleanup BSA temp files ---\n");
-    cleanup_bsa_temp_dirs(&ctx.config)?;
+    /// Index archive contents
+    pub fn index_archives(&self) -> Result<()> {
+        index_archives(self.db, &self.ctx)
+    }
 
-    Ok(stats)
+    /// Install phase: FromArchive + InlineFile + RemappedInlineFile
+    pub fn install_phase(&self) -> Result<()> {
+        use super::ProgressEvent;
+
+        let stats = self.db.get_directive_stats()?;
+        let total_pending = stats.pending;
+
+        if total_pending == 0 {
+            println!("No directives to process");
+            return Ok(());
+        }
+
+        // Signal phase change to Installing
+        if let Some(ref callback) = self.ctx.config.progress_callback {
+            callback(ProgressEvent::PhaseChange {
+                phase: "Installing".to_string(),
+            });
+        }
+
+        let from_archive_count = self.get_type_count("FromArchive")?;
+        let inline_count = self.get_type_count("InlineFile")?;
+        let remapped_count = self.get_type_count("RemappedInlineFile")?;
+
+        let install_total = from_archive_count + inline_count + remapped_count;
+        let pb = self.make_progress_bar(install_total as u64);
+
+        // FromArchive (streaming)
+        let streaming_config = super::streaming::StreamingConfig::default();
+        pb.set_message("Processing FromArchive (streaming)...");
+        self.reporter.phase_started("FromArchive", from_archive_count);
+
+        let progress_callback: Option<super::streaming::ProgressCallback> = if let Some(callback) = self.reporter.get_callback() {
+            let total = self.reporter.get_phase_total();
+            Some(std::sync::Arc::new(move |written_count| {
+                callback(super::ProgressEvent::DirectiveComplete {
+                    index: written_count,
+                    total,
+                });
+            }))
+        } else {
+            None
+        };
+
+        let streaming_stats = super::streaming::process_from_archive_streaming(
+            self.db, &self.ctx, streaming_config, &pb, progress_callback,
+        )?;
+        self.completed.fetch_add(streaming_stats.extracted, Ordering::Relaxed);
+        self.skipped.fetch_add(streaming_stats.skipped, Ordering::Relaxed);
+        self.failed.fetch_add(streaming_stats.failed, Ordering::Relaxed);
+        self.sync_reporter();
+        self.record_phase_failures("FromArchive", streaming_stats.failed);
+
+        // InlineFile
+        let failed_before = self.failed.load(Ordering::Relaxed);
+        pb.set_message("Processing InlineFile...");
+        self.reporter.phase_started("InlineFile", inline_count);
+        process_simple_directives(self.db, &self.ctx, "InlineFile", &pb, &self.completed, &self.skipped, &self.failed, &self.reporter)?;
+        self.sync_reporter();
+        self.record_phase_failures("InlineFile", self.failed.load(Ordering::Relaxed) - failed_before);
+
+        // RemappedInlineFile
+        let failed_before = self.failed.load(Ordering::Relaxed);
+        pb.set_message("Processing RemappedInlineFile...");
+        self.reporter.phase_started("RemappedInlineFile", remapped_count);
+        process_simple_directives(self.db, &self.ctx, "RemappedInlineFile", &pb, &self.completed, &self.skipped, &self.failed, &self.reporter)?;
+        self.sync_reporter();
+        self.record_phase_failures("RemappedInlineFile", self.failed.load(Ordering::Relaxed) - failed_before);
+
+        pb.finish_and_clear();
+        Ok(())
+    }
+
+    /// Patch phase: PatchedFromArchive
+    pub fn patch_phase(&self) -> Result<()> {
+        let patched_count = self.get_type_count("PatchedFromArchive")?;
+        let pb = self.make_progress_bar(patched_count as u64);
+
+        let failed_before = self.failed.load(Ordering::Relaxed);
+        pb.set_message("Processing PatchedFromArchive...");
+        self.reporter.phase_started("PatchedFromArchive", patched_count);
+        process_patched_from_archive(self.db, &self.ctx, &pb, &self.completed, &self.skipped, &self.failed, &self.reporter)?;
+        self.sync_reporter();
+        self.record_phase_failures("PatchedFromArchive", self.failed.load(Ordering::Relaxed) - failed_before);
+
+        pb.finish_and_clear();
+        Ok(())
+    }
+
+    /// DDS Transform phase: TransformedTexture
+    pub fn texture_phase(&self) -> Result<()> {
+        let texture_count = self.get_type_count("TransformedTexture")?;
+        let pb = self.make_progress_bar(texture_count as u64);
+
+        let failed_before = self.failed.load(Ordering::Relaxed);
+        pb.set_message("Processing TransformedTexture...");
+        self.reporter.phase_started("TransformedTexture", texture_count);
+        process_transformed_texture(self.db, &self.ctx, &pb, &self.completed, &self.skipped, &self.failed, &self.reporter)?;
+        self.sync_reporter();
+        self.record_phase_failures("TransformedTexture", self.failed.load(Ordering::Relaxed) - failed_before);
+
+        pb.finish_and_clear();
+        Ok(())
+    }
+
+    /// BSA Build phase: CreateBSA
+    pub fn bsa_phase(&self) -> Result<()> {
+        let bsa_count = self.get_type_count("CreateBSA")?;
+        let pb = self.make_progress_bar(bsa_count as u64);
+
+        let failed_before = self.failed.load(Ordering::Relaxed);
+        pb.set_message("Processing CreateBSA...");
+        self.reporter.phase_started("CreateBSA", bsa_count);
+        process_create_bsa(self.db, &self.ctx, &pb, &self.completed, &self.skipped, &self.failed, &self.reporter)?;
+        self.sync_reporter();
+        self.record_phase_failures("CreateBSA", self.failed.load(Ordering::Relaxed) - failed_before);
+
+        pb.finish_and_clear();
+        Ok(())
+    }
+
+    /// Cleanup phase: extra files + BSA temp dirs
+    pub fn cleanup_phase(&self) -> Result<()> {
+        cleanup_extra_files(self.db, &self.ctx)?;
+        cleanup_bsa_temp_dirs(&self.ctx.config)?;
+        Ok(())
+    }
+
+    /// Sync the reporter with current counters
+    fn sync_reporter(&self) {
+        let current = self.completed.load(Ordering::Relaxed)
+            + self.skipped.load(Ordering::Relaxed)
+            + self.failed.load(Ordering::Relaxed);
+        self.reporter.set_count(current);
+        self.reporter.report_count(current);
+    }
+
+    /// Finalize and return process stats
+    pub fn finish(self) -> ProcessStats {
+        let stats = ProcessStats {
+            completed: self.completed.load(Ordering::Relaxed),
+            skipped: self.skipped.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+        };
+
+        println!(
+            "Processed {} directives ({} completed, {} skipped, {} failed)",
+            stats.completed + stats.skipped + stats.failed,
+            stats.completed,
+            stats.skipped,
+            stats.failed
+        );
+
+        let phase_failures = self.phase_failures.lock().expect("phase_failures lock poisoned");
+        if !phase_failures.is_empty() {
+            eprintln!("\n=== FAILURE SUMMARY ===");
+            for (phase, count) in phase_failures.iter() {
+                eprintln!("  {}: {} failures", phase, count);
+            }
+            eprintln!("=======================\n");
+        }
+
+        stats
+    }
 }
 
 /// Remove any files in the output directory that aren't part of the modlist
@@ -1181,7 +1170,6 @@ fn process_patched_from_archive(
     reporter: &Arc<ProgressReporter>,
 ) -> Result<()> {
     use crate::modlist::PatchedFromArchiveDirective;
-    use crossbeam_channel::bounded;
 
     let failure_tracker = Arc::new(FailureTracker::new());
 
@@ -1271,11 +1259,8 @@ fn process_patched_from_archive(
     pb.reset();
     pb.set_length(total_directives as u64);
     pb.set_position(0);
+    pb.set_message("Applying patches (extracting sources + delta apply)...");
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
-
-    // Create a dummy channel (not used, but keeps API compatible)
-    // The new process_archive_patches writes directly to disk
-    let (tx, _rx) = bounded::<(Vec<u8>, PathBuf, u64, i64)>(1);
 
     // Wrap counters in Arc for sharing
     let completed = Arc::new(AtomicUsize::new(completed.load(Ordering::Relaxed)));
@@ -1311,7 +1296,7 @@ fn process_patched_from_archive(
             ctx,
             archive_hash,
             directives,
-            &tx,
+            Some(1),
             pb,
             &skipped,
             &failed,
@@ -1329,7 +1314,7 @@ fn process_patched_from_archive(
                 ctx,
                 archive_hash,
                 directives,
-                &tx,
+                Some(2),
                 pb,
                 &skipped,
                 &failed,
@@ -1346,7 +1331,7 @@ fn process_patched_from_archive(
             ctx,
             archive_hash,
             directives,
-            &tx,
+            None,
             pb,
             &skipped,
             &failed,
@@ -1370,7 +1355,7 @@ fn process_archive_patches(
     ctx: &ProcessContext,
     archive_hash: &str,
     directives: &[(i64, crate::modlist::PatchedFromArchiveDirective)],
-    _tx: &crossbeam_channel::Sender<(Vec<u8>, PathBuf, u64, i64)>,
+    threads_per_archive: Option<usize>,
     pb: &ProgressBar,
     skipped: &Arc<AtomicUsize>,
     failed: &Arc<AtomicUsize>,
@@ -1378,6 +1363,7 @@ fn process_archive_patches(
     completed: &Arc<AtomicUsize>,
     reporter: &Arc<ProgressReporter>,
 ) {
+    let archive_start = Instant::now();
     let archive_path = match ctx.get_archive_path(archive_hash) {
         Some(p) => p.clone(),
         None => {
@@ -1452,15 +1438,19 @@ fn process_archive_patches(
         }
     };
 
+    let extraction_start = Instant::now();
     let extracted_paths = extract_source_files_to_disk(
         ctx,
         &archive_path,
         &simple_paths,
         &nested_bsas,
+        threads_per_archive,
         temp_dir.path(),
     );
+    let extraction_ms = extraction_start.elapsed().as_millis();
 
     let archive_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    pb.set_message(format!("Patching archive {} ({} directives)", archive_name, to_process.len()));
     let preloaded_patches = preload_patch_blobs(&ctx.config.wabbajack_path, &to_process)
         .unwrap_or_else(|e| {
             tracing::debug!(
@@ -1471,8 +1461,9 @@ fn process_archive_patches(
             HashMap::new()
         });
 
-    // Process each patch sequentially (to limit memory), write directly to disk
-    for (id, directive) in &to_process {
+    // Process each patch in parallel; extracted source paths and delta blobs are immutable.
+    let apply_start = Instant::now();
+    to_process.par_iter().for_each(|(id, directive)| {
         let patch_name = directive.patch_id.to_string();
         let preloaded_delta = preloaded_patches.get(&patch_name).map(|v| v.as_slice());
         let result = apply_patch_streaming(
@@ -1500,7 +1491,17 @@ fn process_archive_patches(
                 reporter.directive_completed();
             }
         }
-    }
+    });
+    let apply_ms = apply_start.elapsed().as_millis();
+    tracing::debug!(
+        "Patch archive {} done: directives={}, extracted_sources={}, extract_ms={}, apply_ms={}, total_ms={}",
+        archive_name,
+        to_process.len(),
+        extracted_paths.len(),
+        extraction_ms,
+        apply_ms,
+        archive_start.elapsed().as_millis()
+    );
 
     // temp_dir is dropped here, cleaning up extracted files
 }
@@ -1548,6 +1549,7 @@ fn extract_source_files_to_disk(
     archive_path: &Path,
     simple_paths: &HashMap<String, String>,
     nested_bsas: &HashMap<String, Vec<String>>,
+    threads_per_archive: Option<usize>,
     temp_dir: &Path,
 ) -> HashMap<String, PathBuf> {
     let mut extracted: HashMap<String, PathBuf> = HashMap::new();
@@ -1601,6 +1603,12 @@ fn extract_source_files_to_disk(
 
                 let needed_paths: Vec<String> = simple_paths.values().cloned().collect();
                 let selective = should_use_selective_extraction(archive_path, needed_paths.len());
+                debug!(
+                    "Patch source extraction strategy: archive={} needed_files={} mode={}",
+                    archive_path.display(),
+                    needed_paths.len(),
+                    if selective { "selective" } else { "full" }
+                );
                 let extract_result = if selective {
                     crate::archive::sevenzip::extract_files_case_insensitive(
                         archive_path,
@@ -1608,9 +1616,17 @@ fn extract_source_files_to_disk(
                         &extract_dir,
                     )
                     .map(|_| ())
-                    .or_else(|_| crate::archive::sevenzip::extract_all(archive_path, &extract_dir).map(|_| ()))
+                    .or_else(|_| crate::archive::sevenzip::extract_all_with_threads(
+                        archive_path,
+                        &extract_dir,
+                        threads_per_archive,
+                    ).map(|_| ()))
                 } else {
-                    crate::archive::sevenzip::extract_all(archive_path, &extract_dir).map(|_| ())
+                    crate::archive::sevenzip::extract_all_with_threads(
+                        archive_path,
+                        &extract_dir,
+                        threads_per_archive,
+                    ).map(|_| ())
                 };
 
                 if extract_result.is_ok() {

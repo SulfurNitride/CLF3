@@ -32,6 +32,7 @@ use crate::modlist::{FromArchiveDirective, ModlistDb};
 use crate::paths;
 
 use super::processor::ProcessContext;
+use super::extract_strategy::should_use_selective_extraction;
 
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -39,12 +40,11 @@ use indicatif::ProgressBar;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 use tracing::{error, warn};
 
 /// Message sent from extractor to mover workers.
@@ -454,31 +454,8 @@ pub fn process_from_archive_streaming(
     Ok(stats)
 }
 
-fn selective_extract_threshold() -> usize {
-    static THRESHOLD: OnceLock<usize> = OnceLock::new();
-    *THRESHOLD.get_or_init(|| {
-        std::env::var("CLF3_SELECTIVE_EXTRACT_THRESHOLD")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(25)
-    })
-}
-
-fn should_use_selective_extraction(archive_path: &Path, needed_files: usize) -> bool {
-    if needed_files == 0 || needed_files > selective_extract_threshold() {
-        return false;
-    }
-
-    match detect_archive_type(archive_path).unwrap_or(NestedArchiveType::Unknown) {
-        NestedArchiveType::SevenZ => {
-            // Solid 7z archives require sequential decompression, so full extraction
-            // remains better in most cases.
-            matches!(sevenzip::is_solid_archive(archive_path), Ok(false))
-        }
-        NestedArchiveType::Zip | NestedArchiveType::Rar | NestedArchiveType::Unknown => true,
-        NestedArchiveType::Tes3Bsa | NestedArchiveType::Bsa | NestedArchiveType::Ba2 => false,
-    }
+fn update_max(target: &AtomicUsize, value: usize) {
+    target.fetch_max(value, Ordering::Relaxed);
 }
 
 /// Process archives using the producer-consumer pipeline.
@@ -505,6 +482,7 @@ fn process_archives_with_pipeline(
     // Bounded channel for backpressure - prevents memory buildup
     // Buffer size based on mover capacity
     let (tx, rx): (Sender<MoveJob>, Receiver<MoveJob>) = bounded(mover_threads * 64);
+    let channel_hwm = Arc::new(AtomicUsize::new(0));
 
     // Shared state for mover workers
     let written_clone = Arc::clone(written);
@@ -551,7 +529,7 @@ fn process_archives_with_pipeline(
                 if let Err(e) = paths::ensure_parent_dirs(&job.output_path) {
                     let count = logged_failures_clone.fetch_add(1, Ordering::Relaxed);
                     if count < MAX_LOGGED_FAILURES {
-                        error!("FAIL [{}]: cannot create dirs: {}", job.directive_id, e);
+                        error!("FAIL [{}]: cannot create dirs for {}: {}", job.directive_id, job.output_path.display(), e);
                     }
                     failed_clone.fetch_add(1, Ordering::Relaxed);
                     return;
@@ -642,6 +620,7 @@ fn process_archives_with_pipeline(
             logged_failures_ref,
             threads_per_archive,
             &tx,
+            &channel_hwm,
             &output_dir,
         );
 
@@ -659,6 +638,10 @@ fn process_archives_with_pipeline(
 
     // Wait for movers to complete
     mover_handle.join().expect("Mover thread panicked");
+    tracing::debug!(
+        "Mover queue high-water mark: {} jobs",
+        channel_hwm.load(Ordering::Relaxed)
+    );
 }
 
 /// Process a single archive: extract to temp, send file paths to channel.
@@ -676,6 +659,7 @@ fn process_single_archive_with_channel(
     logged_failures: &Arc<AtomicUsize>,
     threads: Option<usize>,
     tx: &Sender<MoveJob>,
+    channel_hwm: &Arc<AtomicUsize>,
     output_dir: &PathBuf,
 ) {
     const MAX_LOGGED_FAILURES: usize = 100;
@@ -746,6 +730,13 @@ fn process_single_archive_with_channel(
     }
 
     let selective = should_use_selective_extraction(archive_path, needed_paths.len());
+    tracing::debug!(
+        "Extraction strategy: archive={}, needed_files={}, mode={}",
+        archive_path.display(),
+        needed_paths.len(),
+        if selective { "selective" } else { "full" }
+    );
+    let extract_start = Instant::now();
     let extract_result = if selective {
         sevenzip::extract_files_case_insensitive(archive_path, &needed_paths, temp_dir.path())
             .map(|_| ())
@@ -794,6 +785,7 @@ fn process_single_archive_with_channel(
         failed.fetch_add(to_process.len(), Ordering::Relaxed);
         return;
     }
+    let extract_ms = extract_start.elapsed().as_millis();
 
     // Build map of extracted files (parallel walkdir)
     let extracted_map = build_extracted_file_map(temp_dir.path());
@@ -824,6 +816,8 @@ fn process_single_archive_with_channel(
     process_nested_bsa_directives(
         &nested_bsa_directives,
         &extracted_map,
+        tx,
+        channel_hwm,
         output_dir,
         extracted,
         failed,
@@ -867,9 +861,16 @@ fn process_single_archive_with_channel(
             failed.fetch_add(1, Ordering::Relaxed);
             continue;
         }
+        update_max(channel_hwm, tx.len());
 
         extracted.fetch_add(1, Ordering::Relaxed);
     }
+    tracing::debug!(
+        "Archive extracted: archive={}, directives={}, extract_ms={}",
+        archive_path.display(),
+        to_process.len(),
+        extract_ms
+    );
 }
 
 /// Process nested archive directives - extracts files from nested archives (BSA, ZIP, 7z, etc.).
@@ -877,6 +878,8 @@ fn process_single_archive_with_channel(
 fn process_nested_bsa_directives(
     nested_bsa_directives: &[(i64, &FromArchiveDirective, Option<String>, String)],
     extracted_map: &HashMap<String, PathBuf>,
+    tx: &Sender<MoveJob>,
+    channel_hwm: &Arc<AtomicUsize>,
     output_dir: &PathBuf,
     extracted: &Arc<AtomicUsize>,
     failed: &Arc<AtomicUsize>,
@@ -944,6 +947,7 @@ fn process_nested_bsa_directives(
 
             match tempfile::tempdir_in(output_dir) {
                 Ok(nested_tmp_dir) => {
+                    let nested_tmp_dir = Arc::new(nested_tmp_dir);
                     let batch_result = sevenzip::extract_files_case_insensitive(
                         &archive_disk_path,
                         &unique_files,
@@ -952,8 +956,6 @@ fn process_nested_bsa_directives(
                     match batch_result {
                         Ok(_) => {
                             nested_extracted_map = Some(build_extracted_file_map(nested_tmp_dir.path()));
-                            // Keep tempdir alive through per-file processing.
-                            let _keep_alive = nested_tmp_dir;
                             directives.par_iter().for_each(|(id, directive, file_in_archive)| {
                                 let map = match &nested_extracted_map {
                                     Some(m) => m,
@@ -975,39 +977,40 @@ fn process_nested_bsa_directives(
                                     }
                                 };
 
-                                let data = match fs::read(extracted_path) {
-                                    Ok(d) => d,
+                                let src_size = match fs::metadata(extracted_path) {
+                                    Ok(meta) => meta.len(),
                                     Err(e) => {
                                         let count = logged_failures.fetch_add(1, Ordering::Relaxed);
                                         if count < MAX_LOGGED_FAILURES {
-                                            error!("FAIL [{}]: Nested read error: {}", id, e);
+                                            error!("FAIL [{}]: Nested metadata error: {}", id, e);
                                         }
                                         failed.fetch_add(1, Ordering::Relaxed);
                                         return;
                                     }
                                 };
 
-                                if data.len() as u64 != directive.size {
+                                if src_size != directive.size {
                                     let count = logged_failures.fetch_add(1, Ordering::Relaxed);
                                     if count < MAX_LOGGED_FAILURES {
-                                        error!("FAIL [{}]: Size mismatch: expected {} got {}", id, directive.size, data.len());
+                                        error!("FAIL [{}]: Size mismatch: expected {} got {}", id, directive.size, src_size);
                                     }
                                     failed.fetch_add(1, Ordering::Relaxed);
                                     return;
                                 }
 
-                                let output_path = paths::join_windows_path(output_dir, &directive.to);
-                                if let Err(_e) = paths::ensure_parent_dirs(&output_path) {
+                                let job = MoveJob {
+                                    source_path: extracted_path.clone(),
+                                    output_path: paths::join_windows_path(output_dir, &directive.to),
+                                    expected_size: directive.size,
+                                    directive_id: *id,
+                                    _temp_dir: Arc::clone(&nested_tmp_dir),
+                                    is_shared_source: false,
+                                };
+                                if tx.send(job).is_err() {
                                     failed.fetch_add(1, Ordering::Relaxed);
                                     return;
                                 }
-
-                                if let Err(e) = fs::write(&output_path, &data) {
-                                    failed.fetch_add(1, Ordering::Relaxed);
-                                    error!("FAIL [{}]: write error: {}", id, e);
-                                    return;
-                                }
-
+                                update_max(channel_hwm, tx.len());
                                 extracted.fetch_add(1, Ordering::Relaxed);
                             });
                         }
@@ -1067,6 +1070,8 @@ fn process_nested_bsa_directives(
                 return;
             }
 
+            // For BSA/BA2 nested extraction, write directly to destination.
+            // This avoids extra temp-file churn in the hot path.
             let output_path = paths::join_windows_path(output_dir, &directive.to);
             if let Err(_e) = paths::ensure_parent_dirs(&output_path) {
                 failed.fetch_add(1, Ordering::Relaxed);
@@ -1217,7 +1222,7 @@ fn process_bsa_archive(
         let output_path = paths::join_windows_path(output_dir, &directive.to);
         if let Err(e) = paths::ensure_parent_dirs(&output_path) {
             failed.fetch_add(1, Ordering::Relaxed);
-            error!("FAIL [{}]: cannot create dirs: {}", id, e);
+            error!("FAIL [{}]: cannot create dirs for {}: {}", id, output_path.display(), e);
             return;
         }
 

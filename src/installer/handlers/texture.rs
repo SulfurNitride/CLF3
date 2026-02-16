@@ -6,7 +6,7 @@
 use crate::installer::processor::ProcessContext;
 use crate::modlist::TransformedTextureDirective;
 use crate::paths;
-use crate::textures::{process_texture, OutputFormat};
+use crate::textures::{process_texture_with_fallback, OutputFormat};
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -124,8 +124,8 @@ pub fn handle_transformed_texture(
         }
     };
 
-    // Process the texture (decode, resize, re-encode)
-    let processed = process_texture(
+    // Process the texture with fallback (copies unchanged on decode failure)
+    let (processed, was_fallback) = process_texture_with_fallback(
         source_data,
         directive.image_state.width,
         directive.image_state.height,
@@ -138,8 +138,15 @@ pub fn handle_transformed_texture(
         )
     })?;
 
+    if was_fallback {
+        tracing::warn!(
+            "Texture copied unchanged (unsupported format): {}",
+            directive.to
+        );
+    }
+
     // Verify size (warning only - texture compression is not perfectly deterministic)
-    if processed.data.len() as u64 != directive.size {
+    if !was_fallback && processed.data.len() as u64 != directive.size {
         tracing::debug!(
             "Texture size differs: expected {} bytes, got {} (format: {})",
             directive.size,

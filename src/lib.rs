@@ -12,7 +12,6 @@ pub mod gui;
 pub mod hash;
 pub mod installer;
 pub mod modlist;
-pub mod nak;
 pub mod nxm_handler;
 pub mod octodiff;
 pub mod paths;

@@ -1,6 +1,6 @@
 //! Proton detection for Steam
 //!
-//! Finds Proton versions compatible with NaK (Proton 10+ required).
+//! Finds Proton 10+ versions for Steam integration.
 //! Supports Steam's built-in Protons and custom Protons in compatibilitytools.d.
 
 use std::fs;
@@ -38,7 +38,7 @@ pub fn find_steam_path() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.join("steamapps").exists())
 }
 
-/// Find all compatible Protons (Proton 10+ only, as required by NaK)
+/// Find all compatible Protons (Proton 10+ only)
 pub fn find_steam_protons() -> Vec<SteamProton> {
     let mut protons = Vec::new();
 
@@ -59,7 +59,7 @@ pub fn find_steam_protons() -> Vec<SteamProton> {
         protons.extend(find_system_protons());
     }
 
-    // Filter to only Proton 10+ (required for NaK/Steam-native integration)
+    // Filter to only Proton 10+ (required for Steam-native integration)
     protons.retain(is_proton_10_or_newer);
 
     // Filter to only Protons with valid wine binaries
@@ -82,7 +82,7 @@ fn has_wine_binary(proton: &SteamProton) -> bool {
         || proton.path.join("dist/bin/wine").exists()
 }
 
-/// Check if a Proton version is 10 or newer (required by NaK)
+/// Check if a Proton version is 10 or newer
 fn is_proton_10_or_newer(proton: &SteamProton) -> bool {
     let name = &proton.name;
 
