@@ -24,10 +24,55 @@ use std::fs::{self, File};
 use std::io::BufReader;
 use zip::ZipArchive;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
+
+fn total_ram_bytes() -> u64 {
+    static TOTAL_RAM: OnceLock<u64> = OnceLock::new();
+    *TOTAL_RAM.get_or_init(|| {
+        let sys = sysinfo::System::new_with_specifics(
+            sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
+        );
+        sys.total_memory()
+    })
+}
+
+fn patch_apply_workers() -> usize {
+    static WORKERS: OnceLock<usize> = OnceLock::new();
+    *WORKERS.get_or_init(|| {
+        if let Ok(v) = std::env::var("CLF3_PATCH_APPLY_WORKERS") {
+            if let Ok(n) = v.parse::<usize>() {
+                if n > 0 {
+                    return n;
+                }
+            }
+        }
+
+        let ram = total_ram_bytes();
+        if ram < 12 * 1024 * 1024 * 1024 {
+            1
+        } else if ram < 24 * 1024 * 1024 * 1024 {
+            2
+        } else {
+            (rayon::current_num_threads() / 2).clamp(1, 4)
+        }
+    })
+}
+
+fn should_preload_patch_blobs() -> bool {
+    static SHOULD_PRELOAD: OnceLock<bool> = OnceLock::new();
+    *SHOULD_PRELOAD.get_or_init(|| {
+        if let Ok(v) = std::env::var("CLF3_PRELOAD_PATCH_BLOBS") {
+            let value = v.trim().to_ascii_lowercase();
+            return matches!(value.as_str(), "1" | "true" | "yes" | "on");
+        }
+
+        total_ram_bytes() >= 16 * 1024 * 1024 * 1024
+    })
+}
 
 /// List files in an archive using pure Rust crates
 fn list_archive_files_rust(archive_path: &Path) -> Result<Vec<ArchiveFileEntry>> {
@@ -1451,53 +1496,95 @@ fn process_archive_patches(
 
     let archive_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
     pb.set_message(format!("Patching archive {} ({} directives)", archive_name, to_process.len()));
-    let preloaded_patches = preload_patch_blobs(&ctx.config.wabbajack_path, &to_process)
-        .unwrap_or_else(|e| {
-            tracing::debug!(
-                "Patch preload failed for archive {} (falling back to shared reader): {}",
-                archive_name,
-                e
-            );
-            HashMap::new()
-        });
+    let preload_enabled = should_preload_patch_blobs();
+    let preloaded_patches = if preload_enabled {
+        preload_patch_blobs(&ctx.config.wabbajack_path, &to_process)
+            .unwrap_or_else(|e| {
+                tracing::debug!(
+                    "Patch preload failed for archive {} (falling back to shared reader): {}",
+                    archive_name,
+                    e
+                );
+                HashMap::new()
+            })
+    } else {
+        HashMap::new()
+    };
 
     // Process each patch in parallel; extracted source paths and delta blobs are immutable.
     let apply_start = Instant::now();
-    to_process.par_iter().for_each(|(id, directive)| {
-        let patch_name = directive.patch_id.to_string();
-        let preloaded_delta = preloaded_patches.get(&patch_name).map(|v| v.as_slice());
-        let result = apply_patch_streaming(
-            ctx,
-            &archive_path,
-            directive,
-            &extracted_paths,
-            &patch_name,
-            preloaded_delta,
-        );
+    let apply_workers = patch_apply_workers();
+    if apply_workers <= 1 {
+        for (id, directive) in &to_process {
+            let patch_name = directive.patch_id.to_string();
+            let preloaded_delta = preloaded_patches.get(&patch_name).map(|v| v.as_slice());
+            let result = apply_patch_streaming(
+                ctx,
+                &archive_path,
+                directive,
+                &extracted_paths,
+                &patch_name,
+                preloaded_delta,
+            );
 
-        match result {
-            Ok(()) => {
-                completed.fetch_add(1, Ordering::Relaxed);
-                pb.inc(1);
-                reporter.directive_completed();
-            }
-            Err(e) => {
-                failed.fetch_add(1, Ordering::Relaxed);
-                failure_tracker.record_failure(&archive_name, &e.to_string());
-                if failed.load(Ordering::Relaxed) <= 10 {
-                    pb.println(format!("FAIL [{}] patch: {:#}", id, e));
+            match result {
+                Ok(()) => {
+                    completed.fetch_add(1, Ordering::Relaxed);
+                    pb.inc(1);
+                    reporter.directive_completed();
                 }
-                pb.inc(1);
-                reporter.directive_completed();
+                Err(e) => {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    failure_tracker.record_failure(&archive_name, &e.to_string());
+                    if failed.load(Ordering::Relaxed) <= 10 {
+                        pb.println(format!("FAIL [{}] patch: {:#}", id, e));
+                    }
+                    pb.inc(1);
+                    reporter.directive_completed();
+                }
             }
         }
-    });
+    } else {
+        for chunk in to_process.chunks(apply_workers) {
+            chunk.par_iter().for_each(|(id, directive)| {
+                let patch_name = directive.patch_id.to_string();
+                let preloaded_delta = preloaded_patches.get(&patch_name).map(|v| v.as_slice());
+                let result = apply_patch_streaming(
+                    ctx,
+                    &archive_path,
+                    directive,
+                    &extracted_paths,
+                    &patch_name,
+                    preloaded_delta,
+                );
+
+                match result {
+                    Ok(()) => {
+                        completed.fetch_add(1, Ordering::Relaxed);
+                        pb.inc(1);
+                        reporter.directive_completed();
+                    }
+                    Err(e) => {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        failure_tracker.record_failure(&archive_name, &e.to_string());
+                        if failed.load(Ordering::Relaxed) <= 10 {
+                            pb.println(format!("FAIL [{}] patch: {:#}", id, e));
+                        }
+                        pb.inc(1);
+                        reporter.directive_completed();
+                    }
+                }
+            });
+        }
+    }
     let apply_ms = apply_start.elapsed().as_millis();
     tracing::debug!(
-        "Patch archive {} done: directives={}, extracted_sources={}, extract_ms={}, apply_ms={}, total_ms={}",
+        "Patch archive {} done: directives={}, extracted_sources={}, preload={}, workers={}, extract_ms={}, apply_ms={}, total_ms={}",
         archive_name,
         to_process.len(),
         extracted_paths.len(),
+        preload_enabled,
+        apply_workers,
         extraction_ms,
         apply_ms,
         archive_start.elapsed().as_millis()
