@@ -52,12 +52,34 @@ fn patch_apply_workers() -> usize {
         }
 
         let ram = total_ram_bytes();
-        if ram < 12 * 1024 * 1024 * 1024 {
+        if ram < 16 * 1024 * 1024 * 1024 {
             1
-        } else if ram < 24 * 1024 * 1024 * 1024 {
+        } else if ram < 32 * 1024 * 1024 * 1024 {
             2
         } else {
-            (rayon::current_num_threads() / 2).clamp(1, 4)
+            2
+        }
+    })
+}
+
+fn patch_archive_parallelism() -> usize {
+    static PARALLELISM: OnceLock<usize> = OnceLock::new();
+    *PARALLELISM.get_or_init(|| {
+        if let Ok(v) = std::env::var("CLF3_PATCH_ARCHIVE_PARALLELISM") {
+            if let Ok(n) = v.parse::<usize>() {
+                if n > 0 {
+                    return n;
+                }
+            }
+        }
+
+        let ram = total_ram_bytes();
+        if ram < 16 * 1024 * 1024 * 1024 {
+            1
+        } else if ram < 32 * 1024 * 1024 * 1024 {
+            2
+        } else {
+            3
         }
     })
 }
@@ -70,7 +92,8 @@ fn should_preload_patch_blobs() -> bool {
             return matches!(value.as_str(), "1" | "true" | "yes" | "on");
         }
 
-        total_ram_bytes() >= 16 * 1024 * 1024 * 1024
+        // Default OFF for stability; enable explicitly via env if desired.
+        false
     })
 }
 
@@ -1302,7 +1325,10 @@ fn process_patched_from_archive(
     // Reset progress bar for patching phase
     pb.finish_and_clear();
     pb.reset();
-    pb.set_length(total_directives as u64);
+    // Track two units per directive:
+    // 1) source preparation/extraction
+    // 2) patch apply/write
+    pb.set_length((total_directives as u64).saturating_mul(2));
     pb.set_position(0);
     pb.set_message("Applying patches (extracting sources + delta apply)...");
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
@@ -1334,26 +1360,36 @@ fn process_patched_from_archive(
         "Patching: {} small + {} medium + {} large archives",
         small_archives.len(), medium_archives.len(), large_archives.len()
     );
+    let archive_parallelism = patch_archive_parallelism();
+    debug!(
+        "Patch scheduling: archive_parallelism={} apply_workers={} preload_blobs={}",
+        archive_parallelism,
+        patch_apply_workers(),
+        should_preload_patch_blobs()
+    );
 
     // Process SMALL archives in full parallel
-    small_archives.par_iter().for_each(|(archive_hash, directives, _size)| {
-        process_archive_patches(
-            ctx,
-            archive_hash,
-            directives,
-            Some(1),
-            pb,
-            &skipped,
-            &failed,
-            &failure_tracker,
-            &completed,
-            reporter,
-        );
-    });
+    for chunk in small_archives.chunks(archive_parallelism) {
+        chunk.par_iter().for_each(|(archive_hash, directives, _size)| {
+            process_archive_patches(
+                ctx,
+                archive_hash,
+                directives,
+                Some(1),
+                pb,
+                &skipped,
+                &failed,
+                &failure_tracker,
+                &completed,
+                reporter,
+            );
+        });
+    }
 
     // Process MEDIUM archives with limited parallelism (half threads)
     let half_threads = (rayon::current_num_threads() / 2).max(1);
-    for chunk in medium_archives.chunks(half_threads) {
+    let medium_parallelism = half_threads.min(archive_parallelism.max(1));
+    for chunk in medium_archives.chunks(medium_parallelism) {
         chunk.par_iter().for_each(|(archive_hash, directives, _size)| {
             process_archive_patches(
                 ctx,
@@ -1421,7 +1457,7 @@ fn process_archive_patches(
                     failed.fetch_add(1, Ordering::Relaxed);
                     any_needed = true;
                 }
-                pb.inc(1);
+                pb.inc(2);
                 reporter.directive_completed();
             }
             if any_needed {
@@ -1441,7 +1477,7 @@ fn process_archive_patches(
     let skip_count = directives.len() - to_process.len();
     if skip_count > 0 {
         skipped.fetch_add(skip_count, Ordering::Relaxed);
-        pb.inc(skip_count as u64);
+        pb.inc((skip_count as u64).saturating_mul(2));
         for _ in 0..skip_count {
             reporter.directive_completed();
         }
@@ -1476,7 +1512,7 @@ fn process_archive_patches(
             for (_id, _) in &to_process {
                 failed.fetch_add(1, Ordering::Relaxed);
                 failure_tracker.record_failure("tempdir", &e.to_string());
-                pb.inc(1);
+                pb.inc(2);
                 reporter.directive_completed();
             }
             return;
@@ -1493,6 +1529,8 @@ fn process_archive_patches(
         temp_dir.path(),
     );
     let extraction_ms = extraction_start.elapsed().as_millis();
+    // Stage 1 complete for all directives in this archive.
+    pb.inc(to_process.len() as u64);
 
     let archive_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
     pb.set_message(format!("Patching archive {} ({} directives)", archive_name, to_process.len()));
