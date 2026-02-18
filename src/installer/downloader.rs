@@ -7,7 +7,7 @@ use crate::downloaders::{
     download_file_with_callback, GoogleDriveDownloader, HttpClient, MediaFireDownloader,
     NexusDownloader, ProgressCallback as HttpProgressCallback, WabbajackCdnDownloader,
 };
-use crate::hash::verify_file_hash;
+use crate::hash::{verify_file_hash, verify_file_hash_detailed};
 use crate::modlist::{ArchiveInfo, DownloadState, ModlistDb, NexusState};
 use crate::nxm_handler;
 
@@ -165,6 +165,8 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
     let mut already_downloaded_size: u64 = 0;
     let mut need_download: Vec<ArchiveInfo> = Vec::new();
     let mut truncated_count = 0usize;
+    let mut missing_named_count = 0usize;
+    let mut missing_named_examples: Vec<String> = Vec::new();
 
     // First pass: check which archives exist with correct size
     let mut archives_to_verify: Vec<(ArchiveInfo, PathBuf)> = Vec::new();
@@ -184,6 +186,12 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
                         archive.name,
                         (meta.len() * 100) / (archive.size as u64).max(1)
                     );
+                    warn!(
+                        "Rejecting local archive '{}' due to size mismatch (expected={}, actual={})",
+                        output_path.display(),
+                        archive.size,
+                        meta.len()
+                    );
                     if let Err(e) = fs::remove_file(&output_path) {
                         warn!(
                             "Failed to remove truncated file {}: {}",
@@ -194,8 +202,24 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
                     truncated_count += 1;
                 }
             }
+        } else {
+            // Important UX signal: copied archives must match the exact expected name/path.
+            missing_named_count += 1;
+            if missing_named_examples.len() < 5 {
+                missing_named_examples.push(archive.name.clone());
+            }
         }
         need_download.push(archive);
+    }
+
+    if missing_named_count > 0 {
+        warn!(
+            "{} required archives were not found at exact expected path/name under '{}'. \
+Copied files with different names will not be reused. Examples: {}",
+            missing_named_count,
+            config.downloads_dir.display(),
+            missing_named_examples.join(", ")
+        );
     }
 
     // Second pass: verify hashes of existing archives
@@ -216,8 +240,8 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
             );
             let _ = std::io::Write::flush(&mut std::io::stdout());
 
-            match verify_file_hash(&output_path, &archive.hash) {
-                Ok(true) => {
+            match verify_file_hash_detailed(&output_path, &archive.hash) {
+                Ok((true, _actual_hash)) => {
                     // Hash matches - archive is valid
                     db.mark_archive_downloaded(
                         &archive.hash,
@@ -226,11 +250,17 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
                     already_downloaded += 1;
                     already_downloaded_size += archive.size as u64;
                 }
-                Ok(false) => {
+                Ok((false, actual_hash)) => {
                     // Hash mismatch - corrupted, delete and re-download
                     println!(
                         "\r  Corrupted (hash mismatch): {}                    ",
                         archive.name
+                    );
+                    warn!(
+                        "Rejecting local archive '{}' due to hash mismatch (expected={}, actual={})",
+                        output_path.display(),
+                        archive.hash,
+                        actual_hash
                     );
                     if let Err(e) = fs::remove_file(&output_path) {
                         warn!(
