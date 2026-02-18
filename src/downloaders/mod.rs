@@ -14,7 +14,10 @@ mod nexus;
 pub mod wabbajack_cdn;
 
 pub use google_drive::GoogleDriveDownloader;
-pub use http::{download_file, download_file_with_callback, download_file_with_progress, HttpClient, ProgressCallback};
+pub use http::{
+    download_file, download_file_with_callback, download_file_with_progress, HttpClient,
+    ProgressCallback,
+};
 pub use mediafire::MediaFireDownloader;
 pub use nexus::{NexusDownloader, NexusRateLimits};
 pub use wabbajack_cdn::WabbajackCdnDownloader;
@@ -50,7 +53,10 @@ where
         match f().await {
             Ok(result) => {
                 if attempt > 1 {
-                    info!("{} succeeded on attempt {}/{}", operation_name, attempt, max_retries);
+                    info!(
+                        "{} succeeded on attempt {}/{}",
+                        operation_name, attempt, max_retries
+                    );
                 }
                 return Ok(result);
             }
@@ -69,12 +75,8 @@ where
         }
     }
 
-    Err(last_error.unwrap()).with_context(|| {
-        format!(
-            "{} failed after {} attempts",
-            operation_name, max_retries
-        )
-    })
+    Err(last_error.unwrap())
+        .with_context(|| format!("{} failed after {} attempts", operation_name, max_retries))
 }
 
 /// Download source types (matches Wabbajack modlist format)
@@ -114,7 +116,9 @@ impl DownloadSource {
     /// Get a human-readable description
     pub fn description(&self) -> String {
         match self {
-            DownloadSource::Nexus { game_name, mod_id, .. } => {
+            DownloadSource::Nexus {
+                game_name, mod_id, ..
+            } => {
                 format!("Nexus: {}/mods/{}", game_name, mod_id)
             }
             DownloadSource::Http { url } => format!("HTTP: {}", truncate_url(url)),
@@ -129,7 +133,10 @@ impl DownloadSource {
 
     /// Check if this requires manual user action
     pub fn requires_manual(&self) -> bool {
-        matches!(self, DownloadSource::Manual { .. } | DownloadSource::Mega { .. })
+        matches!(
+            self,
+            DownloadSource::Manual { .. } | DownloadSource::Mega { .. }
+        )
     }
 }
 

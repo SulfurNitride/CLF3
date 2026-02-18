@@ -36,7 +36,8 @@ pub struct BsaCache {
 impl BsaCache {
     /// Create a new cache in a temp file
     pub fn new() -> Result<Self> {
-        let db_path = std::env::temp_dir().join(format!("clf3_bsa_cache_{}.db", std::process::id()));
+        let db_path =
+            std::env::temp_dir().join(format!("clf3_bsa_cache_{}.db", std::process::id()));
 
         let conn = Connection::open(&db_path)
             .with_context(|| format!("Failed to create cache at {}", db_path.display()))?;
@@ -205,7 +206,9 @@ impl BsaCache {
         let conn = self.conn.lock().expect("BSA cache lock poisoned");
 
         let mut stmt = conn
-            .prepare_cached("SELECT data FROM bsa_cache WHERE bsa_path = ?1 AND file_path_normalized = ?2")
+            .prepare_cached(
+                "SELECT data FROM bsa_cache WHERE bsa_path = ?1 AND file_path_normalized = ?2",
+            )
             .context("Failed to prepare select")?;
 
         match stmt.query_row(params![&bsa_str, &normalized], |row| {
@@ -218,7 +221,11 @@ impl BsaCache {
     }
 
     /// Get multiple files from cache in parallel
-    pub fn get_batch(&self, bsa_path: &Path, file_paths: &[&str]) -> Result<Vec<(String, Vec<u8>)>> {
+    pub fn get_batch(
+        &self,
+        bsa_path: &Path,
+        file_paths: &[&str],
+    ) -> Result<Vec<(String, Vec<u8>)>> {
         // For thread safety, we fetch sequentially but could batch
         let results: Vec<_> = file_paths
             .iter()

@@ -30,7 +30,9 @@ use std::path::PathBuf;
 pub use heroic::detect_heroic_games;
 pub use known_games::{find_by_gog_id, find_by_name, find_by_steam_id, KnownGame, KNOWN_GAMES};
 pub use proton::{find_steam_path, find_steam_protons, SteamProton};
-pub use steam::{detect_steam_games, find_game_install_path, find_game_prefix_path, get_known_game};
+pub use steam::{
+    detect_steam_games, find_game_install_path, find_game_prefix_path, get_known_game,
+};
 
 // ============================================================================
 // Core Types
@@ -49,11 +51,17 @@ impl Launcher {
     /// Get a display name for the launcher
     pub fn display_name(&self) -> &'static str {
         match self {
-            Launcher::Steam { is_flatpak: true, .. } => "Steam (Flatpak)",
+            Launcher::Steam {
+                is_flatpak: true, ..
+            } => "Steam (Flatpak)",
             Launcher::Steam { is_snap: true, .. } => "Steam (Snap)",
             Launcher::Steam { .. } => "Steam",
-            Launcher::Heroic { store: HeroicStore::GOG } => "Heroic (GOG)",
-            Launcher::Heroic { store: HeroicStore::Epic } => "Heroic (Epic)",
+            Launcher::Heroic {
+                store: HeroicStore::GOG,
+            } => "Heroic (GOG)",
+            Launcher::Heroic {
+                store: HeroicStore::Epic,
+            } => "Heroic (Epic)",
         }
     }
 }
@@ -170,8 +178,7 @@ impl GameScanResult {
             .filter(|g| {
                 matches!(
                     (&g.launcher, launcher_type),
-                    (Launcher::Steam { .. }, "steam")
-                        | (Launcher::Heroic { .. }, "heroic")
+                    (Launcher::Steam { .. }, "steam") | (Launcher::Heroic { .. }, "heroic")
                 )
             })
             .collect()

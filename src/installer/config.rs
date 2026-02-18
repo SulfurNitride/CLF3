@@ -21,9 +21,7 @@ pub enum ProgressEvent {
         speed: f64,
     },
     /// A download has completed
-    DownloadComplete {
-        name: String,
-    },
+    DownloadComplete { name: String },
     /// An archive has been processed (downloaded or skipped)
     ArchiveComplete {
         /// 1-based index of the completed archive
@@ -39,18 +37,11 @@ pub enum ProgressEvent {
         total_size: u64,
     },
     /// Installation phase changed (e.g., "Downloading", "Extracting", "Installing")
-    PhaseChange {
-        phase: String,
-    },
+    PhaseChange { phase: String },
     /// A directive completed
-    DirectiveComplete {
-        index: usize,
-        total: usize,
-    },
+    DirectiveComplete { index: usize, total: usize },
     /// Status message update
-    Status {
-        message: String,
-    },
+    Status { message: String },
     /// Directive processing phase started (e.g., FromArchive, PatchedFromArchive)
     DirectivePhaseStarted {
         /// Type of directive being processed
@@ -102,7 +93,10 @@ impl std::fmt::Debug for InstallConfig {
             .field("max_concurrent_downloads", &self.max_concurrent_downloads)
             .field("nxm_mode", &self.nxm_mode)
             .field("browser", &self.browser)
-            .field("progress_callback", &self.progress_callback.as_ref().map(|_| "<callback>"))
+            .field(
+                "progress_callback",
+                &self.progress_callback.as_ref().map(|_| "<callback>"),
+            )
             .finish()
     }
 }
@@ -112,7 +106,8 @@ impl InstallConfig {
     /// Uses local cache directory (~/.cache/clf3/) to avoid network filesystem issues
     pub fn db_path(&self) -> PathBuf {
         // Use modlist name for the database filename
-        let modlist_name = self.wabbajack_path
+        let modlist_name = self
+            .wabbajack_path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");

@@ -17,14 +17,13 @@ use unicode_normalization::UnicodeNormalization;
 /// CP437 to Unicode mapping for bytes 0x80-0xFF
 /// Used to convert legacy DOS/Windows filenames to UTF-8
 const CP437_TO_UNICODE: [char; 128] = [
-    'Ç', 'ü', 'é', 'â', 'ä', 'à', 'å', 'ç', 'ê', 'ë', 'è', 'ï', 'î', 'ì', 'Ä', 'Å',
-    'É', 'æ', 'Æ', 'ô', 'ö', 'ò', 'û', 'ù', 'ÿ', 'Ö', 'Ü', '¢', '£', '¥', '₧', 'ƒ',
-    'á', 'í', 'ó', 'ú', 'ñ', 'Ñ', 'ª', 'º', '¿', '⌐', '¬', '½', '¼', '¡', '«', '»',
-    '░', '▒', '▓', '│', '┤', '╡', '╢', '╖', '╕', '╣', '║', '╗', '╝', '╜', '╛', '┐',
-    '└', '┴', '┬', '├', '─', '┼', '╞', '╟', '╚', '╔', '╩', '╦', '╠', '═', '╬', '╧',
-    '╨', '╤', '╥', '╙', '╘', '╒', '╓', '╫', '╪', '┘', '┌', '█', '▄', '▌', '▐', '▀',
-    'α', 'ß', 'Γ', 'π', 'Σ', 'σ', 'µ', 'τ', 'Φ', 'Θ', 'Ω', 'δ', '∞', 'φ', 'ε', '∩',
-    '≡', '±', '≥', '≤', '⌠', '⌡', '÷', '≈', '°', '∙', '·', '√', 'ⁿ', '²', '■', ' ',
+    'Ç', 'ü', 'é', 'â', 'ä', 'à', 'å', 'ç', 'ê', 'ë', 'è', 'ï', 'î', 'ì', 'Ä', 'Å', 'É', 'æ', 'Æ',
+    'ô', 'ö', 'ò', 'û', 'ù', 'ÿ', 'Ö', 'Ü', '¢', '£', '¥', '₧', 'ƒ', 'á', 'í', 'ó', 'ú', 'ñ', 'Ñ',
+    'ª', 'º', '¿', '⌐', '¬', '½', '¼', '¡', '«', '»', '░', '▒', '▓', '│', '┤', '╡', '╢', '╖', '╕',
+    '╣', '║', '╗', '╝', '╜', '╛', '┐', '└', '┴', '┬', '├', '─', '┼', '╞', '╟', '╚', '╔', '╩', '╦',
+    '╠', '═', '╬', '╧', '╨', '╤', '╥', '╙', '╘', '╒', '╓', '╫', '╪', '┘', '┌', '█', '▄', '▌', '▐',
+    '▀', 'α', 'ß', 'Γ', 'π', 'Σ', 'σ', 'µ', 'τ', 'Φ', 'Θ', 'Ω', 'δ', '∞', 'φ', 'ε', '∩', '≡', '±',
+    '≥', '≤', '⌠', '⌡', '÷', '≈', '°', '∙', '·', '√', 'ⁿ', '²', '■', ' ',
 ];
 
 /// Convert a byte sequence that might contain CP437 characters to UTF-8
@@ -139,7 +138,8 @@ pub fn extension(path: &str) -> Option<&str> {
 /// Returns the actual path as it exists in the archive
 pub fn find_in_archive_entries<'a>(entries: &'a [String], target: &str) -> Option<&'a str> {
     let target_normalized = normalize_for_lookup(target);
-    entries.iter()
+    entries
+        .iter()
         .find(|e| normalize_for_lookup(e) == target_normalized)
         .map(|s| s.as_str())
 }
@@ -159,9 +159,13 @@ pub fn ensure_parent_dirs(path: &Path) -> std::io::Result<()> {
                     // Use symlink_metadata so we can identify broken symlinks too
                     let kind = match std::fs::symlink_metadata(&blocker) {
                         Ok(m) => {
-                            if m.is_symlink() { "symlink" }
-                            else if m.is_file() { "file" }
-                            else { "other" }
+                            if m.is_symlink() {
+                                "symlink"
+                            } else if m.is_file() {
+                                "file"
+                            } else {
+                                "other"
+                            }
                         }
                         Err(_) => "unknown",
                     };
@@ -204,7 +208,7 @@ fn find_blocking_entry(dir_path: &Path) -> Option<std::path::PathBuf> {
         match std::fs::symlink_metadata(&current) {
             Ok(meta) if !meta.is_dir() => return Some(current),
             Err(_) => return None, // path doesn't exist yet, nothing blocking
-            _ => {} // is a directory, keep going
+            _ => {}                // is a directory, keep going
         }
     }
     None
@@ -222,15 +226,24 @@ mod tests {
 
     #[test]
     fn test_to_linux_path() {
-        assert_eq!(to_linux_path("Data\\Textures\\armor.dds"), "Data/Textures/armor.dds");
+        assert_eq!(
+            to_linux_path("Data\\Textures\\armor.dds"),
+            "Data/Textures/armor.dds"
+        );
         assert_eq!(to_linux_path("already/linux/path"), "already/linux/path");
         assert_eq!(to_linux_path("mixed\\path/style"), "mixed/path/style");
     }
 
     #[test]
     fn test_normalize() {
-        assert_eq!(normalize_for_lookup("Data\\Textures\\Armor.dds"), "data/textures/armor.dds");
-        assert_eq!(normalize_for_lookup("MESHES/Actor/Character"), "meshes/actor/character");
+        assert_eq!(
+            normalize_for_lookup("Data\\Textures\\Armor.dds"),
+            "data/textures/armor.dds"
+        );
+        assert_eq!(
+            normalize_for_lookup("MESHES/Actor/Character"),
+            "meshes/actor/character"
+        );
     }
 
     #[test]
@@ -247,16 +260,19 @@ mod tests {
             find_in_archive_entries(&entries, "MESHES\\ACTOR\\CHARACTER.NIF"),
             Some("meshes/actor/character.nif")
         );
-        assert_eq!(
-            find_in_archive_entries(&entries, "notfound.txt"),
-            None
-        );
+        assert_eq!(find_in_archive_entries(&entries, "notfound.txt"), None);
     }
 
     #[test]
     fn test_paths_equal() {
-        assert!(paths_equal("Data\\Textures\\armor.dds", "data\\textures\\ARMOR.DDS"));
-        assert!(!paths_equal("Data\\Textures\\armor.dds", "data\\textures\\sword.dds"));
+        assert!(paths_equal(
+            "Data\\Textures\\armor.dds",
+            "data\\textures\\ARMOR.DDS"
+        ));
+        assert!(!paths_equal(
+            "Data\\Textures\\armor.dds",
+            "data\\textures\\sword.dds"
+        ));
     }
 
     #[test]
@@ -275,7 +291,10 @@ mod tests {
 
     #[test]
     fn test_parent_path() {
-        assert_eq!(parent_path("Data\\Textures\\armor.dds"), Some("Data\\Textures"));
+        assert_eq!(
+            parent_path("Data\\Textures\\armor.dds"),
+            Some("Data\\Textures")
+        );
         assert_eq!(parent_path("armor.dds"), None);
     }
 
@@ -312,9 +331,6 @@ mod tests {
         // Test in full path context
         let path1 = "00 - Core/Sound/Vo/AIV/orc/m/atúlg gro-largúm/file.mp3";
         let path2 = "00 - Core/Sound/Vo/AIV/orc/m/atu\u{0301}lg gro-largu\u{0301}m/file.mp3";
-        assert_eq!(
-            normalize_for_lookup(path1),
-            normalize_for_lookup(path2)
-        );
+        assert_eq!(normalize_for_lookup(path1), normalize_for_lookup(path2));
     }
 }

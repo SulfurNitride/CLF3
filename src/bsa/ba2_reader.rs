@@ -38,7 +38,8 @@ pub fn list_files(ba2_path: &Path) -> Result<Vec<Ba2FileEntry>> {
         let path = String::from_utf8_lossy(key.name().as_bytes()).to_string();
 
         // Calculate decompressed size from all chunks
-        let size: u64 = file.iter()
+        let size: u64 = file
+            .iter()
             .map(|chunk| chunk.decompressed_len().unwrap_or(chunk.len()) as u64)
             .sum();
 
@@ -70,7 +71,8 @@ pub fn extract_file(ba2_path: &Path, file_path: &str) -> Result<Vec<u8>> {
         let current_path = String::from_utf8_lossy(key.name().as_bytes()).to_lowercase();
 
         // Try both slash conventions
-        if current_path == normalized || current_path == normalized_backslash
+        if current_path == normalized
+            || current_path == normalized_backslash
             || current_path.replace('\\', "/") == normalized
             || current_path.replace('/', "\\") == normalized_backslash
         {
@@ -215,7 +217,9 @@ mod tests {
         use std::fs;
 
         // Test archive with BA2 inside
-        let archive_path = std::path::Path::new("/mnt/1TB NVME/Mod Downloads/Fallout 4/APC Transport V2.2.7-16211-V2-2-7-1683739675.7z");
+        let archive_path = std::path::Path::new(
+            "/mnt/1TB NVME/Mod Downloads/Fallout 4/APC Transport V2.2.7-16211-V2-2-7-1683739675.7z",
+        );
         if !archive_path.exists() {
             println!("Test archive not found, skipping");
             return;
@@ -231,7 +235,8 @@ mod tests {
             }
         };
 
-        let ba2_entries: Vec<_> = entries.iter()
+        let ba2_entries: Vec<_> = entries
+            .iter()
             .filter(|e| e.path.to_lowercase().ends_with(".ba2"))
             .collect();
 
@@ -250,13 +255,14 @@ mod tests {
         let ba2_path_in_archive = &ba2_entries[0].path;
         println!("Extracting: {}", ba2_path_in_archive);
 
-        let ba2_data = match sevenzip::extract_file_case_insensitive(archive_path, ba2_path_in_archive) {
-            Ok(d) => d,
-            Err(e) => {
-                println!("Failed to extract BA2: {}", e);
-                return;
-            }
-        };
+        let ba2_data =
+            match sevenzip::extract_file_case_insensitive(archive_path, ba2_path_in_archive) {
+                Ok(d) => d,
+                Err(e) => {
+                    println!("Failed to extract BA2: {}", e);
+                    return;
+                }
+            };
         println!("Extracted {} bytes", ba2_data.len());
 
         // Write to temp file with correct extension
@@ -269,8 +275,14 @@ mod tests {
         let mut magic = [0u8; 4];
         let mut f = std::fs::File::open(&temp_ba2_path).unwrap();
         std::io::Read::read_exact(&mut f, &mut magic).unwrap();
-        println!("Magic bytes: {:02X} {:02X} {:02X} {:02X}", magic[0], magic[1], magic[2], magic[3]);
-        assert_eq!(&magic, b"BTDX", "Not a valid BA2 file (expected BTDX magic)");
+        println!(
+            "Magic bytes: {:02X} {:02X} {:02X} {:02X}",
+            magic[0], magic[1], magic[2], magic[3]
+        );
+        assert_eq!(
+            &magic, b"BTDX",
+            "Not a valid BA2 file (expected BTDX magic)"
+        );
 
         // List files in the BA2
         println!("\n=== Step 3: List files in extracted BA2 ===");

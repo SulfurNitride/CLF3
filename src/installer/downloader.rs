@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 /// Max retries for network operations
 const MAX_RETRIES: u32 = 3;
@@ -33,6 +33,12 @@ const RETRY_DELAY: Duration = Duration::from_secs(2);
 const MAX_RATE_LIMIT_RETRIES: u32 = 10;
 /// Initial delay for rate limit retry (increases exponentially)
 const RATE_LIMIT_BASE_DELAY: Duration = Duration::from_secs(30);
+
+/// Wabbajack proxy endpoint for Google Drive, Mega, MediaFire downloads
+const PROXY_BASE_URL: &str = "https://build.wabbajack.org/proxy";
+
+/// Wabbajack mirror endpoint (files stored on CDN by hash)
+const MIRROR_BASE_URL: &str = "https://mirror.wabbajack.org";
 
 /// Result tuple for parallel downloads: (name, path, result, optional nexus state update)
 type DownloadResultTuple = (String, PathBuf, DownloadResult, Option<(String, i64)>);
@@ -144,7 +150,11 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
         return Ok(DownloadStats::default());
     }
 
-    println!("Found {} missing outputs requiring {} archives", missing_count, needed_archives.len());
+    println!(
+        "Found {} missing outputs requiring {} archives",
+        missing_count,
+        needed_archives.len()
+    );
 
     // Get archive info for needed archives
     let needed_hashes: Vec<String> = needed_archives.into_iter().collect();
@@ -169,11 +179,17 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
                     continue;
                 } else {
                     // File exists but wrong size - truncated/corrupted, delete and re-download
-                    println!("  Truncated: {} ({}% complete)",
+                    println!(
+                        "  Truncated: {} ({}% complete)",
                         archive.name,
-                        (meta.len() * 100) / (archive.size as u64).max(1));
+                        (meta.len() * 100) / (archive.size as u64).max(1)
+                    );
                     if let Err(e) = fs::remove_file(&output_path) {
-                        warn!("Failed to remove truncated file {}: {}", output_path.display(), e);
+                        warn!(
+                            "Failed to remove truncated file {}: {}",
+                            output_path.display(),
+                            e
+                        );
                     }
                     truncated_count += 1;
                 }
@@ -185,52 +201,85 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
     // Second pass: verify hashes of existing archives
     let mut corrupted_count = 0usize;
     if !archives_to_verify.is_empty() {
-        println!("Verifying {} existing archives...", archives_to_verify.len());
+        println!(
+            "Verifying {} existing archives...",
+            archives_to_verify.len()
+        );
 
         for (i, (archive, output_path)) in archives_to_verify.iter().enumerate() {
             // Show progress
-            print!("\r  Verifying {}/{}: {}...", i + 1, archives_to_verify.len(),
-                truncate_name(&archive.name, 40));
+            print!(
+                "\r  Verifying {}/{}: {}...",
+                i + 1,
+                archives_to_verify.len(),
+                truncate_name(&archive.name, 40)
+            );
             let _ = std::io::Write::flush(&mut std::io::stdout());
 
             match verify_file_hash(&output_path, &archive.hash) {
                 Ok(true) => {
                     // Hash matches - archive is valid
-                    db.mark_archive_downloaded(&archive.hash, output_path.to_string_lossy().as_ref())?;
+                    db.mark_archive_downloaded(
+                        &archive.hash,
+                        output_path.to_string_lossy().as_ref(),
+                    )?;
                     already_downloaded += 1;
                     already_downloaded_size += archive.size as u64;
                 }
                 Ok(false) => {
                     // Hash mismatch - corrupted, delete and re-download
-                    println!("\r  Corrupted (hash mismatch): {}                    ", archive.name);
+                    println!(
+                        "\r  Corrupted (hash mismatch): {}                    ",
+                        archive.name
+                    );
                     if let Err(e) = fs::remove_file(&output_path) {
-                        warn!("Failed to remove corrupted file {}: {}", output_path.display(), e);
+                        warn!(
+                            "Failed to remove corrupted file {}: {}",
+                            output_path.display(),
+                            e
+                        );
                     }
                     corrupted_count += 1;
                     need_download.push(archive.clone());
                 }
                 Err(e) => {
                     // Error reading file - treat as corrupted
-                    println!("\r  Verify error for {}: {}                    ", archive.name, e);
+                    println!(
+                        "\r  Verify error for {}: {}                    ",
+                        archive.name, e
+                    );
                     if let Err(e) = fs::remove_file(&output_path) {
-                        warn!("Failed to remove unreadable file {}: {}", output_path.display(), e);
+                        warn!(
+                            "Failed to remove unreadable file {}: {}",
+                            output_path.display(),
+                            e
+                        );
                     }
                     corrupted_count += 1;
                     need_download.push(archive.clone());
                 }
             }
         }
-        println!("\r  Verified {} archives ({} valid, {} corrupted)                    ",
-            archives_to_verify.len(), already_downloaded, corrupted_count);
+        println!(
+            "\r  Verified {} archives ({} valid, {} corrupted)                    ",
+            archives_to_verify.len(),
+            already_downloaded,
+            corrupted_count
+        );
     }
 
     if truncated_count > 0 || corrupted_count > 0 {
-        println!("Found {} truncated, {} corrupted archives - will re-download",
-            truncated_count, corrupted_count);
+        println!(
+            "Found {} truncated, {} corrupted archives - will re-download",
+            truncated_count, corrupted_count
+        );
     }
 
     if already_downloaded > 0 {
-        println!("Found {} archives already downloaded ({} bytes)", already_downloaded, already_downloaded_size);
+        println!(
+            "Found {} archives already downloaded ({} bytes)",
+            already_downloaded, already_downloaded_size
+        );
         // Report skipped archives to progress callback
         if let Some(ref callback) = config.progress_callback {
             callback(ProgressEvent::DownloadSkipped {
@@ -350,11 +399,20 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
 
     // Print manual download instructions
     if !manual_downloads_list.is_empty() {
-        println!("\n=== Manual Downloads Required ({}) ===", manual_downloads_list.len());
-        println!("Please download the following files to: {}\n", config.downloads_dir.display());
+        println!(
+            "\n=== Manual Downloads Required ({}) ===",
+            manual_downloads_list.len()
+        );
+        println!(
+            "Please download the following files to: {}\n",
+            config.downloads_dir.display()
+        );
 
         // Log to file for later reference
-        warn!("=== Manual Downloads Required ({}) ===", manual_downloads_list.len());
+        warn!(
+            "=== Manual Downloads Required ({}) ===",
+            manual_downloads_list.len()
+        );
         warn!("Download destination: {}", config.downloads_dir.display());
 
         for (i, md) in manual_downloads_list.iter().enumerate() {
@@ -368,9 +426,15 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
 
             // Log each manual download to file
             if let Some(prompt) = &md.prompt {
-                warn!("[MANUAL] {}: {} (size: {} bytes, note: {})", md.name, md.url, md.expected_size, prompt);
+                warn!(
+                    "[MANUAL] {}: {} (size: {} bytes, note: {})",
+                    md.name, md.url, md.expected_size, prompt
+                );
             } else {
-                warn!("[MANUAL] {}: {} (size: {} bytes)", md.name, md.url, md.expected_size);
+                warn!(
+                    "[MANUAL] {}: {} (size: {} bytes)",
+                    md.name, md.url, md.expected_size
+                );
             }
         }
 
@@ -379,8 +443,14 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
 
     // Print failed download instructions
     if !failed_downloads_list.is_empty() {
-        println!("\n=== Failed Downloads ({}) ===", failed_downloads_list.len());
-        println!("These downloads failed. Try manually downloading to: {}\n", config.downloads_dir.display());
+        println!(
+            "\n=== Failed Downloads ({}) ===",
+            failed_downloads_list.len()
+        );
+        println!(
+            "These downloads failed. Try manually downloading to: {}\n",
+            config.downloads_dir.display()
+        );
 
         // Log to file for later reference
         warn!("=== Failed Downloads ({}) ===", failed_downloads_list.len());
@@ -390,11 +460,18 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
             println!("{}. {}", i + 1, fd.name);
             println!("   URL: {}", fd.url);
             println!("   Error: {}", fd.error);
-            println!("   Expected size: {} bytes ({:.2} MB)", fd.expected_size, fd.expected_size as f64 / 1024.0 / 1024.0);
+            println!(
+                "   Expected size: {} bytes ({:.2} MB)",
+                fd.expected_size,
+                fd.expected_size as f64 / 1024.0 / 1024.0
+            );
             println!();
 
             // Log each failed download to file
-            warn!("[FAILED] {}: {} (error: {}, size: {} bytes)", fd.name, fd.url, fd.error, fd.expected_size);
+            warn!(
+                "[FAILED] {}: {} (error: {}, size: {} bytes)",
+                fd.name, fd.url, fd.error, fd.expected_size
+            );
         }
 
         println!("After downloading, run the command again to continue.\n");
@@ -411,8 +488,7 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
     let limits = ctx.nexus.rate_limits();
     println!(
         "\nNexus API: {}/{} hourly, {}/{} daily",
-        limits.hourly_remaining, limits.hourly_limit,
-        limits.daily_remaining, limits.daily_limit
+        limits.hourly_remaining, limits.hourly_limit, limits.daily_remaining, limits.daily_limit
     );
 
     Ok(stats)
@@ -453,7 +529,8 @@ async fn process_archive(
         Err(e) => {
             ctx.failed.fetch_add(1, Ordering::Relaxed);
             ctx.overall_pb.inc(1);
-            ctx.overall_pb.println(format!("FAIL {} - parse error: {}", archive.name, e));
+            ctx.overall_pb
+                .println(format!("FAIL {} - parse error: {}", archive.name, e));
             return (DownloadResult::Failed, None);
         }
     };
@@ -468,7 +545,9 @@ async fn process_archive(
     }
 
     // Create progress bar for this download
-    let pb = ctx.multi_progress.insert_before(&ctx.overall_pb, ProgressBar::new(archive.size as u64));
+    let pb = ctx
+        .multi_progress
+        .insert_before(&ctx.overall_pb, ProgressBar::new(archive.size as u64));
     pb.set_style(
         ProgressStyle::default_bar()
             .template("  {spinner:.blue} {wide_msg} [{bar:30.white/dim}] {bytes}/{total_bytes} {bytes_per_sec}")
@@ -501,7 +580,9 @@ async fn process_archive(
             let error_msg = root_cause(&e);
             ctx.overall_pb.println(format!(
                 "FAIL [{}] {} - {}",
-                source, truncate_name(&archive.name, 30), error_msg
+                source,
+                truncate_name(&archive.name, 30),
+                error_msg
             ));
             // Record failed download with URL for manual download
             ctx.failed_downloads.lock().await.push(FailedDownloadInfo {
@@ -545,7 +626,7 @@ fn report_archive_complete(ctx: &DownloadContext, name: &str) {
     }
 }
 
-/// Check if this is a manual download type
+/// Check if this is a manual download type (only truly manual sources)
 fn check_manual(state: &DownloadState, archive: &ArchiveInfo) -> Option<ManualDownloadInfo> {
     match state {
         DownloadState::Manual(manual_state) => Some(ManualDownloadInfo {
@@ -554,12 +635,7 @@ fn check_manual(state: &DownloadState, archive: &ArchiveInfo) -> Option<ManualDo
             prompt: Some(manual_state.prompt.clone()),
             expected_size: archive.size as u64,
         }),
-        DownloadState::Mega(mega_state) => Some(ManualDownloadInfo {
-            name: archive.name.clone(),
-            url: mega_state.url.clone(),
-            prompt: Some("Mega downloads require manual download".to_string()),
-            expected_size: archive.size as u64,
-        }),
+        // Mega is now handled via Wabbajack proxy, not manual
         _ => None,
     }
 }
@@ -592,7 +668,10 @@ fn get_manual_url(state: &DownloadState) -> String {
     match state {
         DownloadState::Nexus(s) => {
             let domain = crate::downloaders::NexusDownloader::game_domain(&s.game_name);
-            format!("https://www.nexusmods.com/{}/mods/{}?tab=files", domain, s.mod_id)
+            format!(
+                "https://www.nexusmods.com/{}/mods/{}?tab=files",
+                domain, s.mod_id
+            )
         }
         DownloadState::Http(s) => s.url.clone(),
         DownloadState::WabbajackCDN(s) => s.url.clone(),
@@ -615,6 +694,81 @@ fn root_cause(e: &anyhow::Error) -> String {
     } else {
         msg
     }
+}
+
+/// Get the original source URL for proxy-able download states
+fn get_proxy_source_url(state: &DownloadState) -> Option<String> {
+    match state {
+        DownloadState::GoogleDrive(s) => Some(format!(
+            "https://drive.google.com/uc?id={}&export=download",
+            s.id
+        )),
+        DownloadState::Mega(s) => Some(s.url.clone()),
+        DownloadState::MediaFire(s) => Some(s.url.clone()),
+        _ => None,
+    }
+}
+
+/// Build the proxy URL for a given source URL
+fn build_proxy_url(source_url: &str) -> String {
+    // Manual percent-encoding of the source URL for the query parameter
+    let encoded: String = source_url
+        .bytes()
+        .flat_map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![b as char]
+            }
+            _ => format!("%{:02X}", b).chars().collect(),
+        })
+        .collect();
+    format!("{}?uri={}", PROXY_BASE_URL, encoded)
+}
+
+/// Download a file through the Wabbajack proxy
+async fn download_via_proxy(
+    client: &HttpClient,
+    source_url: &str,
+    output_path: &Path,
+    expected_size: u64,
+    pb: &ProgressBar,
+    callback: Option<&HttpProgressCallback>,
+) -> Result<()> {
+    let proxy_url = build_proxy_url(source_url);
+    debug!("Downloading via proxy: {}", proxy_url);
+    download_file_with_callback(
+        client,
+        &proxy_url,
+        output_path,
+        Some(expected_size),
+        Some(pb),
+        callback,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Convert a base64 hash to hex string for mirror URL
+fn hash_to_hex(base64_hash: &str) -> Result<String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64_hash)
+        .context("Invalid base64 hash for mirror lookup")?;
+    Ok(bytes.iter().map(|b| format!("{:02X}", b)).collect())
+}
+
+/// Download a file from the Wabbajack mirror CDN (by hash)
+async fn download_from_mirror(
+    cdn: &WabbajackCdnDownloader,
+    hash: &str,
+    output_path: &Path,
+    expected_size: u64,
+) -> Result<()> {
+    let hash_hex = hash_to_hex(hash)?;
+    let mirror_url = format!("{}/{}", MIRROR_BASE_URL, hash_hex);
+    debug!("Downloading from mirror: {}", mirror_url);
+    cdn.download(&mirror_url, output_path, expected_size)
+        .await?;
+    Ok(())
 }
 
 /// Download a single archive based on its source type (with retry)
@@ -656,14 +810,18 @@ async fn download_archive(
                             if attempt < MAX_RETRIES {
                                 ctx.overall_pb.println(format!(
                                     "Size mismatch for {} (got {} expected {}), retrying...",
-                                    truncate_name(&archive.name, 25), actual_size, expected_size
+                                    truncate_name(&archive.name, 25),
+                                    actual_size,
+                                    expected_size
                                 ));
                                 tokio::time::sleep(RETRY_DELAY).await;
                                 continue;
                             } else {
                                 bail!(
                                     "Size mismatch after {} attempts: expected {} bytes, got {}",
-                                    MAX_RETRIES, expected_size, actual_size
+                                    MAX_RETRIES,
+                                    expected_size,
+                                    actual_size
                                 );
                             }
                         }
@@ -672,7 +830,8 @@ async fn download_archive(
                         if attempt < MAX_RETRIES {
                             ctx.overall_pb.println(format!(
                                 "Cannot verify {} ({}), retrying...",
-                                truncate_name(&archive.name, 25), e
+                                truncate_name(&archive.name, 25),
+                                e
                             ));
                             tokio::time::sleep(RETRY_DELAY).await;
                             continue;
@@ -683,7 +842,10 @@ async fn download_archive(
                 }
 
                 // Verify hash after size check passes
-                pb.set_message(format!("{} (verifying...)", truncate_name(&archive.name, 30)));
+                pb.set_message(format!(
+                    "{} (verifying...)",
+                    truncate_name(&archive.name, 30)
+                ));
                 match verify_file_hash(output_path, &archive.hash) {
                     Ok(true) => {
                         // Hash matches - success!
@@ -701,7 +863,8 @@ async fn download_archive(
                         } else {
                             bail!(
                                 "Hash verification failed after {} attempts for {}",
-                                MAX_RETRIES, archive.name
+                                MAX_RETRIES,
+                                archive.name
                             );
                         }
                     }
@@ -710,7 +873,8 @@ async fn download_archive(
                         if attempt < MAX_RETRIES {
                             ctx.overall_pb.println(format!(
                                 "Hash verify error for {} ({}), retrying...",
-                                truncate_name(&archive.name, 25), e
+                                truncate_name(&archive.name, 25),
+                                e
                             ));
                             tokio::time::sleep(RETRY_DELAY).await;
                             continue;
@@ -724,17 +888,23 @@ async fn download_archive(
             }
             Err(e) => {
                 let error_str = format!("{:#}", e);
-                let is_rate_limit = error_str.contains("429") || error_str.to_lowercase().contains("rate limit");
+                let is_rate_limit =
+                    error_str.contains("429") || error_str.to_lowercase().contains("rate limit");
 
                 if is_rate_limit {
                     rate_limit_retries += 1;
                     if rate_limit_retries <= MAX_RATE_LIMIT_RETRIES {
                         // Exponential backoff: 30s, 60s, 120s, 240s, 300s (capped)
-                        let delay_secs = (RATE_LIMIT_BASE_DELAY.as_secs() << (rate_limit_retries - 1).min(3)).min(300);
+                        let delay_secs = (RATE_LIMIT_BASE_DELAY.as_secs()
+                            << (rate_limit_retries - 1).min(3))
+                        .min(300);
                         pb.set_message(format!("Rate limited, waiting {}s...", delay_secs));
                         ctx.overall_pb.println(format!(
                             "Rate limit hit for {}, waiting {}s (retry {}/{})",
-                            truncate_name(&archive.name, 25), delay_secs, rate_limit_retries, MAX_RATE_LIMIT_RETRIES
+                            truncate_name(&archive.name, 25),
+                            delay_secs,
+                            rate_limit_retries,
+                            MAX_RATE_LIMIT_RETRIES
                         ));
                         tokio::time::sleep(Duration::from_secs(delay_secs)).await;
                         continue;
@@ -743,6 +913,84 @@ async fn download_archive(
                     // Regular retry for network errors
                     tokio::time::sleep(RETRY_DELAY).await;
                     continue;
+                }
+
+                // Primary download exhausted retries - try proxy/mirror fallback
+                // for proxyable sources (Google Drive, Mega, MediaFire)
+                if let Some(source_url) = get_proxy_source_url(state) {
+                    let progress_callback = make_progress_callback(
+                        archive.name.clone(),
+                        &ctx.config.progress_callback,
+                    );
+                    let callback_ref = progress_callback.as_ref();
+
+                    // Try Wabbajack proxy
+                    pb.set_position(0);
+                    pb.set_message(format!(
+                        "{} (proxy)",
+                        truncate_name(&archive.name, 30)
+                    ));
+                    let _ = std::fs::remove_file(output_path);
+
+                    info!(
+                        "Primary download failed for {}, trying Wabbajack proxy",
+                        archive.name
+                    );
+                    match download_via_proxy(
+                        &ctx.http,
+                        &source_url,
+                        output_path,
+                        expected_size,
+                        pb,
+                        callback_ref,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            info!("Proxy download succeeded for {}", archive.name);
+                            // Skip hash check here - the outer loop handles it
+                            // but we need to return Ok to trigger verification
+                            return Ok(None);
+                        }
+                        Err(proxy_err) => {
+                            debug!(
+                                "Proxy failed for {}: {}",
+                                archive.name, proxy_err
+                            );
+                        }
+                    }
+
+                    // Try Wabbajack mirror (CDN by hash)
+                    pb.set_position(0);
+                    pb.set_message(format!(
+                        "{} (mirror)",
+                        truncate_name(&archive.name, 30)
+                    ));
+                    let _ = std::fs::remove_file(output_path);
+
+                    info!(
+                        "Proxy failed for {}, trying Wabbajack mirror",
+                        archive.name
+                    );
+                    match download_from_mirror(
+                        &ctx.cdn,
+                        &archive.hash,
+                        output_path,
+                        expected_size,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            info!("Mirror download succeeded for {}", archive.name);
+                            return Ok(None);
+                        }
+                        Err(mirror_err) => {
+                            debug!(
+                                "Mirror failed for {}: {}",
+                                archive.name, mirror_err
+                            );
+                        }
+                    }
                 }
 
                 return Err(e);
@@ -779,10 +1027,8 @@ async fn download_archive_inner(
     pb: &ProgressBar,
 ) -> Result<((), Option<(String, i64)>)> {
     // Create progress callback for GUI updates
-    let progress_callback = make_progress_callback(
-        archive.name.clone(),
-        &ctx.config.progress_callback,
-    );
+    let progress_callback =
+        make_progress_callback(archive.name.clone(), &ctx.config.progress_callback);
     let callback_ref = progress_callback.as_ref();
 
     // Returns (result, optional url to cache)
@@ -796,49 +1042,76 @@ async fn download_archive_inner(
                 .unwrap()
                 .as_secs() as i64;
 
-            let (url, url_to_cache) = if let (Some(cached_url), Some(expires)) = (&archive.cached_url, archive.url_expires) {
-                if expires > now + 300 {  // Valid for at least 5 more minutes
+            let (url, url_to_cache) = if let (Some(cached_url), Some(expires)) =
+                (&archive.cached_url, archive.url_expires)
+            {
+                if expires > now + 300 {
+                    // Valid for at least 5 more minutes
                     (cached_url.clone(), None)
                 } else {
                     // Expired, fetch new URL
-                    let url = ctx.nexus
+                    let url = ctx
+                        .nexus
                         .get_download_link(domain, nexus_state.mod_id, nexus_state.file_id)
                         .await
-                        .with_context(|| format!(
-                            "Nexus: {}/mods/{}/files/{}",
-                            domain, nexus_state.mod_id, nexus_state.file_id
-                        ))?;
+                        .with_context(|| {
+                            format!(
+                                "Nexus: {}/mods/{}/files/{}",
+                                domain, nexus_state.mod_id, nexus_state.file_id
+                            )
+                        })?;
                     // Cache for 4 hours
                     let expires = now + 4 * 3600;
                     (url.clone(), Some((url, expires)))
                 }
             } else {
                 // No cache, fetch new URL
-                let url = ctx.nexus
+                let url = ctx
+                    .nexus
                     .get_download_link(domain, nexus_state.mod_id, nexus_state.file_id)
                     .await
-                    .with_context(|| format!(
-                        "Nexus: {}/mods/{}/files/{}",
-                        domain, nexus_state.mod_id, nexus_state.file_id
-                    ))?;
+                    .with_context(|| {
+                        format!(
+                            "Nexus: {}/mods/{}/files/{}",
+                            domain, nexus_state.mod_id, nexus_state.file_id
+                        )
+                    })?;
                 // Cache for 4 hours
                 let expires = now + 4 * 3600;
                 (url.clone(), Some((url, expires)))
             };
 
             // Download the file with progress
-            download_file_with_callback(&ctx.http, &url, output_path, Some(archive.size as u64), Some(pb), callback_ref).await?;
+            download_file_with_callback(
+                &ctx.http,
+                &url,
+                output_path,
+                Some(archive.size as u64),
+                Some(pb),
+                callback_ref,
+            )
+            .await?;
             Ok(((), url_to_cache))
         }
 
         DownloadState::Http(http_state) => {
-            download_file_with_callback(&ctx.http, &http_state.url, output_path, Some(archive.size as u64), Some(pb), callback_ref).await?;
+            download_file_with_callback(
+                &ctx.http,
+                &http_state.url,
+                output_path,
+                Some(archive.size as u64),
+                Some(pb),
+                callback_ref,
+            )
+            .await?;
             Ok(((), None))
         }
 
         DownloadState::WabbajackCDN(cdn_state) => {
             // CDN has its own progress tracking, we just update at the end
-            ctx.cdn.download(&cdn_state.url, output_path, archive.size as u64).await?;
+            ctx.cdn
+                .download(&cdn_state.url, output_path, archive.size as u64)
+                .await?;
             pb.set_position(archive.size as u64);
             // Report final progress for GUI
             if let Some(ref cb) = ctx.config.progress_callback {
@@ -854,7 +1127,9 @@ async fn download_archive_inner(
 
         DownloadState::GoogleDrive(gd_state) => {
             // Use gdrive's own client to maintain cookies through the confirmation flow
-            ctx.gdrive.download_to_file(&gd_state.id, output_path, archive.size as u64, Some(pb)).await?;
+            ctx.gdrive
+                .download_to_file(&gd_state.id, output_path, archive.size as u64, Some(pb))
+                .await?;
             // Report final progress for GUI
             if let Some(ref cb) = ctx.config.progress_callback {
                 cb(ProgressEvent::DownloadProgress {
@@ -869,7 +1144,15 @@ async fn download_archive_inner(
 
         DownloadState::MediaFire(mf_state) => {
             let url = ctx.mediafire.get_download_url(&mf_state.url).await?;
-            download_file_with_callback(&ctx.http, &url, output_path, Some(archive.size as u64), Some(pb), callback_ref).await?;
+            download_file_with_callback(
+                &ctx.http,
+                &url,
+                output_path,
+                Some(archive.size as u64),
+                Some(pb),
+                callback_ref,
+            )
+            .await?;
             Ok(((), None))
         }
 
@@ -888,8 +1171,29 @@ async fn download_archive_inner(
             Ok(((), None))
         }
 
-        // Manual and Mega are handled by check_manual()
-        DownloadState::Manual(_) | DownloadState::Mega(_) => {
+        DownloadState::Mega(mega_state) => {
+            // Mega has no native client - download via Wabbajack proxy directly
+            info!("Mega download for {} - using Wabbajack proxy", archive.name);
+            download_via_proxy(
+                &ctx.http,
+                &mega_state.url,
+                output_path,
+                archive.size as u64,
+                pb,
+                callback_ref,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "Mega proxy download failed for {} ({})",
+                    archive.name, mega_state.url
+                )
+            })?;
+            Ok(((), None))
+        }
+
+        // Manual downloads are handled by check_manual()
+        DownloadState::Manual(_) => {
             unreachable!("Manual downloads should be filtered out before this point")
         }
     }
@@ -934,8 +1238,13 @@ fn copy_game_file(
     }
 
     // Copy the file
-    let bytes_copied = fs::copy(&source, output_path)
-        .with_context(|| format!("Failed to copy {} to {}", source.display(), output_path.display()))?;
+    let bytes_copied = fs::copy(&source, output_path).with_context(|| {
+        format!(
+            "Failed to copy {} to {}",
+            source.display(),
+            output_path.display()
+        )
+    })?;
 
     // Verify size
     if bytes_copied != archive.size as u64 {
@@ -1039,7 +1348,10 @@ async fn download_archives_nxm(
         .to_string_lossy()
         .to_string();
     if let Err(e) = nxm_handler::register_handler(&exe) {
-        warn!("Failed to register NXM handler (browser clicks may not work): {}", e);
+        warn!(
+            "Failed to register NXM handler (browser clicks may not work): {}",
+            e
+        );
     }
 
     // Start NXM server
@@ -1053,7 +1365,10 @@ async fn download_archives_nxm(
     let mut lookup: HashMap<String, NexusPending> = HashMap::new();
     for pending in nexus_pending {
         let domain = NexusDownloader::game_domain(&pending.nexus_state.game_name);
-        let key = format!("{}:{}:{}", domain, pending.nexus_state.mod_id, pending.nexus_state.file_id);
+        let key = format!(
+            "{}:{}:{}",
+            domain, pending.nexus_state.mod_id, pending.nexus_state.file_id
+        );
         lookup.insert(key, pending);
     }
 
@@ -1065,7 +1380,9 @@ async fn download_archives_nxm(
     let overall_pb = multi_progress.add(ProgressBar::new(total_nexus as u64));
     overall_pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} | {msg}")
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} | {msg}",
+            )
             .unwrap()
             .progress_chars("=>-"),
     );
@@ -1088,7 +1405,8 @@ async fn download_archives_nxm(
     let mut nxm_completed = 0usize; // tracks completed for progress callbacks
 
     // Channel for background download tasks to report results: (hash, name, path, result)
-    let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel::<(String, String, PathBuf, Result<()>)>();
+    let (result_tx, mut result_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, String, PathBuf, Result<()>)>();
 
     let open_tab = |pending: &NexusPending, browser: &str| {
         let domain = NexusDownloader::game_domain(&pending.nexus_state.game_name);
@@ -1097,9 +1415,7 @@ async fn download_archives_nxm(
             pending.nexus_state.mod_id,
             pending.nexus_state.file_id,
         );
-        let _ = std::process::Command::new(browser)
-            .arg(&url)
-            .spawn();
+        let _ = std::process::Command::new(browser).arg(&url).spawn();
     };
 
     // Open the first tab
@@ -1294,8 +1610,7 @@ async fn download_archives_nxm(
     let limits = nexus.rate_limits();
     println!(
         "\nNexus API: {}/{} hourly, {}/{} daily",
-        limits.hourly_remaining, limits.hourly_limit,
-        limits.daily_remaining, limits.daily_limit
+        limits.hourly_remaining, limits.hourly_limit, limits.daily_remaining, limits.daily_limit
     );
 
     // Print summary

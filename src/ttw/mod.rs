@@ -109,7 +109,10 @@ pub fn precheck_ttw(modlist: &crate::modlist::Modlist) -> TtwPrecheck {
     // Build user message
     let mut message = String::from("⚠️  This modlist requires Tale of Two Wastelands (TTW)\n\n");
 
-    message.push_str(&format!("Detected via: {}\n\n", ttw_result.markers_found.join(", ")));
+    message.push_str(&format!(
+        "Detected via: {}\n\n",
+        ttw_result.markers_found.join(", ")
+    ));
 
     if let Some(ref path) = fo3_detected {
         message.push_str(&format!("✓ Fallout 3 found: {}\n", path.display()));
@@ -170,10 +173,7 @@ pub fn find_fallout_nv(games: &GameScanResult) -> Option<PathBuf> {
 }
 
 /// Expected TTW output files that should exist after installation
-const TTW_EXPECTED_FILES: &[&str] = &[
-    "TaleOfTwoWastelands.esm",
-    "TaleOfTwoWastelands - Main.bsa",
-];
+const TTW_EXPECTED_FILES: &[&str] = &["TaleOfTwoWastelands.esm", "TaleOfTwoWastelands - Main.bsa"];
 
 /// Verify that a TTW output directory contains valid TTW files
 pub fn verify_ttw_output(path: &Path) -> bool {
@@ -248,8 +248,12 @@ pub fn install_ttw(
     }
 
     // Create destination directory
-    fs::create_dir_all(&dest_path)
-        .with_context(|| format!("Failed to create TTW output directory: {}", dest_path.display()))?;
+    fs::create_dir_all(&dest_path).with_context(|| {
+        format!(
+            "Failed to create TTW output directory: {}",
+            dest_path.display()
+        )
+    })?;
 
     // Find installer binary
     let installer = find_ttw_installer(installer_path)?;
@@ -258,8 +262,14 @@ pub fn install_ttw(
     // Run the installer
     // Command: mpi_installer install --mpi <path> --fo3 <path> --fnv <path> --dest <path>
     info!("Running TTW installer:");
-    info!("  {} install --mpi {} --fo3 {} --fnv {} --dest {}",
-        installer.display(), mpi_path.display(), fo3_path.display(), fnv_path.display(), dest_path.display());
+    info!(
+        "  {} install --mpi {} --fo3 {} --fnv {} --dest {}",
+        installer.display(),
+        mpi_path.display(),
+        fo3_path.display(),
+        fnv_path.display(),
+        dest_path.display()
+    );
 
     let output = Command::new(&installer)
         .arg("install")
@@ -364,8 +374,12 @@ where
     }
 
     // Create destination directory
-    fs::create_dir_all(&dest_path)
-        .with_context(|| format!("Failed to create TTW output directory: {}", dest_path.display()))?;
+    fs::create_dir_all(&dest_path).with_context(|| {
+        format!(
+            "Failed to create TTW output directory: {}",
+            dest_path.display()
+        )
+    })?;
 
     // Find installer binary
     let installer = find_ttw_installer(installer_path)?;
@@ -375,8 +389,14 @@ where
 
     // Run the installer with piped stdout/stderr for real-time streaming
     info!("Running TTW installer:");
-    info!("  {} install --mpi {} --fo3 {} --fnv {} --dest {}",
-        installer.display(), mpi_path.display(), fo3_path.display(), fnv_path.display(), dest_path.display());
+    info!(
+        "  {} install --mpi {} --fo3 {} --fnv {} --dest {}",
+        installer.display(),
+        mpi_path.display(),
+        fo3_path.display(),
+        fnv_path.display(),
+        dest_path.display()
+    );
 
     let mut child = Command::new(&installer)
         .arg("install")
@@ -407,13 +427,20 @@ where
                     info!("[TTW] {}", trimmed);
                     // Parse progress from TTW installer output
                     // Format: "[HH:MM:SS] Assets: X/Y - BSA N/M: ..."
-                    if trimmed.contains("Assets:") || trimmed.contains("Writing BSA")
-                        || trimmed.contains("Installation complete") || trimmed.contains("Processing")
-                        || trimmed.contains("Extracting") || trimmed.contains("checks passed")
+                    if trimmed.contains("Assets:")
+                        || trimmed.contains("Writing BSA")
+                        || trimmed.contains("Installation complete")
+                        || trimmed.contains("Processing")
+                        || trimmed.contains("Extracting")
+                        || trimmed.contains("checks passed")
                     {
                         // Extract just the message part (after timestamp)
                         let msg = if trimmed.starts_with('[') {
-                            trimmed.find(']').map(|i| &trimmed[i+1..]).unwrap_or(trimmed).trim()
+                            trimmed
+                                .find(']')
+                                .map(|i| &trimmed[i + 1..])
+                                .unwrap_or(trimmed)
+                                .trim()
                         } else {
                             trimmed
                         };
@@ -439,8 +466,7 @@ where
     }
 
     // Wait for process to complete
-    let status = child.wait()
-        .context("Failed to wait for TTW installer")?;
+    let status = child.wait().context("Failed to wait for TTW installer")?;
 
     if !status.success() {
         bail!("TTW installer failed with exit code {:?}", status.code());
@@ -472,7 +498,10 @@ fn find_ttw_installer(explicit_path: Option<&Path>) -> Result<PathBuf> {
         if path.exists() {
             return Ok(path.to_path_buf());
         }
-        bail!("TTW installer not found at specified path: {}", path.display());
+        bail!(
+            "TTW installer not found at specified path: {}",
+            path.display()
+        );
     }
 
     // Check common locations first
@@ -480,9 +509,9 @@ fn find_ttw_installer(explicit_path: Option<&Path>) -> Result<PathBuf> {
         // In PATH
         which::which(TTW_INSTALLER_BINARY).ok(),
         // Relative to clf3
-        std::env::current_exe().ok().and_then(|p| {
-            p.parent().map(|d| d.join(TTW_INSTALLER_BINARY))
-        }),
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join(TTW_INSTALLER_BINARY))),
         // Home directory
         dirs::home_dir().map(|h| h.join(".local/bin").join(TTW_INSTALLER_BINARY)),
         // Common install location
@@ -526,7 +555,8 @@ fn download_ttw_installer() -> Result<PathBuf> {
         .build()
         .context("Failed to create HTTP client")?;
 
-    let response = client.get(&api_url)
+    let response = client
+        .get(&api_url)
         .send()
         .context("Failed to fetch GitHub release info")?;
 
@@ -534,30 +564,37 @@ fn download_ttw_installer() -> Result<PathBuf> {
         bail!("GitHub API returned error: {}", response.status());
     }
 
-    let release: serde_json::Value = response.json()
+    let release: serde_json::Value = response
+        .json()
         .context("Failed to parse GitHub release JSON")?;
 
     // Find the Linux asset (it's a zip file)
-    let assets = release["assets"].as_array()
+    let assets = release["assets"]
+        .as_array()
         .context("No assets in release")?;
 
-    let linux_asset = assets.iter()
+    let linux_asset = assets
+        .iter()
         .find(|a| {
             let name = a["name"].as_str().unwrap_or("");
             name.contains("linux") && name.ends_with(".zip")
         })
         .context("No Linux zip found in release assets")?;
 
-    let download_url = linux_asset["browser_download_url"].as_str()
+    let download_url = linux_asset["browser_download_url"]
+        .as_str()
         .context("No download URL for asset")?;
-    let asset_name = linux_asset["name"].as_str().unwrap_or("mpi-installer-linux.zip");
+    let asset_name = linux_asset["name"]
+        .as_str()
+        .unwrap_or("mpi-installer-linux.zip");
 
     info!("Downloading {} from: {}", asset_name, download_url);
 
     // Download to a temp file
     let temp_zip = cache_path.with_extension("zip");
 
-    let mut response = client.get(download_url)
+    let mut response = client
+        .get(download_url)
         .send()
         .context("Failed to download TTW installer")?;
 
@@ -570,8 +607,7 @@ fn download_ttw_installer() -> Result<PathBuf> {
         let mut file = fs::File::create(&temp_zip)
             .with_context(|| format!("Failed to create temp file: {}", temp_zip.display()))?;
 
-        std::io::copy(&mut response, &mut file)
-            .context("Failed to write TTW installer zip")?;
+        std::io::copy(&mut response, &mut file).context("Failed to write TTW installer zip")?;
 
         file.sync_all().context("Failed to sync file")?;
     }
@@ -579,10 +615,8 @@ fn download_ttw_installer() -> Result<PathBuf> {
     info!("Downloaded zip to: {}", temp_zip.display());
 
     // Extract the binary from the ZIP
-    let zip_file = fs::File::open(&temp_zip)
-        .context("Failed to open downloaded zip")?;
-    let mut archive = zip::ZipArchive::new(zip_file)
-        .context("Failed to read zip archive")?;
+    let zip_file = fs::File::open(&temp_zip).context("Failed to open downloaded zip")?;
+    let mut archive = zip::ZipArchive::new(zip_file).context("Failed to read zip archive")?;
 
     // Extract both mpi_installer and tools/xdelta3
     let cache_dir = cache_path.parent().unwrap();
@@ -646,9 +680,7 @@ fn download_ttw_installer() -> Result<PathBuf> {
     info!("TTW installer extracted to: {}", cache_path.display());
 
     // Verify the download is valid (try to run --version or --help)
-    let check = Command::new(&cache_path)
-        .arg("--version")
-        .output();
+    let check = Command::new(&cache_path).arg("--version").output();
 
     match check {
         Ok(output) if output.status.success() => {
@@ -657,11 +689,12 @@ fn download_ttw_installer() -> Result<PathBuf> {
         }
         Ok(output) => {
             // --version might not be supported, try --help
-            let help_check = Command::new(&cache_path)
-                .arg("--help")
-                .output();
+            let help_check = Command::new(&cache_path).arg("--help").output();
             if help_check.is_err() {
-                warn!("Could not verify TTW installer (exit code: {:?})", output.status.code());
+                warn!(
+                    "Could not verify TTW installer (exit code: {:?})",
+                    output.status.code()
+                );
             }
         }
         Err(e) => {
@@ -787,7 +820,10 @@ pub fn add_ttw_to_modlist(install_dir: &Path, profile_name: &str) -> Result<()> 
     fs::write(&modlist_path, new_content)
         .with_context(|| format!("Failed to write modlist: {}", modlist_path.display()))?;
 
-    info!("Added +{} to modlist (at bottom for highest priority)", TTW_MOD_NAME);
+    info!(
+        "Added +{} to modlist (at bottom for highest priority)",
+        TTW_MOD_NAME
+    );
     Ok(())
 }
 
@@ -804,11 +840,17 @@ pub fn finalize_ttw(
         bail!("TTW is not required for this modlist");
     }
 
-    let mpi_path = precheck.mpi_path.as_ref()
+    let mpi_path = precheck
+        .mpi_path
+        .as_ref()
         .context("MPI path not provided")?;
-    let fo3_path = precheck.fo3_detected.as_ref()
+    let fo3_path = precheck
+        .fo3_detected
+        .as_ref()
         .context("Fallout 3 path not detected")?;
-    let fnv_path = precheck.fnv_detected.as_ref()
+    let fnv_path = precheck
+        .fnv_detected
+        .as_ref()
         .context("Fallout New Vegas path not detected")?;
 
     // Install TTW
@@ -905,7 +947,14 @@ where
     }
 
     // Install TTW with progress streaming
-    let ttw_path = install_ttw_with_progress(mpi_path, fo3_path, fnv_path, install_dir, None, progress_callback)?;
+    let ttw_path = install_ttw_with_progress(
+        mpi_path,
+        fo3_path,
+        fnv_path,
+        install_dir,
+        None,
+        progress_callback,
+    )?;
 
     // Add to modlist - find the first profile with a modlist.txt
     let profiles_dir = install_dir.join("profiles");
@@ -1020,14 +1069,14 @@ mod tests {
             is_nsfw: false,
             archives: vec![],
             // Add a directive that references TTW
-            directives: vec![
-                crate::modlist::Directive::InlineFile(crate::modlist::InlineFileDirective {
+            directives: vec![crate::modlist::Directive::InlineFile(
+                crate::modlist::InlineFileDirective {
                     to: "mods/TTW Patch/TaleOfTwoWastelands.esm".to_string(),
                     hash: "abc".to_string(),
                     size: 100,
                     source_data_id: uuid::Uuid::new_v4(),
-                }),
-            ],
+                },
+            )],
         };
 
         let precheck = precheck_ttw(&modlist);

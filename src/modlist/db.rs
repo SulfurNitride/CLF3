@@ -74,7 +74,7 @@ impl ModlistDb {
              PRAGMA synchronous = NORMAL;
              PRAGMA cache_size = 10000;
              PRAGMA temp_store = MEMORY;
-             PRAGMA mmap_size = 268435456;"
+             PRAGMA mmap_size = 268435456;",
         );
 
         if wal_result.is_err() {
@@ -87,8 +87,14 @@ impl ModlistDb {
                  PRAGMA synchronous = NORMAL;
                  PRAGMA cache_size = 10000;
                  PRAGMA temp_store = MEMORY;
-                 PRAGMA busy_timeout = 5000;"
-            ).with_context(|| format!("Failed to configure SQLite pragmas for {}", db_path.display()))?;
+                 PRAGMA busy_timeout = 5000;",
+            )
+            .with_context(|| {
+                format!(
+                    "Failed to configure SQLite pragmas for {}",
+                    db_path.display()
+                )
+            })?;
         }
 
         let db = Self { conn };
@@ -99,8 +105,7 @@ impl ModlistDb {
 
     /// Create an in-memory database (for testing)
     pub fn in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()
-            .context("Failed to create in-memory database")?;
+        let conn = Connection::open_in_memory().context("Failed to create in-memory database")?;
 
         let db = Self { conn };
         db.create_tables()?;
@@ -187,9 +192,9 @@ impl ModlistDb {
 
     /// Get modlist metadata
     pub fn get_metadata(&self, key: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT value FROM metadata WHERE key = ?1"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT value FROM metadata WHERE key = ?1")?;
 
         let result = stmt.query_row([key], |row| row.get(0));
 
@@ -202,11 +207,13 @@ impl ModlistDb {
 
     /// Clear all data from the database (for re-import when wabbajack file changes)
     pub fn clear_all_data(&mut self) -> Result<()> {
-        self.conn.execute_batch(
-            "DELETE FROM directives;
+        self.conn
+            .execute_batch(
+                "DELETE FROM directives;
              DELETE FROM archives;
-             DELETE FROM metadata;"
-        ).context("Failed to clear database")?;
+             DELETE FROM metadata;",
+            )
+            .context("Failed to clear database")?;
         Ok(())
     }
 
@@ -246,7 +253,7 @@ impl ModlistDb {
         {
             let mut stmt = tx.prepare(
                 "INSERT OR REPLACE INTO archives (hash, name, size, meta, state_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5)"
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
 
             for archive in &modlist.archives {
@@ -313,9 +320,9 @@ impl ModlistDb {
 
     /// Get directive counts by status
     pub fn get_directive_stats(&self) -> Result<DirectiveStats> {
-        let mut stmt = self.conn.prepare(
-            "SELECT status, COUNT(*) FROM directives GROUP BY status"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT status, COUNT(*) FROM directives GROUP BY status")?;
 
         let mut stats = DirectiveStats::default();
         let rows = stmt.query_map([], |row| {
@@ -355,11 +362,15 @@ impl ModlistDb {
     }
 
     /// Get pending directives of a specific type (limited)
-    pub fn get_pending_directives(&self, directive_type: &str, limit: usize) -> Result<Vec<(i64, String)>> {
+    pub fn get_pending_directives(
+        &self,
+        directive_type: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, data_json FROM directives
              WHERE directive_type = ?1 AND status = 'pending'
-             LIMIT ?2"
+             LIMIT ?2",
         )?;
 
         let rows = stmt.query_map(params![directive_type, limit as i64], |row| {
@@ -374,10 +385,13 @@ impl ModlistDb {
     }
 
     /// Get ALL pending directives of a specific type (no limit)
-    pub fn get_all_pending_directives_of_type(&self, directive_type: &str) -> Result<Vec<(i64, String)>> {
+    pub fn get_all_pending_directives_of_type(
+        &self,
+        directive_type: &str,
+    ) -> Result<Vec<(i64, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, data_json FROM directives
-             WHERE directive_type = ?1 AND status = 'pending'"
+             WHERE directive_type = ?1 AND status = 'pending'",
         )?;
 
         let rows = stmt.query_map([directive_type], |row| {
@@ -394,12 +408,10 @@ impl ModlistDb {
     /// Get all output paths from all directives (for cleanup)
     pub fn get_all_output_paths(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT to_path FROM directives WHERE to_path IS NOT NULL AND to_path != ''"
+            "SELECT to_path FROM directives WHERE to_path IS NOT NULL AND to_path != ''",
         )?;
 
-        let rows = stmt.query_map([], |row| {
-            row.get::<_, String>(0)
-        })?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -412,7 +424,7 @@ impl ModlistDb {
     pub fn get_directives_for_archive(&self, archive_hash: &str) -> Result<Vec<(i64, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, data_json FROM directives
-             WHERE archive_hash = ?1 AND status = 'pending'"
+             WHERE archive_hash = ?1 AND status = 'pending'",
         )?;
 
         let rows = stmt.query_map([archive_hash], |row| {
@@ -471,7 +483,7 @@ impl ModlistDb {
         let mut stmt = self.conn.prepare(
             "SELECT id, to_path, size, archive_hash FROM directives
              WHERE directive_type = ?1 AND status = 'completed'
-             AND to_path IS NOT NULL AND to_path != ''"
+             AND to_path IS NOT NULL AND to_path != ''",
         )?;
 
         let rows = stmt.query_map([directive_type], |row| {
@@ -505,7 +517,7 @@ impl ModlistDb {
     pub fn get_all_expected_output_paths(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT to_path FROM directives
-             WHERE to_path IS NOT NULL AND to_path != ''"
+             WHERE to_path IS NOT NULL AND to_path != ''",
         )?;
 
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -691,9 +703,9 @@ impl ModlistDb {
 
     /// Get extraction status for an archive
     pub fn get_archive_extraction_status(&self, hash: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT extraction_status FROM archives WHERE hash = ?1"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT extraction_status FROM archives WHERE hash = ?1")?;
 
         match stmt.query_row([hash], |row| row.get::<_, String>(0)) {
             Ok(status) => Ok(Some(status)),
@@ -737,7 +749,7 @@ impl ModlistDb {
     /// Get count of archives by extraction status
     pub fn get_extraction_status_counts(&self) -> Result<(usize, usize, usize, usize)> {
         let mut stmt = self.conn.prepare(
-            "SELECT extraction_status, COUNT(*) FROM archives GROUP BY extraction_status"
+            "SELECT extraction_status, COUNT(*) FROM archives GROUP BY extraction_status",
         )?;
 
         let rows = stmt.query_map([], |row| {
@@ -817,7 +829,11 @@ impl ModlistDb {
     }
 
     /// Insert archive file listings (batch)
-    pub fn index_archive_files(&self, archive_hash: &str, files: &[ArchiveFileEntry]) -> Result<()> {
+    pub fn index_archive_files(
+        &self,
+        archive_hash: &str,
+        files: &[ArchiveFileEntry],
+    ) -> Result<()> {
         // Clear existing entries for this archive
         self.conn.execute(
             "DELETE FROM archive_files WHERE archive_hash = ?1",
@@ -830,7 +846,12 @@ impl ModlistDb {
 
         for entry in files {
             let normalized = normalize_path(&entry.file_path);
-            stmt.execute(params![archive_hash, entry.file_path, normalized, entry.file_size as i64])?;
+            stmt.execute(params![
+                archive_hash,
+                entry.file_path,
+                normalized,
+                entry.file_size as i64
+            ])?;
         }
 
         Ok(())
@@ -878,7 +899,11 @@ impl ModlistDb {
             "SELECT file_path FROM archive_files
              WHERE archive_hash = ?1 AND file_size = ?2
              AND LOWER(file_path) LIKE ?3",
-            params![archive_hash, expected_size as i64, format!("%{}", normalized_filename)],
+            params![
+                archive_hash,
+                expected_size as i64,
+                format!("%{}", normalized_filename)
+            ],
             |row| row.get(0),
         );
 
@@ -915,7 +940,7 @@ impl ModlistDb {
     pub fn get_directive_outputs_with_archives(&self) -> Result<Vec<(String, i64, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT to_path, size, archive_hash FROM directives
-             WHERE archive_hash IS NOT NULL AND archive_hash != ''"
+             WHERE archive_hash IS NOT NULL AND archive_hash != ''",
         )?;
 
         let rows = stmt.query_map([], |row| {

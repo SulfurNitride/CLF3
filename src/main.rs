@@ -24,7 +24,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 #[command(name = "clf3")]
 #[command(author = "CLF3 Team")]
 #[command(version)]
-#[command(about = "Wabbajack modlist installer - burns through modlists like CLF3 burns through concrete")]
+#[command(
+    about = "Wabbajack modlist installer - burns through modlists like CLF3 burns through concrete"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -145,8 +147,11 @@ async fn main() -> Result<()> {
 
     // Create filter - file gets info level, console follows user preference
     let file_filter = EnvFilter::new("clf3=info,warn");
-    let console_filter = EnvFilter::from_default_env()
-        .add_directive(if cli.verbose { "clf3=debug".parse()? } else { "clf3=warn".parse()? });
+    let console_filter = EnvFilter::from_default_env().add_directive(if cli.verbose {
+        "clf3=debug".parse()?
+    } else {
+        "clf3=warn".parse()?
+    });
 
     // File layer (always enabled)
     let file_layer = tracing_subscriber::fmt::layer()
@@ -156,20 +161,20 @@ async fn main() -> Result<()> {
 
     // Console layer (only if verbose or RUST_LOG is set)
     if cli.verbose || std::env::var("RUST_LOG").is_ok() {
-        let console_layer = tracing_subscriber::fmt::layer()
-            .with_filter(console_filter);
+        let console_layer = tracing_subscriber::fmt::layer().with_filter(console_filter);
 
         tracing_subscriber::registry()
             .with(file_layer)
             .with(console_layer)
             .init();
     } else {
-        tracing_subscriber::registry()
-            .with(file_layer)
-            .init();
+        tracing_subscriber::registry().with(file_layer).init();
     }
 
-    tracing::info!("CLF3 started, logging to {}", log_dir.join(&log_filename).display());
+    tracing::info!(
+        "CLF3 started, logging to {}",
+        log_dir.join(&log_filename).display()
+    );
 
     match cli.command {
         None => {
@@ -217,12 +222,23 @@ async fn main() -> Result<()> {
             // Processes archives in batches: ZIP (fastest) -> RAR -> 7z (slowest)
             let stats = installer.run_streaming(8, 8).await?;
 
-            let total_processed = stats.directives_completed + stats.directives_skipped + stats.directives_failed;
+            let total_processed =
+                stats.directives_completed + stats.directives_skipped + stats.directives_failed;
             println!("\n=== Installation Summary ===");
-            println!("Downloads:  {} downloaded, {} skipped, {} manual, {} failed",
-                stats.archives_downloaded, stats.archives_skipped, stats.archives_manual, stats.archives_failed);
-            println!("Directives: {} new, {} existing, {} failed ({} total)",
-                stats.directives_completed, stats.directives_skipped, stats.directives_failed, total_processed);
+            println!(
+                "Downloads:  {} downloaded, {} skipped, {} manual, {} failed",
+                stats.archives_downloaded,
+                stats.archives_skipped,
+                stats.archives_manual,
+                stats.archives_failed
+            );
+            println!(
+                "Directives: {} new, {} existing, {} failed ({} total)",
+                stats.directives_completed,
+                stats.directives_skipped,
+                stats.directives_failed,
+                total_processed
+            );
 
             if stats.archives_manual > 0 || stats.archives_failed > 0 {
                 println!("\nSome archives need manual download. Fix issues and run again.");
@@ -290,7 +306,10 @@ async fn main() -> Result<()> {
             println!("Version:           {}", modlist.version);
             println!("Game:              {}", modlist.game_type);
             println!("Wabbajack Version: {}", modlist.wabbajack_version);
-            println!("NSFW:              {}", if modlist.is_nsfw { "Yes" } else { "No" });
+            println!(
+                "NSFW:              {}",
+                if modlist.is_nsfw { "Yes" } else { "No" }
+            );
             println!();
             println!("Archives:          {}", modlist.archives.len());
             println!("Directives:        {}", modlist.directives.len());

@@ -41,7 +41,8 @@ pub fn get_all_gpu_names() -> Vec<String> {
         ..Default::default()
     });
 
-    let adapters: Vec<wgpu::Adapter> = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN));
+    let adapters: Vec<wgpu::Adapter> =
+        pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN));
 
     adapters
         .into_iter()

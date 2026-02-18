@@ -4,13 +4,12 @@
 
 use anyhow::{bail, Context, Result};
 use ba2::fo4::{
-    Archive, ArchiveKey, ArchiveOptionsBuilder,
-    Chunk, ChunkCompressionOptions, File as Ba2File,
-    FileReadOptionsBuilder, Format, CompressionFormat as Ba2CrateCompression,
-    CompressionLevel, Version,
+    Archive, ArchiveKey, ArchiveOptionsBuilder, Chunk, ChunkCompressionOptions,
+    CompressionFormat as Ba2CrateCompression, CompressionLevel, File as Ba2File,
+    FileReadOptionsBuilder, Format, Version,
 };
 use ba2::prelude::*;
-use ba2::{Copied, CompressionResult};
+use ba2::{CompressionResult, Copied};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs;
@@ -332,7 +331,11 @@ impl Ba2Builder {
             .write(&mut writer, &options)
             .with_context(|| format!("Failed to write BA2: {}", output_path.display()))?;
 
-        info!("Created DX10 BA2: {} ({} files)", output_path.display(), file_count);
+        info!(
+            "Created DX10 BA2: {} ({} files)",
+            output_path.display(),
+            file_count
+        );
         Ok(())
     }
 }
@@ -362,8 +365,7 @@ mod tests {
         let dir = tempdir()?;
         let output = dir.path().join("test.ba2");
 
-        let mut builder = Ba2Builder::new()
-            .with_compression(Ba2CompressionFormat::None);
+        let mut builder = Ba2Builder::new().with_compression(Ba2CompressionFormat::None);
         builder.add_file("test/hello.txt", b"Hello world!".to_vec());
         builder.add_file("test/sub/world.txt", b"World!".to_vec());
 
@@ -373,8 +375,8 @@ mod tests {
         assert!(output.exists());
 
         // Try to read it back using the path
-        let (archive, _) = Archive::read(output.as_path())
-            .with_context(|| "Failed to read created BA2")?;
+        let (archive, _) =
+            Archive::read(output.as_path()).with_context(|| "Failed to read created BA2")?;
 
         assert_eq!(archive.len(), 2);
 

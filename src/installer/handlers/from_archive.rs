@@ -26,16 +26,20 @@ pub enum ArchiveType {
     Zip,
     SevenZ,
     Rar,
-    Tes3Bsa,  // Morrowind BSA
-    Bsa,      // TES4+ BSA (Oblivion, FO3, FNV, Skyrim)
+    Tes3Bsa, // Morrowind BSA
+    Bsa,     // TES4+ BSA (Oblivion, FO3, FNV, Skyrim)
     Ba2,
     Unknown,
 }
 
 /// Detect archive type by reading magic bytes
 pub fn detect_archive_type(path: &Path) -> Result<ArchiveType> {
-    let mut file = File::open(path)
-        .with_context(|| format!("Failed to open file for magic detection: {}", path.display()))?;
+    let mut file = File::open(path).with_context(|| {
+        format!(
+            "Failed to open file for magic detection: {}",
+            path.display()
+        )
+    })?;
 
     let mut magic = [0u8; 8];
     let bytes_read = file.read(&mut magic).unwrap_or(0);
@@ -103,20 +107,37 @@ pub fn handle_from_archive(ctx: &ProcessContext, directive: &FromArchiveDirectiv
         if let Some(cached) = ctx.get_cached_file(archive_hash, path_in_archive) {
             cached
         } else {
-            extract_from_archive_with_temp(archive_path, path_in_archive, &ctx.config.downloads_dir)?
+            extract_from_archive_with_temp(
+                archive_path,
+                path_in_archive,
+                &ctx.config.downloads_dir,
+            )?
         }
     } else {
         // Nested extraction: file is inside a BSA within the archive - try cache first
         let bsa_path_in_archive = &directive.archive_hash_path[1];
         let file_path_in_bsa = &directive.archive_hash_path[2];
-        if let Some(cached) = ctx.get_cached_nested_bsa_file(archive_hash, bsa_path_in_archive, file_path_in_bsa) {
+        if let Some(cached) =
+            ctx.get_cached_nested_bsa_file(archive_hash, bsa_path_in_archive, file_path_in_bsa)
+        {
             cached
-        } else if let Some(bsa_disk_path) = ctx.get_cached_bsa_path(archive_hash, bsa_path_in_archive) {
+        } else if let Some(bsa_disk_path) =
+            ctx.get_cached_bsa_path(archive_hash, bsa_path_in_archive)
+        {
             // BSA is in working folder - extract directly from it
-            bsa::extract_archive_file(&bsa_disk_path, file_path_in_bsa)
-                .with_context(|| format!("Failed to extract '{}' from BSA '{}'", file_path_in_bsa, bsa_path_in_archive))?
+            bsa::extract_archive_file(&bsa_disk_path, file_path_in_bsa).with_context(|| {
+                format!(
+                    "Failed to extract '{}' from BSA '{}'",
+                    file_path_in_bsa, bsa_path_in_archive
+                )
+            })?
         } else {
-            extract_nested_bsa(archive_path, bsa_path_in_archive, file_path_in_bsa, &ctx.config.downloads_dir)?
+            extract_nested_bsa(
+                archive_path,
+                bsa_path_in_archive,
+                file_path_in_bsa,
+                &ctx.config.downloads_dir,
+            )?
         }
     };
 
@@ -146,7 +167,11 @@ pub fn handle_from_archive(ctx: &ProcessContext, directive: &FromArchiveDirectiv
 ///
 /// Archive format is detected by magic bytes, NOT file extension, to handle
 /// mislabeled archives (e.g., `.zip` files that are actually RAR).
-pub fn extract_from_archive_with_temp(archive_path: &Path, file_path: &str, temp_base_dir: &Path) -> Result<Vec<u8>> {
+pub fn extract_from_archive_with_temp(
+    archive_path: &Path,
+    file_path: &str,
+    temp_base_dir: &Path,
+) -> Result<Vec<u8>> {
     // Detect archive type by magic bytes, not extension
     let archive_type = detect_archive_type(archive_path)?;
 
@@ -194,8 +219,8 @@ fn extract_with_7z(archive_path: &Path, file_path: &str, temp_base_dir: &Path) -
     }
 
     // Full extraction fallback - extract to temp and find the file
-    let temp_dir = tempfile::tempdir_in(temp_base_dir)
-        .context("Failed to create temp directory")?;
+    let temp_dir =
+        tempfile::tempdir_in(temp_base_dir).context("Failed to create temp directory")?;
 
     sevenzip::extract_all(archive_path, temp_dir.path())
         .with_context(|| format!("Failed to extract archive: {}", archive_path.display()))?;
@@ -208,14 +233,16 @@ fn extract_with_7z(archive_path: &Path, file_path: &str, temp_base_dir: &Path) -
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
     {
-        let rel_path = entry.path()
+        let rel_path = entry
+            .path()
             .strip_prefix(temp_dir.path())
             .unwrap_or(entry.path());
         let entry_normalized = paths::normalize_for_lookup(&rel_path.to_string_lossy());
 
         if entry_normalized == target_normalized {
-            return fs::read(entry.path())
-                .with_context(|| format!("Failed to read extracted file: {}", entry.path().display()));
+            return fs::read(entry.path()).with_context(|| {
+                format!("Failed to read extracted file: {}", entry.path().display())
+            });
         }
     }
 
@@ -329,9 +356,9 @@ mod tests {
         // TES3 (Morrowind) BSA files start with version 0x100 (256)
         // Header: version (4), hash_offset (4), file_count (4)
         let bsa_data = [
-            0x00, 0x01, 0x00, 0x00,  // Version 0x100 (little-endian)
-            0x0C, 0x00, 0x00, 0x00,  // Hash offset (12 = header size for empty archive)
-            0x00, 0x00, 0x00, 0x00,  // File count (0)
+            0x00, 0x01, 0x00, 0x00, // Version 0x100 (little-endian)
+            0x0C, 0x00, 0x00, 0x00, // Hash offset (12 = header size for empty archive)
+            0x00, 0x00, 0x00, 0x00, // File count (0)
         ];
         fs::write(&bsa_path, &bsa_data)?;
 

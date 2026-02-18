@@ -30,9 +30,13 @@ anyhow = "1.0"
 thiserror = "2.0"
 
 # Compression/Archives
-# Note: zip crate is required for reading .wabbajack files (which are ZIP archives)
-# 7z binary is used for mod archive extraction (ZIP, 7z, RAR)
+# zip: reading .wabbajack files + native ZIP extraction
+# sevenz-rust2: native 7z extraction (pure Rust, multi-threaded LZMA2)
+# unrar: native RAR extraction (FFI to unrar library)
+# 7z binary used as fallback for RAR if needed
 zip = "7.2"
+sevenz-rust2 = "0.20"
+unrar = "0.5"
 flate2 = "1.1"
 tar = "0.4"
 

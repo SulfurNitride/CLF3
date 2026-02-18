@@ -84,7 +84,9 @@ fn read_command<R: Read>(reader: &mut R) -> Result<Option<Command>> {
         }
         CMD_WRITE => {
             let mut buf = [0u8; 8];
-            reader.read_exact(&mut buf).context("reading write length")?;
+            reader
+                .read_exact(&mut buf)
+                .context("reading write length")?;
             let length = i64::from_le_bytes(buf);
             Ok(Some(Command::Write {
                 length: length as usize,
@@ -121,8 +123,7 @@ impl<B: Read + Seek, D: Read + Seek> DeltaReader<B, D> {
     /// - `delta`: The delta/patch file
     pub fn new(basis: B, mut delta: D) -> Result<Self> {
         // Read and validate header
-        let header = Header::read(&mut delta)
-            .context("reading OctoDiff header")?;
+        let header = Header::read(&mut delta).context("reading OctoDiff header")?;
 
         if header.version != 0x01 {
             bail!("unsupported OctoDiff version: {}", header.version);
@@ -217,13 +218,13 @@ mod tests {
     fn test_header_parsing() {
         // Minimal valid OctoDiff header
         let mut data = Vec::new();
-        data.extend_from_slice(MAGIC);           // Magic
-        data.push(0x01);                          // Version
-        data.push(4);                             // Hash algo name length
-        data.extend_from_slice(b"SHA1");          // Hash algo name
+        data.extend_from_slice(MAGIC); // Magic
+        data.push(0x01); // Version
+        data.push(4); // Hash algo name length
+        data.extend_from_slice(b"SHA1"); // Hash algo name
         data.extend_from_slice(&20i32.to_le_bytes()); // Hash length
-        data.extend_from_slice(&[0u8; 20]);       // Hash (zeros)
-        data.extend_from_slice(END_MARKER);       // End marker
+        data.extend_from_slice(&[0u8; 20]); // Hash (zeros)
+        data.extend_from_slice(END_MARKER); // End marker
 
         let header = Header::read(&mut Cursor::new(&data)).unwrap();
         assert_eq!(header.version, 0x01);

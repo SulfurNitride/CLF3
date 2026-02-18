@@ -5,14 +5,14 @@
 //! - Parsing the modlist JSON
 //! - Storing directives in SQLite for efficient access
 
-mod types;
-mod db;
 pub mod browser;
+mod db;
+mod types;
 
-pub use types::*;
-pub use db::*;
 #[allow(unused_imports)] // Used by lib crate (GUI)
 pub use browser::*;
+pub use db::*;
+pub use types::*;
 
 use anyhow::{Context, Result};
 use std::fs::{self, File};
@@ -28,8 +28,13 @@ fn calculate_file_fingerprint(path: &Path) -> Result<String> {
         .with_context(|| format!("Cannot read metadata for {}", path.display()))?;
 
     let size = metadata.len();
-    let mtime = metadata.modified()
-        .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
+    let mtime = metadata
+        .modified()
+        .map(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        })
         .unwrap_or(0);
 
     Ok(format!("{}:{}", size, mtime))
@@ -39,28 +44,28 @@ fn calculate_file_fingerprint(path: &Path) -> Result<String> {
 pub fn parse_wabbajack_file(path: &Path) -> Result<Modlist> {
     info!("Opening wabbajack file: {}", path.display());
 
-    let file = File::open(path)
-        .with_context(|| format!("Failed to open: {}", path.display()))?;
+    let file = File::open(path).with_context(|| format!("Failed to open: {}", path.display()))?;
 
     let reader = BufReader::new(file);
-    let mut archive = ZipArchive::new(reader)
-        .context("Failed to read as ZIP archive")?;
+    let mut archive = ZipArchive::new(reader).context("Failed to read as ZIP archive")?;
 
     info!("Archive contains {} files", archive.len());
 
     // Find and read the modlist file
-    let mut modlist_file = archive.by_name("modlist")
+    let mut modlist_file = archive
+        .by_name("modlist")
         .context("No 'modlist' file found in archive")?;
 
     let mut json_data = String::new();
-    modlist_file.read_to_string(&mut json_data)
+    modlist_file
+        .read_to_string(&mut json_data)
         .context("Failed to read modlist JSON")?;
 
     info!("Read {} bytes of JSON", json_data.len());
 
     // Parse the JSON
-    let modlist: Modlist = serde_json::from_str(&json_data)
-        .context("Failed to parse modlist JSON")?;
+    let modlist: Modlist =
+        serde_json::from_str(&json_data).context("Failed to parse modlist JSON")?;
 
     info!(
         "Parsed modlist '{}' v{} - {} archives, {} directives",
@@ -102,7 +107,10 @@ pub fn import_wabbajack_to_db(wabbajack_path: &Path, db_path: &Path) -> Result<M
             // This can happen if a previous import crashed before setting fingerprint
             let stats = db.get_directive_stats()?;
             if stats.total > 0 {
-                info!("Clearing orphaned data from incomplete previous import ({} directives)", stats.total);
+                info!(
+                    "Clearing orphaned data from incomplete previous import ({} directives)",
+                    stats.total
+                );
                 db.clear_all_data()?;
             }
             true
@@ -125,8 +133,7 @@ pub fn import_wabbajack_to_db(wabbajack_path: &Path, db_path: &Path) -> Result<M
     let stats = db.get_directive_stats()?;
     info!(
         "Database ready: {} total directives ({} pending)",
-        stats.total,
-        stats.pending
+        stats.total, stats.pending
     );
 
     Ok(db)
@@ -140,7 +147,9 @@ mod tests {
     #[test]
     #[ignore] // Run with: cargo test -- --ignored
     fn test_parse_tuxborn() {
-        let path = Path::new("/home/luke/Documents/Wabbajack Rust Update/Tuxborn-Wabbajack/Tuxborn.wabbajack");
+        let path = Path::new(
+            "/home/luke/Documents/Wabbajack Rust Update/Tuxborn-Wabbajack/Tuxborn.wabbajack",
+        );
         if path.exists() {
             let modlist = parse_wabbajack_file(path).unwrap();
             assert_eq!(modlist.name, "Tuxborn");

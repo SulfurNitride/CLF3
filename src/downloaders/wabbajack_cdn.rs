@@ -117,13 +117,7 @@ impl WabbajackCdnDownloader {
         definition
             .parts
             .iter()
-            .map(|part| {
-                format!(
-                    "{}/parts/{}",
-                    url.trim_end_matches('/'),
-                    part.index
-                )
-            })
+            .map(|part| format!("{}/parts/{}", url.trim_end_matches('/'), part.index))
             .collect()
     }
 
@@ -192,11 +186,7 @@ impl WabbajackCdnDownloader {
         let progress_callback = Arc::new(progress_callback);
 
         // Download parts in parallel
-        let parts_with_urls: Vec<_> = definition
-            .parts
-            .iter()
-            .zip(part_urls.iter())
-            .collect();
+        let parts_with_urls: Vec<_> = definition.parts.iter().zip(part_urls.iter()).collect();
 
         let client = self.client.clone();
         let output_path_owned = output_path.to_path_buf();
@@ -214,9 +204,11 @@ impl WabbajackCdnDownloader {
 
                 async move {
                     // Download the part with retry
-                    let bytes = super::with_retry(&format!("CDN part {}", part_index), super::MAX_RETRIES, || {
-                        Self::download_part_static(&client, &url)
-                    })
+                    let bytes = super::with_retry(
+                        &format!("CDN part {}", part_index),
+                        super::MAX_RETRIES,
+                        || Self::download_part_static(&client, &url),
+                    )
                     .await?;
 
                     if bytes.len() != part_size {
@@ -233,13 +225,17 @@ impl WabbajackCdnDownloader {
                         .write(true)
                         .open(&output_path)
                         .await
-                        .with_context(|| format!("Failed to open {} for writing", output_path.display()))?;
+                        .with_context(|| {
+                            format!("Failed to open {} for writing", output_path.display())
+                        })?;
 
                     file.seek(std::io::SeekFrom::Start(part_offset)).await?;
                     file.write_all(&bytes).await?;
 
                     // Update progress
-                    let new_total = downloaded_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
+                    let new_total = downloaded_bytes
+                        .fetch_add(bytes.len() as u64, Ordering::Relaxed)
+                        + bytes.len() as u64;
                     progress_callback(new_total, total_size);
 
                     Ok(())
@@ -263,7 +259,11 @@ impl WabbajackCdnDownloader {
             );
         }
 
-        info!("Downloaded {} bytes to {}", total_downloaded, output_path.display());
+        info!(
+            "Downloaded {} bytes to {}",
+            total_downloaded,
+            output_path.display()
+        );
         Ok(total_downloaded)
     }
 
@@ -299,8 +299,8 @@ impl WabbajackCdnDownloader {
         expected_size: u64,
     ) -> Result<u64> {
         let url = Self::remap_url(base_url);
-        let file_id = Self::extract_file_id(&url)
-            .context("Failed to extract file ID from CDN URL")?;
+        let file_id =
+            Self::extract_file_id(&url).context("Failed to extract file ID from CDN URL")?;
 
         let direct_url = format!("{}/{}", DIRECT_LINK_BASE, file_id);
         info!("Using direct download fallback: {}", direct_url);
@@ -322,10 +322,7 @@ impl WabbajackCdnDownloader {
             .error_for_status()
             .with_context(|| format!("Server error for {}", direct_url))?;
 
-        let bytes = response
-            .bytes()
-            .await
-            .context("Failed to read response")?;
+        let bytes = response.bytes().await.context("Failed to read response")?;
 
         // Verify size
         if bytes.len() as u64 != expected_size {
@@ -363,11 +360,7 @@ fn parse_definition(json_str: &str) -> Result<CdnFileDefinition> {
     }
 
     // Fallback: skip any leading garbage characters (Unicode BOM, etc.)
-    let cleaned: String = json_str
-        .trim()
-        .chars()
-        .skip_while(|c| *c != '{')
-        .collect();
+    let cleaned: String = json_str.trim().chars().skip_while(|c| *c != '{').collect();
 
     serde_json::from_str(&cleaned).context("Failed to parse CDN definition JSON")
 }
@@ -421,9 +414,24 @@ mod tests {
             original_file_name: "file.7z".into(),
             size: 3000,
             parts: vec![
-                CdnPart { hash: "a".into(), index: 0, offset: 0, size: 1000 },
-                CdnPart { hash: "b".into(), index: 1, offset: 1000, size: 1000 },
-                CdnPart { hash: "c".into(), index: 2, offset: 2000, size: 1000 },
+                CdnPart {
+                    hash: "a".into(),
+                    index: 0,
+                    offset: 0,
+                    size: 1000,
+                },
+                CdnPart {
+                    hash: "b".into(),
+                    index: 1,
+                    offset: 1000,
+                    size: 1000,
+                },
+                CdnPart {
+                    hash: "c".into(),
+                    index: 2,
+                    offset: 2000,
+                    size: 1000,
+                },
             ],
         };
 
@@ -445,14 +453,30 @@ mod tests {
 
         // First, just fetch the definition to see the file info
         let definition = downloader.get_definition(base_url).await.unwrap();
-        println!("File: {} by {}", definition.original_file_name, definition.author);
-        println!("Size: {} bytes ({:.2} GB)", definition.size, definition.size as f64 / 1_073_741_824.0);
+        println!(
+            "File: {} by {}",
+            definition.original_file_name, definition.author
+        );
+        println!(
+            "Size: {} bytes ({:.2} GB)",
+            definition.size,
+            definition.size as f64 / 1_073_741_824.0
+        );
         println!("Parts: {}", definition.parts.len());
 
         // Download first 50 parts (100MB) as a speed test
         let test_parts = 50;
-        let test_size: u64 = definition.parts.iter().take(test_parts).map(|p| p.size as u64).sum();
-        println!("\nDownloading first {} parts ({:.2} MB) for speed test...", test_parts, test_size as f64 / 1_048_576.0);
+        let test_size: u64 = definition
+            .parts
+            .iter()
+            .take(test_parts)
+            .map(|p| p.size as u64)
+            .sum();
+        println!(
+            "\nDownloading first {} parts ({:.2} MB) for speed test...",
+            test_parts,
+            test_size as f64 / 1_048_576.0
+        );
 
         let output_path = std::path::Path::new("/tmp/tuxborn_speed_test.partial");
         let start = Instant::now();
@@ -477,30 +501,32 @@ mod tests {
         drop(file);
 
         // Download parts in parallel
-        let results: Vec<Result<()>> = futures::stream::iter(partial_def.parts.iter().zip(part_urls.iter()))
-            .map(|(part, url)| {
-                let url = url.clone();
-                let output_path = output_path.to_path_buf();
-                let part_offset = part.offset as u64;
-                let part_size = part.size;
-                let client = downloader.client.clone();
+        let results: Vec<Result<()>> =
+            futures::stream::iter(partial_def.parts.iter().zip(part_urls.iter()))
+                .map(|(part, url)| {
+                    let url = url.clone();
+                    let output_path = output_path.to_path_buf();
+                    let part_offset = part.offset as u64;
+                    let part_size = part.size;
+                    let client = downloader.client.clone();
 
-                async move {
-                    let bytes = WabbajackCdnDownloader::download_part_static(&client, &url).await?;
-                    assert_eq!(bytes.len(), part_size);
+                    async move {
+                        let bytes =
+                            WabbajackCdnDownloader::download_part_static(&client, &url).await?;
+                        assert_eq!(bytes.len(), part_size);
 
-                    let mut file = tokio::fs::OpenOptions::new()
-                        .write(true)
-                        .open(&output_path)
-                        .await?;
-                    file.seek(std::io::SeekFrom::Start(part_offset)).await?;
-                    file.write_all(&bytes).await?;
-                    Ok(())
-                }
-            })
-            .buffer_unordered(16)
-            .collect()
-            .await;
+                        let mut file = tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&output_path)
+                            .await?;
+                        file.seek(std::io::SeekFrom::Start(part_offset)).await?;
+                        file.write_all(&bytes).await?;
+                        Ok(())
+                    }
+                })
+                .buffer_unordered(16)
+                .collect()
+                .await;
 
         for r in results {
             r.unwrap();
@@ -517,6 +543,10 @@ mod tests {
         let _ = tokio::fs::remove_file(output_path).await;
 
         // Assert reasonable speed (at least 20 MB/s)
-        assert!(speed_mbs > 20.0, "Download speed too slow: {:.2} MB/s", speed_mbs);
+        assert!(
+            speed_mbs > 20.0,
+            "Download speed too slow: {:.2} MB/s",
+            speed_mbs
+        );
     }
 }

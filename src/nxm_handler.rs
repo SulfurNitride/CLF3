@@ -3,7 +3,7 @@
 //! Registers as a handler for nxm:// links and uses a Unix domain socket
 //! to receive download requests from browser clicks.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::io::AsyncBufReadExt;
@@ -32,7 +32,9 @@ impl NxmLink {
     /// Parse an nxm:// URL into its components
     /// Format: nxm://game/mods/mod_id/files/file_id?key=xxx&expires=yyy&user_id=zzz
     pub fn parse(url: &str) -> Result<Self> {
-        let url = url.strip_prefix("nxm://").context("URL must start with nxm://")?;
+        let url = url
+            .strip_prefix("nxm://")
+            .context("URL must start with nxm://")?;
 
         let (path, query) = url.split_once('?').context("URL must have query params")?;
 
@@ -51,8 +53,14 @@ impl NxmLink {
             .filter_map(|pair| pair.split_once('='))
             .collect();
 
-        let key = params.get("key").context("Missing 'key' param")?.to_string();
-        let expires: u64 = params.get("expires").context("Missing 'expires' param")?.parse()?;
+        let key = params
+            .get("key")
+            .context("Missing 'key' param")?
+            .to_string();
+        let expires: u64 = params
+            .get("expires")
+            .context("Missing 'expires' param")?
+            .parse()?;
 
         Ok(Self {
             game_domain,
@@ -156,7 +164,11 @@ pub fn send_to_socket(nxm_url: &str) -> Result<()> {
     if let Err(ref e) = result {
         // Log to a file next to the socket so the user can debug
         let log_path = path.with_extension("log");
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
             let _ = writeln!(f, "[nxm-handle] Error sending '{}': {:#}", nxm_url, e);
         }
     }

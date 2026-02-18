@@ -19,30 +19,27 @@ mod tes3_reader;
 mod writer;
 
 pub use cache::BsaCache;
-pub use reader::{BsaReader, BsaFileEntry, extract_file, extract_batch_parallel, list_files};
+pub use reader::{extract_batch_parallel, extract_file, list_files, BsaFileEntry, BsaReader};
 pub use writer::{BsaBuilder, BsaWriterManager};
 
 // TES3 (Morrowind) support
 pub use tes3_reader::{
+    extract_batch_parallel as extract_tes3_batch_parallel, extract_file as extract_tes3_file,
     list_files as list_tes3_files,
-    extract_file as extract_tes3_file,
-    extract_batch_parallel as extract_tes3_batch_parallel,
 };
 
 // BA2 support for Fallout 4/Starfield
 pub use ba2_reader::{
-    Ba2FileEntry,
-    list_files as list_ba2_files,
-    extract_file as extract_ba2_file,
-    extract_batch_parallel as extract_ba2_batch_parallel,
+    extract_batch_parallel as extract_ba2_batch_parallel, extract_file as extract_ba2_file,
+    list_files as list_ba2_files, Ba2FileEntry,
 };
-pub use ba2_writer::{Ba2Builder, Ba2Format, Ba2CompressionFormat, Ba2Version};
+pub use ba2_writer::{Ba2Builder, Ba2CompressionFormat, Ba2Format, Ba2Version};
 
 use anyhow::{bail, Result};
 use ba2::tes4::{ArchiveFlags, ArchiveTypes, Version};
-use ba2::{FileFormat, guess_format};
+use ba2::{guess_format, FileFormat};
 use std::fs::File;
-use std::io::{Read, BufReader};
+use std::io::{BufReader, Read};
 use std::path::Path;
 use tracing::debug;
 
@@ -77,7 +74,10 @@ pub fn detect_format(path: &Path) -> Option<ArchiveFormat> {
     let ext = path.extension()?.to_str()?.to_lowercase();
     match ext.as_str() {
         "bsa" => {
-            debug!("Detected BSA by extension (assuming TES4): {}", path.display());
+            debug!(
+                "Detected BSA by extension (assuming TES4): {}",
+                path.display()
+            );
             Some(ArchiveFormat::Bsa)
         }
         "ba2" => {
@@ -103,30 +103,39 @@ pub fn list_archive_files(archive_path: &Path) -> Result<Vec<ArchiveFileEntry>> 
     match detect_format(archive_path) {
         Some(ArchiveFormat::Tes3Bsa) => {
             let files = list_tes3_files(archive_path)?;
-            Ok(files.into_iter().map(|f| ArchiveFileEntry {
-                path: f.path,
-                size: f.size,
-                format: ArchiveFormat::Tes3Bsa,
-                is_texture: false,
-            }).collect())
+            Ok(files
+                .into_iter()
+                .map(|f| ArchiveFileEntry {
+                    path: f.path,
+                    size: f.size,
+                    format: ArchiveFormat::Tes3Bsa,
+                    is_texture: false,
+                })
+                .collect())
         }
         Some(ArchiveFormat::Bsa) => {
             let files = list_files(archive_path)?;
-            Ok(files.into_iter().map(|f| ArchiveFileEntry {
-                path: f.path,
-                size: f.size,
-                format: ArchiveFormat::Bsa,
-                is_texture: false,
-            }).collect())
+            Ok(files
+                .into_iter()
+                .map(|f| ArchiveFileEntry {
+                    path: f.path,
+                    size: f.size,
+                    format: ArchiveFormat::Bsa,
+                    is_texture: false,
+                })
+                .collect())
         }
         Some(ArchiveFormat::Ba2) => {
             let files = list_ba2_files(archive_path)?;
-            Ok(files.into_iter().map(|f| ArchiveFileEntry {
-                path: f.path,
-                size: f.size,
-                format: ArchiveFormat::Ba2,
-                is_texture: f.is_texture,
-            }).collect())
+            Ok(files
+                .into_iter()
+                .map(|f| ArchiveFileEntry {
+                    path: f.path,
+                    size: f.size,
+                    format: ArchiveFormat::Ba2,
+                    is_texture: f.is_texture,
+                })
+                .collect())
         }
         None => bail!("Unknown archive format: {}", archive_path.display()),
     }

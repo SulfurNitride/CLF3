@@ -56,7 +56,10 @@ impl GoogleDriveDownloader {
                 debug!("Got direct download (size matches)");
                 return Ok(final_url);
             }
-            debug!("Content-Length {} doesn't match expected {}", len, expected_size);
+            debug!(
+                "Content-Length {} doesn't match expected {}",
+                len, expected_size
+            );
         }
 
         // Check content-type - if it's not HTML, we probably have the file
@@ -72,7 +75,10 @@ impl GoogleDriveDownloader {
         let html = response.text().await.context("Failed to read response")?;
 
         // Debug: log first 500 chars of response
-        debug!("Got HTML response (first 500 chars): {}", &html[..html.len().min(500)]);
+        debug!(
+            "Got HTML response (first 500 chars): {}",
+            &html[..html.len().min(500)]
+        );
 
         parse_confirmation_page(&html, file_id)
     }
@@ -166,7 +172,8 @@ fn parse_confirmation_page(html: &str, file_id: &str) -> Result<String> {
     }
 
     // Method 2: Look for href="/uc?export=download..." pattern (old format)
-    let download_re = DOWNLOAD_RE.get_or_init(|| Regex::new(r#"href="(/uc\?export=download[^"]+)"#).unwrap());
+    let download_re =
+        DOWNLOAD_RE.get_or_init(|| Regex::new(r#"href="(/uc\?export=download[^"]+)"#).unwrap());
     if let Some(caps) = download_re.captures(html) {
         let path = caps.get(1).unwrap().as_str();
         let url = format!("https://docs.google.com{}", path.replace("&amp;", "&"));
@@ -194,8 +201,7 @@ fn parse_confirmation_page(html: &str, file_id: &str) -> Result<String> {
                             .collect();
 
                         if !params.is_empty() {
-                            let query = serde_urlencoded::to_string(&params)
-                                .unwrap_or_default();
+                            let query = serde_urlencoded::to_string(&params).unwrap_or_default();
                             if url.contains('?') {
                                 url = format!("{}&{}", url, query);
                             } else {
@@ -238,7 +244,9 @@ fn parse_confirmation_page(html: &str, file_id: &str) -> Result<String> {
     }
 
     // Check for error messages
-    if html.contains("Google Drive - Virus scan warning") || html.contains("can't scan this file for viruses") {
+    if html.contains("Google Drive - Virus scan warning")
+        || html.contains("can't scan this file for viruses")
+    {
         // This is the virus warning page - we need to bypass it
         // Try constructing the URL directly with confirm=t
         let url = format!(
@@ -249,14 +257,18 @@ fn parse_confirmation_page(html: &str, file_id: &str) -> Result<String> {
         return Ok(url);
     }
 
-    let error_re = ERROR_RE.get_or_init(|| Regex::new(r#"<p class="uc-error-subcaption">(.*?)</p>"#).unwrap());
+    let error_re =
+        ERROR_RE.get_or_init(|| Regex::new(r#"<p class="uc-error-subcaption">(.*?)</p>"#).unwrap());
     if let Some(caps) = error_re.captures(html) {
         let error_msg = caps.get(1).unwrap().as_str();
         bail!("Google Drive error: {}", error_msg);
     }
 
     // Log the HTML for debugging
-    eprintln!("DEBUG: Could not parse GDrive page. First 2000 chars:\n{}", &html[..html.len().min(2000)]);
+    eprintln!(
+        "DEBUG: Could not parse GDrive page. First 2000 chars:\n{}",
+        &html[..html.len().min(2000)]
+    );
 
     bail!("Could not extract download URL from Google Drive confirmation page")
 }
@@ -289,7 +301,8 @@ mod tests {
 
     #[test]
     fn test_parse_uuid_pattern() {
-        let html = r#"<form action="https://drive.usercontent.google.com/download?uuid=abc-123-def">"#;
+        let html =
+            r#"<form action="https://drive.usercontent.google.com/download?uuid=abc-123-def">"#;
         let url = parse_confirmation_page(html, "FILE123").unwrap();
         assert!(url.contains("uuid=abc-123-def") || url.contains("FILE123"));
     }

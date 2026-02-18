@@ -41,7 +41,11 @@ pub fn handle_patched_from_archive(
             cached
         } else {
             // Fall back to direct extraction
-            extract_from_archive_with_temp(archive_path, path_in_archive, &ctx.config.downloads_dir)?
+            extract_from_archive_with_temp(
+                archive_path,
+                path_in_archive,
+                &ctx.config.downloads_dir,
+            )?
         }
     } else {
         // Nested BSA: archive -> BSA -> file
@@ -53,11 +57,13 @@ pub fn handle_patched_from_archive(
             cached
         } else if let Some(bsa_disk_path) = ctx.get_cached_bsa_path(archive_hash, bsa_path) {
             // BSA is in working folder - extract directly from it
-            crate::bsa::extract_archive_file(&bsa_disk_path, file_in_bsa)
-                .with_context(|| format!("Failed to extract {} from BSA {}", file_in_bsa, bsa_path))?
+            crate::bsa::extract_archive_file(&bsa_disk_path, file_in_bsa).with_context(|| {
+                format!("Failed to extract {} from BSA {}", file_in_bsa, bsa_path)
+            })?
         } else {
             // Fall back to direct extraction: extract BSA from archive, then file from BSA
-            let bsa_data = extract_from_archive_with_temp(archive_path, bsa_path, &ctx.config.downloads_dir)?;
+            let bsa_data =
+                extract_from_archive_with_temp(archive_path, bsa_path, &ctx.config.downloads_dir)?;
 
             // Write BSA to temp file and extract from it
             let temp_bsa = tempfile::Builder::new()
@@ -67,8 +73,9 @@ pub fn handle_patched_from_archive(
                 .context("Failed to create temp BSA file")?;
             std::fs::write(temp_bsa.path(), &bsa_data)?;
 
-            crate::bsa::extract_archive_file(temp_bsa.path(), file_in_bsa)
-                .with_context(|| format!("Failed to extract {} from BSA {}", file_in_bsa, bsa_path))?
+            crate::bsa::extract_archive_file(temp_bsa.path(), file_in_bsa).with_context(|| {
+                format!("Failed to extract {} from BSA {}", file_in_bsa, bsa_path)
+            })?
         }
     };
 

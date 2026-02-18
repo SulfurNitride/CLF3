@@ -21,6 +21,7 @@ use super::handlers::from_archive::{
 use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
+use rusqlite::params;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::BufReader;
@@ -109,60 +110,6 @@ fn quick_hash_bytes(data: &[u8]) -> u64 {
     hasher.digest()
 }
 
-fn total_ram_bytes() -> u64 {
-    static TOTAL_RAM: OnceLock<u64> = OnceLock::new();
-    *TOTAL_RAM.get_or_init(|| {
-        let sys = sysinfo::System::new_with_specifics(
-            sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
-        );
-        sys.total_memory()
-    })
-}
-
-fn patch_apply_workers() -> usize {
-    static WORKERS: OnceLock<usize> = OnceLock::new();
-    *WORKERS.get_or_init(|| {
-        if let Ok(v) = std::env::var("CLF3_PATCH_APPLY_WORKERS") {
-            if let Ok(n) = v.parse::<usize>() {
-                if n > 0 {
-                    return n;
-                }
-            }
-        }
-
-        let ram = total_ram_bytes();
-        if ram < 16 * 1024 * 1024 * 1024 {
-            1
-        } else if ram < 32 * 1024 * 1024 * 1024 {
-            2
-        } else {
-            2
-        }
-    })
-}
-
-fn patch_archive_parallelism() -> usize {
-    static PARALLELISM: OnceLock<usize> = OnceLock::new();
-    *PARALLELISM.get_or_init(|| {
-        if let Ok(v) = std::env::var("CLF3_PATCH_ARCHIVE_PARALLELISM") {
-            if let Ok(n) = v.parse::<usize>() {
-                if n > 0 {
-                    return n;
-                }
-            }
-        }
-
-        let ram = total_ram_bytes();
-        if ram < 16 * 1024 * 1024 * 1024 {
-            1
-        } else if ram < 32 * 1024 * 1024 * 1024 {
-            2
-        } else {
-            3
-        }
-    })
-}
-
 fn should_preload_patch_blobs() -> bool {
     static SHOULD_PRELOAD: OnceLock<bool> = OnceLock::new();
     *SHOULD_PRELOAD.get_or_init(|| {
@@ -171,8 +118,9 @@ fn should_preload_patch_blobs() -> bool {
             return matches!(value.as_str(), "1" | "true" | "yes" | "on");
         }
 
-        // Default OFF for stability; enable explicitly via env if desired.
-        false
+        // Default ON: preload delta blobs per-archive so parallel apply doesn't
+        // serialize on the shared wabbajack ZIP mutex.
+        true
     })
 }
 
@@ -641,6 +589,142 @@ impl ProgressReporter {
     }
 }
 
+/// Persistent SQLite-backed store for patch basis entries.
+///
+/// Stores `basis_key -> (local_path, size, quick_hash)` scoped per modlist.
+/// Lives in the same `~/.cache/clf3/extraction_cache.db` used by `BsaCache`.
+pub(crate) struct PatchBasisStore {
+    conn: Mutex<rusqlite::Connection>,
+    modlist_name: String,
+}
+
+impl PatchBasisStore {
+    /// Open (or create) the patch_basis table in the given database.
+    fn open(db_path: &Path, modlist_name: &str) -> Result<Self> {
+        let conn = rusqlite::Connection::open(db_path)
+            .with_context(|| format!("Failed to open patch basis DB at {}", db_path.display()))?;
+
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA cache_size = 500;",
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS patch_basis (
+                modlist_name TEXT NOT NULL,
+                basis_key TEXT NOT NULL,
+                local_path TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                quick_hash INTEGER NOT NULL,
+                PRIMARY KEY (modlist_name, basis_key)
+            )",
+            [],
+        )
+        .context("Failed to create patch_basis table")?;
+
+        Ok(Self {
+            conn: Mutex::new(conn),
+            modlist_name: modlist_name.to_string(),
+        })
+    }
+
+    /// Load all entries for this modlist, verify each (file exists + size + quick_hash),
+    /// and return verified records. Stale entries are deleted from the DB.
+    fn load_verified(&self) -> Result<HashMap<String, PatchBasisRecord>> {
+        let conn = self.conn.lock().expect("patch basis DB lock poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT basis_key, local_path, size, quick_hash FROM patch_basis WHERE modlist_name = ?1",
+        )?;
+
+        let rows: Vec<(String, String, i64, i64)> = stmt
+            .query_map(params![&self.modlist_name], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut verified = HashMap::new();
+        let mut stale_keys = Vec::new();
+
+        for (key, local_path_str, size, quick_hash) in &rows {
+            let local_path = PathBuf::from(local_path_str);
+            let expected_size = *size as u64;
+            let expected_hash = *quick_hash as u64;
+
+            // Verify file still exists with matching size
+            let meta = match fs::metadata(&local_path) {
+                Ok(m) => m,
+                Err(_) => {
+                    stale_keys.push(key.clone());
+                    continue;
+                }
+            };
+
+            if meta.len() != expected_size {
+                stale_keys.push(key.clone());
+                continue;
+            }
+
+            // Verify quick hash
+            match quick_file_hash(&local_path) {
+                Ok(h) if h == expected_hash => {}
+                _ => {
+                    stale_keys.push(key.clone());
+                    continue;
+                }
+            }
+
+            verified.insert(
+                key.clone(),
+                PatchBasisRecord {
+                    local_path,
+                    size: expected_size,
+                    quick_hash: expected_hash,
+                },
+            );
+        }
+
+        // Delete stale entries
+        if !stale_keys.is_empty() {
+            let mut del = conn.prepare(
+                "DELETE FROM patch_basis WHERE modlist_name = ?1 AND basis_key = ?2",
+            )?;
+            for key in &stale_keys {
+                let _ = del.execute(params![&self.modlist_name, key]);
+            }
+            debug!(
+                "Patch basis: pruned {} stale entries, {} verified",
+                stale_keys.len(),
+                verified.len()
+            );
+        }
+
+        Ok(verified)
+    }
+
+    /// Insert or update a single entry.
+    fn upsert(&self, key: &str, record: &PatchBasisRecord) {
+        let conn = self.conn.lock().expect("patch basis DB lock poisoned");
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO patch_basis (modlist_name, basis_key, local_path, size, quick_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                &self.modlist_name,
+                key,
+                &*record.local_path.to_string_lossy(),
+                record.size as i64,
+                record.quick_hash as i64,
+            ],
+        );
+    }
+}
+
 /// Context for processing directives (thread-safe)
 pub struct ProcessContext<'a> {
     /// Installation configuration
@@ -659,6 +743,8 @@ pub struct ProcessContext<'a> {
     patch_basis_db: RwLock<HashMap<String, PatchBasisRecord>>,
     /// Cache of expensive full file hashes by `path|size|mtime`.
     patch_basis_full_hash_cache: Mutex<HashMap<String, String>>,
+    /// Persistent SQLite store for patch basis entries (scoped per modlist).
+    patch_basis_store: Option<PatchBasisStore>,
 }
 
 impl<'a> ProcessContext<'a> {
@@ -711,6 +797,32 @@ impl<'a> ProcessContext<'a> {
             }
         }
 
+        // Open persistent patch basis store and load verified entries
+        let modlist_name = config
+            .wabbajack_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let patch_basis_db_path = cache_dir.join("extraction_cache.db");
+        let (patch_basis_store, preloaded_basis) =
+            match PatchBasisStore::open(&patch_basis_db_path, &modlist_name) {
+                Ok(store) => {
+                    let entries = store.load_verified().unwrap_or_default();
+                    if !entries.is_empty() {
+                        println!(
+                            "Loaded {} verified patch basis entries from cache",
+                            entries.len()
+                        );
+                    }
+                    (Some(store), entries)
+                }
+                Err(e) => {
+                    warn!("Failed to open patch basis store: {}", e);
+                    (None, HashMap::new())
+                }
+            };
+
         Ok(Self {
             config,
             wabbajack: Mutex::new(wabbajack),
@@ -718,8 +830,9 @@ impl<'a> ProcessContext<'a> {
             extraction_cache,
             existing_files,
             needed_patch_basis_keys: RwLock::new(HashSet::new()),
-            patch_basis_db: RwLock::new(HashMap::new()),
+            patch_basis_db: RwLock::new(preloaded_basis),
             patch_basis_full_hash_cache: Mutex::new(HashMap::new()),
+            patch_basis_store,
         })
     }
 
@@ -773,6 +886,47 @@ impl<'a> ProcessContext<'a> {
             .contains(key)
     }
 
+    /// Record a patch basis candidate under both the given key AND the raw
+    /// directive `archive_hash_path` components.  This ensures Phase 5 lookup
+    /// succeeds regardless of whether it resolves paths the same way Phase 3 did.
+    pub fn record_patch_basis_candidate_path_dual(
+        &self,
+        key: &str,
+        archive_hash_path: &[String],
+        source_path: &Path,
+        local_output_path: &Path,
+        expected_size: u64,
+    ) {
+        self.record_patch_basis_candidate_path(key, source_path, local_output_path, expected_size);
+        if let Some(raw_key) = build_patch_basis_key_from_archive_hash_path(archive_hash_path) {
+            if raw_key != key {
+                self.record_patch_basis_candidate_path(
+                    &raw_key,
+                    source_path,
+                    local_output_path,
+                    expected_size,
+                );
+            }
+        }
+    }
+
+    /// Record a patch basis candidate (bytes variant) under both the given key
+    /// AND the raw directive `archive_hash_path` components.
+    pub fn record_patch_basis_candidate_bytes_dual(
+        &self,
+        key: &str,
+        archive_hash_path: &[String],
+        local_output_path: &Path,
+        data: &[u8],
+    ) {
+        self.record_patch_basis_candidate_bytes(key, local_output_path, data);
+        if let Some(raw_key) = build_patch_basis_key_from_archive_hash_path(archive_hash_path) {
+            if raw_key != key {
+                self.record_patch_basis_candidate_bytes(&raw_key, local_output_path, data);
+            }
+        }
+    }
+
     pub fn record_patch_basis_candidate_path(
         &self,
         key: &str,
@@ -803,6 +957,11 @@ impl<'a> ProcessContext<'a> {
             quick_hash,
         };
 
+        // Write-through to SQLite
+        if let Some(ref store) = self.patch_basis_store {
+            store.upsert(key, &record);
+        }
+
         self.patch_basis_db
             .write()
             .expect("patch_basis_db lock poisoned")
@@ -824,6 +983,11 @@ impl<'a> ProcessContext<'a> {
             size: data.len() as u64,
             quick_hash: quick_hash_bytes(data),
         };
+
+        // Write-through to SQLite
+        if let Some(ref store) = self.patch_basis_store {
+            store.upsert(key, &record);
+        }
 
         self.patch_basis_db
             .write()
@@ -1776,71 +1940,41 @@ fn process_patched_from_archive(
         medium_archives.len(),
         large_archives.len()
     );
-    let archive_parallelism = patch_archive_parallelism();
     debug!(
-        "Patch scheduling: archive_parallelism={} apply_workers={} preload_blobs={}",
-        archive_parallelism,
-        patch_apply_workers(),
+        "Patch scheduling: all_archives={} preload_blobs={}",
+        small_archives.len() + medium_archives.len() + large_archives.len(),
         should_preload_patch_blobs()
     );
 
-    // Process SMALL archives in full parallel
-    for chunk in small_archives.chunks(archive_parallelism) {
-        chunk
-            .par_iter()
-            .for_each(|(archive_hash, directives, _size)| {
-                process_archive_patches(
-                    ctx,
-                    archive_hash,
-                    directives,
-                    Some(1),
-                    pb,
-                    &skipped,
-                    &failed,
-                    &failure_tracker,
-                    &completed,
-                    reporter,
-                );
-            });
-    }
+    // Process ALL archives concurrently via par_iter so extraction from one archive
+    // overlaps with patch application from another. 7z extraction is inherently
+    // single-threaded per archive, so concurrent archives keep all cores busy.
+    // Each archive extracts to its own temp dir (disk-based, not RAM).
+    let mut all_archives: Vec<_> = small_archives
+        .iter()
+        .chain(medium_archives.iter())
+        .chain(large_archives.iter())
+        .collect();
+    // Sort by directive count descending so large-work archives start first,
+    // giving them maximum time to extract while smaller archives finish quickly.
+    all_archives.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
 
-    // Process MEDIUM archives with limited parallelism (half threads)
-    let half_threads = (rayon::current_num_threads() / 2).max(1);
-    let medium_parallelism = half_threads.min(archive_parallelism.max(1));
-    for chunk in medium_archives.chunks(medium_parallelism) {
-        chunk
-            .par_iter()
-            .for_each(|(archive_hash, directives, _size)| {
-                process_archive_patches(
-                    ctx,
-                    archive_hash,
-                    directives,
-                    Some(2),
-                    pb,
-                    &skipped,
-                    &failed,
-                    &failure_tracker,
-                    &completed,
-                    reporter,
-                );
-            });
-    }
-
-    // Process LARGE archives sequentially (one at a time, all threads for extraction)
-    for (archive_hash, directives, _size) in &large_archives {
-        process_archive_patches(
-            ctx,
-            archive_hash,
-            directives,
-            None,
-            pb,
-            &skipped,
-            &failed,
-            &failure_tracker,
-            &completed,
-            reporter,
-        );
-    }
+    all_archives
+        .par_iter()
+        .for_each(|(archive_hash, directives, _size)| {
+            process_archive_patches(
+                ctx,
+                archive_hash,
+                directives,
+                None,
+                pb,
+                &skipped,
+                &failed,
+                &failure_tracker,
+                &completed,
+                reporter,
+            );
+        });
 
     // Print failure summary
     failure_tracker.print_summary(pb);
@@ -1958,123 +2092,104 @@ fn process_archive_patches(
         }
     };
 
-    let extraction_start = Instant::now();
-    let extracted_paths = if simple_paths.is_empty() && nested_bsas.is_empty() {
-        HashMap::new()
-    } else {
-        extract_source_files_to_disk(
-            ctx,
-            &archive_path,
-            &simple_paths,
-            &nested_bsas,
-            threads_per_archive,
-            temp_dir.path(),
-        )
-    };
-    let extraction_ms = extraction_start.elapsed().as_millis();
-    // Stage 1 complete for all directives in this archive.
-    pb.inc(to_process.len() as u64);
-
     let archive_name = archive_path
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
     pb.set_message(format!(
+        "Extracting + preloading {} ({} directives)",
+        archive_name,
+        to_process.len()
+    ));
+
+    // Run extraction and delta preloading concurrently — extraction is often
+    // single-threaded 7z decompression, so overlap it with reading delta blobs.
+    let preload_enabled = should_preload_patch_blobs();
+    let extraction_start = Instant::now();
+    let (extracted_paths, preloaded_patches) = std::thread::scope(|s| {
+        let preload_handle = s.spawn(|| {
+            if preload_enabled {
+                preload_patch_blobs(&ctx.config.wabbajack_path, &to_process).unwrap_or_else(|e| {
+                    tracing::debug!(
+                        "Patch preload failed for archive {} (falling back to shared reader): {}",
+                        archive_name,
+                        e
+                    );
+                    HashMap::new()
+                })
+            } else {
+                HashMap::new()
+            }
+        });
+
+        let extracted = if simple_paths.is_empty() && nested_bsas.is_empty() {
+            HashMap::new()
+        } else {
+            extract_source_files_to_disk(
+                ctx,
+                &archive_path,
+                &simple_paths,
+                &nested_bsas,
+                threads_per_archive,
+                temp_dir.path(),
+            )
+        };
+
+        let preloaded = preload_handle.join().unwrap_or_default();
+        (extracted, preloaded)
+    });
+    let extraction_ms = extraction_start.elapsed().as_millis();
+    // Stage 1 complete for all directives in this archive.
+    pb.inc(to_process.len() as u64);
+
+    pb.set_message(format!(
         "Patching archive {} ({} directives)",
         archive_name,
         to_process.len()
     ));
-    let preload_enabled = should_preload_patch_blobs();
-    let preloaded_patches = if preload_enabled {
-        preload_patch_blobs(&ctx.config.wabbajack_path, &to_process).unwrap_or_else(|e| {
-            tracing::debug!(
-                "Patch preload failed for archive {} (falling back to shared reader): {}",
-                archive_name,
-                e
-            );
-            HashMap::new()
-        })
-    } else {
-        HashMap::new()
-    };
 
-    // Process each patch in parallel; extracted source paths and delta blobs are immutable.
+    // Apply all patches in parallel via rayon work-stealing. Since multiple archives
+    // run concurrently via the outer par_iter, rayon naturally balances work across
+    // all cores — threads freed from finished archives help with remaining ones.
     let apply_start = Instant::now();
-    let apply_workers = patch_apply_workers();
-    if apply_workers <= 1 {
-        for (id, directive) in &to_process {
-            let patch_name = directive.patch_id.to_string();
-            let preloaded_delta = preloaded_patches.get(&patch_name).map(|v| v.as_slice());
-            let result = apply_patch_streaming(
-                ctx,
-                &archive_path,
-                directive,
-                &extracted_paths,
-                &verified_local_basis,
-                &patch_name,
-                preloaded_delta,
-            );
+    to_process.par_iter().for_each(|(id, directive)| {
+        let patch_name = directive.patch_id.to_string();
+        let preloaded_delta = preloaded_patches.get(&patch_name).map(|v| v.as_slice());
+        let result = apply_patch_streaming(
+            ctx,
+            &archive_path,
+            directive,
+            &extracted_paths,
+            &verified_local_basis,
+            &patch_name,
+            preloaded_delta,
+        );
 
-            match result {
-                Ok(()) => {
-                    completed.fetch_add(1, Ordering::Relaxed);
-                    pb.inc(1);
-                    reporter.directive_completed();
+        match result {
+            Ok(()) => {
+                completed.fetch_add(1, Ordering::Relaxed);
+                pb.inc(1);
+                reporter.directive_completed();
+            }
+            Err(e) => {
+                failed.fetch_add(1, Ordering::Relaxed);
+                failure_tracker.record_failure(&archive_name, &e.to_string());
+                if failed.load(Ordering::Relaxed) <= 10 {
+                    pb.println(format!("FAIL [{}] patch: {:#}", id, e));
                 }
-                Err(e) => {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    failure_tracker.record_failure(&archive_name, &e.to_string());
-                    if failed.load(Ordering::Relaxed) <= 10 {
-                        pb.println(format!("FAIL [{}] patch: {:#}", id, e));
-                    }
-                    pb.inc(1);
-                    reporter.directive_completed();
-                }
+                pb.inc(1);
+                reporter.directive_completed();
             }
         }
-    } else {
-        for chunk in to_process.chunks(apply_workers) {
-            chunk.par_iter().for_each(|(id, directive)| {
-                let patch_name = directive.patch_id.to_string();
-                let preloaded_delta = preloaded_patches.get(&patch_name).map(|v| v.as_slice());
-                let result = apply_patch_streaming(
-                    ctx,
-                    &archive_path,
-                    directive,
-                    &extracted_paths,
-                    &verified_local_basis,
-                    &patch_name,
-                    preloaded_delta,
-                );
-
-                match result {
-                    Ok(()) => {
-                        completed.fetch_add(1, Ordering::Relaxed);
-                        pb.inc(1);
-                        reporter.directive_completed();
-                    }
-                    Err(e) => {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                        failure_tracker.record_failure(&archive_name, &e.to_string());
-                        if failed.load(Ordering::Relaxed) <= 10 {
-                            pb.println(format!("FAIL [{}] patch: {:#}", id, e));
-                        }
-                        pb.inc(1);
-                        reporter.directive_completed();
-                    }
-                }
-            });
-        }
-    }
+    });
     let apply_ms = apply_start.elapsed().as_millis();
     tracing::debug!(
-        "Patch archive {} done: directives={}, extracted_sources={}, preload={}, workers={}, extract_ms={}, apply_ms={}, total_ms={}",
+        "Patch archive {} done: directives={}, extracted_sources={}, preload={}, extract_ms={}, apply_ms={}, total_ms={}",
         archive_name,
         to_process.len(),
         extracted_paths.len(),
         preload_enabled,
-        apply_workers,
         extraction_ms,
         apply_ms,
         archive_start.elapsed().as_millis()
@@ -2997,5 +3112,139 @@ fn process_single_directive(ctx: &ProcessContext, directive: &Directive) -> Resu
         Directive::CreateBSA(_) => {
             bail!("CreateBSA not yet implemented")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_patch_basis_store_roundtrip() {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let store = PatchBasisStore::open(&db_path, "test_modlist").unwrap();
+
+        // Create a test file for verification
+        let test_file = tmp.path().join("basis.bin");
+        let data = b"hello world patch basis";
+        fs::write(&test_file, data).unwrap();
+
+        let record = PatchBasisRecord {
+            local_path: test_file.clone(),
+            size: data.len() as u64,
+            quick_hash: quick_file_hash(&test_file).unwrap(),
+        };
+
+        // Upsert and reload
+        store.upsert("key1", &record);
+        let loaded = store.load_verified().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded["key1"].local_path, test_file);
+        assert_eq!(loaded["key1"].size, data.len() as u64);
+    }
+
+    #[test]
+    fn test_patch_basis_store_stale_entries_pruned() {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let store = PatchBasisStore::open(&db_path, "test_modlist").unwrap();
+
+        // Insert entry pointing to non-existent file
+        let record = PatchBasisRecord {
+            local_path: PathBuf::from("/nonexistent/file.bin"),
+            size: 100,
+            quick_hash: 12345,
+        };
+        store.upsert("stale_key", &record);
+
+        // Load should prune it
+        let loaded = store.load_verified().unwrap();
+        assert!(loaded.is_empty());
+
+        // Re-open to verify it was actually deleted from DB
+        let store2 = PatchBasisStore::open(&db_path, "test_modlist").unwrap();
+        let loaded2 = store2.load_verified().unwrap();
+        assert!(loaded2.is_empty());
+    }
+
+    #[test]
+    fn test_patch_basis_store_modlist_isolation() {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+
+        // Create a test file
+        let test_file = tmp.path().join("shared.bin");
+        fs::write(&test_file, b"shared data").unwrap();
+
+        let record = PatchBasisRecord {
+            local_path: test_file.clone(),
+            size: 11,
+            quick_hash: quick_file_hash(&test_file).unwrap(),
+        };
+
+        // Store under modlist A
+        let store_a = PatchBasisStore::open(&db_path, "modlist_a").unwrap();
+        store_a.upsert("key1", &record);
+
+        // Store under modlist B with different key
+        let store_b = PatchBasisStore::open(&db_path, "modlist_b").unwrap();
+        store_b.upsert("key2", &record);
+
+        // Each should only see its own entries
+        let loaded_a = store_a.load_verified().unwrap();
+        assert_eq!(loaded_a.len(), 1);
+        assert!(loaded_a.contains_key("key1"));
+
+        let loaded_b = store_b.load_verified().unwrap();
+        assert_eq!(loaded_b.len(), 1);
+        assert!(loaded_b.contains_key("key2"));
+    }
+
+    #[test]
+    fn test_patch_basis_store_size_mismatch_pruned() {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let store = PatchBasisStore::open(&db_path, "test_modlist").unwrap();
+
+        // Create a test file
+        let test_file = tmp.path().join("basis.bin");
+        fs::write(&test_file, b"original").unwrap();
+
+        let record = PatchBasisRecord {
+            local_path: test_file.clone(),
+            size: 999, // Wrong size
+            quick_hash: 0,
+        };
+        store.upsert("bad_size", &record);
+
+        let loaded = store.load_verified().unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn test_build_patch_basis_key() {
+        let key = build_patch_basis_key("abc123", Some("Data\\Textures\\test.dds"), None);
+        assert_eq!(key, "abc123|data/textures/test.dds");
+
+        let key2 = build_patch_basis_key("abc123", Some("path.bsa"), Some("inner/file.nif"));
+        assert_eq!(key2, "abc123|path.bsa|inner/file.nif");
+
+        let key3 = build_patch_basis_key("abc123", None, None);
+        assert_eq!(key3, "abc123");
+    }
+
+    #[test]
+    fn test_build_patch_basis_key_from_archive_hash_path() {
+        let parts = vec![
+            "abc123".to_string(),
+            "Data\\Textures\\test.dds".to_string(),
+        ];
+        let key = build_patch_basis_key_from_archive_hash_path(&parts).unwrap();
+        assert_eq!(key, "abc123|data/textures/test.dds");
+
+        let empty: Vec<String> = vec![];
+        assert!(build_patch_basis_key_from_archive_hash_path(&empty).is_none());
     }
 }

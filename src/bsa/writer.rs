@@ -31,13 +31,13 @@ impl FileEntry {
 
         if should_compress {
             // Compress the file using ba2's compress method
-            let compression_options = FileCompressionOptions::builder()
-                .version(version)
-                .build();
+            let compression_options = FileCompressionOptions::builder().version(version).build();
 
             uncompressed
                 .compress(&compression_options)
-                .with_context(|| format!("Failed to compress: {}/{}", self.dir_path, self.file_name))
+                .with_context(|| {
+                    format!("Failed to compress: {}/{}", self.dir_path, self.file_name)
+                })
         } else {
             Ok(uncompressed)
         }
@@ -279,8 +279,10 @@ impl BsaWriterManager {
             location_index, bsa_name, builder.version
         );
 
-        self.builders
-            .insert(location_index, (bsa_name.to_string(), Arc::new(Mutex::new(builder))));
+        self.builders.insert(
+            location_index,
+            (bsa_name.to_string(), Arc::new(Mutex::new(builder))),
+        );
     }
 
     /// Check if a location is a registered BSA
@@ -295,7 +297,10 @@ impl BsaWriterManager {
             .get(&location_index)
             .ok_or_else(|| anyhow::anyhow!("Location {} is not a BSA target", location_index))?;
 
-        builder.lock().expect("BSA builder lock poisoned").add_file(path, data);
+        builder
+            .lock()
+            .expect("BSA builder lock poisoned")
+            .add_file(path, data);
         Ok(())
     }
 
@@ -352,11 +357,7 @@ impl BsaWriterManager {
     }
 
     /// Write all BSAs with progress callback
-    pub fn write_all_with_progress<F>(
-        &self,
-        dest_dir: &Path,
-        progress: F,
-    ) -> Result<(usize, usize)>
+    pub fn write_all_with_progress<F>(&self, dest_dir: &Path, progress: F) -> Result<(usize, usize)>
     where
         F: Fn(usize, usize, &str) + Send + Sync,
     {

@@ -320,19 +320,35 @@ pub fn precheck_modlist(
     // Determine what's missing
     let mut missing = Vec::new();
 
-    if cached_config.as_ref().map(|c| c.install_dir.is_none()).unwrap_or(true) {
+    if cached_config
+        .as_ref()
+        .map(|c| c.install_dir.is_none())
+        .unwrap_or(true)
+    {
         missing.push("Install directory".to_string());
     }
 
-    if cached_config.as_ref().map(|c| c.downloads_dir.is_none()).unwrap_or(true) {
+    if cached_config
+        .as_ref()
+        .map(|c| c.downloads_dir.is_none())
+        .unwrap_or(true)
+    {
         missing.push("Downloads directory".to_string());
     }
 
     if ttw_result.required {
-        if cached_config.as_ref().map(|c| c.ttw_mpi_path.is_none()).unwrap_or(true) {
+        if cached_config
+            .as_ref()
+            .map(|c| c.ttw_mpi_path.is_none())
+            .unwrap_or(true)
+        {
             missing.push("TTW MPI file".to_string());
         }
-        if cached_config.as_ref().map(|c| c.fo3_path.is_none()).unwrap_or(true) {
+        if cached_config
+            .as_ref()
+            .map(|c| c.fo3_path.is_none())
+            .unwrap_or(true)
+        {
             missing.push("Fallout 3 path".to_string());
         }
     }
@@ -422,10 +438,22 @@ mod tests {
         let cache = test_cache();
 
         cache
-            .save_config("Modlist A", "1.0", "Skyrim", None, &ModlistConfig::default())
+            .save_config(
+                "Modlist A",
+                "1.0",
+                "Skyrim",
+                None,
+                &ModlistConfig::default(),
+            )
             .unwrap();
         cache
-            .save_config("Modlist B", "2.0", "Fallout4", None, &ModlistConfig::default())
+            .save_config(
+                "Modlist B",
+                "2.0",
+                "Fallout4",
+                None,
+                &ModlistConfig::default(),
+            )
             .unwrap();
 
         let list = cache.list_modlists().unwrap();

@@ -170,9 +170,16 @@ impl ImageCache {
         file.flush().await?;
 
         // Update manifest
-        self.manifest.images.insert(machine_name.to_string(), url.to_string());
+        self.manifest
+            .images
+            .insert(machine_name.to_string(), url.to_string());
 
-        debug!("Cached image for {} ({} bytes, format: {})", machine_name, bytes.len(), ext);
+        debug!(
+            "Cached image for {} ({} bytes, format: {})",
+            machine_name,
+            bytes.len(),
+            ext
+        );
 
         Ok(path)
     }
@@ -220,7 +227,10 @@ impl ImageCache {
 
     /// Prepare sync - cleanup stale images and return list of images to download
     /// Call this while holding the lock, then release lock before downloading
-    pub fn prepare_sync(&mut self, modlists: &[(String, String)]) -> Result<(Vec<(String, String)>, usize, usize)> {
+    pub fn prepare_sync(
+        &mut self,
+        modlists: &[(String, String)],
+    ) -> Result<(Vec<(String, String)>, usize, usize)> {
         // Build set of current machine names for cleanup
         let current_names: HashSet<String> = modlists.iter().map(|(n, _)| n.clone()).collect();
 
@@ -304,7 +314,12 @@ async fn download_single_image(
     file.write_all(&bytes).await?;
     file.flush().await?;
 
-    debug!("Downloaded {} ({} bytes, {})", machine_name, bytes.len(), ext);
+    debug!(
+        "Downloaded {} ({} bytes, {})",
+        machine_name,
+        bytes.len(),
+        ext
+    );
     Ok(path)
 }
 
@@ -370,12 +385,18 @@ mod tests {
     #[test]
     fn test_manifest_roundtrip() {
         let mut manifest = ImageManifest::default();
-        manifest.images.insert("test_modlist".into(), "https://example.com/image.webp".into());
+        manifest.images.insert(
+            "test_modlist".into(),
+            "https://example.com/image.webp".into(),
+        );
 
         let json = serde_json::to_string(&manifest).unwrap();
         let loaded: ImageManifest = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(loaded.images.get("test_modlist"), Some(&"https://example.com/image.webp".into()));
+        assert_eq!(
+            loaded.images.get("test_modlist"),
+            Some(&"https://example.com/image.webp".into())
+        );
     }
 
     #[test]

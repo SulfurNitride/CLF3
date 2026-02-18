@@ -219,9 +219,7 @@ pub fn find_by_steam_id(app_id: &str) -> Option<&'static KnownGame> {
 
 /// Find a known game by GOG App ID
 pub fn find_by_gog_id(app_id: &str) -> Option<&'static KnownGame> {
-    KNOWN_GAMES
-        .iter()
-        .find(|g| g.gog_app_id == Some(app_id))
+    KNOWN_GAMES.iter().find(|g| g.gog_app_id == Some(app_id))
 }
 
 /// Find a known game by name (case-insensitive)

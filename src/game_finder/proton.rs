@@ -35,7 +35,9 @@ pub fn find_steam_path() -> Option<PathBuf> {
         home_path.join("snap/steam/common/.local/share/Steam"),
     ];
 
-    candidates.into_iter().find(|p| p.join("steamapps").exists())
+    candidates
+        .into_iter()
+        .find(|p| p.join("steamapps").exists())
 }
 
 /// Find all compatible Protons (Proton 10+ only)
@@ -46,7 +48,9 @@ pub fn find_steam_protons() -> Vec<SteamProton> {
         return protons;
     };
 
-    let is_flatpak = steam_path.to_string_lossy().contains(".var/app/com.valvesoftware.Steam");
+    let is_flatpak = steam_path
+        .to_string_lossy()
+        .contains(".var/app/com.valvesoftware.Steam");
 
     // 1. Steam's built-in Protons (steamapps/common/Proton*)
     protons.extend(find_builtin_protons(&steam_path));
@@ -78,8 +82,7 @@ pub fn find_steam_protons() -> Vec<SteamProton> {
 
 /// Check if a Proton has a valid wine binary
 fn has_wine_binary(proton: &SteamProton) -> bool {
-    proton.path.join("files/bin/wine").exists()
-        || proton.path.join("dist/bin/wine").exists()
+    proton.path.join("files/bin/wine").exists() || proton.path.join("dist/bin/wine").exists()
 }
 
 /// Check if a Proton version is 10 or newer
@@ -104,10 +107,7 @@ fn is_proton_10_or_newer(proton: &SteamProton) -> bool {
     // GE-Proton: extract version from "GE-Proton10-27" format
     if name.starts_with("GE-Proton") {
         if let Some(version_part) = name.strip_prefix("GE-Proton") {
-            let major: Option<u32> = version_part
-                .split('-')
-                .next()
-                .and_then(|s| s.parse().ok());
+            let major: Option<u32> = version_part.split('-').next().and_then(|s| s.parse().ok());
             return major.map(|v| v >= 10).unwrap_or(false);
         }
     }
@@ -115,10 +115,7 @@ fn is_proton_10_or_newer(proton: &SteamProton) -> bool {
     // Steam Proton: extract version from "Proton 10.0" or "Proton 9.0" format
     if name.starts_with("Proton ") {
         if let Some(version_part) = name.strip_prefix("Proton ") {
-            let major: Option<u32> = version_part
-                .split('.')
-                .next()
-                .and_then(|s| s.parse().ok());
+            let major: Option<u32> = version_part.split('.').next().and_then(|s| s.parse().ok());
             return major.map(|v| v >= 10).unwrap_or(false);
         }
     }
@@ -126,10 +123,7 @@ fn is_proton_10_or_newer(proton: &SteamProton) -> bool {
     // EM-Proton: "EM-10.0-33" format
     if name.starts_with("EM-") {
         if let Some(version_part) = name.strip_prefix("EM-") {
-            let major: Option<u32> = version_part
-                .split('.')
-                .next()
-                .and_then(|s| s.parse().ok());
+            let major: Option<u32> = version_part.split('.').next().and_then(|s| s.parse().ok());
             return major.map(|v| v >= 10).unwrap_or(false);
         }
     }
@@ -265,7 +259,11 @@ mod tests {
         let protons = find_steam_protons();
         println!("Found {} compatible Protons:", protons.len());
         for p in &protons {
-            println!("  {} ({})", p.name, if p.is_steam_proton { "Steam" } else { "Custom" });
+            println!(
+                "  {} ({})",
+                p.name,
+                if p.is_steam_proton { "Steam" } else { "Custom" }
+            );
         }
     }
 

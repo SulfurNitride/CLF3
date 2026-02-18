@@ -9,8 +9,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
-const REPOSITORIES_URL: &str = "https://raw.githubusercontent.com/wabbajack-tools/mod-lists/master/repositories.json";
-const FEATURED_URL: &str = "https://raw.githubusercontent.com/wabbajack-tools/mod-lists/master/featured_lists.json";
+const REPOSITORIES_URL: &str =
+    "https://raw.githubusercontent.com/wabbajack-tools/mod-lists/master/repositories.json";
+const FEATURED_URL: &str =
+    "https://raw.githubusercontent.com/wabbajack-tools/mod-lists/master/featured_lists.json";
 
 /// Download metadata for a modlist
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -87,15 +89,24 @@ pub struct ModlistMetadata {
 impl ModlistMetadata {
     /// Get the download URL for this modlist
     pub fn download_url(&self) -> Option<&str> {
-        self.links.as_ref().map(|l| l.download.as_str()).filter(|s| !s.is_empty())
+        self.links
+            .as_ref()
+            .map(|l| l.download.as_str())
+            .filter(|s| !s.is_empty())
     }
 
     pub fn image_url(&self) -> Option<&str> {
-        self.links.as_ref().map(|l| l.image.as_str()).filter(|s| !s.is_empty())
+        self.links
+            .as_ref()
+            .map(|l| l.image.as_str())
+            .filter(|s| !s.is_empty())
     }
 
     pub fn readme_url(&self) -> Option<&str> {
-        self.links.as_ref().map(|l| l.readme.as_str()).filter(|s| !s.is_empty())
+        self.links
+            .as_ref()
+            .map(|l| l.readme.as_str())
+            .filter(|s| !s.is_empty())
     }
 
     pub fn download_size(&self) -> u64 {
@@ -193,11 +204,7 @@ impl ModlistBrowser {
                                     modlist.machine_name = links.machine_url.clone();
                                 }
                             }
-                            debug!(
-                                "  {} modlists from {}",
-                                modlists.len(),
-                                repo_name_clone
-                            );
+                            debug!("  {} modlists from {}", modlists.len(), repo_name_clone);
                             all_modlists.extend(modlists);
                         }
                         Err(e) => {
@@ -221,8 +228,12 @@ impl ModlistBrowser {
         // Count available vs unavailable for logging (but keep all in list)
         let available_count = all_modlists.iter().filter(|m| m.is_available()).count();
         let unavailable_count = all_modlists.len() - available_count;
-        info!("Total modlists: {} ({} available, {} unavailable)",
-              all_modlists.len(), available_count, unavailable_count);
+        info!(
+            "Total modlists: {} ({} available, {} unavailable)",
+            all_modlists.len(),
+            available_count,
+            unavailable_count
+        );
         self.modlists = all_modlists;
 
         // Fetch featured list
@@ -258,9 +269,9 @@ impl ModlistBrowser {
         let query = query.to_lowercase();
         let game = game_filter.unwrap_or("").to_string();
 
-        self.modlists.iter().filter(move |m| {
-            m.is_available() && m.matches_query(&query) && m.matches_game(&game)
-        })
+        self.modlists
+            .iter()
+            .filter(move |m| m.is_available() && m.matches_query(&query) && m.matches_game(&game))
     }
 
     pub fn modlists(&self) -> &[ModlistMetadata] {
@@ -285,7 +296,8 @@ impl ModlistBrowser {
         metadata: &ModlistMetadata,
         output_dir: &std::path::Path,
     ) -> Result<PathBuf> {
-        self.download_modlist_with_progress(metadata, output_dir, |_, _| {}).await
+        self.download_modlist_with_progress(metadata, output_dir, |_, _| {})
+            .await
     }
 
     /// Download a modlist .wabbajack file with progress callback
@@ -322,10 +334,18 @@ impl ModlistBrowser {
         if output_path.exists() && expected_size > 0 {
             if let Ok(file_meta) = std::fs::metadata(&output_path) {
                 if file_meta.len() == expected_size {
-                    info!("Using cached file: {} (size matches: {} bytes)", output_path.display(), expected_size);
+                    info!(
+                        "Using cached file: {} (size matches: {} bytes)",
+                        output_path.display(),
+                        expected_size
+                    );
                     return Ok(output_path);
                 } else {
-                    debug!("Cached file size mismatch: expected {} got {}, re-downloading", expected_size, file_meta.len());
+                    debug!(
+                        "Cached file size mismatch: expected {} got {}, re-downloading",
+                        expected_size,
+                        file_meta.len()
+                    );
                 }
             }
         }
@@ -338,11 +358,7 @@ impl ModlistBrowser {
             .download_with_progress(download_url, &output_path, expected_size, progress_callback)
             .await?;
 
-        info!(
-            "Downloaded {} ({} bytes)",
-            metadata.title,
-            bytes_downloaded
-        );
+        info!("Downloaded {} ({} bytes)", metadata.title, bytes_downloaded);
 
         Ok(output_path)
     }
@@ -413,9 +429,7 @@ impl ModlistBrowser {
         let cache_path = cache_dir.join("modlists.json");
         let metadata = std::fs::metadata(&cache_path).ok()?;
         let modified = metadata.modified().ok()?;
-        let age = std::time::SystemTime::now()
-            .duration_since(modified)
-            .ok()?;
+        let age = std::time::SystemTime::now().duration_since(modified).ok()?;
         Some(age.as_secs())
     }
 }

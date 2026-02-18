@@ -369,7 +369,10 @@ pub enum BSAFileState {
     #[serde(rename = "BA2FileState, Compression.BSA", alias = "BA2File")]
     BA2(BA2FileStateData),
 
-    #[serde(rename = "BA2DX10FileState, Compression.BSA", alias = "BA2DX10FileState")]
+    #[serde(
+        rename = "BA2DX10FileState, Compression.BSA",
+        alias = "BA2DX10FileState"
+    )]
     BA2DX10(BA2DX10FileStateData),
 
     #[serde(rename = "BA2DX10Entry, Compression.BSA", alias = "BA2DX10Entry")]
@@ -484,17 +487,16 @@ impl Modlist {
         let mut markers_found = Vec::new();
 
         // TTW marker files (checked case-insensitively)
-        const TTW_MARKERS: &[&str] = &[
-            "TaleOfTwoWastelands.esm",
-            "YUPTTW.esm",
-        ];
+        const TTW_MARKERS: &[&str] = &["TaleOfTwoWastelands.esm", "YUPTTW.esm"];
 
         for directive in &self.directives {
             let path_lower = directive.to_path().to_lowercase();
 
             for marker in TTW_MARKERS {
                 let marker_lower = marker.to_lowercase();
-                if path_lower.contains(&marker_lower) && !markers_found.contains(&marker.to_string()) {
+                if path_lower.contains(&marker_lower)
+                    && !markers_found.contains(&marker.to_string())
+                {
                     markers_found.push(marker.to_string());
                 }
             }

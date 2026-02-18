@@ -54,12 +54,7 @@ impl NexusRateLimits {
         let headers = response.headers();
 
         fn get_header<T: std::str::FromStr>(headers: &HeaderMap, name: &str) -> Option<T> {
-            headers
-                .get(name)?
-                .to_str()
-                .ok()?
-                .parse()
-                .ok()
+            headers.get(name)?.to_str().ok()?.parse().ok()
         }
 
         Some(Self {
@@ -148,13 +143,12 @@ impl NexusDownloader {
             bail!("Nexus API key validation failed ({}): {}", status, body);
         }
 
-        let user_info: NexusUserInfo = response
-            .json()
-            .await
-            .context("Failed to parse user info")?;
+        let user_info: NexusUserInfo =
+            response.json().await.context("Failed to parse user info")?;
 
         // Store Premium status
-        self.is_premium.store(user_info.is_premium, Ordering::Relaxed);
+        self.is_premium
+            .store(user_info.is_premium, Ordering::Relaxed);
         self.validated.store(true, Ordering::Relaxed);
 
         info!(
@@ -186,7 +180,8 @@ impl NexusDownloader {
     /// This is useful for users who want to use browser-based downloads
     /// even if they have a premium account.
     pub fn set_premium_override(&self, force_non_premium: bool) {
-        self.premium_override.store(force_non_premium, Ordering::Relaxed);
+        self.premium_override
+            .store(force_non_premium, Ordering::Relaxed);
         if force_non_premium {
             info!("Premium override enabled - forcing non-premium (NXM browser) mode");
         } else {
@@ -219,7 +214,8 @@ impl NexusDownloader {
         mod_id: u64,
         file_id: u64,
     ) -> Result<String> {
-        self.get_download_link_internal(game_domain, mod_id, file_id, None, None).await
+        self.get_download_link_internal(game_domain, mod_id, file_id, None, None)
+            .await
     }
 
     /// Get download URL for a file with NXM key/expires (bypasses hourly limit, uses daily limit)
@@ -235,7 +231,8 @@ impl NexusDownloader {
         key: &str,
         expires: u64,
     ) -> Result<String> {
-        self.get_download_link_internal(game_domain, mod_id, file_id, Some(key), Some(expires)).await
+        self.get_download_link_internal(game_domain, mod_id, file_id, Some(key), Some(expires))
+            .await
     }
 
     /// Internal method for getting download links with optional NXM key
@@ -337,9 +334,12 @@ impl NexusDownloader {
         }
 
         // Parse response
-        let body = response.text().await.context("Failed to read response body")?;
-        let links: Vec<DownloadLink> = serde_json::from_str(&body)
-            .context("Failed to parse download links response")?;
+        let body = response
+            .text()
+            .await
+            .context("Failed to read response body")?;
+        let links: Vec<DownloadLink> =
+            serde_json::from_str(&body).context("Failed to parse download links response")?;
 
         links
             .into_iter()
@@ -375,7 +375,7 @@ impl NexusDownloader {
             "cyberpunk2077" | "cyberpunk 2077" => "cyberpunk2077",
             "baldursgate3" | "baldur's gate 3" | "bg3" => "baldursgate3",
             "site" | "moddingtools" => "site", // Modding tools
-            _ => game_name, // Pass through unknown
+            _ => game_name,                    // Pass through unknown
         }
     }
 

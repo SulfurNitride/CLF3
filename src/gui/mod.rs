@@ -2,11 +2,11 @@
 //!
 //! Provides a graphical interface for the modlist installer.
 
-mod settings;
 mod image_cache;
+mod settings;
 
-pub use settings::Settings;
 pub use image_cache::ImageCache;
+pub use settings::Settings;
 
 // Main window component - full installer UI with setup form
 slint::slint! {
@@ -3089,11 +3089,13 @@ pub enum ProgressUpdate {
 }
 
 /// Static channel for communication between background thread and GUI
-static PROGRESS_CHANNEL: Lazy<(Mutex<Sender<ProgressUpdate>>, Mutex<Receiver<ProgressUpdate>>)> =
-    Lazy::new(|| {
-        let (tx, rx) = channel();
-        (Mutex::new(tx), Mutex::new(rx))
-    });
+static PROGRESS_CHANNEL: Lazy<(
+    Mutex<Sender<ProgressUpdate>>,
+    Mutex<Receiver<ProgressUpdate>>,
+)> = Lazy::new(|| {
+    let (tx, rx) = channel();
+    (Mutex::new(tx), Mutex::new(rx))
+});
 
 /// Get a clone of the progress sender for use in background threads
 pub fn get_progress_sender() -> Sender<ProgressUpdate> {
@@ -3197,7 +3199,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
                         window.set_api_key_state(ApiKeyState::Invalid);
                     }
                 }
-            }).ok();
+            })
+            .ok();
         });
     }
 
@@ -3215,10 +3218,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
     window.set_proton_options(std::rc::Rc::new(slint::VecModel::from(proton_options)).into());
 
     // String model for the ComboBox dropdown
-    let proton_names: Vec<slint::SharedString> = protons
-        .iter()
-        .map(|p| p.name.clone().into())
-        .collect();
+    let proton_names: Vec<slint::SharedString> =
+        protons.iter().map(|p| p.name.clone().into()).collect();
     window.set_proton_names(std::rc::Rc::new(slint::VecModel::from(proton_names)).into());
 
     // Store proton info for later use
@@ -3272,13 +3273,15 @@ pub fn run() -> Result<(), slint::PlatformError> {
                                         window.set_ttw_fnv_found(info.fnv_path.is_some());
 
                                         if let Some(fo3) = info.fo3_path {
-                                            window.set_ttw_fo3_path(fo3.display().to_string().into());
+                                            window
+                                                .set_ttw_fo3_path(fo3.display().to_string().into());
                                         } else {
                                             window.set_ttw_fo3_path("".into());
                                         }
 
                                         if let Some(fnv) = info.fnv_path {
-                                            window.set_ttw_fnv_path(fnv.display().to_string().into());
+                                            window
+                                                .set_ttw_fnv_path(fnv.display().to_string().into());
                                         } else {
                                             window.set_ttw_fnv_path("".into());
                                         }
@@ -3301,7 +3304,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
                                     }
                                 }
                             }
-                        }).ok();
+                        })
+                        .ok();
                     });
                 } else {
                     // Clear detected game for non-wabbajack files
@@ -3668,7 +3672,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
                             window.set_api_key_state(ApiKeyState::Invalid);
                         }
                     }
-                }).ok();
+                })
+                .ok();
             });
         }
     });
@@ -4565,7 +4570,11 @@ pub fn run() -> Result<(), slint::PlatformError> {
                         s.default_downloads_dir = dialog.get_default_downloads_dir().to_string();
                         s.nexus_api_key = dialog.get_nexus_api_key().to_string();
                         let gpu_idx = dialog.get_selected_gpu_index();
-                        s.gpu_index = if gpu_idx < 0 { None } else { Some(gpu_idx as usize) };
+                        s.gpu_index = if gpu_idx < 0 {
+                            None
+                        } else {
+                            Some(gpu_idx as usize)
+                        };
 
                         // Save to disk
                         if let Err(e) = s.save() {
@@ -4574,13 +4583,18 @@ pub fn run() -> Result<(), slint::PlatformError> {
 
                         // Apply to main window
                         if let Some(window) = window_weak.upgrade() {
-                            if !s.default_install_dir.is_empty() && window.get_install_dir().is_empty() {
+                            if !s.default_install_dir.is_empty()
+                                && window.get_install_dir().is_empty()
+                            {
                                 window.set_install_dir(s.default_install_dir.clone().into());
                             }
-                            if !s.default_downloads_dir.is_empty() && window.get_downloads_dir().is_empty() {
+                            if !s.default_downloads_dir.is_empty()
+                                && window.get_downloads_dir().is_empty()
+                            {
                                 window.set_downloads_dir(s.default_downloads_dir.clone().into());
                             }
-                            if !s.nexus_api_key.is_empty() && window.get_nexus_api_key().is_empty() {
+                            if !s.nexus_api_key.is_empty() && window.get_nexus_api_key().is_empty()
+                            {
                                 window.set_nexus_api_key(s.nexus_api_key.clone().into());
                             }
                         }
@@ -5213,7 +5227,9 @@ fn game_name_to_app_id(game: &str) -> Option<&'static str> {
 fn game_name_to_app_ids(game: &str) -> Vec<&'static str> {
     match game {
         "Fallout3" | "FO3" => vec!["22370", "22300"], // GOTY first, then base
-        _ => game_name_to_app_id(game).map(|id| vec![id]).unwrap_or_default(),
+        _ => game_name_to_app_id(game)
+            .map(|id| vec![id])
+            .unwrap_or_default(),
     }
 }
 
@@ -5287,8 +5303,8 @@ fn detect_modlist_info(path: &std::path::Path) -> anyhow::Result<ModlistDetectio
     use anyhow::Context;
 
     // Parse the modlist
-    let modlist = crate::modlist::parse_wabbajack_file(path)
-        .context("Failed to parse wabbajack file")?;
+    let modlist =
+        crate::modlist::parse_wabbajack_file(path).context("Failed to parse wabbajack file")?;
 
     // Calculate sizes
     let download_size: u64 = modlist.archives.iter().map(|a| a.size).sum();
@@ -5299,26 +5315,41 @@ fn detect_modlist_info(path: &std::path::Path) -> anyhow::Result<ModlistDetectio
     tx.send(ProgressUpdate::Log(format!(
         "[INFO] Modlist: {} v{}",
         modlist.name, modlist.version
-    ))).ok();
+    )))
+    .ok();
 
     if !modlist.author.is_empty() {
         tx.send(ProgressUpdate::Log(format!(
             "[INFO] Author: {}",
             modlist.author
-        ))).ok();
+        )))
+        .ok();
     }
 
     let game_type = &modlist.game_type;
     let display_name = game_name_to_display(game_type);
 
-    tx.send(ProgressUpdate::Log(format!("[INFO] Game: {}", display_name))).ok();
-    tx.send(ProgressUpdate::Log(format!("[INFO] Download Size: {}", format_bytes(download_size)))).ok();
-    tx.send(ProgressUpdate::Log(format!("[INFO] Install Size: {}", format_bytes(install_size)))).ok();
+    tx.send(ProgressUpdate::Log(format!(
+        "[INFO] Game: {}",
+        display_name
+    )))
+    .ok();
+    tx.send(ProgressUpdate::Log(format!(
+        "[INFO] Download Size: {}",
+        format_bytes(download_size)
+    )))
+    .ok();
+    tx.send(ProgressUpdate::Log(format!(
+        "[INFO] Install Size: {}",
+        format_bytes(install_size)
+    )))
+    .ok();
     tx.send(ProgressUpdate::Log(format!(
         "[INFO] Archives: {}, Directives: {}",
         modlist.archives.len(),
         modlist.directives.len()
-    ))).ok();
+    )))
+    .ok();
 
     // Detect TTW requirement
     let ttw_result = modlist.requires_ttw();
@@ -5328,7 +5359,8 @@ fn detect_modlist_info(path: &std::path::Path) -> anyhow::Result<ModlistDetectio
         tx.send(ProgressUpdate::Log(format!(
             "[INFO] TTW Required: Yes (detected: {})",
             ttw_result.markers_found.join(", ")
-        ))).ok();
+        )))
+        .ok();
     }
 
     // Use detect_all_games for game detection
@@ -5338,9 +5370,16 @@ fn detect_modlist_info(path: &std::path::Path) -> anyhow::Result<ModlistDetectio
     let fo3_path = crate::ttw::find_fallout3(&scan_result);
     if ttw_required {
         if let Some(ref path) = fo3_path {
-            tx.send(ProgressUpdate::Log(format!("[INFO] Fallout 3 found: {}", path.display()))).ok();
+            tx.send(ProgressUpdate::Log(format!(
+                "[INFO] Fallout 3 found: {}",
+                path.display()
+            )))
+            .ok();
         } else {
-            tx.send(ProgressUpdate::Log("[WARN] Fallout 3 not found - required for TTW".to_string())).ok();
+            tx.send(ProgressUpdate::Log(
+                "[WARN] Fallout 3 not found - required for TTW".to_string(),
+            ))
+            .ok();
         }
     }
 
@@ -5348,7 +5387,11 @@ fn detect_modlist_info(path: &std::path::Path) -> anyhow::Result<ModlistDetectio
     let fnv_path = crate::ttw::find_fallout_nv(&scan_result);
     if ttw_required {
         if let Some(ref path) = fnv_path {
-            tx.send(ProgressUpdate::Log(format!("[INFO] Fallout NV found: {}", path.display()))).ok();
+            tx.send(ProgressUpdate::Log(format!(
+                "[INFO] Fallout NV found: {}",
+                path.display()
+            )))
+            .ok();
         }
     }
 
@@ -5362,13 +5405,18 @@ fn detect_modlist_info(path: &std::path::Path) -> anyhow::Result<ModlistDetectio
                 tx.send(ProgressUpdate::Log(format!(
                     "[INFO] Found game at: {}",
                     game.install_path.display()
-                ))).ok();
+                )))
+                .ok();
                 found = Some(format!("{} ({})", display_name, platform));
                 break;
             }
         }
         found.unwrap_or_else(|| {
-            tx.send(ProgressUpdate::Log(format!("[WARN] Game not found: {}", display_name))).ok();
+            tx.send(ProgressUpdate::Log(format!(
+                "[WARN] Game not found: {}",
+                display_name
+            )))
+            .ok();
             format!("{} (not found)", display_name)
         })
     } else {
@@ -5378,15 +5426,20 @@ fn detect_modlist_info(path: &std::path::Path) -> anyhow::Result<ModlistDetectio
     // Load cached config for this modlist
     let (cached_install_dir, cached_downloads_dir, cached_ttw_mpi_path) =
         match crate::installer::ConfigCache::open() {
-            Ok(cache) => {
-                match cache.get_config(&modlist.name, &modlist.version) {
-                    Ok(Some(config)) => {
-                        tx.send(ProgressUpdate::Log("[INFO] Loaded cached configuration".to_string())).ok();
-                        (config.install_dir, config.downloads_dir, config.ttw_mpi_path)
-                    }
-                    _ => (None, None, None),
+            Ok(cache) => match cache.get_config(&modlist.name, &modlist.version) {
+                Ok(Some(config)) => {
+                    tx.send(ProgressUpdate::Log(
+                        "[INFO] Loaded cached configuration".to_string(),
+                    ))
+                    .ok();
+                    (
+                        config.install_dir,
+                        config.downloads_dir,
+                        config.ttw_mpi_path,
+                    )
                 }
-            }
+                _ => (None, None, None),
+            },
             Err(_) => (None, None, None),
         };
 
@@ -5453,9 +5506,14 @@ async fn run_wabbajack_install(
     let tx = get_progress_sender();
 
     // Send initial status
-    tx.send(ProgressUpdate::Phase("Validating".to_string())).ok();
-    tx.send(ProgressUpdate::Status("Parsing modlist...".to_string())).ok();
-    tx.send(ProgressUpdate::Log("[INFO] Starting Wabbajack installation...".to_string())).ok();
+    tx.send(ProgressUpdate::Phase("Validating".to_string()))
+        .ok();
+    tx.send(ProgressUpdate::Status("Parsing modlist...".to_string()))
+        .ok();
+    tx.send(ProgressUpdate::Log(
+        "[INFO] Starting Wabbajack installation...".to_string(),
+    ))
+    .ok();
 
     println!("[GUI] Starting Wabbajack installation...");
     println!("[GUI] Non-premium mode: {}", non_premium);
@@ -5465,14 +5523,26 @@ async fn run_wabbajack_install(
     let modlist = match crate::modlist::parse_wabbajack_file(source) {
         Ok(m) => m,
         Err(e) => {
-            tx.send(ProgressUpdate::Error(format!("Failed to parse modlist: {}", e))).ok();
+            tx.send(ProgressUpdate::Error(format!(
+                "Failed to parse modlist: {}",
+                e
+            )))
+            .ok();
             return Err(e);
         }
     };
     let game_type = &modlist.game_type;
 
-    tx.send(ProgressUpdate::Log(format!("[INFO] Detected game type: {}", game_type))).ok();
-    tx.send(ProgressUpdate::Status(format!("Detected game: {}", game_type))).ok();
+    tx.send(ProgressUpdate::Log(format!(
+        "[INFO] Detected game type: {}",
+        game_type
+    )))
+    .ok();
+    tx.send(ProgressUpdate::Status(format!(
+        "Detected game: {}",
+        game_type
+    )))
+    .ok();
 
     // Find the game installation path (try all possible app IDs for games with variants)
     let app_ids = game_name_to_app_ids(game_type);
@@ -5484,7 +5554,11 @@ async fn run_wabbajack_install(
         let mut found_path = None;
         for app_id in &app_ids {
             if let Some(path) = crate::game_finder::find_game_install_path(app_id) {
-                tx.send(ProgressUpdate::Log(format!("[INFO] Found game at: {}", path.display()))).ok();
+                tx.send(ProgressUpdate::Log(format!(
+                    "[INFO] Found game at: {}",
+                    path.display()
+                )))
+                .ok();
                 found_path = Some(path);
                 break;
             }
@@ -5492,14 +5566,21 @@ async fn run_wabbajack_install(
         match found_path {
             Some(path) => path,
             None => {
-                let err = format!("Game not found: {}. Please ensure the game is installed.", game_type);
+                let err = format!(
+                    "Game not found: {}. Please ensure the game is installed.",
+                    game_type
+                );
                 tx.send(ProgressUpdate::Error(err.clone())).ok();
                 anyhow::bail!(err);
             }
         }
     };
 
-    println!("[GUI] Detected game: {} at {}", game_type, game_dir.display());
+    println!(
+        "[GUI] Detected game: {} at {}",
+        game_type,
+        game_dir.display()
+    );
 
     // Get thread count for concurrency
     let thread_count = std::thread::available_parallelism()
@@ -5508,7 +5589,11 @@ async fn run_wabbajack_install(
 
     // Calculate total download size from archives
     let total_download_size: u64 = modlist.archives.iter().map(|a| a.size).sum();
-    tx.send(ProgressUpdate::SizeProgress(format!("0 B / {}", format_bytes(total_download_size)))).ok();
+    tx.send(ProgressUpdate::SizeProgress(format!(
+        "0 B / {}",
+        format_bytes(total_download_size)
+    )))
+    .ok();
 
     // Track speeds from all concurrent downloads
     let active_speeds: Arc<std::sync::Mutex<std::collections::HashMap<String, f64>>> =
@@ -5531,7 +5616,12 @@ async fn run_wabbajack_install(
     let progress_callback: ProgressCallback = Arc::new(move |event| {
         match event {
             // Download events
-            ProgressEvent::DownloadProgress { name, downloaded, total: _, speed } => {
+            ProgressEvent::DownloadProgress {
+                name,
+                downloaded,
+                total: _,
+                speed,
+            } => {
                 // Update this download's progress
                 if let Ok(mut map) = dl_progress.lock() {
                     map.insert(name.clone(), downloaded);
@@ -5542,23 +5632,35 @@ async fn run_wabbajack_install(
                     map.insert(name, speed);
                     let total_speed: f64 = map.values().sum();
                     let speed_mib = total_speed / (1024.0 * 1024.0);
-                    progress_tx.send(ProgressUpdate::DownloadSpeed(format!("{:.1} MiB/s", speed_mib))).ok();
+                    progress_tx
+                        .send(ProgressUpdate::DownloadSpeed(format!(
+                            "{:.1} MiB/s",
+                            speed_mib
+                        )))
+                        .ok();
 
                     // Calculate total downloaded bytes
                     let completed_so_far = completed.load(std::sync::atomic::Ordering::Relaxed);
-                    let active_bytes: u64 = dl_progress.lock().map(|m| m.values().sum()).unwrap_or(0);
+                    let active_bytes: u64 =
+                        dl_progress.lock().map(|m| m.values().sum()).unwrap_or(0);
                     let current_downloaded = completed_so_far + active_bytes;
 
                     // Send size progress
-                    progress_tx.send(ProgressUpdate::SizeProgress(
-                        format!("{} / {}", format_bytes(current_downloaded), format_bytes(total_size))
-                    )).ok();
+                    progress_tx
+                        .send(ProgressUpdate::SizeProgress(format!(
+                            "{} / {}",
+                            format_bytes(current_downloaded),
+                            format_bytes(total_size)
+                        )))
+                        .ok();
 
                     // Calculate and send ETA
                     if total_speed > 0.0 && current_downloaded < total_size {
                         let remaining = total_size - current_downloaded;
                         let eta_secs = remaining as f64 / total_speed;
-                        progress_tx.send(ProgressUpdate::Eta(format_eta(eta_secs))).ok();
+                        progress_tx
+                            .send(ProgressUpdate::Eta(format_eta(eta_secs)))
+                            .ok();
                     }
                 }
             }
@@ -5575,52 +5677,108 @@ async fn run_wabbajack_install(
                 if let Ok(mut map) = speeds.lock() {
                     map.remove(&name);
                     if map.is_empty() {
-                        progress_tx.send(ProgressUpdate::DownloadSpeed("--".to_string())).ok();
-                        progress_tx.send(ProgressUpdate::Eta("--:--".to_string())).ok();
+                        progress_tx
+                            .send(ProgressUpdate::DownloadSpeed("--".to_string()))
+                            .ok();
+                        progress_tx
+                            .send(ProgressUpdate::Eta("--:--".to_string()))
+                            .ok();
                     } else {
                         let total_speed: f64 = map.values().sum();
                         let speed_mib = total_speed / (1024.0 * 1024.0);
-                        progress_tx.send(ProgressUpdate::DownloadSpeed(format!("{:.1} MiB/s", speed_mib))).ok();
+                        progress_tx
+                            .send(ProgressUpdate::DownloadSpeed(format!(
+                                "{:.1} MiB/s",
+                                speed_mib
+                            )))
+                            .ok();
                     }
                 }
             }
             ProgressEvent::ArchiveComplete { index, total } => {
-                progress_tx.send(ProgressUpdate::FileCount(index as i32, total as i32)).ok();
+                progress_tx
+                    .send(ProgressUpdate::FileCount(index as i32, total as i32))
+                    .ok();
                 let overall_progress = index as f32 / total as f32;
-                progress_tx.send(ProgressUpdate::OverallProgress(overall_progress)).ok();
+                progress_tx
+                    .send(ProgressUpdate::OverallProgress(overall_progress))
+                    .ok();
             }
-            ProgressEvent::DownloadSkipped { count, total_size: skipped_size } => {
+            ProgressEvent::DownloadSkipped {
+                count,
+                total_size: skipped_size,
+            } => {
                 // Add skipped archive sizes to completed bytes so progress is accurate
                 completed.fetch_add(skipped_size, std::sync::atomic::Ordering::Relaxed);
                 // Update the size progress display
                 let current_downloaded = completed.load(std::sync::atomic::Ordering::Relaxed);
-                progress_tx.send(ProgressUpdate::SizeProgress(
-                    format!("{} / {}", format_bytes(current_downloaded), format_bytes(total_size))
-                )).ok();
-                progress_tx.send(ProgressUpdate::Log(
-                    format!("[INFO] Skipped {} already-downloaded archives ({} total)", count, format_bytes(skipped_size))
-                )).ok();
+                progress_tx
+                    .send(ProgressUpdate::SizeProgress(format!(
+                        "{} / {}",
+                        format_bytes(current_downloaded),
+                        format_bytes(total_size)
+                    )))
+                    .ok();
+                progress_tx
+                    .send(ProgressUpdate::Log(format!(
+                        "[INFO] Skipped {} already-downloaded archives ({} total)",
+                        count,
+                        format_bytes(skipped_size)
+                    )))
+                    .ok();
             }
             // Directive/extraction events
             ProgressEvent::PhaseChange { phase } => {
                 progress_tx.send(ProgressUpdate::Phase(phase.clone())).ok();
                 // When switching to Installing/Processing phase, reset progress display
                 if phase == "Installing" || phase == "Processing" {
-                    progress_tx.send(ProgressUpdate::DownloadSpeed("--".to_string())).ok();
-                    progress_tx.send(ProgressUpdate::Eta("--:--".to_string())).ok();
-                    progress_tx.send(ProgressUpdate::SizeProgress("Processing directives...".to_string())).ok();
+                    progress_tx
+                        .send(ProgressUpdate::DownloadSpeed("--".to_string()))
+                        .ok();
+                    progress_tx
+                        .send(ProgressUpdate::Eta("--:--".to_string()))
+                        .ok();
+                    progress_tx
+                        .send(ProgressUpdate::SizeProgress(
+                            "Processing directives...".to_string(),
+                        ))
+                        .ok();
                     progress_tx.send(ProgressUpdate::OverallProgress(0.0)).ok();
                 }
             }
-            ProgressEvent::DirectivePhaseStarted { directive_type, total } => {
-                progress_tx.send(ProgressUpdate::Status(format!("Processing {} ({} directives)...", directive_type, total))).ok();
-                progress_tx.send(ProgressUpdate::SizeProgress(format!("0 / {} {}", total, directive_type))).ok();
-                progress_tx.send(ProgressUpdate::FileCount(0, total as i32)).ok();
+            ProgressEvent::DirectivePhaseStarted {
+                directive_type,
+                total,
+            } => {
+                progress_tx
+                    .send(ProgressUpdate::Status(format!(
+                        "Processing {} ({} directives)...",
+                        directive_type, total
+                    )))
+                    .ok();
+                progress_tx
+                    .send(ProgressUpdate::SizeProgress(format!(
+                        "0 / {} {}",
+                        total, directive_type
+                    )))
+                    .ok();
+                progress_tx
+                    .send(ProgressUpdate::FileCount(0, total as i32))
+                    .ok();
             }
             ProgressEvent::DirectiveComplete { index, total } => {
-                progress_tx.send(ProgressUpdate::FileCount(index as i32, total as i32)).ok();
-                progress_tx.send(ProgressUpdate::OverallProgress(index as f32 / total as f32)).ok();
-                progress_tx.send(ProgressUpdate::SizeProgress(format!("{} / {} directives", index, total))).ok();
+                progress_tx
+                    .send(ProgressUpdate::FileCount(index as i32, total as i32))
+                    .ok();
+                progress_tx
+                    .send(ProgressUpdate::OverallProgress(index as f32 / total as f32))
+                    .ok();
+                progress_tx
+                    .send(ProgressUpdate::SizeProgress(format!(
+                        "{} / {} directives",
+                        index, total
+                    )))
+                    .ok();
             }
             ProgressEvent::Status { message } => {
                 progress_tx.send(ProgressUpdate::Status(message)).ok();
@@ -5642,11 +5800,18 @@ async fn run_wabbajack_install(
     };
 
     // Create installer
-    tx.send(ProgressUpdate::Status("Initializing installer...".to_string())).ok();
+    tx.send(ProgressUpdate::Status(
+        "Initializing installer...".to_string(),
+    ))
+    .ok();
     let mut installer = match Installer::new(config) {
         Ok(i) => i,
         Err(e) => {
-            tx.send(ProgressUpdate::Error(format!("Failed to create installer: {}", e))).ok();
+            tx.send(ProgressUpdate::Error(format!(
+                "Failed to create installer: {}",
+                e
+            )))
+            .ok();
             return Err(e);
         }
     };
@@ -5654,19 +5819,32 @@ async fn run_wabbajack_install(
     // Count archives for progress tracking
     let archive_count = modlist.archives.len();
     let directive_count = modlist.directives.len();
-    tx.send(ProgressUpdate::Log(format!("[INFO] {} archives, {} directives to process", archive_count, directive_count))).ok();
-    tx.send(ProgressUpdate::FileCount(0, archive_count as i32)).ok();
+    tx.send(ProgressUpdate::Log(format!(
+        "[INFO] {} archives, {} directives to process",
+        archive_count, directive_count
+    )))
+    .ok();
+    tx.send(ProgressUpdate::FileCount(0, archive_count as i32))
+        .ok();
 
     // Phase: Downloading
-    tx.send(ProgressUpdate::Phase("Downloading".to_string())).ok();
-    tx.send(ProgressUpdate::Status("Downloading archives...".to_string())).ok();
-    tx.send(ProgressUpdate::Log("[INFO] Starting download phase...".to_string())).ok();
+    tx.send(ProgressUpdate::Phase("Downloading".to_string()))
+        .ok();
+    tx.send(ProgressUpdate::Status(
+        "Downloading archives...".to_string(),
+    ))
+    .ok();
+    tx.send(ProgressUpdate::Log(
+        "[INFO] Starting download phase...".to_string(),
+    ))
+    .ok();
 
     // Use streaming pipeline for better performance
     let stats = match installer.run_streaming(8, 8).await {
         Ok(s) => s,
         Err(e) => {
-            tx.send(ProgressUpdate::Error(format!("Installation failed: {}", e))).ok();
+            tx.send(ProgressUpdate::Error(format!("Installation failed: {}", e)))
+                .ok();
             return Err(e);
         }
     };
@@ -5674,21 +5852,38 @@ async fn run_wabbajack_install(
     // Send completion stats
     tx.send(ProgressUpdate::Log(format!(
         "[INFO] Downloads: {} downloaded, {} skipped, {} manual, {} failed",
-        stats.archives_downloaded, stats.archives_skipped,
-        stats.archives_manual, stats.archives_failed
-    ))).ok();
-    let total_processed = stats.directives_completed + stats.directives_skipped + stats.directives_failed;
+        stats.archives_downloaded,
+        stats.archives_skipped,
+        stats.archives_manual,
+        stats.archives_failed
+    )))
+    .ok();
+    let total_processed =
+        stats.directives_completed + stats.directives_skipped + stats.directives_failed;
     tx.send(ProgressUpdate::Log(format!(
         "[INFO] Directives: {} new, {} existing, {} failed ({} total)",
-        stats.directives_completed, stats.directives_skipped, stats.directives_failed, total_processed
-    ))).ok();
+        stats.directives_completed,
+        stats.directives_skipped,
+        stats.directives_failed,
+        total_processed
+    )))
+    .ok();
 
     println!("[GUI] Installation Summary:");
-    println!("[GUI]   Downloads: {} downloaded, {} skipped, {} manual, {} failed",
-        stats.archives_downloaded, stats.archives_skipped,
-        stats.archives_manual, stats.archives_failed);
-    println!("[GUI]   Directives: {} new, {} existing, {} failed ({} total)",
-        stats.directives_completed, stats.directives_skipped, stats.directives_failed, total_processed);
+    println!(
+        "[GUI]   Downloads: {} downloaded, {} skipped, {} manual, {} failed",
+        stats.archives_downloaded,
+        stats.archives_skipped,
+        stats.archives_manual,
+        stats.archives_failed
+    );
+    println!(
+        "[GUI]   Directives: {} new, {} existing, {} failed ({} total)",
+        stats.directives_completed,
+        stats.directives_skipped,
+        stats.directives_failed,
+        total_processed
+    );
 
     if stats.archives_manual > 0 || stats.archives_failed > 0 {
         // Log failed downloads with details
@@ -5696,11 +5891,10 @@ async fn run_wabbajack_install(
             tx.send(ProgressUpdate::Log(format!(
                 "[FAILED] {}: {}",
                 fd.name, fd.error
-            ))).ok();
-            tx.send(ProgressUpdate::Log(format!(
-                "         URL: {}",
-                fd.url
-            ))).ok();
+            )))
+            .ok();
+            tx.send(ProgressUpdate::Log(format!("         URL: {}", fd.url)))
+                .ok();
         }
 
         // Log manual downloads with details
@@ -5708,17 +5902,18 @@ async fn run_wabbajack_install(
             tx.send(ProgressUpdate::Log(format!(
                 "[MANUAL] {}: {}",
                 md.name, md.url
-            ))).ok();
+            )))
+            .ok();
             if let Some(prompt) = &md.prompt {
-                tx.send(ProgressUpdate::Log(format!(
-                    "         Note: {}",
-                    prompt
-                ))).ok();
+                tx.send(ProgressUpdate::Log(format!("         Note: {}", prompt)))
+                    .ok();
             }
         }
 
-        let err = format!("Some archives need manual download. {} manual, {} failed.",
-            stats.archives_manual, stats.archives_failed);
+        let err = format!(
+            "Some archives need manual download. {} manual, {} failed.",
+            stats.archives_manual, stats.archives_failed
+        );
         tx.send(ProgressUpdate::Error(err.clone())).ok();
         anyhow::bail!(err);
     }
@@ -5730,8 +5925,10 @@ async fn run_wabbajack_install(
     }
 
     // Success!
-    tx.send(ProgressUpdate::Log("[INFO] Installation completed successfully!".to_string())).ok();
+    tx.send(ProgressUpdate::Log(
+        "[INFO] Installation completed successfully!".to_string(),
+    ))
+    .ok();
 
     Ok(())
 }
-

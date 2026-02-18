@@ -21,7 +21,8 @@ pub fn compute_file_hash(path: &Path) -> Result<String> {
     let mut hasher = xxhash_rust::xxh64::Xxh64::new(0);
 
     loop {
-        let bytes_read = reader.read(&mut buf)
+        let bytes_read = reader
+            .read(&mut buf)
             .with_context(|| format!("Failed to read file for hashing: {}", path.display()))?;
 
         if bytes_read == 0 {
@@ -63,7 +64,7 @@ pub fn verify_file_hash_detailed(path: &Path, expected_hash: &str) -> Result<(bo
 /// Returns Vec of (path, expected_hash, actual_hash) for failed verifications.
 #[allow(dead_code)] // Part of hash API, not yet wired up
 pub fn verify_archives_batch<P: AsRef<Path>>(
-    archives: &[(P, &str)], // (path, expected_hash)
+    archives: &[(P, &str)],                           // (path, expected_hash)
     progress_callback: Option<&dyn Fn(usize, usize)>, // (current, total)
 ) -> Result<Vec<(String, String, String)>> {
     let mut failures = Vec::new();

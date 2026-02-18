@@ -13,8 +13,8 @@ use super::{Game, HeroicStore, Launcher};
 
 /// Possible Heroic configuration paths
 const HEROIC_PATHS: &[&str] = &[
-    ".config/heroic",                                          // Native
-    ".var/app/com.heroicgameslauncher.hgl/config/heroic",      // Flatpak
+    ".config/heroic",                                     // Native
+    ".var/app/com.heroicgameslauncher.hgl/config/heroic", // Flatpak
 ];
 
 /// Detect all Heroic games
@@ -31,7 +31,10 @@ pub fn detect_heroic_games() -> Vec<Game> {
             continue;
         }
 
-        println!("[game_finder] Found Heroic installation: {}", heroic_path.display());
+        println!(
+            "[game_finder] Found Heroic installation: {}",
+            heroic_path.display()
+        );
 
         // Detect GOG games
         let gog_games = detect_gog_games(&heroic_path);
@@ -42,7 +45,10 @@ pub fn detect_heroic_games() -> Vec<Game> {
         games.extend(epic_games);
     }
 
-    println!("[game_finder] Heroic: Found {} installed games", games.len());
+    println!(
+        "[game_finder] Heroic: Found {} installed games",
+        games.len()
+    );
     games
 }
 
@@ -96,9 +102,7 @@ fn detect_gog_games(heroic_path: &Path) -> Vec<Game> {
         // Look up known game info
         let known_game = find_by_gog_id(&gog_game.app_name);
 
-        let name = gog_game
-            .title
-            .unwrap_or_else(|| gog_game.app_name.clone());
+        let name = gog_game.title.unwrap_or_else(|| gog_game.app_name.clone());
 
         games.push(Game {
             name,
@@ -110,7 +114,8 @@ fn detect_gog_games(heroic_path: &Path) -> Vec<Game> {
             },
             my_games_folder: known_game.and_then(|g| g.my_games_folder.map(String::from)),
             appdata_local_folder: known_game.and_then(|g| g.appdata_local_folder.map(String::from)),
-            appdata_roaming_folder: known_game.and_then(|g| g.appdata_roaming_folder.map(String::from)),
+            appdata_roaming_folder: known_game
+                .and_then(|g| g.appdata_roaming_folder.map(String::from)),
             registry_path: known_game.map(|g| g.registry_path.to_string()),
             registry_value: known_game.map(|g| g.registry_value.to_string()),
         });
@@ -168,17 +173,13 @@ fn detect_epic_games(heroic_path: &Path) -> Vec<Game> {
                 }
 
                 // Get platform
-                let platform = game_obj
-                    .get("platform")
-                    .and_then(|v| v.as_str());
+                let platform = game_obj.get("platform").and_then(|v| v.as_str());
                 if platform != Some("Windows") && platform != Some("windows") {
                     continue;
                 }
 
                 // Get install path
-                let Some(install_path_str) = game_obj
-                    .get("install_path")
-                    .and_then(|v| v.as_str())
+                let Some(install_path_str) = game_obj.get("install_path").and_then(|v| v.as_str())
                 else {
                     continue;
                 };

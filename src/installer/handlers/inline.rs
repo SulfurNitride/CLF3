@@ -77,8 +77,10 @@ pub fn handle_remapped_inline_file(
 /// Remap path placeholders in content
 fn remap_paths(content: &str, ctx: &ProcessContext) -> String {
     // Early-out: if content has no magic tokens or legacy placeholders, skip all replacements
-    if !content.contains("{--||") && !content.contains("[Game Folder Files]")
-        && !content.contains("[MO2_PATH]") && !content.contains("[DOWNLOADS_PATH]")
+    if !content.contains("{--||")
+        && !content.contains("[Game Folder Files]")
+        && !content.contains("[MO2_PATH]")
+        && !content.contains("[DOWNLOADS_PATH]")
         && !content.contains("download_directory=")
     {
         return content.to_string();
@@ -87,9 +89,27 @@ fn remap_paths(content: &str, ctx: &ProcessContext) -> String {
     let mut result = content.to_string();
 
     // Get base paths and normalize once (remove trailing slashes, ensure forward slashes)
-    let mo2_base = ctx.config.output_dir.to_string_lossy().trim_end_matches('/').trim_end_matches('\\').replace('\\', "/");
-    let game_base = ctx.config.game_dir.to_string_lossy().trim_end_matches('/').trim_end_matches('\\').replace('\\', "/");
-    let downloads_base = ctx.config.downloads_dir.to_string_lossy().trim_end_matches('/').trim_end_matches('\\').replace('\\', "/");
+    let mo2_base = ctx
+        .config
+        .output_dir
+        .to_string_lossy()
+        .trim_end_matches('/')
+        .trim_end_matches('\\')
+        .replace('\\', "/");
+    let game_base = ctx
+        .config
+        .game_dir
+        .to_string_lossy()
+        .trim_end_matches('/')
+        .trim_end_matches('\\')
+        .replace('\\', "/");
+    let downloads_base = ctx
+        .config
+        .downloads_dir
+        .to_string_lossy()
+        .trim_end_matches('/')
+        .trim_end_matches('\\')
+        .replace('\\', "/");
 
     // Derive all variants from the base forward-slash path
     let mo2_forward = format!("Z:{}", mo2_base);
@@ -119,7 +139,10 @@ fn remap_paths(content: &str, ctx: &ProcessContext) -> String {
 
     // Downloads path tokens
     result = result.replace("{--||DOWNLOADS_PATH_MAGIC_FORWARD||--}", &downloads_forward);
-    result = result.replace("{--||DOWNLOADS_PATH_MAGIC_DOUBLE_BACK||--}", &downloads_double_back);
+    result = result.replace(
+        "{--||DOWNLOADS_PATH_MAGIC_DOUBLE_BACK||--}",
+        &downloads_double_back,
+    );
     result = result.replace("{--||DOWNLOADS_PATH_MAGIC_BACK||--}", &downloads_back);
 
     // Legacy placeholders (older Wabbajack format)

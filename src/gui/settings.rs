@@ -80,8 +80,8 @@ impl Settings {
             return Ok(Self::default());
         }
 
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read {:?}", path))?;
+        let content =
+            std::fs::read_to_string(&path).with_context(|| format!("Failed to read {:?}", path))?;
 
         let settings: Self = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse {:?}", path))?;
@@ -96,11 +96,9 @@ impl Settings {
             .with_context(|| format!("Failed to create {:?}", config_dir))?;
 
         let path = Self::settings_path()?;
-        let content = serde_json::to_string_pretty(self)
-            .context("Failed to serialize settings")?;
+        let content = serde_json::to_string_pretty(self).context("Failed to serialize settings")?;
 
-        std::fs::write(&path, content)
-            .with_context(|| format!("Failed to write {:?}", path))?;
+        std::fs::write(&path, content).with_context(|| format!("Failed to write {:?}", path))?;
 
         Ok(())
     }
@@ -133,7 +131,12 @@ impl Settings {
 pub fn get_available_gpus() -> Vec<(usize, String)> {
     crate::textures::list_gpus()
         .into_iter()
-        .map(|gpu| (gpu.adapter_index, format!("{} ({}, {})", gpu.name, gpu.backend, gpu.device_type)))
+        .map(|gpu| {
+            (
+                gpu.adapter_index,
+                format!("{} ({}, {})", gpu.name, gpu.backend, gpu.device_type),
+            )
+        })
         .collect()
 }
 

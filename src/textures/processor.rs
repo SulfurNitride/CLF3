@@ -75,8 +75,12 @@ impl OutputFormat {
             "BC3" | "BC3_UNORM" | "BC3_UNORM_SRGB" | "BC3_SRGB" | "DXT5" => Some(OutputFormat::BC3),
             "BC2" | "BC2_UNORM" | "BC2_UNORM_SRGB" | "BC2_SRGB" | "DXT3" => Some(OutputFormat::BC2),
             "BC1" | "BC1_UNORM" | "BC1_UNORM_SRGB" | "BC1_SRGB" | "DXT1" => Some(OutputFormat::BC1),
-            "RGBA" | "R8G8B8A8" | "R8G8B8A8_UNORM" | "R8G8B8A8_UNORM_SRGB" | "ARGB_8888" => Some(OutputFormat::Rgba),
-            "BGRA" | "B8G8R8A8" | "B8G8R8A8_UNORM" | "B8G8R8A8_UNORM_SRGB" => Some(OutputFormat::Bgra),
+            "RGBA" | "R8G8B8A8" | "R8G8B8A8_UNORM" | "R8G8B8A8_UNORM_SRGB" | "ARGB_8888" => {
+                Some(OutputFormat::Rgba)
+            }
+            "BGRA" | "B8G8R8A8" | "B8G8R8A8_UNORM" | "B8G8R8A8_UNORM_SRGB" => {
+                Some(OutputFormat::Bgra)
+            }
             _ => None,
         }
     }
@@ -178,15 +182,15 @@ fn decode_with_directxtex(input_data: &[u8]) -> Result<RgbaImage> {
     let image = &images[0];
 
     // Copy pixel data
-    let pixel_data =
-        unsafe { std::slice::from_raw_parts(image.pixels, image.slice_pitch) };
+    let pixel_data = unsafe { std::slice::from_raw_parts(image.pixels, image.slice_pitch) };
 
     RgbaImage::from_raw(width, height, pixel_data.to_vec())
         .context("DirectXTex: failed to create RgbaImage")
 }
 
 /// Global GPU encoder (lazy initialized)
-static GPU_ENCODER: std::sync::OnceLock<Arc<Mutex<Option<GpuEncoder>>>> = std::sync::OnceLock::new();
+static GPU_ENCODER: std::sync::OnceLock<Arc<Mutex<Option<GpuEncoder>>>> =
+    std::sync::OnceLock::new();
 
 /// Initialize the global GPU encoder
 pub fn init_gpu() -> Result<()> {
@@ -195,11 +199,17 @@ pub fn init_gpu() -> Result<()> {
     if lock.is_none() {
         match GpuEncoder::new() {
             Ok(e) => {
-                info!("GPU encoder initialized: {} ({})", e.gpu_info.name, e.gpu_info.backend);
+                info!(
+                    "GPU encoder initialized: {} ({})",
+                    e.gpu_info.name, e.gpu_info.backend
+                );
                 *lock = Some(e);
             }
             Err(e) => {
-                warn!("GPU encoder not available: {}. BC7 will use CPU fallback.", e);
+                warn!(
+                    "GPU encoder not available: {}. BC7 will use CPU fallback.",
+                    e
+                );
             }
         }
     }
@@ -240,7 +250,11 @@ fn generate_mipmaps(base: &RgbaImage) -> Vec<(Vec<u8>, u32, u32)> {
 }
 
 /// Create BC7 DDS file with mipmap data
-fn create_bc7_dds_with_mips(mip_data: Vec<Vec<u8>>, base_width: u32, base_height: u32) -> Result<Vec<u8>> {
+fn create_bc7_dds_with_mips(
+    mip_data: Vec<Vec<u8>>,
+    base_width: u32,
+    base_height: u32,
+) -> Result<Vec<u8>> {
     use image_dds::ddsfile::{AlphaMode, D3D10ResourceDimension, Dds, DxgiFormat, NewDxgiParams};
 
     let mip_count = mip_data.len() as u32;
@@ -421,17 +435,24 @@ pub fn resize_texture(
 
 /// Process multiple textures with GPU acceleration for BC7
 /// BC7 textures are batched for GPU, other formats use parallel CPU
-pub fn process_texture_batch(jobs: Vec<TextureJob>) -> Vec<(Option<String>, Result<ProcessedTexture>)> {
+pub fn process_texture_batch(
+    jobs: Vec<TextureJob>,
+) -> Vec<(Option<String>, Result<ProcessedTexture>)> {
     let total = jobs.len();
     let completed = AtomicUsize::new(0);
 
-    info!("Processing {} textures (GPU for BC7, CPU for others)", total);
+    info!(
+        "Processing {} textures (GPU for BC7, CPU for others)",
+        total
+    );
 
     // Initialize GPU if not already done
     let _ = init_gpu();
 
     // Separate BC7 jobs from others
-    let (bc7_jobs, other_jobs): (Vec<_>, Vec<_>) = jobs.into_iter().partition(|j| j.format == OutputFormat::BC7);
+    let (bc7_jobs, other_jobs): (Vec<_>, Vec<_>) = jobs
+        .into_iter()
+        .partition(|j| j.format == OutputFormat::BC7);
 
     let mut results: Vec<(Option<String>, Result<ProcessedTexture>)> = Vec::with_capacity(total);
 
@@ -466,7 +487,10 @@ pub fn process_texture_batch(jobs: Vec<TextureJob>) -> Vec<(Option<String>, Resu
 
     // Process non-BC7 jobs on CPU in parallel
     if !other_jobs.is_empty() {
-        info!("CPU parallel processing {} non-BC7 textures", other_jobs.len());
+        info!(
+            "CPU parallel processing {} non-BC7 textures",
+            other_jobs.len()
+        );
         let cpu_results = process_batch_cpu(other_jobs, &completed);
         results.extend(cpu_results);
     }
@@ -514,12 +538,15 @@ fn process_bc7_batch_gpu(
     // Add failed decodes to results
     for (id, w, h, result) in bad {
         completed.fetch_add(1, Ordering::Relaxed);
-        results.push((id, result.map(|rgba| ProcessedTexture {
-            data: rgba.into_raw(),
-            width: w,
-            height: h,
-            format: OutputFormat::BC7,
-        })));
+        results.push((
+            id,
+            result.map(|rgba| ProcessedTexture {
+                data: rgba.into_raw(),
+                width: w,
+                height: h,
+                format: OutputFormat::BC7,
+            }),
+        ));
     }
 
     if good.is_empty() {
@@ -553,12 +580,13 @@ fn process_bc7_batch_gpu(
                 let mip_data: Vec<Vec<u8>> = all_mips[mip_offset..mip_offset + mip_count].to_vec();
                 mip_offset += mip_count;
 
-                let result = create_bc7_dds_with_mips(mip_data, w, h).map(|data| ProcessedTexture {
-                    data,
-                    width: w,
-                    height: h,
-                    format: OutputFormat::BC7,
-                });
+                let result =
+                    create_bc7_dds_with_mips(mip_data, w, h).map(|data| ProcessedTexture {
+                        data,
+                        width: w,
+                        height: h,
+                        format: OutputFormat::BC7,
+                    });
 
                 completed.fetch_add(1, Ordering::Relaxed);
                 results.push((id, result));
@@ -692,10 +720,7 @@ fn get_format_info(dds: &Dds) -> String {
         let fourcc_str = std::str::from_utf8(&bytes).unwrap_or("????");
         info.push_str(&format!(", FOURCC={}", fourcc_str));
     } else {
-        info.push_str(&format!(
-            ", RGBBitCount={}",
-            pf.rgb_bit_count.unwrap_or(0)
-        ));
+        info.push_str(&format!(", RGBBitCount={}", pf.rgb_bit_count.unwrap_or(0)));
     }
 
     if dds.header10.is_some() {
@@ -713,13 +738,13 @@ pub fn estimate_dds_size(width: u32, height: u32, format: OutputFormat) -> u64 {
     let pixels = width as u64 * height as u64;
     let base_size = match format {
         // BCn formats: 4x4 block compression
-        OutputFormat::BC1 => pixels / 2,        // 0.5 bytes/pixel (8 bytes per 4x4 block)
-        OutputFormat::BC2 | OutputFormat::BC3 => pixels,  // 1 byte/pixel (16 bytes per 4x4 block)
-        OutputFormat::BC4 => pixels / 2,        // 0.5 bytes/pixel
-        OutputFormat::BC5 => pixels,            // 1 byte/pixel
-        OutputFormat::BC7 => pixels,            // 1 byte/pixel
+        OutputFormat::BC1 => pixels / 2, // 0.5 bytes/pixel (8 bytes per 4x4 block)
+        OutputFormat::BC2 | OutputFormat::BC3 => pixels, // 1 byte/pixel (16 bytes per 4x4 block)
+        OutputFormat::BC4 => pixels / 2, // 0.5 bytes/pixel
+        OutputFormat::BC5 => pixels,     // 1 byte/pixel
+        OutputFormat::BC7 => pixels,     // 1 byte/pixel
         // Uncompressed
-        OutputFormat::Rgba | OutputFormat::Bgra => pixels * 4,  // 4 bytes/pixel
+        OutputFormat::Rgba | OutputFormat::Bgra => pixels * 4, // 4 bytes/pixel
     };
     // Add ~33% for mipmaps + 148 bytes for DDS header
     base_size * 4 / 3 + 148
@@ -733,8 +758,8 @@ pub fn process_texture_file(
     target_height: u32,
     output_format: OutputFormat,
 ) -> Result<ProcessedTexture> {
-    let input_data = std::fs::read(input_path)
-        .with_context(|| format!("Failed to read: {:?}", input_path))?;
+    let input_data =
+        std::fs::read(input_path).with_context(|| format!("Failed to read: {:?}", input_path))?;
 
     let result = process_texture(&input_data, target_width, target_height, output_format)?;
 

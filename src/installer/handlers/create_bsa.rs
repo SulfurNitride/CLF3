@@ -21,9 +21,7 @@ enum ArchiveKind {
         types: ArchiveTypes,
     },
     /// FO4 BA2 (Fallout 4, Fallout 76, Starfield)
-    Ba2 {
-        version: Ba2Version,
-    },
+    Ba2 { version: Ba2Version },
 }
 
 /// Handle a CreateBSA directive
@@ -38,17 +36,18 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
         .join(directive.temp_id.to_string());
 
     if !staging_dir.exists() {
-        anyhow::bail!(
-            "Staging directory not found: {}",
-            staging_dir.display()
-        );
+        anyhow::bail!("Staging directory not found: {}", staging_dir.display());
     }
 
     // Get archive settings from state
     let archive_kind = match &directive.state {
         BSAState::BSA(state) => {
-            tracing::info!("Creating TES4 BSA: {} (version {}, magic {})",
-                directive.to, state.version, state.magic);
+            tracing::info!(
+                "Creating TES4 BSA: {} (version {}, magic {})",
+                directive.to,
+                state.version,
+                state.magic
+            );
             let version = match state.version {
                 103 => Version::v103,
                 104 => Version::v104,
@@ -57,12 +56,20 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
             };
             let flags = ArchiveFlags::from_bits_truncate(state.archive_flags);
             let types = ArchiveTypes::from_bits_truncate(state.file_flags as u16);
-            ArchiveKind::Bsa { version, flags, types }
+            ArchiveKind::Bsa {
+                version,
+                flags,
+                types,
+            }
         }
         BSAState::BA2(state) => {
             let version = Ba2Version::from_u32(state.version);
-            tracing::info!("Creating FO4 BA2: {} (type {:?}, version {:?})",
-                directive.to, state.archive_type, version);
+            tracing::info!(
+                "Creating FO4 BA2: {} (type {:?}, version {:?})",
+                directive.to,
+                state.archive_type,
+                version
+            );
             ArchiveKind::Ba2 { version }
         }
     };
@@ -107,7 +114,11 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
     paths::ensure_parent_dirs(&output_path)?;
 
     match archive_kind {
-        ArchiveKind::Bsa { version, flags, types } => {
+        ArchiveKind::Bsa {
+            version,
+            flags,
+            types,
+        } => {
             // Try building with original flags first
             let build_result = {
                 let mut builder = BsaBuilder::new()
@@ -140,11 +151,16 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
                         builder.add_file(&path, data);
                     }
 
-                    builder
-                        .build(&output_path)
-                        .with_context(|| format!("Failed to build BSA (uncompressed): {}", output_path.display()))?;
+                    builder.build(&output_path).with_context(|| {
+                        format!(
+                            "Failed to build BSA (uncompressed): {}",
+                            output_path.display()
+                        )
+                    })?;
                 } else {
-                    return Err(e).with_context(|| format!("Failed to build BSA: {}", output_path.display()));
+                    return Err(e).with_context(|| {
+                        format!("Failed to build BSA: {}", output_path.display())
+                    });
                 }
             }
         }

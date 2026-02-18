@@ -384,32 +384,34 @@ pub fn process_from_archive_streaming(
         );
     }
 
-    // Process MEDIUM archives with pipeline
-    if !medium_archives.is_empty() {
-        let half_threads = (rayon::current_num_threads() / 2).max(1);
+    // Process MEDIUM archives sequentially with full CPU (same as large)
+    for archive in medium_archives {
+        let archive_name = archive
+            .2
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "medium".to_string());
+
         pb.set_message(format!(
-            "Processing {} medium archives ({} at a time)...",
-            medium_archives.len(),
-            half_threads
+            "{} ({} files) [MEDIUM]",
+            archive_name,
+            archive.1.len()
         ));
 
-        // Process medium archives in chunks with pipeline
-        for chunk in medium_archives.chunks(half_threads) {
-            process_archives_with_pipeline(
-                chunk.to_vec(),
-                ctx,
-                &extracted,
-                &written,
-                &skipped,
-                &failed,
-                &logged_failures,
-                pb,
-                Some(ArchiveSizeTier::Medium.threads_per_archive()),
-                extractor_threads,
-                mover_threads,
-                adjusted_callback.clone(),
-            );
-        }
+        process_archives_with_pipeline(
+            vec![archive],
+            ctx,
+            &extracted,
+            &written,
+            &skipped,
+            &failed,
+            &logged_failures,
+            pb,
+            None, // All threads for sequential processing
+            extractor_threads,
+            mover_threads,
+            adjusted_callback.clone(),
+        );
     }
 
     // Process LARGE archives SEQUENTIALLY with pipeline (all threads)
@@ -921,8 +923,9 @@ fn process_single_archive_with_channel(
         if !path_in_archive.is_empty() {
             if let Some(archive_hash) = directive.archive_hash_path.first() {
                 let basis_key = build_patch_basis_key(archive_hash, Some(path_in_archive), None);
-                ctx.record_patch_basis_candidate_path(
+                ctx.record_patch_basis_candidate_path_dual(
                     &basis_key,
+                    &directive.archive_hash_path,
                     &src_path,
                     &final_output_path,
                     directive.size,
@@ -1110,8 +1113,9 @@ fn process_nested_bsa_directives(
                                         Some(&archive_path_in_outer),
                                         Some(file_in_archive),
                                     );
-                                    ctx.record_patch_basis_candidate_path(
+                                    ctx.record_patch_basis_candidate_path_dual(
                                         &basis_key,
+                                        &directive.archive_hash_path,
                                         extracted_path,
                                         &job.output_path,
                                         directive.size,
@@ -1210,7 +1214,12 @@ fn process_nested_bsa_directives(
                         Some(&archive_path_in_outer),
                         Some(file_in_archive),
                     );
-                    ctx.record_patch_basis_candidate_bytes(&basis_key, &output_path, &data);
+                    ctx.record_patch_basis_candidate_bytes_dual(
+                        &basis_key,
+                        &directive.archive_hash_path,
+                        &output_path,
+                        &data,
+                    );
                 }
 
                 extracted.fetch_add(1, Ordering::Relaxed);
@@ -1279,8 +1288,9 @@ fn process_whole_file_directives(
             return;
         }
         let basis_key = build_patch_basis_key(archive_hash, None, None);
-        ctx.record_patch_basis_candidate_path(
+        ctx.record_patch_basis_candidate_path_dual(
             &basis_key,
+            &directive.archive_hash_path,
             archive_path,
             &output_path,
             directive.size,
@@ -1385,7 +1395,12 @@ fn process_bsa_archive(
             }
             if let Some(archive_hash) = directive.archive_hash_path.first() {
                 let basis_key = build_patch_basis_key(archive_hash, Some(file_path_in_bsa), None);
-                ctx.record_patch_basis_candidate_bytes(&basis_key, &output_path, &data);
+                ctx.record_patch_basis_candidate_bytes_dual(
+                    &basis_key,
+                    &directive.archive_hash_path,
+                    &output_path,
+                    &data,
+                );
             }
 
             extracted.fetch_add(1, Ordering::Relaxed);

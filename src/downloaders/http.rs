@@ -190,7 +190,9 @@ pub async fn download_file_with_progress(
     let download_result: Result<u64> = async {
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result.context("Failed to read chunk")?;
-            file.write_all(&chunk).await.context("Failed to write chunk")?;
+            file.write_all(&chunk)
+                .await
+                .context("Failed to write chunk")?;
             let len = chunk.len() as u64;
             progress.add_bytes(len);
 
@@ -316,7 +318,9 @@ pub async fn download_file_with_callback(
     let download_result: Result<u64> = async {
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result.context("Failed to read chunk")?;
-            file.write_all(&chunk).await.context("Failed to write chunk")?;
+            file.write_all(&chunk)
+                .await
+                .context("Failed to write chunk")?;
             let len = chunk.len() as u64;
             progress.add_bytes(len);
 
