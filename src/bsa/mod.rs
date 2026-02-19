@@ -158,6 +158,47 @@ pub fn extract_archive_file(archive_path: &Path, file_path: &str) -> Result<Vec<
     }
 }
 
+/// Extract multiple files from any Bethesda archive in parallel via callback.
+/// Opens the archive once, decompresses matching files in parallel, and delivers
+/// each file through the callback. `wanted` should contain lowercase forward-slash paths.
+pub fn extract_archive_batch<F>(
+    archive_path: &Path,
+    wanted: &std::collections::HashSet<String>,
+    callback: F,
+) -> Result<usize>
+where
+    F: Fn(&str, Vec<u8>) -> Result<()> + Send + Sync,
+{
+    match detect_format(archive_path) {
+        Some(ArchiveFormat::Ba2) => {
+            extract_ba2_batch_parallel(archive_path, wanted, callback)
+        }
+        Some(ArchiveFormat::Bsa) => {
+            // TES4 BSA: use existing batch (already parallel decompress), deliver via callback
+            let paths_vec: Vec<&str> = wanted.iter().map(|s| s.as_str()).collect();
+            let results = extract_batch_parallel(archive_path, &paths_vec, None)?;
+            let mut count = 0;
+            for (path, data) in results {
+                callback(&path, data)?;
+                count += 1;
+            }
+            Ok(count)
+        }
+        Some(ArchiveFormat::Tes3Bsa) => {
+            // TES3: uncompressed, use existing batch then deliver via callback
+            let paths_vec: Vec<&str> = wanted.iter().map(|s| s.as_str()).collect();
+            let results = extract_tes3_batch_parallel(archive_path, &paths_vec, None)?;
+            let mut count = 0;
+            for (path, data) in results {
+                callback(&path, data)?;
+                count += 1;
+            }
+            Ok(count)
+        }
+        None => bail!("Unknown archive format: {}", archive_path.display()),
+    }
+}
+
 /// BSA version detection from archive name
 pub fn detect_version(name: &str) -> Version {
     let name_lower = name.to_lowercase();

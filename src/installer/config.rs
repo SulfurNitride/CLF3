@@ -78,6 +78,9 @@ pub struct InstallConfig {
     /// Browser command to open Nexus pages
     pub browser: String,
 
+    /// Optional directory to persist patched outputs by hash for reuse
+    pub patch_cache_dir: Option<PathBuf>,
+
     /// Optional callback for progress reporting
     pub progress_callback: Option<ProgressCallback>,
 }
@@ -93,6 +96,7 @@ impl std::fmt::Debug for InstallConfig {
             .field("max_concurrent_downloads", &self.max_concurrent_downloads)
             .field("nxm_mode", &self.nxm_mode)
             .field("browser", &self.browser)
+            .field("patch_cache_dir", &self.patch_cache_dir)
             .field(
                 "progress_callback",
                 &self.progress_callback.as_ref().map(|_| "<callback>"),

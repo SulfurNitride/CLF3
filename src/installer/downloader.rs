@@ -16,6 +16,7 @@ use super::config::{InstallConfig, ProgressEvent};
 use anyhow::{bail, Context, Result};
 use futures::stream::{self, StreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -39,6 +40,9 @@ const PROXY_BASE_URL: &str = "https://build.wabbajack.org/proxy";
 
 /// Wabbajack mirror endpoint (files stored on CDN by hash)
 const MIRROR_BASE_URL: &str = "https://mirror.wabbajack.org";
+/// Browser-like UA helps avoid ModDB anti-bot blocks on start/mirror pages.
+const MODDB_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0";
 
 /// Result tuple for parallel downloads: (name, path, result, optional nexus state update)
 type DownloadResultTuple = (String, PathBuf, DownloadResult, Option<(String, i64)>);
@@ -659,15 +663,142 @@ fn report_archive_complete(ctx: &DownloadContext, name: &str) {
 /// Check if this is a manual download type (only truly manual sources)
 fn check_manual(state: &DownloadState, archive: &ArchiveInfo) -> Option<ManualDownloadInfo> {
     match state {
-        DownloadState::Manual(manual_state) => Some(ManualDownloadInfo {
-            name: archive.name.clone(),
-            url: manual_state.url.clone(),
-            prompt: Some(manual_state.prompt.clone()),
-            expected_size: archive.size as u64,
-        }),
+        DownloadState::Manual(manual_state) => {
+            // ModDB "manual" links can often be resolved automatically.
+            if is_moddb_url(&manual_state.url) {
+                None
+            } else {
+                Some(ManualDownloadInfo {
+                    name: archive.name.clone(),
+                    url: manual_state.url.clone(),
+                    prompt: Some(manual_state.prompt.clone()),
+                    expected_size: archive.size as u64,
+                })
+            }
+        }
         // Mega is now handled via Wabbajack proxy, not manual
         _ => None,
     }
+}
+
+fn is_moddb_url(url: &str) -> bool {
+    url.contains("moddb.com")
+}
+
+fn is_moddb_start_url(url: &str) -> bool {
+    url.contains("/addons/start/") || url.contains("/downloads/start/")
+}
+
+fn moddb_abs_url(url: &str) -> String {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        url.to_string()
+    } else {
+        format!("https://www.moddb.com{}", url)
+    }
+}
+
+fn extract_moddb_start_url(html: &str) -> Option<String> {
+    let re = Regex::new(r#"href="([^"]*(?:/addons/start/\d+|/downloads/start/\d+)[^"]*)""#).ok()?;
+    let capture = re.captures(html)?;
+    Some(moddb_abs_url(capture.get(1)?.as_str()))
+}
+
+fn extract_moddb_mirror_url(html: &str) -> Option<String> {
+    // Download-start pages include a mirror URL both in a link and in JS redirect.
+    let re = Regex::new(r#"(?:(?:href|window\.location\.href)=")([^"]*/downloads/mirror/[^"]+)""#)
+        .ok()?;
+    let capture = re.captures(html)?;
+    Some(moddb_abs_url(capture.get(1)?.as_str()))
+}
+
+async fn fetch_moddb_html(
+    client: &HttpClient,
+    url: &str,
+    referer: Option<&str>,
+) -> Result<String> {
+    let mut request = client
+        .inner()
+        .get(url)
+        .header(reqwest::header::USER_AGENT, MODDB_USER_AGENT)
+        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+        .header(
+            reqwest::header::ACCEPT,
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        );
+    if let Some(referer_url) = referer {
+        request = request.header(reqwest::header::REFERER, referer_url);
+    }
+
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("Failed to fetch ModDB page: {}", url))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!("ModDB page error {}: {}", status.as_u16(), root_cause_text(&body));
+    }
+    response
+        .text()
+        .await
+        .with_context(|| format!("Failed to read ModDB page: {}", url))
+}
+
+fn root_cause_text(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "empty response".to_string();
+    }
+    let single_line = trimmed.replace('\n', " ");
+    if single_line.len() > 120 {
+        format!("{}...", &single_line[..117])
+    } else {
+        single_line
+    }
+}
+
+async fn resolve_moddb_download_url(client: &HttpClient, source_url: &str) -> Result<String> {
+    let source_url = moddb_abs_url(source_url);
+    let start_url = if is_moddb_start_url(&source_url) {
+        source_url.clone()
+    } else {
+        let page_html = fetch_moddb_html(client, &source_url, None).await?;
+        extract_moddb_start_url(&page_html).with_context(|| {
+            format!(
+                "Could not find ModDB start link on page: {}",
+                source_url
+            )
+        })?
+    };
+
+    let start_html = fetch_moddb_html(client, &start_url, Some(&source_url)).await?;
+    let mirror_url = extract_moddb_mirror_url(&start_html).with_context(|| {
+        format!(
+            "Could not find ModDB mirror link on start page: {}",
+            start_url
+        )
+    })?;
+
+    // Follow redirects once with browser-like headers to produce a stable direct file URL.
+    let response = client
+        .inner()
+        .get(&mirror_url)
+        .header(reqwest::header::USER_AGENT, MODDB_USER_AGENT)
+        .header(reqwest::header::REFERER, &start_url)
+        .send()
+        .await
+        .with_context(|| format!("Failed to resolve ModDB mirror URL: {}", mirror_url))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!(
+            "ModDB mirror resolution error {}: {}",
+            status.as_u16(),
+            root_cause_text(&body)
+        );
+    }
+
+    Ok(response.url().to_string())
 }
 
 /// Truncate a filename for display
@@ -1223,8 +1354,35 @@ async fn download_archive_inner(
         }
 
         // Manual downloads are handled by check_manual()
-        DownloadState::Manual(_) => {
-            unreachable!("Manual downloads should be filtered out before this point")
+        DownloadState::Manual(manual_state) => {
+            if is_moddb_url(&manual_state.url) {
+                let resolved_url = resolve_moddb_download_url(&ctx.http, &manual_state.url)
+                    .await
+                    .with_context(|| {
+                        format!("Failed to resolve ModDB download URL: {}", manual_state.url)
+                    })?;
+
+                info!(
+                    "Resolved ModDB URL for {}: {} -> {}",
+                    archive.name, manual_state.url, resolved_url
+                );
+
+                download_file_with_callback(
+                    &ctx.http,
+                    &resolved_url,
+                    output_path,
+                    Some(archive.size as u64),
+                    Some(pb),
+                    callback_ref,
+                )
+                .await?;
+                Ok(((), None))
+            } else {
+                bail!(
+                    "Manual download required and no automation handler available: {}",
+                    manual_state.url
+                )
+            }
         }
     }
 }
@@ -1731,4 +1889,27 @@ async fn download_non_nexus_files(
         failed_downloads: failed_downloads_list,
         manual_downloads: manual_downloads_list,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_moddb_start_url_from_addon_page() {
+        let html = r#"<a href="/addons/start/88982" class="button">Download</a>"#;
+        let start = extract_moddb_start_url(html).expect("missing start URL");
+        assert_eq!(start, "https://www.moddb.com/addons/start/88982");
+    }
+
+    #[test]
+    fn extract_moddb_mirror_url_from_start_page() {
+        let html =
+            r#"window.location.href="https://www.moddb.com/downloads/mirror/88982/130/abc123";"#;
+        let mirror = extract_moddb_mirror_url(html).expect("missing mirror URL");
+        assert_eq!(
+            mirror,
+            "https://www.moddb.com/downloads/mirror/88982/130/abc123"
+        );
+    }
 }

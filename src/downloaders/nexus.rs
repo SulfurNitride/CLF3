@@ -374,6 +374,10 @@ impl NexusDownloader {
             "enderalspecialedition" => "enderalspecialedition",
             "cyberpunk2077" | "cyberpunk 2077" => "cyberpunk2077",
             "baldursgate3" | "baldur's gate 3" | "bg3" => "baldursgate3",
+            "vtmb"
+            | "vampirethemasqueradebloodlines"
+            | "vampire the masquerade bloodlines"
+            | "vampire: the masquerade - bloodlines" => "vampirebloodlines",
             "site" | "moddingtools" => "site", // Modding tools
             _ => game_name,                    // Pass through unknown
         }
@@ -405,6 +409,11 @@ mod tests {
         assert_eq!(
             NexusDownloader::game_domain("skyrimspecialedition"),
             "skyrimspecialedition"
+        );
+        assert_eq!(NexusDownloader::game_domain("VtMB"), "vampirebloodlines");
+        assert_eq!(
+            NexusDownloader::game_domain("VampireTheMasqueradeBloodlines"),
+            "vampirebloodlines"
         );
         assert_eq!(NexusDownloader::game_domain("unknowngame"), "unknowngame");
     }

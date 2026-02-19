@@ -4,11 +4,10 @@
 //! 1. Game Check    — validate game dir, detect game type
 //! 2. Download      — fetch all required archives
 //! 3. Validate      — verify archive sizes match expected
-//! 4. Install       — FromArchive + InlineFile + RemappedInlineFile
-//! 5. Patch         — PatchedFromArchive directives
-//! 6. DDS Transform — TransformedTexture directives
-//! 7. BSA Build     — CreateBSA directives
-//! 8. Cleanup       — extra files + BSA temp dirs
+//! 4. Install+Patch — FromArchive + PatchedFromArchive + InlineFile + RemappedInlineFile
+//! 5. DDS Transform — TransformedTexture directives
+//! 6. BSA Build     — CreateBSA directives
+//! 7. Cleanup       — extra files + BSA temp dirs
 
 pub mod config;
 pub mod config_cache;
@@ -124,12 +123,15 @@ impl Installer {
         downloader::download_archives(&self.db, &self.config).await
     }
 
-    /// Validate ALL downloaded archives (check sizes match expected)
+    /// Validate ALL downloaded archives (check sizes AND hashes)
     /// This catches truncated/corrupted downloads from interrupted sessions
     fn validate_archives(&self) -> Result<Vec<(String, String)>> {
+        use crate::hash::compute_file_hash;
+        use rayon::prelude::*;
+        use std::sync::Mutex;
+
         // Validate ALL archives that exist in downloads folder
         let archives = self.db.get_all_archives()?;
-        let mut errors: Vec<(String, String)> = Vec::new();
 
         // Only check archives that actually exist on disk
         let archives_to_check: Vec<_> = archives
@@ -152,17 +154,20 @@ impl Installer {
                 .progress_chars("=>-"),
         );
         pb.enable_steady_tick(Duration::from_millis(100));
-        pb.set_message("Validating downloaded archives...");
+        pb.set_message("Verifying archives (size + hash)...");
 
-        for archive in archives_to_check {
-            let file_path = self.config.downloads_dir.join(&archive.name);
+        let errors = Mutex::new(Vec::new());
+        let downloads_dir = &self.config.downloads_dir;
+
+        archives_to_check.par_iter().for_each(|archive| {
+            let file_path = downloads_dir.join(&archive.name);
 
             match fs::metadata(&file_path) {
                 Ok(meta) => {
                     let actual_size = meta.len();
                     let expected_size = archive.size as u64;
                     if actual_size != expected_size {
-                        errors.push((
+                        errors.lock().expect("errors mutex").push((
                             archive.name.clone(),
                             format!(
                                 "Size mismatch: expected {} bytes, got {} ({}%)",
@@ -171,18 +176,50 @@ impl Installer {
                                 (actual_size * 100) / expected_size.max(1)
                             ),
                         ));
+                        pb.inc(1);
+                        return;
+                    }
+
+                    // Size OK — verify hash
+                    match compute_file_hash(&file_path) {
+                        Ok(actual_hash) => {
+                            if actual_hash != archive.hash {
+                                errors.lock().expect("errors mutex").push((
+                                    archive.name.clone(),
+                                    format!(
+                                        "Hash mismatch: expected {}, got {}",
+                                        archive.hash, actual_hash
+                                    ),
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            errors.lock().expect("errors mutex").push((
+                                archive.name.clone(),
+                                format!("Hash computation failed: {}", e),
+                            ));
+                        }
                     }
                 }
                 Err(e) => {
-                    errors.push((archive.name.clone(), format!("Cannot read file: {}", e)));
+                    errors.lock().expect("errors mutex").push((
+                        archive.name.clone(),
+                        format!("Cannot read file: {}", e),
+                    ));
                 }
             }
 
             pb.inc(1);
-        }
+        });
 
         pb.finish_and_clear();
-        println!("Validated {} archives", archives.len());
+        let errors = errors.into_inner().expect("errors mutex");
+        println!(
+            "Verified {} archives ({} valid, {} corrupted)",
+            archives_to_check.len(),
+            archives_to_check.len() - errors.len(),
+            errors.len()
+        );
 
         Ok(errors)
     }
@@ -235,9 +272,9 @@ impl Installer {
         }
         log_phase_metrics("Downloading", download_start);
 
-        // === Phase 3: Validate Archives ===
+        // === Phase 3: Validate + Index Archives ===
         let validate_start = Instant::now();
-        println!("\n=== Phase 3: Validate Archives ===\n");
+        println!("\n=== Phase 3: Validate + Index Archives ===\n");
         self.report_progress(ProgressEvent::PhaseChange {
             phase: "Validating".to_string(),
         });
@@ -293,60 +330,58 @@ impl Installer {
                 println!("Re-download had {} failures", redownload_stats.failed);
             }
         }
-        log_phase_metrics("Validating", validate_start);
 
-        // Create the directive processor for phases 4-8
+        // Create the directive processor for phases 3b-8
         let dp = processor::DirectiveProcessor::new(&self.db, &self.config)?;
 
-        // Pre-flight: check archives and index
-        let preflight_start = Instant::now();
+        // Pre-flight: check archives and index (same phase)
         dp.preflight_check()?;
         dp.index_archives()?;
         dp.prepare_patch_basis_db()?;
-        log_phase_metrics("Preflight/Index", preflight_start);
+        log_phase_metrics("Validate+Index", validate_start);
 
-        // === Phase 4: Install Files ===
+        // === Phase 4: Install + Patch Files ===
         let install_start = Instant::now();
-        println!("\n=== Phase 4: Install Files ===\n");
+        println!("\n=== Phase 4: Install + Patch Files ===\n");
         self.report_progress(ProgressEvent::PhaseChange {
             phase: "Installing".to_string(),
         });
         self.report_progress(ProgressEvent::Status {
-            message: "Installing files...".to_string(),
+            message: "Installing + patching files...".to_string(),
         });
         dp.install_phase()?;
-        log_phase_metrics("Installing", install_start);
+        log_phase_metrics("Install+Patch", install_start);
 
-        // === Phase 5: Apply Patches ===
-        let patch_start = Instant::now();
-        println!("\n=== Phase 5: Apply Patches ===\n");
-        self.report_progress(ProgressEvent::PhaseChange {
-            phase: "Patching".to_string(),
-        });
-        dp.patch_phase()?;
-        log_phase_metrics("Patching", patch_start);
+        // Check for install failures — abort early so user can fix and retry
+        let install_failures = dp.failed_count();
+        if install_failures > 0 {
+            bail!(
+                "Install + Patch phase had {} failures. Please fix the issues above and re-run.",
+                install_failures
+            );
+        }
 
-        // === Phase 6: DDS Transformations ===
+        // === Phase 5: DDS Transformations ===
         let dds_start = Instant::now();
-        println!("\n=== Phase 6: DDS Transformations ===\n");
+        println!("\n=== Phase 5: DDS Transformations ===\n");
         self.report_progress(ProgressEvent::PhaseChange {
             phase: "DDS Transform".to_string(),
         });
         dp.texture_phase()?;
         log_phase_metrics("DDS Transform", dds_start);
 
-        // === Phase 7: BSA Building ===
+        // === Phase 6: BSA Building ===
         let bsa_start = Instant::now();
-        println!("\n=== Phase 7: BSA Building ===\n");
+        println!("\n=== Phase 6: BSA Building ===\n");
         self.report_progress(ProgressEvent::PhaseChange {
             phase: "BSA Build".to_string(),
         });
         dp.bsa_phase()?;
         log_phase_metrics("BSA Build", bsa_start);
 
-        // === Phase 8: Cleanup ===
+        // === Phase 7: Cleanup ===
         let cleanup_start = Instant::now();
-        println!("\n=== Phase 8: Cleanup ===\n");
+        println!("\n=== Phase 7: Cleanup ===\n");
         self.report_progress(ProgressEvent::PhaseChange {
             phase: "Cleanup".to_string(),
         });

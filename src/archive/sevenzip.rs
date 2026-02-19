@@ -121,7 +121,8 @@ pub fn list_archive(archive_path: &Path) -> Result<Vec<ArchiveEntry>> {
     let archive_type = detect_archive_type(archive_path).unwrap_or(ArchiveType::Unknown);
 
     match archive_type {
-        ArchiveType::Zip => list_zip(archive_path),
+        ArchiveType::Zip => list_zip(archive_path)
+            .or_else(|_| list_archive_7z_binary(archive_path)),
         ArchiveType::SevenZ => list_7z_native(archive_path)
             .or_else(|_| list_archive_7z_binary(archive_path)),
         ArchiveType::Rar => list_rar(archive_path)
@@ -135,7 +136,8 @@ pub fn extract_file(archive_path: &Path, file_path: &str) -> Result<Vec<u8>> {
     let archive_type = detect_archive_type(archive_path).unwrap_or(ArchiveType::Unknown);
 
     match archive_type {
-        ArchiveType::Zip => extract_zip_file(archive_path, file_path),
+        ArchiveType::Zip => extract_zip_file(archive_path, file_path)
+            .or_else(|_| extract_file_7z_binary(archive_path, file_path)),
         ArchiveType::SevenZ => extract_7z_file_native(archive_path, file_path)
             .or_else(|_| extract_file_7z_binary(archive_path, file_path)),
         ArchiveType::Rar => extract_rar_file(archive_path, file_path)
@@ -173,7 +175,8 @@ pub fn extract_files(archive_path: &Path, files: &[&str], output_dir: &Path) -> 
     let archive_type = detect_archive_type(archive_path).unwrap_or(ArchiveType::Unknown);
 
     match archive_type {
-        ArchiveType::Zip => extract_zip_files(archive_path, files, output_dir),
+        ArchiveType::Zip => extract_zip_files(archive_path, files, output_dir)
+            .or_else(|_| extract_files_7z_binary(archive_path, files, output_dir)),
         ArchiveType::SevenZ => extract_7z_files_native(archive_path, files, output_dir)
             .or_else(|_| extract_files_7z_binary(archive_path, files, output_dir)),
         ArchiveType::Rar => extract_rar_files(archive_path, files, output_dir)
@@ -241,7 +244,11 @@ pub fn extract_all_with_threads(
     let archive_type = detect_archive_type(archive_path).unwrap_or(ArchiveType::Unknown);
 
     match archive_type {
-        ArchiveType::Zip => extract_zip_all(archive_path, output_dir),
+        ArchiveType::Zip => extract_zip_all(archive_path, output_dir)
+            .or_else(|e| {
+                tracing::warn!("Native ZIP extraction failed, falling back to 7z binary: {}", e);
+                extract_all_7z_binary(archive_path, output_dir, threads)
+            }),
         ArchiveType::SevenZ => extract_7z_all_native(archive_path, output_dir, threads)
             .or_else(|e| {
                 tracing::warn!("Native 7z extraction failed, falling back to 7z binary: {}", e);
@@ -303,9 +310,45 @@ pub fn get_7z_path() -> Result<PathBuf> {
     bail!("7z binary not found. Please install p7zip or place 7zz in the bin/ directory.")
 }
 
+/// Get the path to an `innoextract` binary for Inno Setup installer fallback.
+pub fn get_innoextract_path() -> Result<PathBuf> {
+    // Try relative to executable first
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            for name in &["bin/innoextract", "innoextract"] {
+                let bin_path = exe_dir.join(name);
+                if bin_path.exists() {
+                    return Ok(bin_path);
+                }
+            }
+        }
+    }
+
+    // Try relative to current directory
+    let cwd_path = PathBuf::from("bin/innoextract");
+    if cwd_path.exists() {
+        return Ok(cwd_path);
+    }
+
+    // Try system PATH
+    if let Ok(output) = Command::new("which").arg("innoextract").output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Ok(PathBuf::from(path));
+            }
+        }
+    }
+
+    bail!("innoextract binary not found. Please install innoextract or place it in bin/.")
+}
+
 /// Normalize a path for case-insensitive comparison.
 fn normalize_path(path: &str) -> String {
-    path.to_lowercase()
+    // Wabbajack sometimes appends variant markers like "#plus"/"#basic"
+    // to archive paths. These are not part of the actual path in archives.
+    let base = path.split('#').next().unwrap_or(path);
+    base.to_lowercase()
         .replace('\\', "/")
         .trim_matches('/')
         .to_string()
@@ -835,6 +878,14 @@ fn list_archive_7z_binary(archive_path: &Path) -> Result<Vec<ArchiveEntry>> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if should_try_innoextract_fallback(archive_path, &stderr, &stdout) {
+            tracing::warn!(
+                "7z could not list {}, trying innoextract fallback",
+                archive_path.display()
+            );
+            return list_archive_innoextract(archive_path);
+        }
         bail!("7z list failed: {}", stderr);
     }
 
@@ -865,6 +916,15 @@ fn extract_file_7z_binary(archive_path: &Path, file_path: &str) -> Result<Vec<u8
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if should_try_innoextract_fallback(archive_path, &stderr, &stdout) {
+            tracing::warn!(
+                "7z could not extract '{}' from {}, trying innoextract fallback",
+                file_path,
+                archive_path.display()
+            );
+            return extract_file_innoextract(archive_path, file_path);
+        }
         bail!(
             "7z extract failed for '{}' in {}: {}",
             file_path,
@@ -912,6 +972,7 @@ fn extract_files_7z_binary(archive_path: &Path, files: &[&str], output_dir: &Pat
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let reparse_paths = parse_incorrect_reparse_paths(&stderr);
 
         if !reparse_paths.is_empty() {
@@ -939,6 +1000,14 @@ fn extract_files_7z_binary(archive_path: &Path, files: &[&str], output_dir: &Pat
                 stderr,
                 retry_stderr
             );
+        }
+
+        if should_try_innoextract_fallback(archive_path, &stderr, &stdout) {
+            tracing::warn!(
+                "7z could not extract selected files from {}, trying innoextract fallback",
+                archive_path.display()
+            );
+            return extract_files_innoextract(archive_path, files, output_dir);
         }
 
         bail!(
@@ -978,6 +1047,7 @@ fn extract_all_7z_binary(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let reparse_paths = parse_incorrect_reparse_paths(&stderr);
 
         if !reparse_paths.is_empty() {
@@ -1013,6 +1083,14 @@ fn extract_all_7z_binary(
                 stderr,
                 retry_stderr
             );
+        }
+
+        if should_try_innoextract_fallback(archive_path, &stderr, &stdout) {
+            tracing::warn!(
+                "7z could not extract {}, trying innoextract fallback",
+                archive_path.display()
+            );
+            return extract_all_innoextract(archive_path, output_dir);
         }
 
         bail!(
@@ -1132,6 +1210,173 @@ fn parse_incorrect_reparse_paths(stderr: &str) -> Vec<String> {
     paths
 }
 
+fn should_try_innoextract_fallback(archive_path: &Path, stderr: &str, stdout: &str) -> bool {
+    let is_exe = archive_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("exe"))
+        .unwrap_or(false);
+    if !is_exe {
+        return false;
+    }
+
+    let haystack = format!("{}\n{}", stderr, stdout).to_ascii_lowercase();
+    haystack.contains("cannot open the file as archive")
+}
+
+fn parse_inno_size(size_text: &str) -> Option<u64> {
+    // Examples: "558 B", "24.5 KiB", "1.2 MiB"
+    let mut parts = size_text.split_whitespace();
+    let value = parts.next()?.parse::<f64>().ok()?;
+    let unit = parts.next().unwrap_or("B");
+    let mult = match unit {
+        "B" => 1.0,
+        "KiB" => 1024.0,
+        "MiB" => 1024.0 * 1024.0,
+        "GiB" => 1024.0 * 1024.0 * 1024.0,
+        _ => 1.0,
+    };
+    Some((value * mult).round() as u64)
+}
+
+fn parse_inno_list(output: &str) -> Vec<ArchiveEntry> {
+    let mut entries = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("- \"") {
+            continue;
+        }
+
+        let after_prefix = &trimmed[3..];
+        let Some(path_end) = after_prefix.find('"') else {
+            continue;
+        };
+        let path = &after_prefix[..path_end];
+        if path.ends_with('/') {
+            continue;
+        }
+
+        // Best-effort parse of the "(SIZE UNIT)" segment.
+        let size = if let Some(open_idx) = trimmed.rfind('(') {
+            if let Some(close_rel) = trimmed[open_idx + 1..].find(')') {
+                let close_idx = open_idx + 1 + close_rel;
+                parse_inno_size(&trimmed[open_idx + 1..close_idx]).unwrap_or(0)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        entries.push(ArchiveEntry {
+            path: path.to_string(),
+            size,
+            is_dir: false,
+        });
+    }
+    entries
+}
+
+fn list_archive_innoextract(archive_path: &Path) -> Result<Vec<ArchiveEntry>> {
+    let inno_path = get_innoextract_path()?;
+    let output = Command::new(&inno_path)
+        .arg("-l")
+        .arg(archive_path)
+        .output()
+        .with_context(|| format!("Failed to run innoextract list on {}", archive_path.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("innoextract list failed: {}", stderr);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_inno_list(&stdout))
+}
+
+fn extract_all_innoextract(archive_path: &Path, output_dir: &Path) -> Result<usize> {
+    let inno_path = get_innoextract_path()?;
+    fs::create_dir_all(output_dir)?;
+
+    let output = Command::new(&inno_path)
+        .arg("-e")
+        .arg("-s")
+        .arg("-d")
+        .arg(output_dir)
+        .arg(archive_path)
+        .output()
+        .with_context(|| format!("Failed to run innoextract on {}", archive_path.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("innoextract extract failed for {}: {}", archive_path.display(), stderr);
+    }
+
+    let count = walkdir::WalkDir::new(output_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .count();
+    Ok(count)
+}
+
+fn extract_files_innoextract(archive_path: &Path, files: &[&str], output_dir: &Path) -> Result<()> {
+    let inno_path = get_innoextract_path()?;
+    fs::create_dir_all(output_dir)?;
+
+    let mut cmd = Command::new(&inno_path);
+    cmd.arg("-e").arg("-s").arg("-d").arg(output_dir);
+    for file in files {
+        // innoextract path filters are slash-separated
+        cmd.arg("-I").arg(file.replace('\\', "/"));
+    }
+    cmd.arg(archive_path);
+
+    let output = cmd
+        .output()
+        .with_context(|| format!("Failed to run innoextract on {}", archive_path.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("innoextract selective extract failed: {}", stderr);
+    }
+
+    Ok(())
+}
+
+fn extract_file_innoextract(archive_path: &Path, file_path: &str) -> Result<Vec<u8>> {
+    let tmp = tempfile::tempdir().context("Failed to create temp dir for innoextract")?;
+    extract_files_innoextract(archive_path, &[file_path], tmp.path())?;
+
+    let target = normalize_path(file_path);
+    for entry in walkdir::WalkDir::new(tmp.path())
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = match entry.path().strip_prefix(tmp.path()) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if normalize_path(&rel.to_string_lossy()) == target {
+            return fs::read(entry.path()).with_context(|| {
+                format!(
+                    "Failed to read extracted inno file: {}",
+                    entry.path().display()
+                )
+            });
+        }
+    }
+
+    bail!(
+        "innoextract did not produce '{}' from {}",
+        file_path,
+        archive_path.display()
+    )
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1201,6 +1446,28 @@ ERROR: Incorrect reparse stream : errno=17 : File exists : Foo/Bar.txt";
             let path = result.unwrap();
             assert!(path.exists() || path.to_string_lossy().contains("7z"));
         }
+    }
+
+    #[test]
+    fn test_parse_inno_size() {
+        assert_eq!(parse_inno_size("558 B"), Some(558));
+        assert_eq!(parse_inno_size("24.5 KiB"), Some(25088));
+        assert_eq!(parse_inno_size("1 MiB"), Some(1048576));
+    }
+
+    #[test]
+    fn test_parse_inno_list() {
+        let sample = r#"
+Listing "Example"
+ - "app/Unofficial_Patch/maps/ch_hub_1.bsp" (12.5 KiB) - overwritten
+ - "app/Docs/readme.txt" (558 B) - overwritten
+"#;
+        let entries = parse_inno_list(sample);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, "app/Unofficial_Patch/maps/ch_hub_1.bsp");
+        assert_eq!(entries[0].size, 12800);
+        assert_eq!(entries[1].path, "app/Docs/readme.txt");
+        assert_eq!(entries[1].size, 558);
     }
 
     // --- Native ZIP tests (no 7z binary needed) ---

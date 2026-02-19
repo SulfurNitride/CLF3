@@ -45,7 +45,6 @@ ba2 = "3.0.1"
 
 # Parallelism
 rayon = "1.11.0"
-crossbeam-channel = "0.5"
 
 # System info (memory monitoring)
 sysinfo = "0.38.0"
@@ -110,6 +109,11 @@ once_cell = "1.19"
 
 # Unicode normalization (for path matching with accented characters)
 unicode-normalization = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
 
 [dev-dependencies]
 # tempfile also in main dependencies now

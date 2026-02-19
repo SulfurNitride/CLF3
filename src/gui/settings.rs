@@ -44,6 +44,10 @@ pub struct Settings {
     /// Path to existing TTW output directory (if already installed)
     #[serde(default)]
     pub ttw_output_path: String,
+
+    /// Optional directory for persistent patched-file cache
+    #[serde(default)]
+    pub patch_cache_dir: String,
 }
 
 impl Settings {
@@ -164,6 +168,7 @@ mod tests {
             ttw_mpi_path: String::new(),
             fallout3_path: String::new(),
             ttw_output_path: String::new(),
+            patch_cache_dir: "/home/user/.cache/clf3/patches".into(),
         };
 
         let json = serde_json::to_string(&settings).unwrap();

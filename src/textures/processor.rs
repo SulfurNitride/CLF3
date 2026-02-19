@@ -227,7 +227,78 @@ fn calculate_mip_levels(width: u32, height: u32) -> u32 {
     (max_dim as f32).log2().floor() as u32 + 1
 }
 
-/// Generate all mipmap levels from base image
+/// Pad RGBA data with edge replication when dimensions are smaller than the
+/// target (for BC7 which requires 4x4 block alignment on small mip levels).
+fn pad_rgba_with_edge_replicate(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+) -> Vec<u8> {
+    let mut padded = vec![0u8; (dst_width * dst_height * 4) as usize];
+    for y in 0..dst_height {
+        let sy = y.min(src_height.saturating_sub(1));
+        for x in 0..dst_width {
+            let sx = x.min(src_width.saturating_sub(1));
+            let src_idx = ((sy * src_width + sx) * 4) as usize;
+            let dst_idx = ((y * dst_width + x) * 4) as usize;
+            padded[dst_idx..dst_idx + 4].copy_from_slice(&src[src_idx..src_idx + 4]);
+        }
+    }
+    padded
+}
+
+/// Pre-generate BC7-ready mip images from a base RGBA image.
+/// Small mip levels (< 4x4) are padded up to 4x4 for BC block encoding.
+fn build_bc7_mip_images(
+    base: RgbaImage,
+    target_width: u32,
+    target_height: u32,
+) -> Vec<(Vec<u8>, u32, u32)> {
+    let mip_count = calculate_mip_levels(target_width, target_height);
+    let mut mip_images: Vec<(Vec<u8>, u32, u32)> = Vec::with_capacity(mip_count as usize);
+
+    let mut current_image = base;
+    let mut mip_width = target_width;
+    let mut mip_height = target_height;
+
+    for mip_level in 0..mip_count {
+        let encode_width = mip_width.max(4);
+        let encode_height = mip_height.max(4);
+
+        let rgba_data = if mip_width < 4 || mip_height < 4 {
+            pad_rgba_with_edge_replicate(
+                current_image.as_raw(),
+                mip_width,
+                mip_height,
+                encode_width,
+                encode_height,
+            )
+        } else {
+            current_image.as_raw().clone()
+        };
+
+        mip_images.push((rgba_data, encode_width, encode_height));
+
+        if mip_level < mip_count - 1 {
+            let next_width = (mip_width / 2).max(1);
+            let next_height = (mip_height / 2).max(1);
+
+            let dynamic = DynamicImage::ImageRgba8(current_image);
+            current_image = dynamic
+                .resize_exact(next_width, next_height, image::imageops::FilterType::Lanczos3)
+                .into_rgba8();
+
+            mip_width = next_width;
+            mip_height = next_height;
+        }
+    }
+
+    mip_images
+}
+
+/// Generate all mipmap levels from base image (for non-BC7 formats that don't need padding).
 fn generate_mipmaps(base: &RgbaImage) -> Vec<(Vec<u8>, u32, u32)> {
     let mut mips = Vec::new();
     let mut width = base.width();
@@ -247,6 +318,61 @@ fn generate_mipmaps(base: &RgbaImage) -> Vec<(Vec<u8>, u32, u32)> {
     }
 
     mips
+}
+
+/// CPU-prepared texture data ready for BC7 GPU encoding.
+/// Holds pre-computed mip images so GPU submission doesn't need to decode/resize.
+struct PreparedBc7Texture {
+    /// Target width (base mip level)
+    target_width: u32,
+    /// Target height (base mip level)
+    target_height: u32,
+    /// Mip chain: (rgba_data, width, height) for each level
+    mip_images: Vec<(Vec<u8>, u32, u32)>,
+    /// Original job ID for tracking
+    id: Option<String>,
+}
+
+impl PreparedBc7Texture {
+    /// Estimate transient GPU bytes needed during batch submission.
+    /// Accounts for: RGBA texture upload + BC7 output buffer + staging buffer + overhead.
+    fn estimated_gpu_batch_bytes(&self) -> u64 {
+        let mut total = 0u64;
+        for (rgba_data, width, height) in &self.mip_images {
+            let blocks_x = (*width as u64).div_ceil(4);
+            let blocks_y = (*height as u64).div_ceil(4);
+            let bc7_bytes = blocks_x * blocks_y * 16;
+            // RGBA upload + output BC7 + staging buffer + per-mip overhead
+            total += rgba_data.len() as u64 + (bc7_bytes * 2) + (256 * 1024);
+        }
+        total
+    }
+}
+
+/// Decode, resize, and pre-compute BC7-ready mip images on CPU.
+fn prepare_bc7_texture(job: &TextureJob) -> Result<PreparedBc7Texture> {
+    let rgba = decode_dds_to_rgba(&job.data)?;
+
+    let current_w = rgba.width();
+    let current_h = rgba.height();
+
+    let resized = if current_w != job.width || current_h != job.height {
+        let dynamic = DynamicImage::ImageRgba8(rgba);
+        dynamic
+            .resize_exact(job.width, job.height, image::imageops::FilterType::Lanczos3)
+            .into_rgba8()
+    } else {
+        rgba
+    };
+
+    let mip_images = build_bc7_mip_images(resized, job.width, job.height);
+
+    Ok(PreparedBc7Texture {
+        target_width: job.width,
+        target_height: job.height,
+        mip_images,
+        id: job.id.clone(),
+    })
 }
 
 /// Create BC7 DDS file with mipmap data
@@ -369,15 +495,15 @@ pub fn process_texture(
     })
 }
 
-/// Process texture to BC7 using GPU encoder
+/// Process texture to BC7 using GPU encoder with edge-replication padding.
 fn process_texture_bc7_gpu(encoder: &mut GpuEncoder, rgba: &RgbaImage) -> Result<Vec<u8>> {
     let width = rgba.width();
     let height = rgba.height();
 
     debug!("GPU BC7 encoding {}x{} with mipmaps", width, height);
 
-    // Generate all mipmap levels on CPU
-    let mips = generate_mipmaps(rgba);
+    // Pre-generate all mipmap levels on CPU with edge-replication padding
+    let mips = build_bc7_mip_images(rgba.clone(), width, height);
 
     // Encode all mips on GPU using batch processing
     let mut batch = encoder.create_batch();
@@ -456,18 +582,17 @@ pub fn process_texture_batch(
 
     let mut results: Vec<(Option<String>, Result<ProcessedTexture>)> = Vec::with_capacity(total);
 
-    // Process BC7 jobs on GPU in batches
+    // Process BC7 jobs on GPU with budget-aware batching
     if !bc7_jobs.is_empty() {
         info!("GPU batch processing {} BC7 textures", bc7_jobs.len());
 
         if let Some(encoder_arc) = get_gpu_encoder() {
             if let Ok(mut guard) = encoder_arc.lock() {
                 if let Some(ref mut encoder) = *guard {
-                    // Process BC7 in batches of 32 to avoid GPU memory pressure
-                    for chunk in bc7_jobs.chunks(32) {
-                        let chunk_results = process_bc7_batch_gpu(encoder, chunk, &completed);
-                        results.extend(chunk_results);
-                    }
+                    // Budget-aware batching: prepares on CPU in parallel,
+                    // then submits to GPU in batches sized by memory budget
+                    let chunk_results = process_bc7_batch_gpu(encoder, &bc7_jobs, &completed);
+                    results.extend(chunk_results);
                 } else {
                     // No GPU, fall back to CPU
                     let cpu_results = process_batch_cpu(bc7_jobs, &completed);
@@ -504,79 +629,94 @@ pub fn process_texture_batch(
     results
 }
 
-/// Process BC7 textures using GPU batch encoding
+/// Process BC7 textures using GPU with budget-aware batching.
+///
+/// Phase 1: Prepare all textures on CPU in parallel (decode + resize + mip generation)
+/// Phase 2: Submit to GPU in batches sized by memory budget (not fixed count)
 fn process_bc7_batch_gpu(
     encoder: &mut GpuEncoder,
     jobs: &[TextureJob],
     completed: &AtomicUsize,
 ) -> Vec<(Option<String>, Result<ProcessedTexture>)> {
     let mut results = Vec::with_capacity(jobs.len());
+    let budget = encoder.batch_budget_bytes();
 
-    // Decode and resize all textures (CPU)
-    let decoded: Vec<_> = jobs
-        .iter()
-        .map(|job| {
-            let decode_result = decode_dds_to_rgba(&job.data).and_then(|rgba| {
-                let w = rgba.width();
-                let h = rgba.height();
-                if w != job.width || h != job.height {
-                    let dynamic = DynamicImage::ImageRgba8(rgba);
-                    Ok(dynamic
-                        .resize_exact(job.width, job.height, image::imageops::FilterType::Lanczos3)
-                        .into_rgba8())
-                } else {
-                    Ok(rgba)
-                }
-            });
-            (job.id.clone(), job.width, job.height, decode_result)
-        })
+    // Phase 1: Prepare all textures on CPU in parallel (decode + resize + generate mips)
+    let prepared: Vec<Result<PreparedBc7Texture>> = jobs
+        .par_iter()
+        .map(|job| prepare_bc7_texture(job))
         .collect();
 
-    // Separate successful decodes from failures
-    let (good, bad): (Vec<_>, Vec<_>) = decoded.into_iter().partition(|(_, _, _, r)| r.is_ok());
-
-    // Add failed decodes to results
-    for (id, w, h, result) in bad {
-        completed.fetch_add(1, Ordering::Relaxed);
-        results.push((
-            id,
-            result.map(|rgba| ProcessedTexture {
-                data: rgba.into_raw(),
-                width: w,
-                height: h,
-                format: OutputFormat::BC7,
-            }),
-        ));
+    // Separate successful preparations from failures
+    let mut good: Vec<PreparedBc7Texture> = Vec::new();
+    for prep in prepared {
+        match prep {
+            Ok(p) => good.push(p),
+            Err(e) => {
+                completed.fetch_add(1, Ordering::Relaxed);
+                results.push((None, Err(e)));
+            }
+        }
     }
 
     if good.is_empty() {
         return results;
     }
 
-    // For each successful decode, generate mipmaps and queue for GPU
+    // Phase 2: Submit to GPU in budget-aware batches
+    let mut batch_textures: Vec<PreparedBc7Texture> = Vec::new();
+    let mut batch_bytes: u64 = 0;
+
+    let mut pending: std::collections::VecDeque<PreparedBc7Texture> = good.into_iter().collect();
+
+    while let Some(texture) = pending.pop_front() {
+        let tex_bytes = texture.estimated_gpu_batch_bytes();
+
+        // If adding this texture would exceed budget, flush current batch first
+        if !batch_textures.is_empty() && batch_bytes + tex_bytes > budget {
+            flush_gpu_batch(encoder, &mut batch_textures, &mut results, completed);
+            batch_bytes = 0;
+        }
+
+        batch_bytes += tex_bytes;
+        batch_textures.push(texture);
+    }
+
+    // Flush remaining
+    if !batch_textures.is_empty() {
+        flush_gpu_batch(encoder, &mut batch_textures, &mut results, completed);
+    }
+
+    results
+}
+
+/// Flush a batch of prepared textures through the GPU encoder.
+fn flush_gpu_batch(
+    encoder: &mut GpuEncoder,
+    textures: &mut Vec<PreparedBc7Texture>,
+    results: &mut Vec<(Option<String>, Result<ProcessedTexture>)>,
+    completed: &AtomicUsize,
+) {
+    let batch_size = textures.len();
+    debug!("Flushing GPU batch: {} textures", batch_size);
+
     let mut batch = encoder.create_batch();
-    let mut job_mip_counts: Vec<(Option<String>, u32, u32, usize)> = Vec::new(); // (id, w, h, mip_count)
+    let mut job_meta: Vec<(Option<String>, u32, u32, usize)> = Vec::with_capacity(batch_size);
 
-    for (id, w, h, result) in good {
-        let rgba = result.unwrap();
-        let mips = generate_mipmaps(&rgba);
-        let mip_count = mips.len();
-
-        for (mip_data, mw, mh) in mips {
-            if let Err(e) = encoder.queue_bc7(&mut batch, &mip_data, mw, mh) {
+    for texture in textures.iter() {
+        let mip_count = texture.mip_images.len();
+        for (mip_data, w, h) in &texture.mip_images {
+            if let Err(e) = encoder.queue_bc7(&mut batch, mip_data, *w, *h) {
                 warn!("Failed to queue BC7 mip: {}", e);
             }
         }
-
-        job_mip_counts.push((id, w, h, mip_count));
+        job_meta.push((texture.id.clone(), texture.target_width, texture.target_height, mip_count));
     }
 
-    // Flush batch and get all encoded mips
     match encoder.flush_batch(batch) {
         Ok(all_mips) => {
-            // Reassemble each texture's mips into a DDS
             let mut mip_offset = 0;
-            for (id, w, h, mip_count) in job_mip_counts {
+            for (id, w, h, mip_count) in job_meta {
                 let mip_data: Vec<Vec<u8>> = all_mips[mip_offset..mip_offset + mip_count].to_vec();
                 mip_offset += mip_count;
 
@@ -593,16 +733,15 @@ fn process_bc7_batch_gpu(
             }
         }
         Err(e) => {
-            // GPU batch failed, fall back to CPU for all
             warn!("GPU batch failed: {}, falling back to CPU", e);
-            for (id, _w, _h, _) in job_mip_counts {
+            for (id, _w, _h, _) in job_meta {
                 completed.fetch_add(1, Ordering::Relaxed);
                 results.push((id, Err(anyhow!("GPU batch failed: {}", e))));
             }
         }
     }
 
-    results
+    textures.clear();
 }
 
 /// Process textures using CPU (rayon parallel)

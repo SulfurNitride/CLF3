@@ -214,6 +214,7 @@ async fn main() -> Result<()> {
                 max_concurrent_downloads: concurrent,
                 nxm_mode,
                 browser,
+                patch_cache_dir: None,
                 progress_callback: None, // CLI doesn't need progress callback
             };
 

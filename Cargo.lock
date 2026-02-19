@@ -1059,7 +1059,6 @@ dependencies = [
  "block_compression",
  "chrono",
  "clap",
- "crossbeam-channel",
  "directxtex",
  "dirs",
  "encoding_rs",

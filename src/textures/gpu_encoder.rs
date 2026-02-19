@@ -51,6 +51,7 @@ pub struct GpuEncoder {
     device: Arc<Device>,
     queue: Arc<Queue>,
     compressor: GpuBlockCompressor,
+    batch_budget_bytes: u64,
     pub gpu_info: GpuInfo,
 }
 
@@ -118,6 +119,7 @@ impl GpuEncoder {
         };
 
         let adapter_info = adapter.get_info();
+        let adapter_limits = adapter.limits();
         let gpu_info = GpuInfo {
             name: adapter_info.name.clone(),
             backend: format!("{:?}", adapter_info.backend),
@@ -128,6 +130,31 @@ impl GpuEncoder {
         info!(
             "Selected GPU: {} ({}, {})",
             gpu_info.name, gpu_info.backend, gpu_info.device_type
+        );
+
+        // Derive conservative per-batch GPU memory budget from adapter limits.
+        // This is a practical proxy for VRAM pressure since direct VRAM reporting
+        // is not consistently available across backends.
+        let binding_cap = adapter_limits
+            .max_buffer_size
+            .min(adapter_limits.max_storage_buffer_binding_size as u64)
+            .max(64 * 1024 * 1024);
+        let utilization = match adapter_info.device_type {
+            wgpu::DeviceType::DiscreteGpu => 0.25,
+            wgpu::DeviceType::IntegratedGpu => 0.12,
+            wgpu::DeviceType::VirtualGpu => 0.08,
+            wgpu::DeviceType::Cpu => 0.04,
+            _ => 0.10,
+        };
+        let batch_budget_bytes =
+            ((binding_cap as f64) * utilization) as u64;
+        let batch_budget_bytes = batch_budget_bytes.clamp(64 * 1024 * 1024, 1024 * 1024 * 1024);
+
+        info!(
+            "GPU batch budget: {:.0} MB (binding_cap={:.0} MB, utilization={:.0}%)",
+            batch_budget_bytes as f64 / 1024.0 / 1024.0,
+            binding_cap as f64 / 1024.0 / 1024.0,
+            utilization * 100.0,
         );
 
         // Request device
@@ -154,6 +181,7 @@ impl GpuEncoder {
             device,
             queue,
             compressor,
+            batch_budget_bytes,
             gpu_info,
         })
     }
@@ -505,6 +533,11 @@ impl GpuEncoder {
     /// Get GPU information
     pub fn info(&self) -> &GpuInfo {
         &self.gpu_info
+    }
+
+    /// Recommended memory budget for a single GPU batch (bytes).
+    pub fn batch_budget_bytes(&self) -> u64 {
+        self.batch_budget_bytes
     }
 }
 

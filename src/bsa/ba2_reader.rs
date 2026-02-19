@@ -6,10 +6,12 @@ use anyhow::{bail, Context, Result};
 use ba2::fo4::{Archive, FileWriteOptions};
 use ba2::prelude::*;
 use ba2::ByteSlice;
+use rayon::prelude::*;
+use std::collections::HashSet;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// Normalize a file path to both forward-slash and backslash lowercase forms for BA2 lookup.
 fn normalize_ba2_path(path: &str) -> (String, String) {
@@ -92,90 +94,62 @@ pub fn extract_file(ba2_path: &Path, file_path: &str) -> Result<Vec<u8>> {
     )
 }
 
-/// Extract multiple files from a single BA2 in parallel
-pub fn extract_batch_parallel(
+/// Extract multiple files from a BA2 archive in parallel.
+/// Opens the archive once, collects matching entries, then decompresses
+/// and delivers them in parallel using rayon via a callback.
+/// `wanted` should contain lowercase forward-slash-separated paths.
+pub fn extract_batch_parallel<F>(
     ba2_path: &Path,
-    file_paths: &[&str],
-    max_memory_bytes: Option<usize>,
-) -> Result<Vec<(String, Vec<u8>)>> {
+    wanted: &HashSet<String>,
+    callback: F,
+) -> Result<usize>
+where
+    F: Fn(&str, Vec<u8>) -> Result<()> + Send + Sync,
+{
     let (archive, options): (Archive, _) = Archive::read(ba2_path)
         .with_context(|| format!("Failed to open BA2: {}", ba2_path.display()))?;
 
     let write_options: FileWriteOptions = options.into();
 
-    // Build set of normalized paths we need (try both slash conventions)
-    let mut needed = std::collections::HashSet::with_capacity(file_paths.len() * 2);
-    let mut path_lookup = std::collections::HashMap::with_capacity(file_paths.len() * 2);
-
-    for p in file_paths {
-        let (forward, back) = normalize_ba2_path(p);
-        path_lookup.insert(forward.clone(), *p);
-        path_lookup.insert(back.clone(), *p);
-        needed.insert(forward);
-        needed.insert(back);
-    }
-
-    // Memory tracking
-    let bytes_extracted = AtomicUsize::new(0);
-    let max_bytes = max_memory_bytes.unwrap_or(usize::MAX);
-
-    // Collect matching files
-    let mut matches: Vec<(String, &ba2::fo4::File)> = Vec::new();
-
+    // Collect matching entries with references
+    let mut entries: Vec<(String, &ba2::fo4::File)> = Vec::new();
     for (key, file) in archive.iter() {
-        let raw_path = String::from_utf8_lossy(key.name().as_bytes());
-        let (current_forward, current_back) = normalize_ba2_path(&raw_path);
-
-        if needed.contains(&current_forward) || needed.contains(&current_back) {
-            let original = path_lookup
-                .get(&current_forward)
-                .or_else(|| path_lookup.get(&current_back))
-                .map(|s| s.to_string())
-                .unwrap_or(current_forward.clone());
-
-            matches.push((original, file));
+        let path = String::from_utf8_lossy(key.name().as_bytes()).to_string();
+        let lookup = path.replace('\\', "/").to_lowercase();
+        if wanted.contains(&lookup) {
+            entries.push((path, file));
         }
     }
 
     debug!(
         "Found {}/{} files in BA2 {}",
-        matches.len(),
-        file_paths.len(),
+        entries.len(),
+        wanted.len(),
         ba2_path.display()
     );
 
-    // Process - note: ba2 files hold references so we can't easily parallelize extraction
-    // Process sequentially but still track memory
-    let mut results: Vec<(String, Vec<u8>)> = Vec::new();
+    // Decompress + deliver in parallel
+    let extracted = AtomicUsize::new(0);
+    entries
+        .par_iter()
+        .try_for_each(|(path, file)| -> Result<()> {
+            let mut buffer = Cursor::new(Vec::new());
+            file.write(&mut buffer, &write_options)
+                .with_context(|| format!("Failed to extract file: {}", path))?;
 
-    for (path, file) in matches {
-        let current = bytes_extracted.load(Ordering::Relaxed);
-        if current >= max_bytes {
-            warn!("Memory limit reached, stopping extraction");
-            break;
-        }
+            callback(path, buffer.into_inner())?;
+            extracted.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })?;
 
-        let mut buffer = Cursor::new(Vec::new());
-        match file.write(&mut buffer, &write_options) {
-            Ok(()) => {
-                let data = buffer.into_inner();
-                bytes_extracted.fetch_add(data.len(), Ordering::Relaxed);
-                results.push((path, data));
-            }
-            Err(e) => {
-                warn!("Failed to extract {}: {}", path, e);
-            }
-        }
-    }
-
-    info!(
-        "Extracted {} files ({:.1} MB) from {}",
-        results.len(),
-        bytes_extracted.load(Ordering::Relaxed) as f64 / 1024.0 / 1024.0,
+    let count = extracted.load(Ordering::Relaxed);
+    debug!(
+        "Batch extracted {} of {} wanted files from BA2 {}",
+        count,
+        wanted.len(),
         ba2_path.display()
     );
-
-    Ok(results)
+    Ok(count)
 }
 
 #[cfg(test)]

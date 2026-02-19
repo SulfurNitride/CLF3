@@ -965,6 +965,7 @@ slint::slint! {
         // Settings values
         in-out property <string> default_install_dir: "";
         in-out property <string> default_downloads_dir: "";
+        in-out property <string> patch_cache_dir: "";
         in-out property <string> nexus_api_key: "";
         in-out property <[GpuOption]> gpu_options: [];
         in-out property <int> selected_gpu_index: -1;
@@ -972,6 +973,7 @@ slint::slint! {
         // Callbacks
         callback browse_install();
         callback browse_downloads();
+        callback browse_patch_cache();
         callback save_settings();
         callback cancel_settings();
         callback gpu_selected(int);
@@ -1099,6 +1101,63 @@ slint::slint! {
                             clicked => { browse_downloads(); }
                         }
                     }
+                }
+            }
+
+            // API Key
+            VerticalLayout {
+                spacing: 6px;
+
+                Text {
+                    text: "Patched File Cache Directory (Optional)";
+                    font-size: 13px;
+                    font-weight: 500;
+                    color: #bac2de;
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 36px;
+                        background: #11111b;
+                        border-radius: 6px;
+
+                        Text {
+                            x: 12px;
+                            text: patch_cache_dir == "" ? "Disabled" : patch_cache_dir;
+                            font-size: 13px;
+                            color: patch_cache_dir == "" ? #6c7086 : #cdd6f4;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+
+                    Rectangle {
+                        width: 70px;
+                        height: 36px;
+                        background: #313244;
+                        border-radius: 6px;
+
+                        Text {
+                            text: "Browse";
+                            font-size: 13px;
+                            color: #89b4fa;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        TouchArea {
+                            clicked => { browse_patch_cache(); }
+                        }
+                    }
+                }
+
+                Text {
+                    text: "Reuses previously patched outputs by hash to avoid re-extracting.";
+                    font-size: 11px;
+                    color: #6c7086;
                 }
             }
 
@@ -3372,6 +3431,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // Set up start install callback with validation
     window.on_start_install({
         let window_weak = window.as_weak();
+        let settings = settings.clone();
         move || {
             let window = window_weak.unwrap();
 
@@ -3380,6 +3440,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
             let install_dir = window.get_install_dir().to_string();
             let downloads_dir = window.get_downloads_dir().to_string();
             let api_key = window.get_nexus_api_key().to_string();
+            let patch_cache_dir = settings.borrow().patch_cache_dir.clone();
             let proton_index = window.get_selected_proton_index();
 
             // Get selected Proton name
@@ -3501,6 +3562,11 @@ pub fn run() -> Result<(), slint::PlatformError> {
             let install_clone = install_dir.clone();
             let downloads_clone = downloads_dir.clone();
             let api_key_clone = api_key.clone();
+            let patch_cache_dir_clone = if patch_cache_dir.trim().is_empty() {
+                None
+            } else {
+                Some(patch_cache_dir)
+            };
             let ttw_mpi_clone = ttw_mpi_path.clone();
             let ttw_fo3_clone = ttw_fo3_path.clone();
             let ttw_fnv_clone = ttw_fnv_path.clone();
@@ -3531,6 +3597,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                         &downloads_clone,
                         &api_key_clone,
                         non_premium,
+                        patch_cache_dir_clone.clone(),
                     ).await;
 
                     match &result {
@@ -4502,6 +4569,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
             let current = settings.borrow();
             dialog.set_default_install_dir(current.default_install_dir.clone().into());
             dialog.set_default_downloads_dir(current.default_downloads_dir.clone().into());
+            dialog.set_patch_cache_dir(current.patch_cache_dir.clone().into());
             dialog.set_nexus_api_key(current.nexus_api_key.clone().into());
             dialog.set_selected_gpu_index(current.gpu_index.map(|i| i as i32).unwrap_or(-1));
             drop(current);
@@ -4547,6 +4615,21 @@ pub fn run() -> Result<(), slint::PlatformError> {
                 }
             });
 
+            // Browse patch cache callback
+            dialog.on_browse_patch_cache({
+                let dialog_weak = dialog.as_weak();
+                move || {
+                    if let Some(dialog) = dialog_weak.upgrade() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_title("Select Patched File Cache Directory")
+                            .pick_folder()
+                        {
+                            dialog.set_patch_cache_dir(path.display().to_string().into());
+                        }
+                    }
+                }
+            });
+
             // GPU selection callback
             dialog.on_gpu_selected({
                 let dialog_weak = dialog.as_weak();
@@ -4568,6 +4651,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                         let mut s = settings.borrow_mut();
                         s.default_install_dir = dialog.get_default_install_dir().to_string();
                         s.default_downloads_dir = dialog.get_default_downloads_dir().to_string();
+                        s.patch_cache_dir = dialog.get_patch_cache_dir().to_string();
                         s.nexus_api_key = dialog.get_nexus_api_key().to_string();
                         let gpu_idx = dialog.get_selected_gpu_index();
                         s.gpu_index = if gpu_idx < 0 {
@@ -5219,6 +5303,7 @@ fn game_name_to_app_id(game: &str) -> Option<&'static str> {
         "Starfield" => Some("1716740"),
         "Cyberpunk2077" | "Cyberpunk 2077" => Some("1091500"),
         "BaldursGate3" | "Baldur's Gate 3" => Some("1086940"),
+        "VtMB" | "VTMB" | "VampireTheMasqueradeBloodlines" => Some("2600"),
         _ => None,
     }
 }
@@ -5250,6 +5335,9 @@ fn game_name_to_display(game: &str) -> &str {
         "Starfield" => "Starfield",
         "Cyberpunk2077" => "Cyberpunk 2077",
         "BaldursGate3" => "Baldur's Gate 3",
+        "VtMB" | "VTMB" | "VampireTheMasqueradeBloodlines" => {
+            "Vampire: The Masquerade - Bloodlines"
+        }
         _ => game,
     }
 }
@@ -5498,6 +5586,7 @@ async fn run_wabbajack_install(
     downloads_dir: &str,
     api_key: &str,
     non_premium: bool,
+    patch_cache_dir: Option<String>,
 ) -> anyhow::Result<()> {
     use crate::installer::{InstallConfig, Installer, ProgressCallback, ProgressEvent};
     use std::path::PathBuf;
@@ -5796,6 +5885,7 @@ async fn run_wabbajack_install(
         max_concurrent_downloads: thread_count,
         nxm_mode: non_premium,
         browser: "xdg-open".to_string(),
+        patch_cache_dir: patch_cache_dir.map(PathBuf::from),
         progress_callback: Some(progress_callback),
     };
 

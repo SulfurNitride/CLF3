@@ -1,110 +1,108 @@
-//! Producer-consumer pipeline for FromArchive extraction.
+//! Fused install + patch pipeline for FromArchive and PatchedFromArchive directives.
 //!
 //! # Architecture
 //!
-//! Uses a bounded channel to decouple extraction from file moving:
-//!
 //! ```text
-//! Extractor Workers (N/2 threads)     Mover Workers (N/2 threads)
-//! ┌─────────────────────────────┐     ┌─────────────────────────────┐
-//! │ - Run 7z extraction         │     │ - Receive file paths        │
-//! │ - Extract to temp dir       │────▶│ - Verify size via metadata  │
-//! │ - Send paths via channel    │     │ - fs::rename to final dest  │
-//! └─────────────────────────────┘     └─────────────────────────────┘
+//! Phase A: Extract + Patch (all N threads, per archive)
+//!   Extract archive → temp dir
+//!   FromArchive files: ready in temp
+//!   PatchedFromArchive files: apply delta patch → write to temp
+//!   Build manifest of staged files
+//!
+//! Phase B: Finalize (all N threads, per archive, immediately after Phase A)
+//!   Reflink/copy staged files → final destinations
+//!   Verify file sizes
+//!   All verified → delete temp dir
+//!   Failures → log, keep temp for diagnostics
+//!   Next archive
+//! ```
 //!
 //! Archives are tiered by size for optimal resource usage:
 //! - Small (≤512MB):  Full parallel - 1 thread each, many archives at once
-//! - Medium (512MB-2GB): Half parallel - 2 threads each
-//! - Large (≥2GB):    Sequential - all threads for one archive
+//! - Medium (512MB-2GB): Bounded parallel (1 thread per archive)
+//! - Large (≥2GB):    Bounded parallel (1 thread per archive)
 //!
-//! BSA/BA2: Read directly using bsa module (no extraction needed)
-//! ```
+//! BSA/BA2: Read directly using bsa module (no extraction needed) for pure FromArchive.
+//! BSA/BA2 with PatchedFromArchive sources go through the fused pipeline.
 //!
-//! Where N = system thread count (e.g., 8 or 16).
-//!
-//! Uses full archive extraction followed by fs::rename for instant file moves
-//! (no copying on same filesystem). Temp dir auto-deletes unneeded files.
+//! Peak temp disk = one archive's worth at a time (finalize immediately after each archive).
 
 use crate::archive::sevenzip;
 use crate::bsa;
 use crate::installer::handlers::from_archive::{
     detect_archive_type, ArchiveType as NestedArchiveType,
 };
-use crate::modlist::{FromArchiveDirective, ModlistDb};
+use crate::modlist::{Directive, FromArchiveDirective, ModlistDb, PatchedFromArchiveDirective};
 use crate::paths;
 
 use super::extract_strategy::should_use_selective_extraction;
-use super::processor::{build_patch_basis_key, ProcessContext};
+use super::processor::{
+    apply_patch_to_temp, build_patch_basis_key, build_patch_basis_key_from_archive_hash_path,
+    output_exists, preload_patch_blobs_by_name, restore_patched_output_from_cache,
+    should_preload_patch_blobs, store_patched_output_in_cache, ProcessContext,
+};
 
 use anyhow::Result;
-use crossbeam_channel::{bounded, Receiver, Sender};
-use indicatif::ProgressBar;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::thread;
-use std::time::Instant;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
-/// Message sent from extractor to mover workers.
-struct MoveJob {
-    /// Path to the extracted file in temp directory
-    source_path: PathBuf,
+/// A file staged in a temp directory, ready to be finalized to its output path.
+struct StagedFile {
+    /// Path to the file in the temp directory
+    temp_path: PathBuf,
     /// Final output path
     output_path: PathBuf,
     /// Expected file size for verification
     expected_size: u64,
     /// Directive ID for error reporting
     directive_id: i64,
-    /// Keep temp directory alive until this job is processed
-    _temp_dir: Arc<tempfile::TempDir>,
-    /// If true, this source has multiple destinations - must reflink/copy instead of rename
-    is_shared_source: bool,
 }
 
-/// Archive size tier for determining parallelism strategy.
-///
-/// Total threads stay constant across tiers - only the distribution changes:
-/// - Small: many archives, few threads each
-/// - Medium: fewer archives, more threads each
-/// - Large: one archive, all threads
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ArchiveSizeTier {
-    /// ≤512MB: Full parallel (all archives × 1 thread each)
-    Small,
-    /// 512MB-2GB: Half parallel (half archives × 2 threads each)
-    Medium,
-    /// ≥2GB: Sequential (1 archive × all threads)
-    Large,
+/// Result of processing a single archive (extract + patch).
+struct ArchiveResult {
+    /// All files staged for finalization
+    staged_files: Vec<StagedFile>,
+    /// Temp directory holding staged files (dropped after finalization to clean up)
+    temp_dir: tempfile::TempDir,
+    /// Additional temp directories for nested archive extraction (dropped after finalization)
+    nested_temp_dirs: Vec<tempfile::TempDir>,
+    /// Number of directives skipped (cache hits, already exist)
+    skipped_count: usize,
+    /// Number of FromArchive files extracted
+    extracted_count: usize,
+    /// Number of PatchedFromArchive files patched
+    patched_count: usize,
+    /// Number of directives that failed
+    failed_count: usize,
 }
 
-impl ArchiveSizeTier {
-    fn from_size(size: u64) -> Self {
-        const HALF_GB: u64 = 512 * 1024 * 1024;
-        const TWO_GB: u64 = 2 * 1024 * 1024 * 1024;
-
-        if size <= HALF_GB {
-            ArchiveSizeTier::Small
-        } else if size < TWO_GB {
-            ArchiveSizeTier::Medium
-        } else {
-            ArchiveSizeTier::Large
-        }
-    }
-
-    /// Get the number of 7z threads to use for this tier.
-    /// Total threads stay constant, distributed across fewer archives for larger files.
-    fn threads_per_archive(&self) -> usize {
-        match self {
-            ArchiveSizeTier::Small => 1,  // Many archives, 1 thread each
-            ArchiveSizeTier::Medium => 2, // Fewer archives, 2 threads each
-            ArchiveSizeTier::Large => 0,  // 0 = all threads (sequential processing)
-        }
-    }
+/// Unified directive enum for grouping both types by archive.
+enum ArchiveDirective {
+    FromArchive {
+        id: i64,
+        directive: FromArchiveDirective,
+        resolved_path: Option<String>,
+        file_in_bsa: Option<String>,
+    },
+    Patched {
+        id: i64,
+        directive: PatchedFromArchiveDirective,
+    },
 }
+
+/// Statistics from finalization of one archive.
+struct FinalizeStats {
+    written: usize,
+    skipped: usize,
+    failed: usize,
+}
+
 
 /// Configuration for extraction (simplified).
 #[derive(Debug, Clone, Default)]
@@ -166,50 +164,52 @@ pub fn cleanup_temp_dirs(downloads_dir: &std::path::Path) -> usize {
 /// Called with the current count of written files.
 pub type ProgressCallback = Arc<dyn Fn(usize) + Send + Sync>;
 
-/// Main entry point for streaming extraction with producer-consumer pipeline.
+/// Main entry point for fused install + patch pipeline.
 ///
-/// Processes archives using a decoupled extraction/move pipeline:
-/// - Extractor workers (N/2 threads): Run 7z, produce file paths via channel
-/// - Mover workers (N/2 threads): Consume paths, copy to final destination
-pub fn process_from_archive_streaming(
+/// Processes both FromArchive and PatchedFromArchive directives in a single pass
+/// per archive. Each archive is extracted once, then both file copies and patches
+/// are staged to temp, and finalized (reflink/copy) to their output paths.
+pub fn process_fused_streaming(
     db: &ModlistDb,
     ctx: &ProcessContext,
     _config: StreamingConfig,
     pb: &ProgressBar,
     progress_callback: Option<ProgressCallback>,
 ) -> Result<StreamingStats> {
+    const MAX_LOGGED_FAILURES: usize = 100;
+
     // Clean up any leftover temp dirs from previous interrupted runs
     cleanup_temp_dirs(&ctx.config.downloads_dir);
 
+    // === Load FromArchive directives ===
     pb.set_message("Loading FromArchive directives...");
-    let all_raw = db.get_all_pending_directives_of_type("FromArchive")?;
+    let from_archive_raw = db.get_all_pending_directives_of_type("FromArchive")?;
 
-    if all_raw.is_empty() {
+    // === Load PatchedFromArchive directives ===
+    pb.set_message("Loading PatchedFromArchive directives...");
+    let patched_raw = db.get_all_pending_directives_of_type("PatchedFromArchive")?;
+
+    if from_archive_raw.is_empty() && patched_raw.is_empty() {
         return Ok(StreamingStats::default());
     }
 
     pb.set_message("Pre-filtering completed files...");
 
-    // Parse, pre-filter against existing files, and group by archive
-    // This avoids checking each file during extraction
-    // Tuple: (directive_id, directive, resolved_path, file_in_bsa_if_nested)
-    let mut by_archive: HashMap<
-        String,
-        Vec<(i64, FromArchiveDirective, Option<String>, Option<String>)>,
-    > = HashMap::new();
+    // Parse FromArchive directives, pre-filter, group by archive
+    let mut by_archive: HashMap<String, Vec<ArchiveDirective>> = HashMap::new();
     let mut whole_file_directives: Vec<(i64, FromArchiveDirective)> = Vec::new();
     let mut parse_failures = 0;
     let mut pre_skipped = 0usize;
 
-    for (id, json) in all_raw {
-        match serde_json::from_str::<crate::modlist::Directive>(&json) {
-            Ok(crate::modlist::Directive::FromArchive(d)) => {
+    for (id, json) in from_archive_raw {
+        match serde_json::from_str::<Directive>(&json) {
+            Ok(Directive::FromArchive(d)) => {
                 // PRE-FILTER: Skip if output already exists with correct size
                 let normalized_to = paths::normalize_for_lookup(&d.to);
                 if let Some(&existing_size) = ctx.existing_files.get(&normalized_to) {
                     if existing_size == d.size {
                         pre_skipped += 1;
-                        continue; // Skip this directive entirely
+                        continue;
                     }
                 }
 
@@ -217,7 +217,6 @@ pub fn process_from_archive_streaming(
                     // Whole file - archive IS the file
                     whole_file_directives.push((id, d));
                 } else if let Some(hash) = d.archive_hash_path.first() {
-                    // Look up the correct path from the archive index
                     let resolved_path = if d.archive_hash_path.len() >= 2 {
                         let requested_path = &d.archive_hash_path[1];
                         db.lookup_archive_file(hash, requested_path).ok().flatten()
@@ -225,22 +224,53 @@ pub fn process_from_archive_streaming(
                         None
                     };
 
-                    // Check if this is a nested BSA directive (len >= 3)
                     let file_in_bsa = if d.archive_hash_path.len() >= 3 {
                         Some(d.archive_hash_path[2].clone())
                     } else {
                         None
                     };
 
-                    by_archive.entry(hash.clone()).or_default().push((
-                        id,
-                        d,
-                        resolved_path,
-                        file_in_bsa,
-                    ));
+                    by_archive
+                        .entry(hash.clone())
+                        .or_default()
+                        .push(ArchiveDirective::FromArchive {
+                            id,
+                            directive: d,
+                            resolved_path,
+                            file_in_bsa,
+                        });
                 }
             }
             _ => {
+                parse_failures += 1;
+            }
+        }
+    }
+
+    // Parse PatchedFromArchive directives, pre-filter, group by archive
+    // Patched directives that are pre-skipped are already counted in the shared pre_skipped counter
+
+    for (id, json) in patched_raw {
+        match serde_json::from_str::<Directive>(&json) {
+            Ok(Directive::PatchedFromArchive(d)) => {
+                let normalized_to = paths::normalize_for_lookup(&d.to);
+                if let Some(&existing_size) = ctx.existing_files.get(&normalized_to) {
+                    if existing_size == d.size {
+                        // counted in shared pre_skipped
+                        pre_skipped += 1;
+                        continue;
+                    }
+                }
+
+                if let Some(hash) = d.archive_hash_path.first() {
+                    by_archive
+                        .entry(hash.clone())
+                        .or_default()
+                        .push(ArchiveDirective::Patched { id, directive: d });
+                }
+            }
+            _ => {
+                // patched parse failures are counted in the shared parse_failures counter
                 parse_failures += 1;
             }
         }
@@ -254,7 +284,6 @@ pub fn process_from_archive_streaming(
     }
 
     // Create a wrapper callback that adds pre_skipped offset to the count
-    // This ensures the GUI sees the correct total progress including pre-filtered files
     let adjusted_callback: Option<ProgressCallback> = progress_callback.map(|cb| {
         let offset = pre_skipped;
         Arc::new(move |count: usize| {
@@ -262,13 +291,22 @@ pub fn process_from_archive_streaming(
         }) as ProgressCallback
     });
 
-    // Group archives by size tier and type
+    // Classify archives by type
     let archives: Vec<_> = by_archive.into_iter().collect();
     let archive_count = archives.len();
-    let mut small_archives = Vec::with_capacity(archive_count); // ≤512MB - full parallel (1 thread each)
-    let mut medium_archives = Vec::with_capacity(archive_count / 4); // 512MB-2GB - half parallel (2 threads each)
-    let mut large_archives = Vec::with_capacity(4); // ≥2GB - sequential (all threads)
-    let mut bsa_archives = Vec::with_capacity(archive_count / 4); // BSA/BA2 handled separately
+
+    // Unified list of all archives to process, with type tag
+    enum ArchiveKind {
+        /// Extract via 7z/ZIP/RAR, then finalize
+        Extract,
+        /// Read directly via BSA/BA2 module (no extraction)
+        BsaDirect,
+    }
+
+    let mut all_archives: Vec<(String, Vec<ArchiveDirective>, PathBuf, ArchiveKind)> =
+        Vec::with_capacity(archive_count);
+    let mut extract_count = 0usize;
+    let mut bsa_only_count = 0usize;
 
     for (archive_hash, directives) in archives {
         let archive_path = match ctx.get_archive_path(&archive_hash) {
@@ -278,54 +316,34 @@ pub fn process_from_archive_streaming(
 
         let archive_type = detect_archive_type(&archive_path).unwrap_or(NestedArchiveType::Unknown);
 
-        // BSA/BA2 handled separately (no extraction needed)
-        if matches!(
-            archive_type,
-            NestedArchiveType::Tes3Bsa | NestedArchiveType::Bsa | NestedArchiveType::Ba2
-        ) {
-            bsa_archives.push((archive_hash, directives, archive_path));
-            continue;
-        }
+        // BSA/BA2 with ONLY FromArchive directives → fast direct-read path
+        let has_patched = directives
+            .iter()
+            .any(|d| matches!(d, ArchiveDirective::Patched { .. }));
 
-        // Categorize by size tier
-        let archive_size = fs::metadata(&archive_path).map(|m| m.len()).unwrap_or(0);
-
-        match ArchiveSizeTier::from_size(archive_size) {
-            ArchiveSizeTier::Small => {
-                small_archives.push((archive_hash, directives, archive_path, archive_size))
-            }
-            ArchiveSizeTier::Medium => {
-                medium_archives.push((archive_hash, directives, archive_path, archive_size))
-            }
-            ArchiveSizeTier::Large => {
-                large_archives.push((archive_hash, directives, archive_path, archive_size))
-            }
+        if !has_patched
+            && matches!(
+                archive_type,
+                NestedArchiveType::Tes3Bsa | NestedArchiveType::Bsa | NestedArchiveType::Ba2
+            )
+        {
+            bsa_only_count += 1;
+            all_archives.push((archive_hash, directives, archive_path, ArchiveKind::BsaDirect));
+        } else {
+            extract_count += 1;
+            all_archives.push((archive_hash, directives, archive_path, ArchiveKind::Extract));
         }
     }
 
-    // Sort each tier by size (smallest first) so quick archives complete first
-    small_archives.sort_by_key(|(_, _, _, size)| *size);
-    medium_archives.sort_by_key(|(_, _, _, size)| *size);
-    large_archives.sort_by_key(|(_, _, _, size)| *size);
+    // Sort by directive count descending so big archives start first
+    all_archives.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
 
-    let total_archives =
-        small_archives.len() + medium_archives.len() + large_archives.len() + bsa_archives.len();
-    let total_files: usize = small_archives
-        .iter()
-        .map(|(_, d, _, _)| d.len())
-        .chain(medium_archives.iter().map(|(_, d, _, _)| d.len()))
-        .chain(large_archives.iter().map(|(_, d, _, _)| d.len()))
-        .chain(bsa_archives.iter().map(|(_, d, _)| d.len()))
-        .sum();
+    let total_archives = all_archives.len();
+    let total_files: usize = all_archives.iter().map(|(_, d, _, _)| d.len()).sum();
 
     eprintln!(
-        "Processing {} archives ({} files): {} small + {} medium + {} large + {} BSA",
-        total_archives,
-        total_files,
-        small_archives.len(),
-        medium_archives.len(),
-        large_archives.len(),
-        bsa_archives.len()
+        "Processing {} archives ({} files): {} extract + {} BSA-only",
+        total_archives, total_files, extract_count, bsa_only_count
     );
 
     // Stats
@@ -334,155 +352,156 @@ pub fn process_from_archive_streaming(
     let skipped = Arc::new(AtomicUsize::new(0));
     let failed = Arc::new(AtomicUsize::new(0));
     let logged_failures = Arc::new(AtomicUsize::new(0));
+    let completed_archives = Arc::new(AtomicUsize::new(0));
 
-    // Clear old progress bar line and reset for archive processing
+    // Multi-progress display: overall bar + per-archive spinner bars
+    let mp = MultiProgress::new();
     pb.finish_and_clear();
-    pb.reset();
-    pb.set_length(total_archives as u64);
-    pb.set_position(0);
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    let overall_pb = mp.add(ProgressBar::new(total_archives as u64));
+    overall_pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} archives | {msg}")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+    overall_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    overall_pb.set_message("Starting...");
+
+    let archive_bar_style = ProgressStyle::default_spinner()
+        .template("  {spinner:.blue} {wide_msg}")
+        .unwrap();
 
     // Process whole-file directives first (simple copy)
     if !whole_file_directives.is_empty() {
-        pb.set_message(format!(
+        overall_pb.set_message(format!(
             "Copying {} whole-file directives...",
             whole_file_directives.len()
         ));
         process_whole_file_directives(&whole_file_directives, ctx, &extracted, &skipped, &failed);
     }
 
-    // Calculate thread distribution for producer-consumer pipeline
-    let total_threads = rayon::current_num_threads();
-    let extractor_threads = (total_threads / 2).max(1);
-    let mover_threads = (total_threads - extractor_threads).max(1);
+    // Process ALL archives in a single parallel pool (rayon manages thread count)
+    all_archives.par_iter().for_each(
+        |(archive_hash, directives, archive_path, kind)| {
+            let archive_name = archive_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| archive_hash.clone());
+            let display_name = truncate_name(&archive_name, 50);
 
-    eprintln!(
-        "Using producer-consumer pipeline: {} extractor + {} mover threads",
-        extractor_threads, mover_threads
+            let is_bsa_direct = matches!(kind, ArchiveKind::BsaDirect);
+            let label = if is_bsa_direct { "reading" } else { "extracting" };
+
+            // Per-archive progress bar
+            let archive_pb = mp.insert_before(&overall_pb, ProgressBar::new_spinner());
+            archive_pb.set_style(archive_bar_style.clone());
+            archive_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+            archive_pb.set_message(format!(
+                "{} ({} files) {}...",
+                display_name,
+                directives.len(),
+                label,
+            ));
+
+            if is_bsa_direct {
+                // BSA/BA2 direct-read path
+                let bsa_directives: Vec<(
+                    i64,
+                    FromArchiveDirective,
+                    Option<String>,
+                    Option<String>,
+                )> = directives
+                    .iter()
+                    .filter_map(|d| match d {
+                        ArchiveDirective::FromArchive {
+                            id,
+                            directive,
+                            resolved_path,
+                            file_in_bsa,
+                        } => Some((
+                            *id,
+                            directive.clone(),
+                            resolved_path.clone(),
+                            file_in_bsa.clone(),
+                        )),
+                        _ => None,
+                    })
+                    .collect();
+
+                process_bsa_archive(
+                    archive_path,
+                    &bsa_directives,
+                    ctx,
+                    &extracted,
+                    &written,
+                    &skipped,
+                    &failed,
+                    &logged_failures,
+                    adjusted_callback.clone(),
+                );
+            } else {
+                // Extract + Patch fused pipeline
+                let result = process_single_archive_fused(
+                    archive_path,
+                    archive_hash,
+                    directives,
+                    ctx,
+                    Some(1),
+                );
+
+                match result {
+                    Ok(archive_result) => {
+                        extracted.fetch_add(
+                            archive_result.extracted_count + archive_result.patched_count,
+                            Ordering::Relaxed,
+                        );
+                        skipped.fetch_add(archive_result.skipped_count, Ordering::Relaxed);
+                        failed.fetch_add(archive_result.failed_count, Ordering::Relaxed);
+
+                        archive_pb.set_message(format!(
+                            "{} ({} files) finalizing...",
+                            display_name,
+                            archive_result.staged_files.len()
+                        ));
+
+                        let fin_stats = finalize_archive(
+                            archive_result,
+                            &ctx.config.output_dir,
+                            &logged_failures,
+                            &adjusted_callback,
+                        );
+                        written.fetch_add(fin_stats.written, Ordering::Relaxed);
+                        skipped.fetch_add(fin_stats.skipped, Ordering::Relaxed);
+                        failed.fetch_add(fin_stats.failed, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                        if count < MAX_LOGGED_FAILURES {
+                            error!("FAIL: Archive {}: {:#}", archive_name, e);
+                        }
+                        failed.fetch_add(directives.len(), Ordering::Relaxed);
+                    }
+                }
+            }
+
+            archive_pb.finish_and_clear();
+            completed_archives.fetch_add(1, Ordering::Relaxed);
+            let done = completed_archives.load(Ordering::Relaxed);
+            overall_pb.set_position(done as u64);
+            overall_pb.set_message(format!(
+                "OK:{} Skip:{} Fail:{}",
+                written.load(Ordering::Relaxed),
+                skipped.load(Ordering::Relaxed),
+                failed.load(Ordering::Relaxed)
+            ));
+        },
     );
 
-    // Process SMALL archives using producer-consumer pipeline
-    if !small_archives.is_empty() {
-        pb.set_message(format!(
-            "Processing {} small archives (producer-consumer)...",
-            small_archives.len()
-        ));
-
-        process_archives_with_pipeline(
-            small_archives,
-            ctx,
-            &extracted,
-            &written,
-            &skipped,
-            &failed,
-            &logged_failures,
-            pb,
-            Some(ArchiveSizeTier::Small.threads_per_archive()),
-            extractor_threads,
-            mover_threads,
-            adjusted_callback.clone(),
-        );
-    }
-
-    // Process MEDIUM archives sequentially with full CPU (same as large)
-    for archive in medium_archives {
-        let archive_name = archive
-            .2
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "medium".to_string());
-
-        pb.set_message(format!(
-            "{} ({} files) [MEDIUM]",
-            archive_name,
-            archive.1.len()
-        ));
-
-        process_archives_with_pipeline(
-            vec![archive],
-            ctx,
-            &extracted,
-            &written,
-            &skipped,
-            &failed,
-            &logged_failures,
-            pb,
-            None, // All threads for sequential processing
-            extractor_threads,
-            mover_threads,
-            adjusted_callback.clone(),
-        );
-    }
-
-    // Process LARGE archives SEQUENTIALLY with pipeline (all threads)
-    for archive in large_archives {
-        let archive_name = archive
-            .2
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "large".to_string());
-
-        pb.set_message(format!(
-            "{} ({} files) [LARGE]",
-            archive_name,
-            archive.1.len()
-        ));
-
-        process_archives_with_pipeline(
-            vec![archive],
-            ctx,
-            &extracted,
-            &written,
-            &skipped,
-            &failed,
-            &logged_failures,
-            pb,
-            None, // All threads for large archives
-            extractor_threads,
-            mover_threads,
-            adjusted_callback.clone(),
-        );
-    }
-
-    // Process BSA/BA2 archives (read directly, no extraction needed)
-    for (_archive_hash, directives, archive_path) in bsa_archives {
-        let archive_name = archive_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "bsa".to_string());
-
-        pb.set_message(format!(
-            "{} ({} files) [BSA]",
-            archive_name,
-            directives.len()
-        ));
-
-        // Process BSA directly (no extraction to temp needed)
-        process_bsa_archive(
-            &archive_path,
-            &directives,
-            ctx,
-            &extracted,
-            &written,
-            &skipped,
-            &failed,
-            &logged_failures,
-            adjusted_callback.clone(),
-        );
-
-        pb.inc(1);
-        pb.set_message(format!(
-            "OK:{} Skip:{} Fail:{}",
-            written.load(Ordering::Relaxed),
-            skipped.load(Ordering::Relaxed),
-            failed.load(Ordering::Relaxed)
-        ));
-    }
+    overall_pb.finish_and_clear();
 
     let stats = StreamingStats {
         extracted: extracted.load(Ordering::Relaxed),
         written: written.load(Ordering::Relaxed),
-        // Include pre_skipped in the skipped count for accurate totals
         skipped: skipped.load(Ordering::Relaxed) + parse_failures + pre_skipped,
         failed: failed.load(Ordering::Relaxed),
     };
@@ -495,434 +514,364 @@ pub fn process_from_archive_streaming(
     Ok(stats)
 }
 
-fn update_max(target: &AtomicUsize, value: usize) {
-    target.fetch_max(value, Ordering::Relaxed);
-}
-
-/// Process archives using the producer-consumer pipeline.
+/// Process a single archive: extract to temp, apply patches, return staged files.
 ///
-/// Extractor workers extract files to temp dirs and send paths to channel.
-/// Mover workers receive paths and copy files to final destinations.
-#[allow(clippy::too_many_arguments)]
-fn process_archives_with_pipeline(
-    archives: Vec<(
-        String,
-        Vec<(i64, FromArchiveDirective, Option<String>, Option<String>)>,
-        PathBuf,
-        u64,
-    )>,
+/// Handles both FromArchive and PatchedFromArchive directives in one extraction pass.
+fn process_single_archive_fused(
+    archive_path: &Path,
+    _archive_hash: &str,
+    directives: &[ArchiveDirective],
     ctx: &ProcessContext,
-    extracted: &Arc<AtomicUsize>,
-    written: &Arc<AtomicUsize>,
-    skipped: &Arc<AtomicUsize>,
-    failed: &Arc<AtomicUsize>,
-    logged_failures: &Arc<AtomicUsize>,
-    pb: &ProgressBar,
     threads_per_archive: Option<usize>,
-    _extractor_threads: usize,
-    mover_threads: usize,
-    progress_callback: Option<ProgressCallback>,
-) {
+) -> Result<ArchiveResult> {
     const MAX_LOGGED_FAILURES: usize = 100;
 
-    // Bounded channel for backpressure - prevents memory buildup
-    // Buffer size based on mover capacity
-    let (tx, rx): (Sender<MoveJob>, Receiver<MoveJob>) = bounded(mover_threads * 64);
-    let channel_hwm = Arc::new(AtomicUsize::new(0));
+    let temp_dir = tempfile::tempdir_in(&ctx.config.output_dir)?;
+    let output_dir = &ctx.config.output_dir;
 
-    // Shared state for mover workers
-    let written_clone = Arc::clone(written);
-    let skipped_clone = Arc::clone(skipped);
-    let failed_clone = Arc::clone(failed);
-    let logged_failures_clone = Arc::clone(logged_failures);
-    let progress_callback_clone = progress_callback.clone();
+    // Separate directive types
+    let mut from_simple: Vec<(i64, &FromArchiveDirective, Option<&str>)> = Vec::new();
+    let mut from_nested: Vec<(i64, &FromArchiveDirective, Option<&str>, &str)> = Vec::new();
+    let mut patched_directives: Vec<(i64, &PatchedFromArchiveDirective)> = Vec::new();
 
-    // Spawn mover workers in a separate thread pool
-    let mover_handle = thread::spawn(move || {
-        // Use a thread pool for movers
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(mover_threads)
-            .build()
-            .expect("Failed to create mover thread pool");
-
-        pool.install(|| {
-            // Process jobs from channel until it's closed
-            rx.iter().par_bridge().for_each(|job: MoveJob| {
-                // Verify size via metadata (no RAM needed)
-                let src_size = match fs::metadata(&job.source_path) {
-                    Ok(m) => m.len(),
-                    Err(e) => {
-                        let count = logged_failures_clone.fetch_add(1, Ordering::Relaxed);
-                        if count < MAX_LOGGED_FAILURES {
-                            error!("FAIL [{}]: metadata error: {}", job.directive_id, e);
-                        }
-                        failed_clone.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
-                };
-
-                if src_size != job.expected_size {
-                    let count = logged_failures_clone.fetch_add(1, Ordering::Relaxed);
-                    if count < MAX_LOGGED_FAILURES {
-                        error!(
-                            "FAIL [{}]: size mismatch: expected {} got {}",
-                            job.directive_id, job.expected_size, src_size
-                        );
-                    }
-                    failed_clone.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-
-                // Create output directory
-                if let Err(e) = paths::ensure_parent_dirs(&job.output_path) {
-                    let count = logged_failures_clone.fetch_add(1, Ordering::Relaxed);
-                    if count < MAX_LOGGED_FAILURES {
-                        error!(
-                            "FAIL [{}]: cannot create dirs for {}: {}",
-                            job.directive_id,
-                            job.output_path.display(),
-                            e
-                        );
-                    }
-                    failed_clone.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-
-                // Check if output already exists (race condition: another job may have created it)
-                if let Ok(meta) = fs::metadata(&job.output_path) {
-                    if meta.len() == job.expected_size {
-                        // Already exists with correct size - treat as skip/success
-                        skipped_clone.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
-                    // Wrong size - remove and re-copy
-                    let _ = fs::remove_file(&job.output_path);
-                }
-
-                if job.is_shared_source {
-                    // Source has multiple destinations - use reflink (instant CoW) with copy fallback
-                    // Remove any existing file first (reflink fails if dest exists)
-                    let _ = fs::remove_file(&job.output_path);
-                    if let Err(e) =
-                        reflink_copy::reflink_or_copy(&job.source_path, &job.output_path)
-                    {
-                        // Check if another thread created the file (race condition)
-                        // If file exists with correct size, treat as success
-                        if let Ok(meta) = fs::metadata(&job.output_path) {
-                            if meta.len() == job.expected_size {
-                                skipped_clone.fetch_add(1, Ordering::Relaxed);
-                                return;
-                            }
-                        }
-                        let count = logged_failures_clone.fetch_add(1, Ordering::Relaxed);
-                        if count < MAX_LOGGED_FAILURES {
-                            error!("FAIL [{}]: reflink/copy error: {}", job.directive_id, e);
-                        }
-                        failed_clone.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
+    for d in directives {
+        match d {
+            ArchiveDirective::FromArchive {
+                id,
+                directive,
+                resolved_path,
+                file_in_bsa,
+            } => {
+                let resolved = resolved_path.as_deref();
+                if let Some(ref bsa_file) = file_in_bsa {
+                    from_nested.push((*id, directive, resolved, bsa_file));
                 } else {
-                    // Single destination - use rename (instant move)
-                    // Remove destination first if it exists (rename behavior varies by OS)
-                    let _ = fs::remove_file(&job.output_path);
-                    if fs::rename(&job.source_path, &job.output_path).is_err() {
-                        // Fallback to reflink/copy if rename fails (cross-filesystem)
-                        if let Err(e) =
-                            reflink_copy::reflink_or_copy(&job.source_path, &job.output_path)
-                        {
-                            // Check if another thread created the file (race condition)
-                            if let Ok(meta) = fs::metadata(&job.output_path) {
-                                if meta.len() == job.expected_size {
-                                    skipped_clone.fetch_add(1, Ordering::Relaxed);
-                                    return;
-                                }
-                            }
-                            let count = logged_failures_clone.fetch_add(1, Ordering::Relaxed);
-                            if count < MAX_LOGGED_FAILURES {
-                                error!(
-                                    "FAIL [{}]: rename then reflink/copy failed: {}",
-                                    job.directive_id, e
-                                );
-                            }
-                            failed_clone.fetch_add(1, Ordering::Relaxed);
-                            return;
-                        }
-                        let _ = fs::remove_file(&job.source_path);
-                    }
-                }
-
-                let new_count = written_clone.fetch_add(1, Ordering::Relaxed) + 1;
-                // Call progress callback if provided
-                if let Some(ref callback) = progress_callback_clone {
-                    callback(new_count);
-                }
-            });
-        });
-    });
-
-    // Process archives in parallel (extractor side)
-    let pb_ref = pb;
-    let ctx_ref = ctx;
-    let extracted_ref = extracted;
-    let skipped_ref = skipped;
-    let failed_ref = failed;
-    let logged_failures_ref = logged_failures;
-    let output_dir = ctx.config.output_dir.clone();
-
-    archives
-        .par_iter()
-        .for_each(|(_archive_hash, directives, archive_path, _size)| {
-            process_single_archive_with_channel(
-                archive_path,
-                directives,
-                ctx_ref,
-                extracted_ref,
-                skipped_ref,
-                failed_ref,
-                logged_failures_ref,
-                threads_per_archive,
-                &tx,
-                &channel_hwm,
-                &output_dir,
-            );
-
-            pb_ref.inc(1);
-            pb_ref.set_message(format!(
-                "OK:{} Skip:{} Fail:{}",
-                written.load(Ordering::Relaxed),
-                skipped_ref.load(Ordering::Relaxed),
-                failed_ref.load(Ordering::Relaxed)
-            ));
-        });
-
-    // Drop sender to signal movers to finish
-    drop(tx);
-
-    // Wait for movers to complete
-    mover_handle.join().expect("Mover thread panicked");
-    tracing::debug!(
-        "Mover queue high-water mark: {} jobs",
-        channel_hwm.load(Ordering::Relaxed)
-    );
-}
-
-/// Process a single archive: extract to temp, send file paths to channel.
-///
-/// Uses full archive extraction (single fast `7z x` call) followed by fs::rename
-/// for instant file moves. This is faster than streaming individual files.
-#[allow(clippy::too_many_arguments)]
-fn process_single_archive_with_channel(
-    archive_path: &PathBuf,
-    directives: &[(i64, FromArchiveDirective, Option<String>, Option<String>)],
-    ctx: &ProcessContext,
-    extracted: &Arc<AtomicUsize>,
-    skipped: &Arc<AtomicUsize>,
-    failed: &Arc<AtomicUsize>,
-    logged_failures: &Arc<AtomicUsize>,
-    threads: Option<usize>,
-    tx: &Sender<MoveJob>,
-    channel_hwm: &Arc<AtomicUsize>,
-    output_dir: &PathBuf,
-) {
-    const MAX_LOGGED_FAILURES: usize = 100;
-
-    // Filter directives that need processing (skip existing files)
-    let to_process: Vec<_> = directives
-        .iter()
-        .filter(|(_, d, _, _)| {
-            let normalized_to = paths::normalize_for_lookup(&d.to);
-            if let Some(&existing_size) = ctx.existing_files.get(&normalized_to) {
-                if existing_size == d.size {
-                    skipped.fetch_add(1, Ordering::Relaxed);
-                    return false;
+                    from_simple.push((*id, directive, resolved));
                 }
             }
-            true
-        })
-        .collect();
-
-    if to_process.is_empty() {
-        return;
-    }
-
-    // Create temp dir for extraction in output_dir (faster if output is local, downloads on NAS)
-    let temp_dir = match tempfile::tempdir_in(&ctx.config.output_dir) {
-        Ok(d) => Arc::new(d),
-        Err(e) => {
-            error!("FAIL: Cannot create temp dir: {}", e);
-            failed.fetch_add(to_process.len(), Ordering::Relaxed);
-            return;
-        }
-    };
-
-    // Separate simple directives from nested BSA directives
-    let mut simple_directives: Vec<_> = Vec::new();
-    let mut nested_bsa_directives: Vec<_> = Vec::new();
-
-    for item in &to_process {
-        let (id, directive, resolved, file_in_bsa) = item;
-        if file_in_bsa.is_some() {
-            nested_bsa_directives.push((
-                *id,
-                directive,
-                resolved.clone(),
-                file_in_bsa.clone().unwrap(),
-            ));
-        } else {
-            simple_directives.push((*id, directive, resolved.clone()));
+            ArchiveDirective::Patched { id, directive } => {
+                patched_directives.push((*id, directive));
+            }
         }
     }
 
-    // Build unique list of needed paths (simple files + nested archive containers).
+    // Filter patched directives: check cache and existing outputs first
+    let mut patched_to_process: Vec<(i64, &PatchedFromArchiveDirective)> = Vec::new();
+    let mut patched_skipped = 0usize;
+    let mut patched_cache_completed = 0usize;
+
+    for (id, directive) in &patched_directives {
+        if output_exists(ctx, &directive.to, directive.size) {
+            patched_skipped += 1;
+            continue;
+        }
+
+        match restore_patched_output_from_cache(ctx, directive) {
+            Ok(true) => {
+                patched_cache_completed += 1;
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(
+                    "Patch cache restore failed for '{}': {} (falling back)",
+                    directive.to, e
+                );
+            }
+        }
+
+        patched_to_process.push((*id, directive));
+    }
+
+    // Build verified local basis for patched directives
+    let mut verified_local_basis: HashMap<String, PathBuf> = HashMap::new();
+    let mut needs_extraction: Vec<(i64, &PatchedFromArchiveDirective)> = Vec::new();
+
+    for (id, directive) in &patched_to_process {
+        let basis_key =
+            build_patch_basis_key_from_archive_hash_path(&directive.archive_hash_path);
+        if let Some(key) = basis_key.as_deref() {
+            if let Some(local_path) =
+                ctx.resolve_verified_patch_basis_path(key, Some(&directive.from_hash))
+            {
+                verified_local_basis.insert(key.to_string(), local_path);
+                // Still need to process this directive but source comes from local basis
+                needs_extraction.push((*id, directive));
+                continue;
+            }
+        }
+        needs_extraction.push((*id, directive));
+    }
+    // All patched_to_process need processing; needs_extraction is the same list
+    // The verified_local_basis just provides an alternative source path
+    drop(needs_extraction);
+
+    // Collect all paths needed from the archive (union of FromArchive + PatchedFromArchive)
     let mut needed_paths = Vec::new();
     let mut seen_needed = HashSet::new();
 
-    for (_, directive, resolved) in &simple_directives {
-        let path_in_archive = resolved
-            .as_deref()
+    for (_, directive, resolved) in &from_simple {
+        let path = resolved
             .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
             .unwrap_or("");
-        if !path_in_archive.is_empty()
-            && seen_needed.insert(paths::normalize_for_lookup(path_in_archive))
-        {
-            needed_paths.push(path_in_archive.to_string());
-        }
-    }
-    for (_, directive, resolved, _) in &nested_bsa_directives {
-        let path_in_archive = resolved
-            .as_deref()
-            .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
-            .unwrap_or("");
-        if !path_in_archive.is_empty()
-            && seen_needed.insert(paths::normalize_for_lookup(path_in_archive))
-        {
-            needed_paths.push(path_in_archive.to_string());
+        if !path.is_empty() && seen_needed.insert(normalize_archive_lookup_path(path)) {
+            needed_paths.push(path.to_string());
         }
     }
 
-    let selective = should_use_selective_extraction(archive_path, needed_paths.len());
-    tracing::debug!(
-        "Extraction strategy: archive={}, needed_files={}, mode={}",
-        archive_path.display(),
-        needed_paths.len(),
-        if selective { "selective" } else { "full" }
+    for (_, directive, resolved, _) in &from_nested {
+        let path = resolved
+            .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
+            .unwrap_or("");
+        if !path.is_empty() && seen_needed.insert(normalize_archive_lookup_path(path)) {
+            needed_paths.push(path.to_string());
+        }
+    }
+
+    // For patched directives, include their source paths (unless served by local basis)
+    for (_, directive) in &patched_to_process {
+        let basis_key =
+            build_patch_basis_key_from_archive_hash_path(&directive.archive_hash_path);
+        if basis_key
+            .as_deref()
+            .is_some_and(|k| verified_local_basis.contains_key(k))
+        {
+            continue; // Source comes from local basis, no extraction needed
+        }
+
+        if directive.archive_hash_path.len() >= 2 {
+            let path = &directive.archive_hash_path[1];
+            if seen_needed.insert(normalize_archive_lookup_path(path)) {
+                needed_paths.push(path.clone());
+            }
+        }
+    }
+
+    // Detect archive type for extraction strategy
+    let archive_type =
+        detect_archive_type(archive_path).unwrap_or(NestedArchiveType::Unknown);
+    let is_bsa = matches!(
+        archive_type,
+        NestedArchiveType::Tes3Bsa | NestedArchiveType::Bsa | NestedArchiveType::Ba2
     );
-    let extract_start = Instant::now();
-    let extract_result = if selective {
-        sevenzip::extract_files_case_insensitive(archive_path, &needed_paths, temp_dir.path())
-            .map(|_| ())
-            .or_else(|e| {
+
+    // Concurrent: extraction + patch delta preloading
+    let preload_enabled = should_preload_patch_blobs() && !patched_to_process.is_empty();
+    let wabbajack_path = ctx.config.wabbajack_path.clone();
+    let extract_dir = temp_dir.path().to_path_buf();
+
+    let (mut extracted_map, preloaded_patches) = std::thread::scope(|s| {
+        // Preload patch deltas in background
+        let preload_handle = s.spawn(|| {
+            if preload_enabled {
+                let patch_names: HashSet<String> = patched_to_process
+                    .iter()
+                    .map(|(_, d)| d.patch_id.to_string())
+                    .collect();
+                preload_patch_blobs_by_name(&wabbajack_path, &patch_names).unwrap_or_else(|e| {
+                    debug!("Patch preload failed (falling back to shared reader): {}", e);
+                    HashMap::new()
+                })
+            } else {
+                HashMap::new()
+            }
+        });
+
+        // Extract archive
+        if is_bsa {
+            // BSA/BA2: extract each needed file individually (preserving path structure)
+            extract_bsa_files_to_temp(archive_path, &needed_paths, &extract_dir);
+        } else if !needed_paths.is_empty() {
+            if let Err(e) = extract_archive_to_temp(
+                archive_path,
+                &needed_paths,
+                &extract_dir,
+                threads_per_archive,
+            ) {
+                error!("FAIL: Cannot extract {}: {}", archive_path.display(), e);
+            }
+        }
+
+        let map = build_extracted_file_map(&extract_dir);
+        let patches = preload_handle.join().unwrap_or_default();
+        (map, patches)
+    });
+
+    // Extract nested BSA/BA2 sources for PatchedFromArchive directives with archive_hash_path.len() >= 3
+    // Group by BSA/BA2 container so we open each archive only once (parallel batch extraction)
+    let mut nested_temp_dirs: Vec<tempfile::TempDir> = Vec::new();
+    {
+        // Collect needed files grouped by their BSA/BA2 container path
+        let mut by_bsa_container: HashMap<PathBuf, Vec<(String, String)>> = HashMap::new();
+
+        for (_, directive) in &patched_to_process {
+            if directive.archive_hash_path.len() < 3 {
+                continue;
+            }
+            let basis_key =
+                build_patch_basis_key_from_archive_hash_path(&directive.archive_hash_path);
+            if basis_key
+                .as_deref()
+                .is_some_and(|k| verified_local_basis.contains_key(k))
+            {
+                continue;
+            }
+
+            let bsa_path = &directive.archive_hash_path[1];
+            let file_in_bsa = &directive.archive_hash_path[2];
+            let combined_key = format!("{}/{}", bsa_path, file_in_bsa);
+            let combined_normalized = paths::normalize_for_lookup(&combined_key);
+
+            if extracted_map.contains_key(&combined_normalized) {
+                continue;
+            }
+
+            let bsa_normalized = normalize_archive_lookup_path(bsa_path);
+            if let Some(disk_path) = extracted_map.get(&bsa_normalized) {
+                by_bsa_container
+                    .entry(disk_path.clone())
+                    .or_default()
+                    .push((file_in_bsa.clone(), combined_normalized));
+            } else {
                 warn!(
-                    "Selective extraction failed for {}, falling back to full extraction: {}",
-                    archive_path.display(),
+                    "Nested BSA container not found for patch source: {}",
+                    bsa_path
+                );
+            }
+        }
+
+        // Batch extract from each BSA/BA2 container (opens archive once, parallel decompression)
+        for (bsa_disk_path, needed_files) in &by_bsa_container {
+            let wanted: HashSet<String> = needed_files
+                .iter()
+                .map(|(file_in_bsa, _)| file_in_bsa.replace('\\', "/").to_lowercase())
+                .collect();
+
+            let nested_tmp = match tempfile::tempdir_in(output_dir) {
+                Ok(t) => t,
+                Err(e) => {
+                    error!("FAIL: create temp dir for nested BSA batch: {}", e);
+                    continue;
+                }
+            };
+
+            // Build reverse lookup: normalized BSA path -> combined_normalized key
+            let mut path_to_combined: HashMap<String, String> = HashMap::new();
+            for (file_in_bsa, combined_normalized) in needed_files {
+                let normalized = file_in_bsa.replace('\\', "/").to_lowercase();
+                path_to_combined.insert(normalized, combined_normalized.clone());
+            }
+
+            // Collect extracted file mappings via Mutex (callback is Fn, not FnMut)
+            let extracted_entries: std::sync::Mutex<Vec<(String, PathBuf)>> =
+                std::sync::Mutex::new(Vec::new());
+            let tmp_path = nested_tmp.path().to_path_buf();
+
+            if let Err(e) = bsa::extract_archive_batch(bsa_disk_path, &wanted, |path, data| {
+                let normalized = path.replace('\\', "/").to_lowercase();
+                let temp_file = tmp_path.join(path);
+                if let Some(parent) = temp_file.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                fs::write(&temp_file, &data)
+                    .map_err(|e| anyhow::anyhow!("write nested BSA extract: {}", e))?;
+
+                if let Some(combined_key) = path_to_combined.get(&normalized) {
+                    extracted_entries
+                        .lock()
+                        .expect("extracted_entries mutex")
+                        .push((combined_key.clone(), temp_file));
+                }
+                Ok(())
+            }) {
+                error!(
+                    "FAIL: batch extract from nested BSA/BA2 {}: {}",
+                    bsa_disk_path.display(),
                     e
                 );
-                sevenzip::extract_all_with_threads(archive_path, temp_dir.path(), threads)
-                    .map(|_| ())
-            })
-    } else {
-        // Full extraction remains best for large file sets and solid 7z archives.
-        // If full extraction fails (often due to problematic reparse/symlink entries),
-        // retry with just the files we actually need.
-        sevenzip::extract_all_with_threads(archive_path, temp_dir.path(), threads)
-            .map(|_| ())
-            .or_else(|full_err| {
-                if needed_paths.is_empty() {
-                    return Err(full_err);
-                }
+            }
 
-                warn!(
-                    "Full extraction failed for {}, retrying selective extraction of {} needed files: {}",
-                    archive_path.display(),
-                    needed_paths.len(),
-                    full_err
-                );
-                sevenzip::extract_files_case_insensitive(archive_path, &needed_paths, temp_dir.path())
-                    .map(|_| ())
-                    .map_err(|selective_err| {
-                        anyhow::anyhow!(
-                            "full extraction failed: {}; selective fallback failed: {}",
-                            full_err,
-                            selective_err
-                        )
-                    })
-            })
-    };
+            // Merge extracted entries into the main map
+            for (key, path) in extracted_entries.into_inner().expect("extracted_entries mutex") {
+                extracted_map.insert(key, path);
+            }
 
-    if let Err(e) = extract_result {
-        let count = logged_failures.fetch_add(1, Ordering::Relaxed);
-        if count < MAX_LOGGED_FAILURES {
-            error!("FAIL: Cannot extract {}: {}", archive_path.display(), e);
+            nested_temp_dirs.push(nested_tmp);
         }
-        failed.fetch_add(to_process.len(), Ordering::Relaxed);
-        return;
     }
-    let extract_ms = extract_start.elapsed().as_millis();
 
-    // Build map of extracted files (parallel walkdir)
-    let extracted_map = build_extracted_file_map(temp_dir.path());
+    let mut staged_files = Vec::new();
+    let total_skipped = patched_skipped;
+    let mut extracted_count = 0usize;
+    let mut patched_count = patched_cache_completed;
+    let mut failed_count = 0usize;
 
-    // Count how many destinations each source file has
-    // Files with multiple destinations need reflink/copy instead of rename
+    // Count how many destinations each source has (for shared source detection)
     let mut source_use_count: HashMap<String, usize> = HashMap::new();
-    for (_, directive, resolved) in &simple_directives {
-        let path_in_archive = resolved
-            .as_deref()
+    for (_, directive, resolved) in &from_simple {
+        let path = resolved
             .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
             .unwrap_or("");
-        let normalized = paths::normalize_for_lookup(path_in_archive);
+        let normalized = normalize_archive_lookup_path(path);
+        *source_use_count.entry(normalized).or_insert(0) += 1;
+    }
+    // BSA containers used by nested directives should not be renamed
+    for (_, directive, resolved, _) in &from_nested {
+        let path = resolved
+            .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
+            .unwrap_or("");
+        let normalized = normalize_archive_lookup_path(path);
         *source_use_count.entry(normalized).or_insert(0) += 1;
     }
 
-    // Also count BSA files used by nested directives - they must not be renamed
-    // until all nested extractions are done
-    for (_, directive, resolved, _) in &nested_bsa_directives {
-        let bsa_path = resolved
-            .as_deref()
-            .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
-            .unwrap_or("");
-        let normalized = paths::normalize_for_lookup(bsa_path);
-        // Mark as shared so it uses reflink/copy instead of rename
-        *source_use_count.entry(normalized).or_insert(0) += 1;
+    // === Process nested BSA directives FIRST (before anything can rename BSA files) ===
+    if !from_nested.is_empty() {
+        let (nested_staged, nested_bsa_temp_dirs) = process_nested_bsa_directives_staged(
+            &from_nested,
+            &extracted_map,
+            ctx,
+            output_dir,
+        );
+        nested_temp_dirs.extend(nested_bsa_temp_dirs);
+        for result in nested_staged {
+            match result {
+                Ok(sf) => {
+                    staged_files.push(sf);
+                    extracted_count += 1;
+                }
+                Err(msg) => {
+                    error!("{}", msg);
+                    failed_count += 1;
+                }
+            }
+        }
     }
 
-    // Process nested BSA directives FIRST (before movers can rename BSA files)
-    process_nested_bsa_directives(
-        &nested_bsa_directives,
-        &extracted_map,
-        ctx,
-        tx,
-        channel_hwm,
-        output_dir,
-        extracted,
-        failed,
-        logged_failures,
-    );
-
-    // Send simple directives to mover workers via channel
-    for (id, directive, resolved) in simple_directives {
+    // === Process FromArchive simple directives ===
+    for (id, directive, resolved) in &from_simple {
         let path_in_archive = resolved
-            .as_deref()
             .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
             .unwrap_or("");
-        let normalized = paths::normalize_for_lookup(path_in_archive);
+        let normalized = normalize_archive_lookup_path(path_in_archive);
 
         let src_path = match extracted_map.get(&normalized) {
             Some(p) => p.clone(),
             None => {
-                let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                let count = failed_count;
                 if count < MAX_LOGGED_FAILURES {
                     error!("FAIL [{}]: not found in archive: {}", id, path_in_archive);
                 }
-                failed.fetch_add(1, Ordering::Relaxed);
+                failed_count += 1;
                 continue;
             }
         };
 
         let final_output_path = paths::join_windows_path(output_dir, &directive.to);
+
+        // Record patch basis
         if !path_in_archive.is_empty() {
-            if let Some(archive_hash) = directive.archive_hash_path.first() {
-                let basis_key = build_patch_basis_key(archive_hash, Some(path_in_archive), None);
+            if let Some(ahash) = directive.archive_hash_path.first() {
+                let basis_key = build_patch_basis_key(ahash, Some(path_in_archive), None);
                 ctx.record_patch_basis_candidate_path_dual(
                     &basis_key,
                     &directive.archive_hash_path,
@@ -933,102 +882,396 @@ fn process_single_archive_with_channel(
             }
         }
 
-        // If this source has multiple destinations, use reflink/copy
-        let is_shared_source = source_use_count.get(&normalized).copied().unwrap_or(0) > 1;
-
-        let job = MoveJob {
-            source_path: src_path,
+        staged_files.push(StagedFile {
+            temp_path: src_path,
             output_path: final_output_path,
             expected_size: directive.size,
-            directive_id: id,
-            _temp_dir: Arc::clone(&temp_dir),
-            is_shared_source,
-        };
-
-        if tx.send(job).is_err() {
-            failed.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-        update_max(channel_hwm, tx.len());
-
-        extracted.fetch_add(1, Ordering::Relaxed);
+            directive_id: *id,
+        });
+        extracted_count += 1;
     }
-    tracing::debug!(
-        "Archive extracted: archive={}, directives={}, extract_ms={}",
-        archive_path.display(),
-        to_process.len(),
-        extract_ms
-    );
+
+    // === Process PatchedFromArchive directives ===
+    // Use parallel processing for patch application
+    let patch_results: Vec<_> = patched_to_process
+        .par_iter()
+        .map(|(id, directive)| {
+            let patch_name = directive.patch_id.to_string();
+            let preloaded_delta = preloaded_patches.get(&patch_name).map(|v| v.as_slice());
+
+            // Find source path
+            let source_path = resolve_patch_source(
+                directive,
+                &verified_local_basis,
+                &extracted_map,
+                archive_path,
+            );
+
+            let source_path = match source_path {
+                Ok(p) => p,
+                Err(e) => {
+                    return Err((*id, format!("Source not found for patch: {:#}", e)));
+                }
+            };
+
+            // Apply patch to temp file
+            let temp_output = temp_dir
+                .path()
+                .join(format!("patched_{}.tmp", id));
+            if let Err(e) = apply_patch_to_temp(
+                ctx,
+                &source_path,
+                &patch_name,
+                preloaded_delta,
+                &temp_output,
+                directive.size,
+            ) {
+                return Err((*id, format!("Patch apply failed: {:#}", e)));
+            }
+
+            // Store in patch cache (from temp — cache verifies hash on restore)
+            if let Err(e) = store_patched_output_in_cache(ctx, directive, &temp_output) {
+                warn!("Failed to cache patch output '{}': {}", directive.to, e);
+            }
+
+            let final_output_path = paths::join_windows_path(output_dir, &directive.to);
+            Ok(StagedFile {
+                temp_path: temp_output,
+                output_path: final_output_path,
+                expected_size: directive.size,
+                directive_id: *id,
+            })
+        })
+        .collect();
+
+    for result in patch_results {
+        match result {
+            Ok(sf) => {
+                staged_files.push(sf);
+                patched_count += 1;
+            }
+            Err((id, msg)) => {
+                if failed_count < MAX_LOGGED_FAILURES {
+                    error!("FAIL [{}]: {}", id, msg);
+                }
+                failed_count += 1;
+            }
+        }
+    }
+
+    Ok(ArchiveResult {
+        staged_files,
+        temp_dir,
+        nested_temp_dirs,
+        skipped_count: total_skipped,
+        extracted_count,
+        patched_count,
+        failed_count,
+    })
 }
 
-/// Process nested archive directives - extracts files from nested archives (BSA, ZIP, 7z, etc.).
-#[allow(clippy::too_many_arguments)]
-fn process_nested_bsa_directives(
-    nested_bsa_directives: &[(i64, &FromArchiveDirective, Option<String>, String)],
+/// Resolve the source path for a PatchedFromArchive directive.
+///
+/// Priority: verified local basis → extracted file map → archive itself (len==1)
+fn resolve_patch_source(
+    directive: &PatchedFromArchiveDirective,
+    verified_local_basis: &HashMap<String, PathBuf>,
     extracted_map: &HashMap<String, PathBuf>,
-    ctx: &ProcessContext,
-    tx: &Sender<MoveJob>,
-    channel_hwm: &Arc<AtomicUsize>,
-    output_dir: &PathBuf,
-    extracted: &Arc<AtomicUsize>,
-    failed: &Arc<AtomicUsize>,
+    archive_path: &Path,
+) -> Result<PathBuf> {
+    let basis_key =
+        build_patch_basis_key_from_archive_hash_path(&directive.archive_hash_path);
+
+    if let Some(key) = basis_key.as_deref() {
+        if let Some(path) = verified_local_basis.get(key) {
+            return Ok(path.clone());
+        }
+    }
+
+    if directive.archive_hash_path.len() == 1 {
+        // Source is the archive file itself
+        return Ok(archive_path.to_path_buf());
+    }
+
+    if directive.archive_hash_path.len() == 2 {
+        let path = &directive.archive_hash_path[1];
+        let normalized = normalize_archive_lookup_path(path);
+        return extracted_map
+            .get(&normalized)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Source not found in extracted files: {}", path));
+    }
+
+    if directive.archive_hash_path.len() >= 3 {
+        let bsa_path = &directive.archive_hash_path[1];
+        let file_in_bsa = &directive.archive_hash_path[2];
+        // Try combined key first (inserted by nested BSA extraction above)
+        let combined_key = format!("{}/{}", bsa_path, file_in_bsa);
+        let combined_normalized = paths::normalize_for_lookup(&combined_key);
+        if let Some(path) = extracted_map.get(&combined_normalized) {
+            return Ok(path.clone());
+        }
+        // Also try just the inner file path (in case it was extracted differently)
+        let inner_normalized = normalize_archive_lookup_path(file_in_bsa);
+        return extracted_map.get(&inner_normalized).cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Source not found in BSA/BA2: {} / {}",
+                bsa_path,
+                file_in_bsa
+            )
+        });
+    }
+
+    anyhow::bail!("Invalid archive_hash_path")
+}
+
+/// Extract BSA/BA2 files to temp directory in parallel, preserving path structure.
+/// Opens the archive once and decompresses all matching files in parallel.
+fn extract_bsa_files_to_temp(archive_path: &Path, needed_paths: &[String], temp_dir: &Path) {
+    let wanted: HashSet<String> = needed_paths
+        .iter()
+        .map(|p| p.replace('\\', "/").to_lowercase())
+        .collect();
+
+    if let Err(e) = bsa::extract_archive_batch(archive_path, &wanted, |path, data| {
+        let temp_file = temp_dir.join(path);
+        if let Some(parent) = temp_file.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        fs::write(&temp_file, &data).map_err(|e| {
+            anyhow::anyhow!("BSA extract write error for {}: {}", path, e)
+        })
+    }) {
+        error!(
+            "FAIL: BSA batch extraction error for {}: {}",
+            archive_path.display(),
+            e
+        );
+    }
+}
+
+/// Extract archive (7z/ZIP/RAR) to temp directory with fallback chain.
+fn extract_archive_to_temp(
+    archive_path: &Path,
+    needed_paths: &[String],
+    temp_dir: &Path,
+    threads: Option<usize>,
+) -> Result<()> {
+    let selective = should_use_selective_extraction(archive_path, needed_paths.len());
+    debug!(
+        "Extraction strategy: archive={}, needed_files={}, mode={}",
+        archive_path.display(),
+        needed_paths.len(),
+        if selective { "selective" } else { "full" }
+    );
+
+    if selective {
+        sevenzip::extract_files_case_insensitive(archive_path, needed_paths, temp_dir)
+            .map(|_| ())
+            .or_else(|e| {
+                warn!(
+                    "Selective extraction failed for {}, falling back to full: {}",
+                    archive_path.display(),
+                    e
+                );
+                sevenzip::extract_all_with_threads(archive_path, temp_dir, threads).map(|_| ())
+            })
+    } else {
+        sevenzip::extract_all_with_threads(archive_path, temp_dir, threads)
+            .map(|_| ())
+            .or_else(|full_err| {
+                if needed_paths.is_empty() {
+                    return Err(full_err);
+                }
+                warn!(
+                    "Full extraction failed for {}, retrying selective of {} files: {}",
+                    archive_path.display(),
+                    needed_paths.len(),
+                    full_err
+                );
+                sevenzip::extract_files_case_insensitive(archive_path, needed_paths, temp_dir)
+                    .map(|_| ())
+                    .map_err(|selective_err| {
+                        anyhow::anyhow!(
+                            "full extraction failed: {}; selective fallback failed: {}",
+                            full_err,
+                            selective_err
+                        )
+                    })
+            })
+    }
+}
+
+/// Finalize staged files: reflink/copy to output, verify size, cleanup temp.
+fn finalize_archive(
+    result: ArchiveResult,
+    _output_dir: &Path,
     logged_failures: &Arc<AtomicUsize>,
-) {
+    progress_callback: &Option<ProgressCallback>,
+) -> FinalizeStats {
     const MAX_LOGGED_FAILURES: usize = 100;
 
-    if nested_bsa_directives.is_empty() {
-        return;
-    }
+    let written = AtomicUsize::new(0);
+    let skipped_atomic = AtomicUsize::new(0);
+    let failed_atomic = AtomicUsize::new(0);
 
-    // Group by nested archive file
-    let mut by_archive: HashMap<String, Vec<(i64, &FromArchiveDirective, String)>> = HashMap::new();
-    for (id, directive, resolved, file_in_archive) in nested_bsa_directives {
-        let archive_path = resolved
-            .as_deref()
-            .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
-            .unwrap_or("")
-            .to_string();
-        by_archive.entry(archive_path).or_default().push((
-            *id,
-            *directive,
-            file_in_archive.clone(),
-        ));
-    }
-
-    for (archive_path_in_outer, directives) in by_archive {
-        let normalized_archive = paths::normalize_for_lookup(&archive_path_in_outer);
-
-        let archive_disk_path = match extracted_map.get(&normalized_archive) {
-            Some(p) => p.clone(),
-            None => {
-                let count = logged_failures.fetch_add(1, Ordering::Relaxed);
-                if count < MAX_LOGGED_FAILURES {
-                    error!("FAIL: Nested archive not found: {}", archive_path_in_outer);
-                }
-                failed.fetch_add(directives.len(), Ordering::Relaxed);
-                continue;
+    result.staged_files.par_iter().for_each(|sf| {
+        // Create output directory
+        if let Err(e) = paths::ensure_parent_dirs(&sf.output_path) {
+            let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+            if count < MAX_LOGGED_FAILURES {
+                error!(
+                    "FAIL [{}]: cannot create dirs for {}: {}",
+                    sf.directive_id,
+                    sf.output_path.display(),
+                    e
+                );
             }
-        };
+            failed_atomic.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
 
-        // Detect archive type to use correct extraction method
-        let archive_type = match detect_archive_type(&archive_disk_path) {
-            Ok(t) => t,
+        // Check if output already exists with correct size (race condition)
+        if let Ok(meta) = fs::metadata(&sf.output_path) {
+            if meta.len() == sf.expected_size {
+                skipped_atomic.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            // Wrong size - remove and re-copy
+            let _ = fs::remove_file(&sf.output_path);
+        }
+
+        // Verify source exists and has expected size
+        let src_size = match fs::metadata(&sf.temp_path) {
+            Ok(m) => m.len(),
             Err(e) => {
                 let count = logged_failures.fetch_add(1, Ordering::Relaxed);
                 if count < MAX_LOGGED_FAILURES {
                     error!(
-                        "FAIL: Cannot detect archive type for {}: {}",
-                        archive_path_in_outer, e
+                        "FAIL [{}]: staged file missing: {}: {}",
+                        sf.directive_id,
+                        sf.temp_path.display(),
+                        e
                     );
                 }
-                failed.fetch_add(directives.len(), Ordering::Relaxed);
+                failed_atomic.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+
+        if src_size != sf.expected_size {
+            let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+            if count < MAX_LOGGED_FAILURES {
+                error!(
+                    "FAIL [{}]: size mismatch: expected {} got {}",
+                    sf.directive_id, sf.expected_size, src_size
+                );
+            }
+            failed_atomic.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        // Always copy (not rename) to preserve temp source for other directives
+        // sharing the same extracted file. Temp dir cleanup handles the originals.
+        let _ = fs::remove_file(&sf.output_path);
+        if let Err(e) = reflink_copy::reflink_or_copy(&sf.temp_path, &sf.output_path) {
+            // Check if another thread already created it (race condition)
+            if let Ok(meta) = fs::metadata(&sf.output_path) {
+                if meta.len() == sf.expected_size {
+                    skipped_atomic.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+            let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+            if count < MAX_LOGGED_FAILURES {
+                error!(
+                    "FAIL [{}]: copy failed: {}",
+                    sf.directive_id, e
+                );
+            }
+            failed_atomic.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        let new_count = written.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(ref callback) = progress_callback {
+            callback(new_count);
+        }
+    });
+
+    // Explicitly drop temp dirs after all staged files have been copied out.
+    // This cleans up the extraction artifacts.
+    drop(result.temp_dir);
+    drop(result.nested_temp_dirs);
+
+    FinalizeStats {
+        written: written.load(Ordering::Relaxed),
+        skipped: skipped_atomic.load(Ordering::Relaxed),
+        failed: failed_atomic.load(Ordering::Relaxed),
+    }
+}
+
+/// Process nested archive directives, returning staged files and temp dirs to keep alive.
+///
+/// Extracts files from nested archives (BSA, ZIP, 7z, etc.) that were themselves
+/// extracted from the outer archive.
+fn process_nested_bsa_directives_staged(
+    nested_bsa_directives: &[(i64, &FromArchiveDirective, Option<&str>, &str)],
+    extracted_map: &HashMap<String, PathBuf>,
+    ctx: &ProcessContext,
+    output_dir: &Path,
+) -> (Vec<Result<StagedFile, String>>, Vec<tempfile::TempDir>) {
+    if nested_bsa_directives.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut kept_temp_dirs: Vec<tempfile::TempDir> = Vec::new();
+
+    // Group by nested archive file
+    let mut by_archive: HashMap<String, Vec<(i64, &FromArchiveDirective, &str)>> = HashMap::new();
+    for (id, directive, resolved, file_in_archive) in nested_bsa_directives {
+        let archive_path = resolved
+            .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
+            .unwrap_or("")
+            .to_string();
+        by_archive
+            .entry(archive_path)
+            .or_default()
+            .push((*id, *directive, *file_in_archive));
+    }
+
+    let results = std::sync::Mutex::new(Vec::new());
+
+    for (archive_path_in_outer, directives) in by_archive {
+        let normalized_archive = normalize_archive_lookup_path(&archive_path_in_outer);
+
+        let archive_disk_path = match extracted_map.get(&normalized_archive) {
+            Some(p) => p.clone(),
+            None => {
+                for (id, _, _) in &directives {
+                    results.lock().expect("results mutex").push(Err(format!(
+                        "FAIL [{}]: Nested archive not found: {}",
+                        id, archive_path_in_outer
+                    )));
+                }
                 continue;
             }
         };
 
-        // For non-BSA nested archives, extract all needed files in one batched call.
-        let mut nested_extracted_map: Option<HashMap<String, PathBuf>> = None;
-        let mut nested_extract_failed = false;
+        let archive_type = match detect_archive_type(&archive_disk_path) {
+            Ok(t) => t,
+            Err(e) => {
+                for (id, _, _) in &directives {
+                    results.lock().expect("results mutex").push(Err(format!(
+                        "FAIL [{}]: Cannot detect archive type for {}: {}",
+                        id, archive_path_in_outer, e
+                    )));
+                }
+                continue;
+            }
+        };
+
+        // For non-BSA nested archives, extract all needed files in one batched call
         if matches!(
             archive_type,
             NestedArchiveType::Zip
@@ -1039,15 +1282,14 @@ fn process_nested_bsa_directives(
             let mut unique_files = Vec::new();
             let mut seen = HashSet::new();
             for (_, _, file_in_archive) in &directives {
-                let normalized = paths::normalize_for_lookup(file_in_archive);
+                let normalized = normalize_archive_lookup_path(file_in_archive);
                 if seen.insert(normalized) {
-                    unique_files.push(file_in_archive.clone());
+                    unique_files.push(file_in_archive.to_string());
                 }
             }
 
             match tempfile::tempdir_in(output_dir) {
                 Ok(nested_tmp_dir) => {
-                    let nested_tmp_dir = Arc::new(nested_tmp_dir);
                     let batch_result = sevenzip::extract_files_case_insensitive(
                         &archive_disk_path,
                         &unique_files,
@@ -1055,61 +1297,50 @@ fn process_nested_bsa_directives(
                     );
                     match batch_result {
                         Ok(_) => {
-                            nested_extracted_map =
-                                Some(build_extracted_file_map(nested_tmp_dir.path()));
-                            directives.par_iter().for_each(|(id, directive, file_in_archive)| {
-                                let map = match &nested_extracted_map {
-                                    Some(m) => m,
-                                    None => {
-                                        failed.fetch_add(1, Ordering::Relaxed);
-                                        return;
-                                    }
-                                };
-                                let normalized_file = paths::normalize_for_lookup(file_in_archive);
-                                let extracted_path = match map.get(&normalized_file) {
+                            let nested_map =
+                                build_extracted_file_map(nested_tmp_dir.path());
+
+                            // Process each directive
+                            for (id, directive, file_in_archive) in &directives {
+                                let normalized_file =
+                                    normalize_archive_lookup_path(file_in_archive);
+                                let extracted_path = match nested_map.get(&normalized_file) {
                                     Some(p) => p,
                                     None => {
-                                        let count = logged_failures.fetch_add(1, Ordering::Relaxed);
-                                        if count < MAX_LOGGED_FAILURES {
-                                            error!("FAIL [{}]: Nested file not found after batch extract: {}", id, file_in_archive);
-                                        }
-                                        failed.fetch_add(1, Ordering::Relaxed);
-                                        return;
+                                        results.lock().expect("results mutex").push(Err(format!(
+                                            "FAIL [{}]: Nested file not found: {}",
+                                            id, file_in_archive
+                                        )));
+                                        continue;
                                     }
                                 };
 
                                 let src_size = match fs::metadata(extracted_path) {
                                     Ok(meta) => meta.len(),
                                     Err(e) => {
-                                        let count = logged_failures.fetch_add(1, Ordering::Relaxed);
-                                        if count < MAX_LOGGED_FAILURES {
-                                            error!("FAIL [{}]: Nested metadata error: {}", id, e);
-                                        }
-                                        failed.fetch_add(1, Ordering::Relaxed);
-                                        return;
+                                        results.lock().expect("results mutex").push(Err(format!(
+                                            "FAIL [{}]: Nested metadata error: {}",
+                                            id, e
+                                        )));
+                                        continue;
                                     }
                                 };
 
                                 if src_size != directive.size {
-                                    let count = logged_failures.fetch_add(1, Ordering::Relaxed);
-                                    if count < MAX_LOGGED_FAILURES {
-                                        error!("FAIL [{}]: Size mismatch: expected {} got {}", id, directive.size, src_size);
-                                    }
-                                    failed.fetch_add(1, Ordering::Relaxed);
-                                    return;
+                                    results.lock().expect("results mutex").push(Err(format!(
+                                        "FAIL [{}]: Size mismatch: expected {} got {}",
+                                        id, directive.size, src_size
+                                    )));
+                                    continue;
                                 }
 
-                                let job = MoveJob {
-                                    source_path: extracted_path.clone(),
-                                    output_path: paths::join_windows_path(output_dir, &directive.to),
-                                    expected_size: directive.size,
-                                    directive_id: *id,
-                                    _temp_dir: Arc::clone(&nested_tmp_dir),
-                                    is_shared_source: false,
-                                };
-                                if let Some(archive_hash) = directive.archive_hash_path.first() {
+                                let final_path =
+                                    paths::join_windows_path(output_dir, &directive.to);
+
+                                // Record patch basis
+                                if let Some(ahash) = directive.archive_hash_path.first() {
                                     let basis_key = build_patch_basis_key(
-                                        archive_hash,
+                                        ahash,
                                         Some(&archive_path_in_outer),
                                         Some(file_in_archive),
                                     );
@@ -1117,113 +1348,138 @@ fn process_nested_bsa_directives(
                                         &basis_key,
                                         &directive.archive_hash_path,
                                         extracted_path,
-                                        &job.output_path,
+                                        &final_path,
                                         directive.size,
                                     );
                                 }
-                                if tx.send(job).is_err() {
-                                    failed.fetch_add(1, Ordering::Relaxed);
-                                    return;
-                                }
-                                update_max(channel_hwm, tx.len());
-                                extracted.fetch_add(1, Ordering::Relaxed);
-                            });
+
+                                results.lock().expect("results mutex").push(Ok(StagedFile {
+                                    temp_path: extracted_path.clone(),
+                                    output_path: final_path,
+                                    expected_size: directive.size,
+                                    directive_id: *id,
+                                }));
+                            }
+
+                            // Keep temp dir alive until finalize_archive copies files out
+                            kept_temp_dirs.push(nested_tmp_dir);
                         }
                         Err(e) => {
-                            let count = logged_failures.fetch_add(1, Ordering::Relaxed);
-                            if count < MAX_LOGGED_FAILURES {
-                                error!(
-                                    "FAIL: Nested batch extract error from {:?} archive {}: {}",
-                                    archive_type,
-                                    archive_disk_path.display(),
-                                    e
-                                );
+                            for (id, _, _) in &directives {
+                                results.lock().expect("results mutex").push(Err(format!(
+                                    "FAIL [{}]: Nested batch extract error from {:?} archive {}: {}",
+                                    id, archive_type, archive_disk_path.display(), e
+                                )));
                             }
-                            nested_extract_failed = true;
                         }
                     }
                 }
                 Err(e) => {
-                    let count = logged_failures.fetch_add(1, Ordering::Relaxed);
-                    if count < MAX_LOGGED_FAILURES {
-                        error!("FAIL: Cannot create temp dir for nested extraction: {}", e);
+                    for (id, _, _) in &directives {
+                        results.lock().expect("results mutex").push(Err(format!(
+                            "FAIL [{}]: Cannot create temp dir for nested extraction: {}",
+                            id, e
+                        )));
                     }
-                    nested_extract_failed = true;
                 }
             }
-        }
-
-        if nested_extract_failed {
-            failed.fetch_add(directives.len(), Ordering::Relaxed);
             continue;
         }
 
-        if nested_extracted_map.is_some() {
-            continue;
+        // BSA/BA2: batch extract in parallel (open once, decompress all files at once)
+        let mut wanted_paths: HashSet<String> = HashSet::new();
+        let mut path_to_directives: HashMap<String, Vec<(i64, &FromArchiveDirective, &str)>> =
+            HashMap::new();
+
+        for (id, directive, file_in_archive) in &directives {
+            let normalized = file_in_archive.replace('\\', "/").to_lowercase();
+            wanted_paths.insert(normalized.clone());
+            path_to_directives
+                .entry(normalized)
+                .or_default()
+                .push((*id, *directive, *file_in_archive));
         }
 
-        directives
-            .par_iter()
-            .for_each(|(id, directive, file_in_archive)| {
-                // BSA/BA2 extraction using bsa module
-                let data = match bsa::extract_archive_file(&archive_disk_path, file_in_archive) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        let count = logged_failures.fetch_add(1, Ordering::Relaxed);
-                        if count < MAX_LOGGED_FAILURES {
-                            error!(
-                                "FAIL [{}]: Nested extract error from {:?} archive: {}",
-                                id, archive_type, e
-                            );
-                        }
-                        failed.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
+        if let Err(e) = bsa::extract_archive_batch(
+            &archive_disk_path,
+            &wanted_paths,
+            |path, data| {
+                let lookup = path.replace('\\', "/").to_lowercase();
+                let Some(directive_list) = path_to_directives.get(&lookup) else {
+                    return Ok(());
                 };
 
-                if data.len() as u64 != directive.size {
-                    let count = logged_failures.fetch_add(1, Ordering::Relaxed);
-                    if count < MAX_LOGGED_FAILURES {
-                        error!(
+                for &(id, directive, file_in_archive) in directive_list {
+                    if data.len() as u64 != directive.size {
+                        results.lock().expect("results mutex").push(Err(format!(
                             "FAIL [{}]: Size mismatch: expected {} got {}",
-                            id,
-                            directive.size,
-                            data.len()
+                            id, directive.size, data.len()
+                        )));
+                        continue;
+                    }
+
+                    let out_path = paths::join_windows_path(output_dir, &directive.to);
+                    if let Err(_e) = paths::ensure_parent_dirs(&out_path) {
+                        results.lock().expect("results mutex").push(Err(format!(
+                            "FAIL [{}]: Cannot create parent dirs",
+                            id
+                        )));
+                        continue;
+                    }
+
+                    if let Err(e) = fs::write(&out_path, &data) {
+                        results.lock().expect("results mutex").push(Err(format!("FAIL [{}]: write error: {}", id, e)));
+                        continue;
+                    }
+
+                    if let Some(ahash) = directive.archive_hash_path.first() {
+                        let basis_key = build_patch_basis_key(
+                            ahash,
+                            Some(&archive_path_in_outer),
+                            Some(file_in_archive),
+                        );
+                        ctx.record_patch_basis_candidate_bytes_dual(
+                            &basis_key,
+                            &directive.archive_hash_path,
+                            &out_path,
+                            &data,
                         );
                     }
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
 
-                // For BSA/BA2 nested extraction, write directly to destination.
-                // This avoids extra temp-file churn in the hot path.
-                let output_path = paths::join_windows_path(output_dir, &directive.to);
-                if let Err(_e) = paths::ensure_parent_dirs(&output_path) {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    return;
+                    results.lock().expect("results mutex").push(Ok(StagedFile {
+                        temp_path: out_path.clone(),
+                        output_path: out_path,
+                        expected_size: directive.size,
+                        directive_id: id,
+                    }));
                 }
+                Ok(())
+            },
+        ) {
+            // Batch extraction failed entirely — report for all directives
+            for (id, _, _) in &directives {
+                results.lock().expect("results mutex").push(Err(format!(
+                    "FAIL [{}]: Nested BSA batch extract error from {:?}: {}",
+                    id, archive_type, e
+                )));
+            }
+        }
+    }
 
-                if let Err(e) = fs::write(&output_path, &data) {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    error!("FAIL [{}]: write error: {}", id, e);
-                    return;
-                }
-                if let Some(archive_hash) = directive.archive_hash_path.first() {
-                    let basis_key = build_patch_basis_key(
-                        archive_hash,
-                        Some(&archive_path_in_outer),
-                        Some(file_in_archive),
-                    );
-                    ctx.record_patch_basis_candidate_bytes_dual(
-                        &basis_key,
-                        &directive.archive_hash_path,
-                        &output_path,
-                        &data,
-                    );
-                }
+    (results.into_inner().expect("results mutex"), kept_temp_dirs)
+}
 
-                extracted.fetch_add(1, Ordering::Relaxed);
-            });
+fn normalize_archive_lookup_path(path: &str) -> String {
+    let base = path.split('#').next().unwrap_or(path);
+    paths::normalize_for_lookup(base)
+}
+
+/// Truncate a name to max_len characters, adding "..." if needed.
+fn truncate_name(name: &str, max_len: usize) -> String {
+    if name.len() <= max_len {
+        name.to_string()
+    } else {
+        format!("{}...", &name[..max_len.saturating_sub(3)])
     }
 }
 
@@ -1238,7 +1494,6 @@ fn process_whole_file_directives(
     directives.par_iter().for_each(|(id, directive)| {
         let archive_hash = &directive.archive_hash_path[0];
 
-        // Check if output already exists with correct size
         let normalized_to = paths::normalize_for_lookup(&directive.to);
         if let Some(&existing_size) = ctx.existing_files.get(&normalized_to) {
             if existing_size == directive.size {
@@ -1255,7 +1510,6 @@ fn process_whole_file_directives(
             }
         };
 
-        // Verify size matches
         let archive_size = match fs::metadata(archive_path) {
             Ok(m) => m.len(),
             Err(_) => {
@@ -1265,7 +1519,6 @@ fn process_whole_file_directives(
         };
 
         if archive_size != directive.size {
-            // Not actually a whole-file directive - size mismatch
             failed.fetch_add(1, Ordering::Relaxed);
             error!(
                 "FAIL [{}]: whole-file size mismatch {} vs {}",
@@ -1274,7 +1527,6 @@ fn process_whole_file_directives(
             return;
         }
 
-        // Copy the file
         let output_path = paths::join_windows_path(&ctx.config.output_dir, &directive.to);
         if let Err(e) = paths::ensure_parent_dirs(&output_path) {
             failed.fetch_add(1, Ordering::Relaxed);
@@ -1300,8 +1552,8 @@ fn process_whole_file_directives(
     });
 }
 
-/// Process a BSA/BA2 archive directly (no extraction needed).
-/// BSA files are read directly using the bsa module.
+/// Process a BSA/BA2 archive directly using batch extraction.
+/// Opens the archive ONCE and decompresses all files in parallel via callback.
 #[allow(clippy::too_many_arguments)]
 fn process_bsa_archive(
     archive_path: &PathBuf,
@@ -1316,7 +1568,6 @@ fn process_bsa_archive(
 ) {
     const MAX_LOGGED_FAILURES: usize = 100;
 
-    // Filter directives that need processing (skip existing files)
     let to_process: Vec<_> = directives
         .iter()
         .filter(|(_, d, _, _)| {
@@ -1337,85 +1588,99 @@ fn process_bsa_archive(
 
     let output_dir = &ctx.config.output_dir;
 
-    // Process files from BSA in parallel
-    to_process
-        .par_iter()
-        .for_each(|(id, directive, resolved, _file_in_bsa)| {
-            // For BSA archives, the file path is in archive_hash_path[1]
-            let file_path_in_bsa = resolved
-                .as_deref()
-                .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
-                .unwrap_or("");
+    // Build lookup: normalized BSA path -> list of directives needing that file
+    let mut path_to_directives: HashMap<String, Vec<&(i64, FromArchiveDirective, Option<String>, Option<String>)>> =
+        HashMap::new();
+    let mut wanted_paths: HashSet<String> = HashSet::new();
 
-            // Extract from BSA
-            let data = match bsa::extract_archive_file(archive_path, file_path_in_bsa) {
-                Ok(d) => d,
-                Err(e) => {
-                    let count = logged_failures.fetch_add(1, Ordering::Relaxed);
-                    if count < MAX_LOGGED_FAILURES {
-                        error!("FAIL [{}]: BSA read error: {}", id, e);
-                    }
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-            };
+    for item in &to_process {
+        let (_, directive, resolved, _) = item;
+        let file_path_in_bsa = resolved
+            .as_deref()
+            .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
+            .unwrap_or("");
 
-            // Verify size
+        let normalized = file_path_in_bsa.replace('\\', "/").to_lowercase();
+        wanted_paths.insert(normalized.clone());
+        path_to_directives
+            .entry(normalized)
+            .or_default()
+            .push(item);
+    }
+
+    // Extract all files in parallel via batch callback
+    let path_to_directives = &path_to_directives;
+    if let Err(e) = bsa::extract_archive_batch(archive_path, &wanted_paths, |path, data| {
+        let lookup = path.replace('\\', "/").to_lowercase();
+        let Some(directive_list) = path_to_directives.get(&lookup) else {
+            return Ok(());
+        };
+
+        for &(id, ref directive, _, _) in directive_list {
             if data.len() as u64 != directive.size {
                 let count = logged_failures.fetch_add(1, Ordering::Relaxed);
                 if count < MAX_LOGGED_FAILURES {
                     error!(
                         "FAIL [{}]: BSA size mismatch: expected {} got {}",
-                        id,
-                        directive.size,
-                        data.len()
+                        id, directive.size, data.len()
                     );
                 }
                 failed.fetch_add(1, Ordering::Relaxed);
-                return;
+                continue;
             }
 
-            // Write to output
-            let output_path = paths::join_windows_path(output_dir, &directive.to);
-            if let Err(e) = paths::ensure_parent_dirs(&output_path) {
+            let out_path = paths::join_windows_path(output_dir, &directive.to);
+            if let Err(e) = paths::ensure_parent_dirs(&out_path) {
                 failed.fetch_add(1, Ordering::Relaxed);
-                error!(
-                    "FAIL [{}]: cannot create dirs for {}: {}",
-                    id,
-                    output_path.display(),
-                    e
-                );
-                return;
+                error!("FAIL [{}]: cannot create dirs for {}: {}", id, out_path.display(), e);
+                continue;
             }
 
-            if let Err(e) = fs::write(&output_path, &data) {
+            if let Err(e) = fs::write(&out_path, &data) {
                 failed.fetch_add(1, Ordering::Relaxed);
                 error!("FAIL [{}]: write error: {}", id, e);
-                return;
+                continue;
             }
+
             if let Some(archive_hash) = directive.archive_hash_path.first() {
-                let basis_key = build_patch_basis_key(archive_hash, Some(file_path_in_bsa), None);
+                let file_path_in_bsa = directive
+                    .archive_hash_path
+                    .get(1)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                let basis_key =
+                    build_patch_basis_key(archive_hash, Some(file_path_in_bsa), None);
                 ctx.record_patch_basis_candidate_bytes_dual(
                     &basis_key,
                     &directive.archive_hash_path,
-                    &output_path,
+                    &out_path,
                     &data,
                 );
             }
 
             extracted.fetch_add(1, Ordering::Relaxed);
             let new_count = written.fetch_add(1, Ordering::Relaxed) + 1;
-            // Call progress callback if provided
             if let Some(ref callback) = progress_callback {
                 callback(new_count);
             }
-        });
+        }
+        Ok(())
+    }) {
+        let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+        if count < MAX_LOGGED_FAILURES {
+            error!(
+                "FAIL: BSA batch extraction error for {}: {}",
+                archive_path.display(),
+                e
+            );
+        }
+        failed.fetch_add(to_process.len(), Ordering::Relaxed);
+    }
 }
 
 /// Build a map of all files in a directory: normalized path -> actual file path on disk.
 ///
 /// Handles CP437-encoded filenames that 7z may extract from legacy Windows archives.
-/// Creates entries for both the original path and CP437-to-UTF8 converted path.
 fn build_extracted_file_map(dir: &std::path::Path) -> HashMap<String, PathBuf> {
     let entries: Vec<_> = walkdir::WalkDir::new(dir)
         .into_iter()
@@ -1428,7 +1693,6 @@ fn build_extracted_file_map(dir: &std::path::Path) -> HashMap<String, PathBuf> {
     for entry in &entries {
         let rel_path = entry.path().strip_prefix(dir).unwrap_or(entry.path());
 
-        // Get the path as bytes (OsStr -> bytes on Unix)
         #[cfg(unix)]
         let path_bytes: Vec<u8> = {
             use std::os::unix::ffi::OsStrExt;
@@ -1437,14 +1701,11 @@ fn build_extracted_file_map(dir: &std::path::Path) -> HashMap<String, PathBuf> {
         #[cfg(not(unix))]
         let path_bytes: Vec<u8> = rel_path.to_string_lossy().as_bytes().to_vec();
 
-        // Check if path contains non-ASCII bytes (potential CP437)
         let has_high_bytes = path_bytes.iter().any(|&b| b >= 0x80);
 
-        // Add the regular normalized path
         let normalized = paths::normalize_for_lookup(&rel_path.to_string_lossy());
         map.insert(normalized, entry.path().to_path_buf());
 
-        // If path contains high bytes, also add CP437-converted version
         if has_high_bytes {
             let utf8_path = paths::cp437_to_utf8(&path_bytes);
             let normalized_cp437 = paths::normalize_for_lookup(&utf8_path);
@@ -1462,7 +1723,6 @@ mod tests {
     #[test]
     fn test_large_archive_threshold() {
         let threshold = get_large_archive_threshold();
-        // Should be either 1GB or 2GB depending on system RAM
         let one_gb = 1024 * 1024 * 1024;
         let two_gb = 2048 * 1024 * 1024;
         assert!(
@@ -1474,43 +1734,9 @@ mod tests {
 
     #[test]
     fn test_threshold_is_cached() {
-        // Call twice - should return same value (cached)
         let first = get_large_archive_threshold();
         let second = get_large_archive_threshold();
         assert_eq!(first, second, "Threshold should be cached and consistent");
     }
 
-    #[test]
-    fn test_archive_size_tier() {
-        const HALF_GB: u64 = 512 * 1024 * 1024;
-        const TWO_GB: u64 = 2 * 1024 * 1024 * 1024;
-
-        // Small: <=512MB
-        assert_eq!(ArchiveSizeTier::from_size(0), ArchiveSizeTier::Small);
-        assert_eq!(ArchiveSizeTier::from_size(HALF_GB), ArchiveSizeTier::Small);
-
-        // Medium: 512MB-2GB
-        assert_eq!(
-            ArchiveSizeTier::from_size(HALF_GB + 1),
-            ArchiveSizeTier::Medium
-        );
-        assert_eq!(
-            ArchiveSizeTier::from_size(TWO_GB - 1),
-            ArchiveSizeTier::Medium
-        );
-
-        // Large: >=2GB
-        assert_eq!(ArchiveSizeTier::from_size(TWO_GB), ArchiveSizeTier::Large);
-        assert_eq!(
-            ArchiveSizeTier::from_size(TWO_GB + 1),
-            ArchiveSizeTier::Large
-        );
-    }
-
-    #[test]
-    fn test_tier_threads() {
-        assert_eq!(ArchiveSizeTier::Small.threads_per_archive(), 1);
-        assert_eq!(ArchiveSizeTier::Medium.threads_per_archive(), 2);
-        assert_eq!(ArchiveSizeTier::Large.threads_per_archive(), 0); // 0 = all threads
-    }
 }
