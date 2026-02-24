@@ -151,8 +151,10 @@ pub fn extract_batch_parallel(
     file_paths: &[&str],
     max_memory_bytes: Option<usize>,
 ) -> Result<Vec<(String, Vec<u8>)>> {
-    let (archive, _): (Archive, _) = Archive::read(bsa_path)
+    let (archive, options): (Archive, _) = Archive::read(bsa_path)
         .with_context(|| format!("Failed to open BSA: {}", bsa_path.display()))?;
+
+    let compression_options: FileCompressionOptions = (&options).into();
 
     // Build set of normalized paths we need
     let needed: HashSet<String> = file_paths
@@ -170,8 +172,9 @@ pub fn extract_batch_parallel(
     let bytes_extracted = AtomicUsize::new(0);
     let max_bytes = max_memory_bytes.unwrap_or(usize::MAX);
 
-    // Collect matching files with their archive location
-    let mut matches: Vec<(String, bool, Vec<u8>)> = Vec::new();
+    // Collect matching files — decompress using the ba2 crate's API
+    // which correctly handles the BSA compressed format (4-byte size prefix + zlib)
+    let mut matches: Vec<(String, Vec<u8>)> = Vec::new();
 
     for (dir_key, folder) in archive.iter() {
         let dir_name = String::from_utf8_lossy(dir_key.name().as_bytes()).to_lowercase();
@@ -185,13 +188,25 @@ pub fn extract_batch_parallel(
             };
 
             if needed.contains(&full_path) {
-                // Get original path casing
                 let original = path_lookup
                     .get(&full_path)
                     .map(|s| s.to_string())
                     .unwrap_or(full_path);
 
-                matches.push((original, file.is_compressed(), file.as_bytes().to_vec()));
+                // Use the crate's decompress which handles BSA format correctly
+                let data = if file.is_compressed() {
+                    match file.decompress(&compression_options) {
+                        Ok(decompressed) => decompressed.as_bytes().to_vec(),
+                        Err(e) => {
+                            warn!("Failed to decompress {}: {}", original, e);
+                            continue;
+                        }
+                    }
+                } else {
+                    file.as_bytes().to_vec()
+                };
+
+                matches.push((original, data));
             }
         }
     }
@@ -203,33 +218,16 @@ pub fn extract_batch_parallel(
         bsa_path.display()
     );
 
-    // Process in parallel with rayon
+    // Filter by memory limit
     let results: Vec<(String, Vec<u8>)> = matches
-        .into_par_iter()
-        .filter_map(|(path, is_compressed, raw_data)| {
-            // Check memory limit
+        .into_iter()
+        .filter(|(_, data)| {
             let current = bytes_extracted.load(Ordering::Relaxed);
             if current >= max_bytes {
-                return None;
+                return false;
             }
-
-            // Decompress if needed
-            let data = if is_compressed {
-                // We need to re-read this from the BSA due to ba2's API
-                // For now, just decompress inline (not ideal but works)
-                match decompress_zlib(&raw_data) {
-                    Ok(decompressed) => decompressed,
-                    Err(e) => {
-                        warn!("Failed to decompress {}: {}", path, e);
-                        return None;
-                    }
-                }
-            } else {
-                raw_data
-            };
-
             bytes_extracted.fetch_add(data.len(), Ordering::Relaxed);
-            Some((path, data))
+            true
         })
         .collect();
 
@@ -241,17 +239,6 @@ pub fn extract_batch_parallel(
     );
 
     Ok(results)
-}
-
-/// Simple zlib decompression
-fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>> {
-    use flate2::read::ZlibDecoder;
-    use std::io::Read;
-
-    let mut decoder = ZlibDecoder::new(data);
-    let mut decompressed = Vec::new();
-    decoder.read_to_end(&mut decompressed)?;
-    Ok(decompressed)
 }
 
 /// Check current memory pressure

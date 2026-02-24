@@ -179,6 +179,7 @@ pub fn extract_files(archive_path: &Path, files: &[&str], output_dir: &Path) -> 
             .or_else(|_| extract_files_7z_binary(archive_path, files, output_dir)),
         ArchiveType::SevenZ => extract_7z_files_native(archive_path, files, output_dir)
             .or_else(|_| extract_files_7z_binary(archive_path, files, output_dir)),
+
         ArchiveType::Rar => extract_rar_files(archive_path, files, output_dir)
             .or_else(|_| extract_files_7z_binary(archive_path, files, output_dir)),
         _ => extract_files_7z_binary(archive_path, files, output_dir),
@@ -254,6 +255,7 @@ pub fn extract_all_with_threads(
                 tracing::warn!("Native 7z extraction failed, falling back to 7z binary: {}", e);
                 extract_all_7z_binary(archive_path, output_dir, threads)
             }),
+
         ArchiveType::Rar => extract_rar_all(archive_path, output_dir)
             .or_else(|e| {
                 tracing::warn!("Native RAR extraction failed, falling back to 7z binary: {}", e);

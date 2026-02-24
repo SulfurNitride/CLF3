@@ -17,10 +17,8 @@
 //!   Next archive
 //! ```
 //!
-//! Archives are tiered by size for optimal resource usage:
-//! - Small (≤512MB):  Full parallel - 1 thread each, many archives at once
-//! - Medium (512MB-2GB): Bounded parallel (1 thread per archive)
-//! - Large (≥2GB):    Bounded parallel (1 thread per archive)
+//! Archives are processed in parallel via rayon's work-stealing pool.
+//! BSA/BA2 direct-reads use rayon internally for parallel decompression.
 //!
 //! BSA/BA2: Read directly using bsa module (no extraction needed) for pure FromArchive.
 //! BSA/BA2 with PatchedFromArchive sources go through the fused pipeline.
@@ -164,6 +162,7 @@ pub fn cleanup_temp_dirs(downloads_dir: &std::path::Path) -> usize {
 /// Called with the current count of written files.
 pub type ProgressCallback = Arc<dyn Fn(usize) + Send + Sync>;
 
+
 /// Main entry point for fused install + patch pipeline.
 ///
 /// Processes both FromArchive and PatchedFromArchive directives in a single pass
@@ -283,11 +282,16 @@ pub fn process_fused_streaming(
         warn!("WARN: {} directives failed to parse", parse_failures);
     }
 
-    // Create a wrapper callback that adds pre_skipped offset to the count
+    // Global counter for GUI progress — shared across all archives
+    let global_written = Arc::new(AtomicUsize::new(0));
+
+    // Create a wrapper callback that uses global counter + pre_skipped offset
     let adjusted_callback: Option<ProgressCallback> = progress_callback.map(|cb| {
         let offset = pre_skipped;
-        Arc::new(move |count: usize| {
-            cb(offset + count);
+        let counter = global_written.clone();
+        Arc::new(move |_per_archive_count: usize| {
+            let total = counter.fetch_add(1, Ordering::Relaxed) + 1;
+            cb(offset + total);
         }) as ProgressCallback
     });
 
@@ -1470,8 +1474,7 @@ fn process_nested_bsa_directives_staged(
 }
 
 fn normalize_archive_lookup_path(path: &str) -> String {
-    let base = path.split('#').next().unwrap_or(path);
-    paths::normalize_for_lookup(base)
+    paths::normalize_for_lookup(path)
 }
 
 /// Truncate a name to max_len characters, adding "..." if needed.
