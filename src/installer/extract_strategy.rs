@@ -9,6 +9,8 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 /// Max number of files to request selectively before preferring full extraction.
+/// Set very high by default — Wabbajack always passes file lists to 7z regardless
+/// of count, and selective extraction avoids writing unneeded files to temp.
 pub fn selective_extract_threshold() -> usize {
     static THRESHOLD: OnceLock<usize> = OnceLock::new();
     *THRESHOLD.get_or_init(|| {
@@ -16,23 +18,7 @@ pub fn selective_extract_threshold() -> usize {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&v| v > 0)
-            .unwrap_or(25)
-    })
-}
-
-/// Separate threshold for selective extraction on solid 7z archives.
-///
-/// Solid archives may require substantial decompression even for a few files, but
-/// full extraction also incurs large write amplification. In practice, selective
-/// extraction is still better for very small request sets.
-pub fn solid_7z_selective_threshold() -> usize {
-    static THRESHOLD: OnceLock<usize> = OnceLock::new();
-    *THRESHOLD.get_or_init(|| {
-        std::env::var("CLF3_SOLID_7Z_SELECTIVE_THRESHOLD")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(8)
+            .unwrap_or(10_000)
     })
 }
 
@@ -40,21 +26,27 @@ pub fn solid_7z_selective_threshold() -> usize {
 ///
 /// Rules:
 /// - Never selective when no files are needed.
-/// - Never selective when request set exceeds configured threshold.
 /// - Never selective for BSA/BA2 (handled by direct readers).
-/// - For solid 7z, only selective for very small request sets.
+/// - Always selective for solid 7z: decompression work is identical (must decompress
+///   everything in a solid archive), but selective skips writing unneeded files to disk.
+///   An 11 GB solid archive needing 50 files writes 10 MB instead of 11 GB to temp.
+/// - For non-solid archives, selective up to a high threshold (10k files).
 pub fn should_use_selective_extraction(archive_path: &Path, needed_files: usize) -> bool {
-    if needed_files == 0 || needed_files > selective_extract_threshold() {
+    if needed_files == 0 {
         return false;
     }
 
     match detect_archive_type(archive_path).unwrap_or(ArchiveType::Unknown) {
+        // Solid 7z: ALWAYS selective — decompression cost is the same, but avoids
+        // writing the entire archive to temp. Unwanted entries drain to io::sink().
         ArchiveType::SevenZ => match sevenzip::is_solid_archive(archive_path) {
-            Ok(true) => needed_files <= solid_7z_selective_threshold(),
-            Ok(false) => true,
-            Err(_) => true,
+            Ok(true) => true,
+            Ok(false) => needed_files <= selective_extract_threshold(),
+            Err(_) => needed_files <= selective_extract_threshold(),
         },
-        ArchiveType::Zip | ArchiveType::Rar | ArchiveType::Unknown => true,
+        ArchiveType::Zip | ArchiveType::Rar | ArchiveType::Unknown => {
+            needed_files <= selective_extract_threshold()
+        }
         ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2 => false,
     }
 }

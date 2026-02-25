@@ -450,7 +450,7 @@ pub fn process_fused_streaming(
                     archive_hash,
                     directives,
                     ctx,
-                    None,
+                    Some(2),
                 );
 
                 match result {
