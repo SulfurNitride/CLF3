@@ -123,19 +123,20 @@ impl Installer {
         downloader::download_archives(&self.db, &self.config).await
     }
 
-    /// Validate ALL downloaded archives (check sizes AND hashes)
-    /// This catches truncated/corrupted downloads from interrupted sessions
+    /// Validate downloaded archives that haven't been verified yet.
+    /// Archives with download_status='completed' were already hash-verified
+    /// during the download phase — skip them to avoid redundant I/O.
     fn validate_archives(&self) -> Result<Vec<(String, String)>> {
         use crate::hash::compute_file_hash;
         use rayon::prelude::*;
         use std::sync::Mutex;
 
-        // Validate ALL archives that exist in downloads folder
         let archives = self.db.get_all_archives()?;
 
-        // Only check archives that actually exist on disk
+        // Skip archives already hash-verified in download phase
         let archives_to_check: Vec<_> = archives
             .iter()
+            .filter(|a| a.download_status != "completed")
             .filter(|a| self.config.downloads_dir.join(&a.name).exists())
             .collect();
 
