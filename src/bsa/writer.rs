@@ -10,27 +10,32 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs;
 use std::io::BufWriter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
 use super::{default_flags_fo3, default_flags_oblivion, detect_types, detect_version};
 
-/// Helper struct to hold file data with lifetime for BSA creation
+/// File entry that reads from disk on demand instead of holding data in memory
 struct FileEntry {
     dir_path: String,
     file_name: String,
-    data: Vec<u8>,
+    disk_path: PathBuf,
 }
 
 impl FileEntry {
-    /// Create a BSA file, optionally compressing it
-    fn as_bsa_file(&self, version: Version, should_compress: bool) -> Result<BsaFile<'static>> {
-        // Create an uncompressed file from our raw data
-        let uncompressed = BsaFile::from_decompressed(self.data.clone().into_boxed_slice());
+    /// Read file from disk and create a BSA file, optionally compressing it.
+    /// Peak memory per call = 1 file's worth of data.
+    fn into_bsa_file(self, version: Version, should_compress: bool) -> Result<BsaFile<'static>> {
+        let data = fs::read(&self.disk_path).with_context(|| {
+            format!(
+                "Failed to read staged file: {}",
+                self.disk_path.display()
+            )
+        })?;
+        let uncompressed = BsaFile::from_decompressed(data.into_boxed_slice());
 
         if should_compress {
-            // Compress the file using ba2's compress method
             let compression_options = FileCompressionOptions::builder().version(version).build();
 
             uncompressed
@@ -44,10 +49,14 @@ impl FileEntry {
     }
 }
 
-/// Builder for creating BSA archives
+/// Builder for creating BSA archives.
+///
+/// Stores file paths on disk instead of raw data. Files are read one at a time
+/// during build(), keeping peak memory at ~1 file per rayon thread instead of
+/// the entire archive's worth of data.
 pub struct BsaBuilder {
-    /// Files organized by directory -> filename -> data
-    files: HashMap<String, HashMap<String, Vec<u8>>>,
+    /// Files organized by directory -> filename -> path on disk
+    files: HashMap<String, HashMap<String, PathBuf>>,
     flags: ArchiveFlags,
     types: ArchiveTypes,
     version: Version,
@@ -109,10 +118,11 @@ impl BsaBuilder {
         self
     }
 
-    /// Add a file to the archive
-    pub fn add_file(&mut self, path: &str, data: Vec<u8>) {
+    /// Register a staged file for inclusion in the archive.
+    /// The file is NOT read into memory — only the path is stored.
+    pub fn add_file(&mut self, archive_path: &str, disk_path: PathBuf) {
         // Normalize: forward slashes, strip leading slash
-        let normalized = path.replace('\\', "/");
+        let normalized = archive_path.replace('\\', "/");
         let normalized = normalized.trim_start_matches('/');
 
         let (dir_path, file_name) = if let Some(idx) = normalized.rfind('/') {
@@ -127,7 +137,7 @@ impl BsaBuilder {
         self.files
             .entry(dir_path)
             .or_default()
-            .insert(file_name, data);
+            .insert(file_name, disk_path);
     }
 
     /// Get number of files
@@ -140,52 +150,49 @@ impl BsaBuilder {
         self.file_count() == 0
     }
 
-    /// Build and write the BSA to disk
+    /// Build and write the BSA to disk.
+    ///
+    /// Reads files from disk on demand during parallel compression.
+    /// Peak memory ≈ num_rayon_threads * largest_file_size (not total archive size).
     pub fn build(self, output_path: &Path) -> Result<()> {
         if self.is_empty() {
             bail!("Cannot create empty BSA archive");
         }
 
         let file_count = self.file_count();
-        let total_size: u64 = self
-            .files
-            .values()
-            .flat_map(|files| files.values())
-            .map(|data| data.len() as u64)
-            .sum();
 
         info!(
-            "Building BSA: {} ({} files, {} MB, version {:?}, flags {:?})",
+            "Building BSA: {} ({} files, version {:?}, flags {:?})",
             output_path.display(),
             file_count,
-            total_size / 1_000_000,
             self.version,
             self.flags
         );
 
-        // Check if we should compress files
         let should_compress = self.flags.contains(ArchiveFlags::COMPRESSED);
 
-        // Flatten to FileEntry structs that own their data
+        // Flatten to FileEntry structs — no data loaded yet, just paths
         let entries: Vec<FileEntry> = self
             .files
             .into_iter()
             .flat_map(|(dir_path, files)| {
-                files.into_iter().map(move |(file_name, data)| FileEntry {
+                files.into_iter().map(move |(file_name, disk_path)| FileEntry {
                     dir_path: dir_path.clone(),
                     file_name,
-                    data,
+                    disk_path,
                 })
             })
             .collect();
 
-        // Process files in parallel - create and compress BsaFile entries
+        // Read + compress files in parallel. Each thread reads one file at a time.
         let version = self.version;
         let processed: Result<Vec<(String, String, BsaFile)>> = entries
-            .par_iter()
+            .into_par_iter()
             .map(|entry| {
-                let file = entry.as_bsa_file(version, should_compress)?;
-                Ok((entry.dir_path.clone(), entry.file_name.clone(), file))
+                let dir_path = entry.dir_path.clone();
+                let file_name = entry.file_name.clone();
+                let file = entry.into_bsa_file(version, should_compress)?;
+                Ok((dir_path, file_name, file))
             })
             .collect();
 
@@ -291,7 +298,7 @@ impl BsaWriterManager {
     }
 
     /// Add a file to a BSA (thread-safe)
-    pub fn add_file(&self, location_index: i32, path: &str, data: Vec<u8>) -> Result<()> {
+    pub fn add_file(&self, location_index: i32, path: &str, disk_path: PathBuf) -> Result<()> {
         let (_, builder) = self
             .builders
             .get(&location_index)
@@ -300,7 +307,7 @@ impl BsaWriterManager {
         builder
             .lock()
             .expect("BSA builder lock poisoned")
-            .add_file(path, data);
+            .add_file(path, disk_path);
         Ok(())
     }
 
@@ -325,7 +332,6 @@ impl BsaWriterManager {
                 let output_path = dest_dir.join(name);
                 let builder_data = {
                     let guard = builder.lock().expect("BSA builder lock poisoned");
-                    // Clone the data we need for building
                     BsaBuilder {
                         files: guard.files.clone(),
                         flags: guard.flags,
@@ -413,6 +419,7 @@ impl Default for BsaWriterManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use tempfile::tempdir;
 
     #[test]
@@ -428,9 +435,15 @@ mod tests {
 
     #[test]
     fn test_add_files() {
+        let dir = tempdir().unwrap();
+        let f1 = dir.path().join("test.dds");
+        let f2 = dir.path().join("test2.dds");
+        fs::write(&f1, &[1, 2, 3]).unwrap();
+        fs::write(&f2, &[4, 5, 6]).unwrap();
+
         let mut builder = BsaBuilder::new();
-        builder.add_file("textures/test.dds", vec![1, 2, 3]);
-        builder.add_file("textures/sub/test2.dds", vec![4, 5, 6]);
+        builder.add_file("textures/test.dds", f1);
+        builder.add_file("textures/sub/test2.dds", f2);
 
         assert_eq!(builder.file_count(), 2);
         assert!(!builder.is_empty());

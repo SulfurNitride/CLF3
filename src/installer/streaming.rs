@@ -450,7 +450,7 @@ pub fn process_fused_streaming(
                     archive_hash,
                     directives,
                     ctx,
-                    Some(1),
+                    None,
                 );
 
                 match result {
@@ -771,28 +771,63 @@ fn process_single_archive_fused(
                 std::sync::Mutex::new(Vec::new());
             let tmp_path = nested_tmp.path().to_path_buf();
 
-            if let Err(e) = bsa::extract_archive_batch(bsa_disk_path, &wanted, |path, data| {
-                let normalized = path.replace('\\', "/").to_lowercase();
-                let temp_file = tmp_path.join(path);
-                if let Some(parent) = temp_file.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                fs::write(&temp_file, &data)
-                    .map_err(|e| anyhow::anyhow!("write nested BSA extract: {}", e))?;
+            if bsa::detect_format(bsa_disk_path).is_some() {
+                // BSA/BA2: use native batch extraction
+                if let Err(e) = bsa::extract_archive_batch(bsa_disk_path, &wanted, |path, data| {
+                    let normalized = path.replace('\\', "/").to_lowercase();
+                    let temp_file = tmp_path.join(path);
+                    if let Some(parent) = temp_file.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    fs::write(&temp_file, &data)
+                        .map_err(|e| anyhow::anyhow!("write nested BSA extract: {}", e))?;
 
-                if let Some(combined_key) = path_to_combined.get(&normalized) {
-                    extracted_entries
-                        .lock()
-                        .expect("extracted_entries mutex")
-                        .push((combined_key.clone(), temp_file));
+                    if let Some(combined_key) = path_to_combined.get(&normalized) {
+                        extracted_entries
+                            .lock()
+                            .expect("extracted_entries mutex")
+                            .push((combined_key.clone(), temp_file));
+                    }
+                    Ok(())
+                }) {
+                    error!(
+                        "FAIL: batch extract from nested BSA/BA2 {}: {}",
+                        bsa_disk_path.display(),
+                        e
+                    );
                 }
-                Ok(())
-            }) {
-                error!(
-                    "FAIL: batch extract from nested BSA/BA2 {}: {}",
-                    bsa_disk_path.display(),
-                    e
-                );
+            } else {
+                // Non-BSA container (e.g. .fomod which is a ZIP): use generic archive extraction
+                let wanted_files: Vec<String> = wanted.iter().cloned().collect();
+                match sevenzip::extract_files_case_insensitive(bsa_disk_path, &wanted_files, &tmp_path) {
+                    Ok(_) => {
+                        // Scan extracted files and register them
+                        for (file_in_bsa, combined_normalized) in needed_files {
+                            let normalized = file_in_bsa.replace('\\', "/").to_lowercase();
+                            // Try to find the extracted file (case-insensitive scan)
+                            let candidate = tmp_path.join(&normalized);
+                            let found = if candidate.exists() {
+                                Some(candidate)
+                            } else {
+                                // Walk the temp dir for a case-insensitive match
+                                find_file_case_insensitive(&tmp_path, &normalized)
+                            };
+                            if let Some(temp_file) = found {
+                                extracted_entries
+                                    .lock()
+                                    .expect("extracted_entries mutex")
+                                    .push((combined_normalized.clone(), temp_file));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            "FAIL: extract from nested archive {}: {}",
+                            bsa_disk_path.display(),
+                            e
+                        );
+                    }
+                }
             }
 
             // Merge extracted entries into the main map
@@ -1717,6 +1752,23 @@ fn build_extracted_file_map(dir: &std::path::Path) -> HashMap<String, PathBuf> {
     }
 
     map
+}
+
+/// Walk a directory tree to find a file matching the given relative path (case-insensitive).
+fn find_file_case_insensitive(base: &Path, normalized_rel: &str) -> Option<PathBuf> {
+    for entry in walkdir::WalkDir::new(base)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        if let Ok(rel) = entry.path().strip_prefix(base) {
+            let rel_normalized = rel.to_string_lossy().replace('\\', "/").to_lowercase();
+            if rel_normalized == normalized_rel {
+                return Some(entry.path().to_path_buf());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

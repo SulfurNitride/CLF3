@@ -10,6 +10,7 @@ use crate::paths;
 use anyhow::{Context, Result};
 use ba2::tes4::{ArchiveFlags, ArchiveTypes, Version};
 use std::fs;
+use std::path::PathBuf;
 use walkdir::WalkDir;
 
 /// Archive type to create
@@ -22,6 +23,36 @@ enum ArchiveKind {
     },
     /// FO4 BA2 (Fallout 4, Fallout 76, Starfield)
     Ba2 { version: Ba2Version },
+}
+
+/// Collect staged file paths from a staging directory.
+/// Returns (archive_path, disk_path) pairs. Does NOT read file contents.
+fn collect_staged_files(
+    staging_dir: &std::path::Path,
+    archive_kind: &ArchiveKind,
+) -> Result<Vec<(String, PathBuf)>> {
+    let mut files = Vec::new();
+
+    for entry in WalkDir::new(staging_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let file_path = entry.into_path();
+
+        let rel_path = file_path
+            .strip_prefix(staging_dir)
+            .with_context(|| format!("Failed to get relative path for {}", file_path.display()))?;
+
+        let archive_path = match archive_kind {
+            ArchiveKind::Bsa { .. } => rel_path.to_string_lossy().replace('/', "\\"),
+            ArchiveKind::Ba2 { .. } => rel_path.to_string_lossy().replace('\\', "/"),
+        };
+
+        files.push((archive_path, file_path));
+    }
+
+    Ok(files)
 }
 
 /// Handle a CreateBSA directive
@@ -74,33 +105,8 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
         }
     };
 
-    // Collect all files from staging directory first
-    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-
-    for entry in WalkDir::new(&staging_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
-        let file_path = entry.path();
-
-        // Get relative path from staging dir
-        let rel_path = file_path
-            .strip_prefix(&staging_dir)
-            .with_context(|| format!("Failed to get relative path for {}", file_path.display()))?;
-
-        // Read file data
-        let data = fs::read(file_path)
-            .with_context(|| format!("Failed to read staged file: {}", file_path.display()))?;
-
-        // Convert path to archive format (backslashes for BSA, forward slashes for BA2)
-        let archive_path = match &archive_kind {
-            ArchiveKind::Bsa { .. } => rel_path.to_string_lossy().replace('/', "\\"),
-            ArchiveKind::Ba2 { .. } => rel_path.to_string_lossy().replace('\\', "/"),
-        };
-
-        files.push((archive_path, data));
-    }
+    // Collect staged file paths (no data read yet)
+    let files = collect_staged_files(&staging_dir, &archive_kind)?;
 
     if files.is_empty() {
         anyhow::bail!(
@@ -119,27 +125,26 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
             flags,
             types,
         } => {
-            // Try building with original flags first
+            // Build BSA — files are read from disk on demand during build()
             let build_result = {
                 let mut builder = BsaBuilder::new()
                     .with_version(version)
                     .with_flags(flags)
                     .with_types(types);
 
-                for (path, data) in &files {
-                    builder.add_file(path, data.clone());
+                for (path, disk_path) in &files {
+                    builder.add_file(path, disk_path.clone());
                 }
 
                 builder.build(&output_path)
             };
 
-            // If it fails with overflow, try without compression
+            // If it fails with overflow, retry without compression
             if let Err(e) = build_result {
                 let err_str = format!("{:?}", e);
                 if err_str.contains("overflow") {
                     tracing::warn!("BSA build failed with overflow, retrying without compression");
 
-                    // Remove COMPRESSED flag
                     let flags_no_compress = flags & !ArchiveFlags::COMPRESSED;
 
                     let mut builder = BsaBuilder::new()
@@ -147,8 +152,8 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
                         .with_flags(flags_no_compress)
                         .with_types(types);
 
-                    for (path, data) in files {
-                        builder.add_file(&path, data);
+                    for (path, disk_path) in &files {
+                        builder.add_file(path, disk_path.clone());
                     }
 
                     builder.build(&output_path).with_context(|| {
@@ -165,12 +170,15 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
             }
         }
         ArchiveKind::Ba2 { version } => {
-            // Build BA2 archive with version from modlist
+            // BA2 builder still takes Vec<u8> — read files for it
             let mut builder = Ba2Builder::from_name(&directive.to)
                 .with_version(version)
                 .with_compression(Ba2CompressionFormat::Zlib);
 
-            for (path, data) in files {
+            for (path, disk_path) in files {
+                let data = fs::read(&disk_path).with_context(|| {
+                    format!("Failed to read staged file: {}", disk_path.display())
+                })?;
                 builder.add_file(&path, data);
             }
 

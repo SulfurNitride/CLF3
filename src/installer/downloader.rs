@@ -14,6 +14,7 @@ use crate::nxm_handler;
 use super::config::{InstallConfig, ProgressEvent};
 
 use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
 use futures::stream::{self, StreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use regex::Regex;
@@ -168,7 +169,6 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
     let mut already_downloaded = 0usize;
     let mut already_downloaded_size: u64 = 0;
     let mut need_download: Vec<ArchiveInfo> = Vec::new();
-    let mut truncated_count = 0usize;
     let mut missing_named_count = 0usize;
     let mut missing_named_examples: Vec<String> = Vec::new();
 
@@ -184,26 +184,16 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
                     archives_to_verify.push((archive, output_path));
                     continue;
                 } else {
-                    // File exists but wrong size - truncated/corrupted, delete and re-download
-                    println!(
-                        "  Truncated: {} ({}% complete)",
-                        archive.name,
-                        (meta.len() * 100) / (archive.size as u64).max(1)
-                    );
+                    // Size mismatch — don't delete yet, verify hash first
+                    // (modlist metadata size can be stale while hash remains correct)
                     warn!(
-                        "Rejecting local archive '{}' due to size mismatch (expected={}, actual={})",
+                        "Size mismatch for '{}' (expected={}, actual={}) — will verify hash",
                         output_path.display(),
                         archive.size,
                         meta.len()
                     );
-                    if let Err(e) = fs::remove_file(&output_path) {
-                        warn!(
-                            "Failed to remove truncated file {}: {}",
-                            output_path.display(),
-                            e
-                        );
-                    }
-                    truncated_count += 1;
+                    archives_to_verify.push((archive, output_path));
+                    continue;
                 }
             }
         } else {
@@ -234,17 +224,30 @@ Copied files with different names will not be reused. Examples: {}",
             archives_to_verify.len()
         );
 
-        for (i, (archive, output_path)) in archives_to_verify.iter().enumerate() {
-            // Show progress
-            print!(
-                "\r  Verifying {}/{}: {}...",
-                i + 1,
-                archives_to_verify.len(),
-                truncate_name(&archive.name, 40)
-            );
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+        // Verify hashes in parallel using rayon — pipelining reads helps even on slow storage
+        let verify_total = archives_to_verify.len();
+        let verify_progress = AtomicUsize::new(0);
 
-            match verify_file_hash_detailed(&output_path, &archive.hash) {
+        // Each result: Ok(true) = valid, Ok(false) = hash mismatch, Err = read error
+        let verify_results: Vec<Result<(bool, String)>> = archives_to_verify
+            .par_iter()
+            .map(|(archive, output_path)| {
+                let done = verify_progress.fetch_add(1, Ordering::Relaxed) + 1;
+                // Progress line (may interleave, that's fine)
+                eprint!(
+                    "\r  Verifying {}/{}...            ",
+                    done, verify_total
+                );
+                verify_file_hash_detailed(output_path, &archive.hash)
+            })
+            .collect();
+        eprintln!();
+
+        // Process results sequentially (DB writes, file deletes, bookkeeping)
+        for ((archive, output_path), result) in
+            archives_to_verify.iter().zip(verify_results.into_iter())
+        {
+            match result {
                 Ok((true, _actual_hash)) => {
                     // Hash matches - archive is valid
                     db.mark_archive_downloaded(
@@ -257,7 +260,7 @@ Copied files with different names will not be reused. Examples: {}",
                 Ok((false, actual_hash)) => {
                     // Hash mismatch - corrupted, delete and re-download
                     println!(
-                        "\r  Corrupted (hash mismatch): {}                    ",
+                        "  Corrupted (hash mismatch): {}",
                         archive.name
                     );
                     warn!(
@@ -266,7 +269,7 @@ Copied files with different names will not be reused. Examples: {}",
                         archive.hash,
                         actual_hash
                     );
-                    if let Err(e) = fs::remove_file(&output_path) {
+                    if let Err(e) = fs::remove_file(output_path) {
                         warn!(
                             "Failed to remove corrupted file {}: {}",
                             output_path.display(),
@@ -279,10 +282,10 @@ Copied files with different names will not be reused. Examples: {}",
                 Err(e) => {
                     // Error reading file - treat as corrupted
                     println!(
-                        "\r  Verify error for {}: {}                    ",
+                        "  Verify error for {}: {}",
                         archive.name, e
                     );
-                    if let Err(e) = fs::remove_file(&output_path) {
+                    if let Err(e) = fs::remove_file(output_path) {
                         warn!(
                             "Failed to remove unreadable file {}: {}",
                             output_path.display(),
@@ -295,17 +298,17 @@ Copied files with different names will not be reused. Examples: {}",
             }
         }
         println!(
-            "\r  Verified {} archives ({} valid, {} corrupted)                    ",
-            archives_to_verify.len(),
+            "  Verified {} archives ({} valid, {} corrupted)",
+            verify_total,
             already_downloaded,
             corrupted_count
         );
     }
 
-    if truncated_count > 0 || corrupted_count > 0 {
+    if corrupted_count > 0 {
         println!(
-            "Found {} truncated, {} corrupted archives - will re-download",
-            truncated_count, corrupted_count
+            "Found {} corrupted archives - will re-download",
+            corrupted_count
         );
     }
 
