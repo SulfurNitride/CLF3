@@ -16,8 +16,8 @@ pub fn compute_file_hash(path: &Path) -> Result<String> {
     let file = File::open(path)
         .with_context(|| format!("Failed to open file for hashing: {}", path.display()))?;
 
-    let mut reader = BufReader::with_capacity(1024 * 1024, file); // 1MB buffer
-    let mut buf = vec![0u8; 1024 * 1024]; // 1MB chunks
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file); // 8MB buffer
+    let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8MB chunks
     let mut hasher = xxhash_rust::xxh64::Xxh64::new(0);
 
     loop {

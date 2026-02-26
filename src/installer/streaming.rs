@@ -320,17 +320,12 @@ pub fn process_fused_streaming(
 
         let archive_type = detect_archive_type(&archive_path).unwrap_or(NestedArchiveType::Unknown);
 
-        // BSA/BA2 with ONLY FromArchive directives → fast direct-read path
-        let has_patched = directives
-            .iter()
-            .any(|d| matches!(d, ArchiveDirective::Patched { .. }));
-
-        if !has_patched
-            && matches!(
-                archive_type,
-                NestedArchiveType::Tes3Bsa | NestedArchiveType::Bsa | NestedArchiveType::Ba2
-            )
-        {
+        // BSA/BA2 → fast direct-read path (reads files by name, no temp extraction)
+        // Works for both pure FromArchive and mixed FromArchive+Patched directives.
+        if matches!(
+            archive_type,
+            NestedArchiveType::Tes3Bsa | NestedArchiveType::Bsa | NestedArchiveType::Ba2
+        ) {
             bsa_only_count += 1;
             all_archives.push((archive_hash, directives, archive_path, ArchiveKind::BsaDirect));
         } else {
@@ -339,8 +334,14 @@ pub fn process_fused_streaming(
         }
     }
 
-    // Sort by directive count descending so big archives start first
-    all_archives.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    // Sort by file size descending so large archives start first and don't become
+    // tail stragglers. Directive count as tiebreak. An 8 GB solid 7z with 199 files
+    // must start before a 50 MB zip with 2000 files.
+    all_archives.sort_by(|a, b| {
+        let size_a = std::fs::metadata(&a.2).map(|m| m.len()).unwrap_or(0);
+        let size_b = std::fs::metadata(&b.2).map(|m| m.len()).unwrap_or(0);
+        size_b.cmp(&size_a).then_with(|| b.1.len().cmp(&a.1.len()))
+    });
 
     let total_archives = all_archives.len();
     let total_files: usize = all_archives.iter().map(|(_, d, _, _)| d.len()).sum();
@@ -384,122 +385,168 @@ pub fn process_fused_streaming(
         process_whole_file_directives(&whole_file_directives, ctx, &extracted, &skipped, &failed);
     }
 
-    // Process ALL archives in a single parallel pool (rayon manages thread count)
-    all_archives.par_iter().for_each(
-        |(archive_hash, directives, archive_path, kind)| {
-            let archive_name = archive_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| archive_hash.clone());
-            let display_name = truncate_name(&archive_name, 50);
+    // Process archives using rayon::scope — each archive is a separate spawned task.
+    // Archives are already sorted by file size descending, so large archives get spawned
+    // (and start executing) first. When they finish, those threads steal remaining work
+    // from smaller archives via rayon's work-stealing scheduler.
+    rayon::scope(|s| {
+        for (archive_hash, directives, archive_path, kind) in &all_archives {
+            // Capture references for the closure
+            let extracted = &extracted;
+            let written = &written;
+            let skipped = &skipped;
+            let failed = &failed;
+            let logged_failures = &logged_failures;
+            let completed_archives = &completed_archives;
+            let overall_pb = &overall_pb;
+            let archive_bar_style = &archive_bar_style;
+            let mp = &mp;
+            let adjusted_callback = &adjusted_callback;
 
-            let is_bsa_direct = matches!(kind, ArchiveKind::BsaDirect);
-            let label = if is_bsa_direct { "reading" } else { "extracting" };
+            s.spawn(move |_| {
+                let archive_name = archive_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| archive_hash.clone());
+                let display_name = truncate_name(&archive_name, 50);
 
-            // Per-archive progress bar
-            let archive_pb = mp.insert_before(&overall_pb, ProgressBar::new_spinner());
-            archive_pb.set_style(archive_bar_style.clone());
-            archive_pb.enable_steady_tick(std::time::Duration::from_millis(100));
-            archive_pb.set_message(format!(
-                "{} ({} files) {}...",
-                display_name,
-                directives.len(),
-                label,
-            ));
+                let is_bsa_direct = matches!(kind, ArchiveKind::BsaDirect);
+                let label = if is_bsa_direct { "reading" } else { "extracting" };
 
-            if is_bsa_direct {
-                // BSA/BA2 direct-read path
-                let bsa_directives: Vec<(
-                    i64,
-                    FromArchiveDirective,
-                    Option<String>,
-                    Option<String>,
-                )> = directives
-                    .iter()
-                    .filter_map(|d| match d {
-                        ArchiveDirective::FromArchive {
-                            id,
-                            directive,
-                            resolved_path,
-                            file_in_bsa,
-                        } => Some((
-                            *id,
-                            directive.clone(),
-                            resolved_path.clone(),
-                            file_in_bsa.clone(),
-                        )),
-                        _ => None,
-                    })
-                    .collect();
+                // Per-archive progress bar
+                let archive_pb = mp.insert_before(overall_pb, ProgressBar::new_spinner());
+                archive_pb.set_style(archive_bar_style.clone());
+                archive_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+                archive_pb.set_message(format!(
+                    "{} ({} files) {}...",
+                    display_name,
+                    directives.len(),
+                    label,
+                ));
 
-                process_bsa_archive(
-                    archive_path,
-                    &bsa_directives,
-                    ctx,
-                    &extracted,
-                    &written,
-                    &skipped,
-                    &failed,
-                    &logged_failures,
-                    adjusted_callback.clone(),
-                );
-            } else {
-                // Extract + Patch fused pipeline
-                let result = process_single_archive_fused(
-                    archive_path,
-                    archive_hash,
-                    directives,
-                    ctx,
-                    Some(2),
-                );
+                if is_bsa_direct {
+                    // BSA/BA2 direct-read path — handles both FromArchive and Patched
+                    let bsa_from: Vec<(
+                        i64,
+                        FromArchiveDirective,
+                        Option<String>,
+                        Option<String>,
+                    )> = directives
+                        .iter()
+                        .filter_map(|d| match d {
+                            ArchiveDirective::FromArchive {
+                                id,
+                                directive,
+                                resolved_path,
+                                file_in_bsa,
+                            } => Some((
+                                *id,
+                                directive.clone(),
+                                resolved_path.clone(),
+                                file_in_bsa.clone(),
+                            )),
+                            _ => None,
+                        })
+                        .collect();
 
-                match result {
-                    Ok(archive_result) => {
-                        extracted.fetch_add(
-                            archive_result.extracted_count + archive_result.patched_count,
-                            Ordering::Relaxed,
+                    let bsa_patched: Vec<(i64, &PatchedFromArchiveDirective)> = directives
+                        .iter()
+                        .filter_map(|d| match d {
+                            ArchiveDirective::Patched { id, directive } => {
+                                Some((*id, directive))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+
+                    // Process FromArchive directives (direct read → write)
+                    if !bsa_from.is_empty() {
+                        process_bsa_archive(
+                            archive_path,
+                            &bsa_from,
+                            ctx,
+                            extracted,
+                            written,
+                            skipped,
+                            failed,
+                            logged_failures,
+                            adjusted_callback.clone(),
                         );
-                        skipped.fetch_add(archive_result.skipped_count, Ordering::Relaxed);
-                        failed.fetch_add(archive_result.failed_count, Ordering::Relaxed);
-
-                        archive_pb.set_message(format!(
-                            "{} ({} files) finalizing...",
-                            display_name,
-                            archive_result.staged_files.len()
-                        ));
-
-                        let fin_stats = finalize_archive(
-                            archive_result,
-                            &ctx.config.output_dir,
-                            &logged_failures,
-                            &adjusted_callback,
-                        );
-                        written.fetch_add(fin_stats.written, Ordering::Relaxed);
-                        skipped.fetch_add(fin_stats.skipped, Ordering::Relaxed);
-                        failed.fetch_add(fin_stats.failed, Ordering::Relaxed);
                     }
-                    Err(e) => {
-                        let count = logged_failures.fetch_add(1, Ordering::Relaxed);
-                        if count < MAX_LOGGED_FAILURES {
-                            error!("FAIL: Archive {}: {:#}", archive_name, e);
+
+                    // Process Patched directives: read basis from BSA, apply patch
+                    if !bsa_patched.is_empty() {
+                        process_bsa_patched_directives(
+                            archive_path,
+                            archive_hash,
+                            &bsa_patched,
+                            ctx,
+                            extracted,
+                            written,
+                            skipped,
+                            failed,
+                            logged_failures,
+                            adjusted_callback.clone(),
+                        );
+                    }
+                } else {
+                    // Extract + Patch fused pipeline
+                    let result = process_single_archive_fused(
+                        archive_path,
+                        archive_hash,
+                        directives,
+                        ctx,
+                        Some(2),
+                    );
+
+                    match result {
+                        Ok(archive_result) => {
+                            extracted.fetch_add(
+                                archive_result.extracted_count + archive_result.patched_count,
+                                Ordering::Relaxed,
+                            );
+                            skipped.fetch_add(archive_result.skipped_count, Ordering::Relaxed);
+                            failed.fetch_add(archive_result.failed_count, Ordering::Relaxed);
+
+                            archive_pb.set_message(format!(
+                                "{} ({} files) finalizing...",
+                                display_name,
+                                archive_result.staged_files.len()
+                            ));
+
+                            let fin_stats = finalize_archive(
+                                archive_result,
+                                &ctx.config.output_dir,
+                                logged_failures,
+                                adjusted_callback,
+                            );
+                            written.fetch_add(fin_stats.written, Ordering::Relaxed);
+                            skipped.fetch_add(fin_stats.skipped, Ordering::Relaxed);
+                            failed.fetch_add(fin_stats.failed, Ordering::Relaxed);
                         }
-                        failed.fetch_add(directives.len(), Ordering::Relaxed);
+                        Err(e) => {
+                            let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                            if count < MAX_LOGGED_FAILURES {
+                                error!("FAIL: Archive {}: {:#}", archive_name, e);
+                            }
+                            failed.fetch_add(directives.len(), Ordering::Relaxed);
+                        }
                     }
                 }
-            }
 
-            archive_pb.finish_and_clear();
-            completed_archives.fetch_add(1, Ordering::Relaxed);
-            let done = completed_archives.load(Ordering::Relaxed);
-            overall_pb.set_position(done as u64);
-            overall_pb.set_message(format!(
-                "OK:{} Skip:{} Fail:{}",
-                written.load(Ordering::Relaxed),
-                skipped.load(Ordering::Relaxed),
-                failed.load(Ordering::Relaxed)
-            ));
-        },
-    );
+                archive_pb.finish_and_clear();
+                completed_archives.fetch_add(1, Ordering::Relaxed);
+                let done = completed_archives.load(Ordering::Relaxed);
+                overall_pb.set_position(done as u64);
+                overall_pb.set_message(format!(
+                    "OK:{} Skip:{} Fail:{}",
+                    written.load(Ordering::Relaxed),
+                    skipped.load(Ordering::Relaxed),
+                    failed.load(Ordering::Relaxed)
+                ));
+            });
+        }
+    });
 
     overall_pb.finish_and_clear();
 
@@ -1708,6 +1755,152 @@ fn process_bsa_archive(
         if count < MAX_LOGGED_FAILURES {
             error!(
                 "FAIL: BSA batch extraction error for {}: {}",
+                archive_path.display(),
+                e
+            );
+        }
+        failed.fetch_add(to_process.len(), Ordering::Relaxed);
+    }
+}
+
+/// Process PatchedFromArchive directives where the basis file is inside a BSA/BA2.
+/// Reads basis directly from BSA, writes to temp, applies patch, writes final output.
+/// Much faster than extracting the entire BSA via 7z.
+fn process_bsa_patched_directives(
+    archive_path: &PathBuf,
+    _archive_hash: &str,
+    directives: &[(i64, &PatchedFromArchiveDirective)],
+    ctx: &ProcessContext,
+    extracted: &Arc<AtomicUsize>,
+    written: &Arc<AtomicUsize>,
+    skipped: &Arc<AtomicUsize>,
+    failed: &Arc<AtomicUsize>,
+    logged_failures: &Arc<AtomicUsize>,
+    progress_callback: Option<ProgressCallback>,
+) {
+    const MAX_LOGGED_FAILURES: usize = 100;
+    let output_dir = &ctx.config.output_dir;
+
+    // Filter already-done directives
+    let to_process: Vec<_> = directives
+        .iter()
+        .filter(|(_, d)| !output_exists(ctx, &d.to, d.size))
+        .collect();
+
+    if to_process.is_empty() {
+        skipped.fetch_add(directives.len(), Ordering::Relaxed);
+        return;
+    }
+
+    // Collect needed BSA paths for batch read
+    let mut wanted_paths: HashSet<String> = HashSet::new();
+    let mut path_to_directives: HashMap<String, Vec<&(i64, &PatchedFromArchiveDirective)>> =
+        HashMap::new();
+
+    for item in &to_process {
+        let (_, directive) = item;
+        // archive_hash_path: [archive_hash, file_in_bsa] or [archive_hash, bsa_path, file_in_bsa]
+        let file_path_in_bsa = if directive.archive_hash_path.len() >= 2 {
+            &directive.archive_hash_path[1]
+        } else {
+            continue;
+        };
+        let normalized = file_path_in_bsa.replace('\\', "/").to_lowercase();
+        wanted_paths.insert(normalized.clone());
+        path_to_directives
+            .entry(normalized)
+            .or_default()
+            .push(item);
+    }
+
+    // Read basis files from BSA in one batch, apply patches inline
+    let path_to_directives = &path_to_directives;
+    if let Err(e) = bsa::extract_archive_batch(archive_path, &wanted_paths, |path, data| {
+        let lookup = path.replace('\\', "/").to_lowercase();
+        let Some(directive_list) = path_to_directives.get(&lookup) else {
+            return Ok(());
+        };
+
+        for &(id, directive) in directive_list {
+            // Write basis to temp file for mmap-based patching
+            let temp_dir = match tempfile::tempdir_in(output_dir) {
+                Ok(d) => d,
+                Err(e) => {
+                    let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                    if count < MAX_LOGGED_FAILURES {
+                        tracing::error!("FAIL [{}]: cannot create temp dir: {}", id, e);
+                    }
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+
+            let basis_temp = temp_dir.path().join("basis");
+            if let Err(e) = fs::write(&basis_temp, &data) {
+                let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                if count < MAX_LOGGED_FAILURES {
+                    tracing::error!("FAIL [{}]: cannot write basis temp: {}", id, e);
+                }
+                failed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
+            let final_output = paths::join_windows_path(output_dir, &directive.to);
+            if let Err(e) = paths::ensure_parent_dirs(&final_output) {
+                failed.fetch_add(1, Ordering::Relaxed);
+                tracing::error!("FAIL [{}]: cannot create dirs: {}", id, e);
+                continue;
+            }
+
+            // Apply patch: basis + delta → final output
+            let patch_name = directive.patch_id.to_string();
+            match apply_patch_to_temp(
+                ctx,
+                &basis_temp,
+                &patch_name,
+                None,
+                &final_output,
+                directive.size,
+            ) {
+                Ok(()) => {
+                    // Record patch basis for future runs
+                    if let Some(ahash) = directive.archive_hash_path.first() {
+                        let file_in = directive
+                            .archive_hash_path
+                            .get(1)
+                            .map(|s| s.as_str())
+                            .unwrap_or("");
+                        let basis_key =
+                            build_patch_basis_key(ahash, Some(file_in), None);
+                        ctx.record_patch_basis_candidate_bytes_dual(
+                            &basis_key,
+                            &directive.archive_hash_path,
+                            &final_output,
+                            &data,
+                        );
+                    }
+
+                    extracted.fetch_add(1, Ordering::Relaxed);
+                    let new_count = written.fetch_add(1, Ordering::Relaxed) + 1;
+                    if let Some(ref callback) = progress_callback {
+                        callback(new_count);
+                    }
+                }
+                Err(e) => {
+                    let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                    if count < MAX_LOGGED_FAILURES {
+                        tracing::error!("FAIL [{}]: patch apply failed: {}", id, e);
+                    }
+                    failed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        Ok(())
+    }) {
+        let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+        if count < MAX_LOGGED_FAILURES {
+            tracing::error!(
+                "FAIL: BSA patch batch error for {}: {}",
                 archive_path.display(),
                 e
             );

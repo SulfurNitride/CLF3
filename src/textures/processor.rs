@@ -4,7 +4,7 @@
 //! All encoding goes through GPU (BC7) or CPU (BC4, BC5, BC3, BC1).
 
 use anyhow::{anyhow, Context, Result};
-use directxtex::{ScratchImage, DDS_FLAGS, DXGI_FORMAT, TEX_FILTER_FLAGS};
+use directxtex::{ScratchImage, DDS_FLAGS, DXGI_FORMAT, TEX_COMPRESS_FLAGS, TEX_FILTER_FLAGS};
 use image::{DynamicImage, RgbaImage};
 use image_dds::{ddsfile::Dds, ImageFormat, Mipmaps, Quality, SurfaceRgba8};
 use rayon::prelude::*;
@@ -21,6 +21,8 @@ use super::gpu_encoder::GpuEncoder;
 pub enum OutputFormat {
     /// BC7 - High quality, best for diffuse/color textures
     BC7,
+    /// BC6H - HDR float format (unsigned), encoded via DirectXTex
+    BC6H,
     /// BC5 - Two channel, ideal for normal maps
     BC5,
     /// BC4 - Single channel, good for grayscale (height, parallax)
@@ -38,17 +40,18 @@ pub enum OutputFormat {
 }
 
 impl OutputFormat {
-    /// Convert to image_dds ImageFormat
-    fn to_image_format(self) -> ImageFormat {
+    /// Convert to image_dds ImageFormat (BC6H not supported by image_dds — uses DirectXTex)
+    fn to_image_format(self) -> Option<ImageFormat> {
         match self {
-            OutputFormat::BC7 => ImageFormat::BC7RgbaUnorm,
-            OutputFormat::BC5 => ImageFormat::BC5RgUnorm,
-            OutputFormat::BC4 => ImageFormat::BC4RUnorm,
-            OutputFormat::BC3 => ImageFormat::BC3RgbaUnorm,
-            OutputFormat::BC2 => ImageFormat::BC2RgbaUnorm,
-            OutputFormat::BC1 => ImageFormat::BC1RgbaUnorm,
-            OutputFormat::Rgba => ImageFormat::Rgba8Unorm,
-            OutputFormat::Bgra => ImageFormat::Bgra8Unorm,
+            OutputFormat::BC7 => Some(ImageFormat::BC7RgbaUnorm),
+            OutputFormat::BC6H => None,
+            OutputFormat::BC5 => Some(ImageFormat::BC5RgUnorm),
+            OutputFormat::BC4 => Some(ImageFormat::BC4RUnorm),
+            OutputFormat::BC3 => Some(ImageFormat::BC3RgbaUnorm),
+            OutputFormat::BC2 => Some(ImageFormat::BC2RgbaUnorm),
+            OutputFormat::BC1 => Some(ImageFormat::BC1RgbaUnorm),
+            OutputFormat::Rgba => Some(ImageFormat::Rgba8Unorm),
+            OutputFormat::Bgra => Some(ImageFormat::Bgra8Unorm),
         }
     }
 
@@ -56,6 +59,7 @@ impl OutputFormat {
     pub fn name(&self) -> &'static str {
         match self {
             OutputFormat::BC7 => "BC7",
+            OutputFormat::BC6H => "BC6H",
             OutputFormat::BC5 => "BC5",
             OutputFormat::BC4 => "BC4",
             OutputFormat::BC3 => "BC3",
@@ -70,6 +74,7 @@ impl OutputFormat {
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
             "BC7" | "BC7_UNORM" | "BC7_UNORM_SRGB" | "BC7_SRGB" => Some(OutputFormat::BC7),
+            "BC6H" | "BC6H_UF16" | "BC6H_SF16" | "BC6H_TYPELESS" => Some(OutputFormat::BC6H),
             "BC5" | "BC5_UNORM" | "BC5_SNORM" | "BC5_TYPELESS" => Some(OutputFormat::BC5),
             "BC4" | "BC4_UNORM" | "BC4_SNORM" | "BC4_TYPELESS" => Some(OutputFormat::BC4),
             "BC3" | "BC3_UNORM" | "BC3_UNORM_SRGB" | "BC3_SRGB" | "DXT5" => Some(OutputFormat::BC3),
@@ -423,6 +428,11 @@ pub fn process_texture(
     target_height: u32,
     output_format: OutputFormat,
 ) -> Result<ProcessedTexture> {
+    // BC6H: route entirely through DirectXTex (image_dds can't encode HDR formats)
+    if output_format == OutputFormat::BC6H {
+        return process_texture_bc6h_directxtex(input_data, target_width, target_height);
+    }
+
     // Decode to RGBA
     let rgba = decode_dds_to_rgba(input_data)?;
 
@@ -471,13 +481,12 @@ pub fn process_texture(
     }
 
     // CPU path for non-BC7 or GPU fallback
+    let image_format = output_format
+        .to_image_format()
+        .context("No image_dds format for this output format")?;
     let surface = SurfaceRgba8::from_image(&resized);
     let encoded = surface
-        .encode(
-            output_format.to_image_format(),
-            Quality::Normal,
-            Mipmaps::GeneratedAutomatic,
-        )
+        .encode(image_format, Quality::Normal, Mipmaps::GeneratedAutomatic)
         .context("Failed to encode texture")?;
 
     // Convert to DDS bytes
@@ -492,6 +501,82 @@ pub fn process_texture(
         width: target_width,
         height: target_height,
         format: output_format,
+    })
+}
+
+/// Process BC6H texture entirely via DirectXTex (load → resize → compress → save).
+/// Preserves HDR data instead of falling back to BC1.
+fn process_texture_bc6h_directxtex(
+    input_data: &[u8],
+    target_width: u32,
+    target_height: u32,
+) -> Result<ProcessedTexture> {
+    let flags = DDS_FLAGS::DDS_FLAGS_ALLOW_LARGE_FILES;
+    let scratch = ScratchImage::load_dds(input_data, flags, None, None)
+        .context("DirectXTex: failed to load DDS for BC6H")?;
+
+    let metadata = scratch.metadata();
+    let current_w = metadata.width as u32;
+    let current_h = metadata.height as u32;
+
+    // Decompress to float if currently compressed
+    let decompressed = if metadata.format.is_compressed() {
+        scratch
+            .decompress(DXGI_FORMAT::DXGI_FORMAT_R16G16B16A16_FLOAT)
+            .context("DirectXTex: failed to decompress for BC6H")?
+    } else {
+        scratch
+    };
+
+    // Resize if needed
+    let resized = if current_w != target_width || current_h != target_height {
+        debug!(
+            "DirectXTex BC6H: resizing {}x{} -> {}x{}",
+            current_w, current_h, target_width, target_height
+        );
+        decompressed
+            .resize(
+                target_width as usize,
+                target_height as usize,
+                TEX_FILTER_FLAGS::TEX_FILTER_DEFAULT,
+            )
+            .context("DirectXTex: failed to resize for BC6H")?
+    } else {
+        decompressed
+    };
+
+    // Generate mipmaps
+    let with_mips = resized
+        .generate_mip_maps(TEX_FILTER_FLAGS::TEX_FILTER_DEFAULT, 0)
+        .unwrap_or(resized);
+
+    // Compress to BC6H_UF16
+    let compressed = with_mips
+        .compress(
+            DXGI_FORMAT::DXGI_FORMAT_BC6H_UF16,
+            TEX_COMPRESS_FLAGS::TEX_COMPRESS_DEFAULT,
+            0.5,
+        )
+        .context("DirectXTex: failed to compress to BC6H")?;
+
+    // Save to DDS
+    let blob = compressed
+        .save_dds(DDS_FLAGS::default())
+        .context("DirectXTex: failed to save BC6H DDS")?;
+    let output_data = blob.buffer().to_vec();
+
+    info!(
+        "DirectXTex BC6H: {}x{} -> {} bytes",
+        target_width,
+        target_height,
+        output_data.len()
+    );
+
+    Ok(ProcessedTexture {
+        data: output_data,
+        width: target_width,
+        height: target_height,
+        format: OutputFormat::BC6H,
     })
 }
 
@@ -765,6 +850,11 @@ fn process_texture_cpu(
     target_height: u32,
     output_format: OutputFormat,
 ) -> Result<ProcessedTexture> {
+    // BC6H: route through DirectXTex
+    if output_format == OutputFormat::BC6H {
+        return process_texture_bc6h_directxtex(input_data, target_width, target_height);
+    }
+
     let rgba = decode_dds_to_rgba(input_data)?;
 
     let current_w = rgba.width();
@@ -783,13 +873,12 @@ fn process_texture_cpu(
         rgba
     };
 
+    let image_format = output_format
+        .to_image_format()
+        .context("No image_dds format for this output format")?;
     let surface = SurfaceRgba8::from_image(&resized);
     let encoded = surface
-        .encode(
-            output_format.to_image_format(),
-            Quality::Normal,
-            Mipmaps::GeneratedAutomatic,
-        )
+        .encode(image_format, Quality::Normal, Mipmaps::GeneratedAutomatic)
         .context("Failed to encode texture")?;
 
     let output_dds = encoded.to_dds().context("Failed to create DDS")?;
@@ -881,6 +970,7 @@ pub fn estimate_dds_size(width: u32, height: u32, format: OutputFormat) -> u64 {
         OutputFormat::BC2 | OutputFormat::BC3 => pixels, // 1 byte/pixel (16 bytes per 4x4 block)
         OutputFormat::BC4 => pixels / 2, // 0.5 bytes/pixel
         OutputFormat::BC5 => pixels,     // 1 byte/pixel
+        OutputFormat::BC6H => pixels,    // 1 byte/pixel (16 bytes per 4x4 block)
         OutputFormat::BC7 => pixels,     // 1 byte/pixel
         // Uncompressed
         OutputFormat::Rgba | OutputFormat::Bgra => pixels * 4, // 4 bytes/pixel

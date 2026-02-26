@@ -179,6 +179,19 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
         let output_path = config.downloads_dir.join(&archive.name);
         if output_path.exists() {
             if let Ok(meta) = fs::metadata(&output_path) {
+                // Already hash-verified in a previous run? Skip re-hashing.
+                if archive.download_status == "completed" {
+                    if let Some(ref lp) = archive.local_path {
+                        if output_path.to_string_lossy() == lp.as_str()
+                            || meta.len() == archive.size as u64
+                        {
+                            already_downloaded += 1;
+                            already_downloaded_size += archive.size as u64;
+                            continue;
+                        }
+                    }
+                }
+
                 if meta.len() == archive.size as u64 {
                     // Size matches - queue for hash verification
                     archives_to_verify.push((archive, output_path));
