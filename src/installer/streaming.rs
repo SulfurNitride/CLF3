@@ -385,167 +385,229 @@ pub fn process_fused_streaming(
         process_whole_file_directives(&whole_file_directives, ctx, &extracted, &skipped, &failed);
     }
 
-    // Process archives using rayon::scope — each archive is a separate spawned task.
-    // Archives are already sorted by file size descending, so large archives get spawned
-    // (and start executing) first. When they finish, those threads steal remaining work
-    // from smaller archives via rayon's work-stealing scheduler.
-    rayon::scope(|s| {
-        for (archive_hash, directives, archive_path, kind) in &all_archives {
-            // Capture references for the closure
-            let extracted = &extracted;
-            let written = &written;
-            let skipped = &skipped;
-            let failed = &failed;
-            let logged_failures = &logged_failures;
-            let completed_archives = &completed_archives;
-            let overall_pb = &overall_pb;
-            let archive_bar_style = &archive_bar_style;
-            let mp = &mp;
-            let adjusted_callback = &adjusted_callback;
+    // Split into BSA-direct (cheap, unlimited parallelism) and extract (expensive, bounded).
+    // Each 7z/LZMA2 decompressor allocates dictionary buffers; too many = OOM.
+    // Wabbajack limits to Environment.ProcessorCount concurrent extractions.
+    let (bsa_archives, extract_archives): (Vec<_>, Vec<_>) = all_archives
+        .into_iter()
+        .partition(|(_, _, _, kind)| matches!(kind, ArchiveKind::BsaDirect));
 
-            s.spawn(move |_| {
-                let archive_name = archive_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| archive_hash.clone());
-                let display_name = truncate_name(&archive_name, 50);
+    // Limit concurrent extractions: use a dedicated rayon pool with bounded threads.
+    // This prevents OOM from too many LZMA2 decoders running simultaneously.
+    // Each extraction gets threads_per_archive=2 internal threads, so effective
+    // thread count = max_concurrent_extractions * 2.
+    let max_concurrent_extractions = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let extract_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(max_concurrent_extractions)
+        .thread_name(|i| format!("extract-{}", i))
+        .build()
+        .expect("Failed to build extraction thread pool");
 
-                let is_bsa_direct = matches!(kind, ArchiveKind::BsaDirect);
-                let label = if is_bsa_direct { "reading" } else { "extracting" };
+    // Process BSA-direct archives in main rayon pool (unlimited, they're fast)
+    // and extract archives in bounded pool — concurrently via std::thread::scope.
+    std::thread::scope(|thread_scope| {
+        // BSA-direct: spawn into main rayon pool
+        let bsa_handle = thread_scope.spawn(|| {
+            rayon::scope(|s| {
+                for (archive_hash, directives, archive_path, _kind) in &bsa_archives {
+                    let extracted = &extracted;
+                    let written = &written;
+                    let skipped = &skipped;
+                    let failed = &failed;
+                    let logged_failures = &logged_failures;
+                    let completed_archives = &completed_archives;
+                    let overall_pb = &overall_pb;
+                    let archive_bar_style = &archive_bar_style;
+                    let mp = &mp;
+                    let adjusted_callback = &adjusted_callback;
 
-                // Per-archive progress bar
-                let archive_pb = mp.insert_before(overall_pb, ProgressBar::new_spinner());
-                archive_pb.set_style(archive_bar_style.clone());
-                archive_pb.enable_steady_tick(std::time::Duration::from_millis(100));
-                archive_pb.set_message(format!(
-                    "{} ({} files) {}...",
-                    display_name,
-                    directives.len(),
-                    label,
-                ));
+                    s.spawn(move |_| {
+                        let archive_name = archive_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| archive_hash.clone());
+                        let display_name = truncate_name(&archive_name, 50);
 
-                if is_bsa_direct {
-                    // BSA/BA2 direct-read path — handles both FromArchive and Patched
-                    let bsa_from: Vec<(
-                        i64,
-                        FromArchiveDirective,
-                        Option<String>,
-                        Option<String>,
-                    )> = directives
-                        .iter()
-                        .filter_map(|d| match d {
-                            ArchiveDirective::FromArchive {
-                                id,
-                                directive,
-                                resolved_path,
-                                file_in_bsa,
-                            } => Some((
-                                *id,
-                                directive.clone(),
-                                resolved_path.clone(),
-                                file_in_bsa.clone(),
-                            )),
-                            _ => None,
-                        })
-                        .collect();
+                        let archive_pb = mp.insert_before(overall_pb, ProgressBar::new_spinner());
+                        archive_pb.set_style(archive_bar_style.clone());
+                        archive_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+                        archive_pb.set_message(format!(
+                            "{} ({} files) reading...",
+                            display_name,
+                            directives.len(),
+                        ));
 
-                    let bsa_patched: Vec<(i64, &PatchedFromArchiveDirective)> = directives
-                        .iter()
-                        .filter_map(|d| match d {
-                            ArchiveDirective::Patched { id, directive } => {
-                                Some((*id, directive))
-                            }
-                            _ => None,
-                        })
-                        .collect();
+                        // BSA/BA2 direct-read path — handles both FromArchive and Patched
+                        let bsa_from: Vec<(
+                            i64,
+                            FromArchiveDirective,
+                            Option<String>,
+                            Option<String>,
+                        )> = directives
+                            .iter()
+                            .filter_map(|d| match d {
+                                ArchiveDirective::FromArchive {
+                                    id,
+                                    directive,
+                                    resolved_path,
+                                    file_in_bsa,
+                                } => Some((
+                                    *id,
+                                    directive.clone(),
+                                    resolved_path.clone(),
+                                    file_in_bsa.clone(),
+                                )),
+                                _ => None,
+                            })
+                            .collect();
 
-                    // Process FromArchive directives (direct read → write)
-                    if !bsa_from.is_empty() {
-                        process_bsa_archive(
-                            archive_path,
-                            &bsa_from,
-                            ctx,
-                            extracted,
-                            written,
-                            skipped,
-                            failed,
-                            logged_failures,
-                            adjusted_callback.clone(),
-                        );
-                    }
+                        let bsa_patched: Vec<(i64, &PatchedFromArchiveDirective)> = directives
+                            .iter()
+                            .filter_map(|d| match d {
+                                ArchiveDirective::Patched { id, directive } => {
+                                    Some((*id, directive))
+                                }
+                                _ => None,
+                            })
+                            .collect();
 
-                    // Process Patched directives: read basis from BSA, apply patch
-                    if !bsa_patched.is_empty() {
-                        process_bsa_patched_directives(
+                        if !bsa_from.is_empty() {
+                            process_bsa_archive(
+                                archive_path,
+                                &bsa_from,
+                                ctx,
+                                extracted,
+                                written,
+                                skipped,
+                                failed,
+                                logged_failures,
+                                adjusted_callback.clone(),
+                            );
+                        }
+
+                        if !bsa_patched.is_empty() {
+                            process_bsa_patched_directives(
+                                archive_path,
+                                archive_hash,
+                                &bsa_patched,
+                                ctx,
+                                extracted,
+                                written,
+                                skipped,
+                                failed,
+                                logged_failures,
+                                adjusted_callback.clone(),
+                            );
+                        }
+
+                        archive_pb.finish_and_clear();
+                        completed_archives.fetch_add(1, Ordering::Relaxed);
+                        let done = completed_archives.load(Ordering::Relaxed);
+                        overall_pb.set_position(done as u64);
+                        overall_pb.set_message(format!(
+                            "OK:{} Skip:{} Fail:{}",
+                            written.load(Ordering::Relaxed),
+                            skipped.load(Ordering::Relaxed),
+                            failed.load(Ordering::Relaxed)
+                        ));
+                    });
+                }
+            });
+        });
+
+        // Extract archives: run in bounded pool (prevents OOM from too many decompressors)
+        let extract_handle = thread_scope.spawn(|| {
+            extract_pool.scope(|s| {
+                for (archive_hash, directives, archive_path, _kind) in &extract_archives {
+                    let extracted = &extracted;
+                    let written = &written;
+                    let skipped = &skipped;
+                    let failed = &failed;
+                    let logged_failures = &logged_failures;
+                    let completed_archives = &completed_archives;
+                    let overall_pb = &overall_pb;
+                    let archive_bar_style = &archive_bar_style;
+                    let mp = &mp;
+                    let adjusted_callback = &adjusted_callback;
+
+                    s.spawn(move |_| {
+                        let archive_name = archive_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| archive_hash.clone());
+                        let display_name = truncate_name(&archive_name, 50);
+
+                        let archive_pb = mp.insert_before(overall_pb, ProgressBar::new_spinner());
+                        archive_pb.set_style(archive_bar_style.clone());
+                        archive_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+                        archive_pb.set_message(format!(
+                            "{} ({} files) extracting...",
+                            display_name,
+                            directives.len(),
+                        ));
+
+                        // Extract + Patch fused pipeline
+                        let result = process_single_archive_fused(
                             archive_path,
                             archive_hash,
-                            &bsa_patched,
+                            directives,
                             ctx,
-                            extracted,
-                            written,
-                            skipped,
-                            failed,
-                            logged_failures,
-                            adjusted_callback.clone(),
+                            Some(2),
                         );
-                    }
-                } else {
-                    // Extract + Patch fused pipeline
-                    let result = process_single_archive_fused(
-                        archive_path,
-                        archive_hash,
-                        directives,
-                        ctx,
-                        Some(2),
-                    );
 
-                    match result {
-                        Ok(archive_result) => {
-                            extracted.fetch_add(
-                                archive_result.extracted_count + archive_result.patched_count,
-                                Ordering::Relaxed,
-                            );
-                            skipped.fetch_add(archive_result.skipped_count, Ordering::Relaxed);
-                            failed.fetch_add(archive_result.failed_count, Ordering::Relaxed);
+                        match result {
+                            Ok(archive_result) => {
+                                extracted.fetch_add(
+                                    archive_result.extracted_count + archive_result.patched_count,
+                                    Ordering::Relaxed,
+                                );
+                                skipped.fetch_add(archive_result.skipped_count, Ordering::Relaxed);
+                                failed.fetch_add(archive_result.failed_count, Ordering::Relaxed);
 
-                            archive_pb.set_message(format!(
-                                "{} ({} files) finalizing...",
-                                display_name,
-                                archive_result.staged_files.len()
-                            ));
+                                archive_pb.set_message(format!(
+                                    "{} ({} files) finalizing...",
+                                    display_name,
+                                    archive_result.staged_files.len()
+                                ));
 
-                            let fin_stats = finalize_archive(
-                                archive_result,
-                                &ctx.config.output_dir,
-                                logged_failures,
-                                adjusted_callback,
-                            );
-                            written.fetch_add(fin_stats.written, Ordering::Relaxed);
-                            skipped.fetch_add(fin_stats.skipped, Ordering::Relaxed);
-                            failed.fetch_add(fin_stats.failed, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            let count = logged_failures.fetch_add(1, Ordering::Relaxed);
-                            if count < MAX_LOGGED_FAILURES {
-                                error!("FAIL: Archive {}: {:#}", archive_name, e);
+                                let fin_stats = finalize_archive(
+                                    archive_result,
+                                    &ctx.config.output_dir,
+                                    logged_failures,
+                                    adjusted_callback,
+                                );
+                                written.fetch_add(fin_stats.written, Ordering::Relaxed);
+                                skipped.fetch_add(fin_stats.skipped, Ordering::Relaxed);
+                                failed.fetch_add(fin_stats.failed, Ordering::Relaxed);
                             }
-                            failed.fetch_add(directives.len(), Ordering::Relaxed);
+                            Err(e) => {
+                                let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                                if count < MAX_LOGGED_FAILURES {
+                                    error!("FAIL: Archive {}: {:#}", archive_name, e);
+                                }
+                                failed.fetch_add(directives.len(), Ordering::Relaxed);
+                            }
                         }
-                    }
-                }
 
-                archive_pb.finish_and_clear();
-                completed_archives.fetch_add(1, Ordering::Relaxed);
-                let done = completed_archives.load(Ordering::Relaxed);
-                overall_pb.set_position(done as u64);
-                overall_pb.set_message(format!(
-                    "OK:{} Skip:{} Fail:{}",
-                    written.load(Ordering::Relaxed),
-                    skipped.load(Ordering::Relaxed),
-                    failed.load(Ordering::Relaxed)
-                ));
+                        archive_pb.finish_and_clear();
+                        completed_archives.fetch_add(1, Ordering::Relaxed);
+                        let done = completed_archives.load(Ordering::Relaxed);
+                        overall_pb.set_position(done as u64);
+                        overall_pb.set_message(format!(
+                            "OK:{} Skip:{} Fail:{}",
+                            written.load(Ordering::Relaxed),
+                            skipped.load(Ordering::Relaxed),
+                            failed.load(Ordering::Relaxed)
+                        ));
+                    });
+                }
             });
-        }
+        });
+
+        bsa_handle.join().expect("BSA processing thread panicked");
+        extract_handle.join().expect("Extract processing thread panicked");
     });
 
     overall_pb.finish_and_clear();
