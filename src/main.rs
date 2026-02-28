@@ -35,6 +35,10 @@ struct Cli {
     /// Enable verbose logging (use RUST_LOG=debug for more detail)
     #[arg(short, long, global = true)]
     verbose: bool,
+
+    /// Enable JSON-formatted log output for easier parsing
+    #[arg(long, global = true)]
+    json_log: bool,
 }
 
 #[derive(Subcommand)]
@@ -162,28 +166,62 @@ async fn run() -> Result<()> {
         "clf3=warn".parse()?
     });
 
-    // File layer (always enabled)
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(non_blocking)
-        .with_ansi(false)
-        .with_filter(file_filter);
-
-    // Console layer (only if verbose or RUST_LOG is set)
-    if cli.verbose || std::env::var("RUST_LOG").is_ok() {
-        let console_layer = tracing_subscriber::fmt::layer().with_filter(console_filter);
-
-        tracing_subscriber::registry()
-            .with(file_layer)
-            .with(console_layer)
-            .init();
+    // Set up tracing based on flags
+    if cli.json_log {
+        // JSON format for both file and console
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_writer(non_blocking)
+            .with_ansi(false)
+            .json()
+            .with_filter(file_filter);
+        
+        if cli.verbose || std::env::var("RUST_LOG").is_ok() {
+            let console_layer = tracing_subscriber::fmt::layer()
+                .json()
+                .with_filter(console_filter);
+            tracing_subscriber::registry()
+                .with(file_layer)
+                .with(console_layer)
+                .init();
+        } else {
+            let console_layer = tracing_subscriber::fmt::layer()
+                .json()
+                .with_filter(console_filter);
+            tracing_subscriber::registry()
+                .with(file_layer)
+                .with(console_layer)
+                .init();
+        }
     } else {
-        tracing_subscriber::registry().with(file_layer).init();
+        // Default text format
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_writer(non_blocking)
+            .with_ansi(false)
+            .with_filter(file_filter);
+
+        if cli.verbose || std::env::var("RUST_LOG").is_ok() {
+            let console_layer = tracing_subscriber::fmt::layer().with_filter(console_filter);
+            tracing_subscriber::registry()
+                .with(file_layer)
+                .with(console_layer)
+                .init();
+        } else {
+            tracing_subscriber::registry().with(file_layer).init();
+        }
     }
 
-    tracing::info!(
-        "CLF3 started, logging to {}",
-        log_dir.join(&log_filename).display()
-    );
+    if cli.json_log {
+        tracing::info!(
+            json_logging = true,
+            "CLF3 started with JSON logging, log file: {}",
+            log_dir.join(&log_filename).display()
+        );
+    } else {
+        tracing::info!(
+            "CLF3 started, logging to {}",
+            log_dir.join(&log_filename).display()
+        );
+    }
 
     match cli.command {
         None => {
