@@ -115,6 +115,8 @@ struct DdsJob {
     data: Vec<u8>,
 }
 
+
+
 /// Configuration for extraction (simplified).
 #[derive(Debug, Clone, Default)]
 pub struct StreamingConfig;
@@ -497,72 +499,61 @@ pub fn process_fused_streaming(
         process_whole_file_directives(&whole_file_directives, ctx, &extracted, &skipped, &failed);
     }
 
-    // Split into BSA-direct (cheap, unlimited parallelism) and extract (expensive, bounded).
-    // Each 7z/LZMA2 decompressor allocates dictionary buffers; too many = OOM.
-    // Wabbajack limits to Environment.ProcessorCount concurrent extractions.
+    // Split into BSA-direct (cheap) and extract (expensive).
     let (bsa_archives, extract_archives): (Vec<_>, Vec<_>) = all_archives
         .into_iter()
         .partition(|(_, _, _, kind)| matches!(kind, ArchiveKind::BsaDirect));
 
-    // Full CPU pool, 1 LZMA thread per archive
+    // Further split extract archives: 7z (LZMA2, heavy) vs ZIP/RAR (lightweight).
+    // 7z decompressors hold 64MB+ dictionary buffers each — limit to 2 concurrent.
+    // ZIP/RAR are cheap and run freely with full CPU parallelism.
+    let (mut sevenzip_archives, light_archives): (Vec<_>, Vec<_>) = extract_archives
+        .into_iter()
+        .partition(|(_, _, path, _)| {
+            detect_archive_type(path)
+                .map(|t| matches!(t, NestedArchiveType::SevenZ))
+                .unwrap_or(false)
+        });
+
+    // 7z: sort by directive count descending (most files first).
+    // Every entry in a solid 7z must be decompressed regardless, so archives
+    // with more files take longer. Start the biggest jobs first to avoid
+    // tail stragglers.
+    sevenzip_archives.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+
     let num_cpus = std::thread::available_parallelism()
         .map(|n| n.get().max(2))
         .unwrap_or(4);
-    let extract_pool = rayon::ThreadPoolBuilder::new()
+
+    // 7z pool: 4 threads, gated to 2 concurrent initially.
+    // When BSA + ZIP/RAR work finishes, gate opens to 4.
+    const LZMA2_INITIAL: usize = 2;
+    const LZMA2_BOOSTED: usize = 4;
+    let lzma2_gate = Arc::new((
+        std::sync::Mutex::new((0usize, LZMA2_INITIAL)), // (active, max)
+        std::sync::Condvar::new(),
+    ));
+    let sevenzip_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(LZMA2_BOOSTED)
+        .thread_name(|i| format!("7z-extract-{}", i))
+        .build()
+        .expect("Failed to build 7z extraction thread pool");
+
+    // ZIP/RAR pool: full CPU parallelism (lightweight decompressors)
+    let light_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(num_cpus)
         .thread_name(|i| format!("extract-{}", i))
         .build()
         .expect("Failed to build extraction thread pool");
 
-    // Schedule order: 2 largest first, 2 smallest next, rest in original order.
-    // This gives big archives a head start while small ones fill gaps.
-    let extract_archives = {
-        let mut indexed: Vec<(usize, u64)> = extract_archives
-            .iter()
-            .enumerate()
-            .map(|(i, (_, _, path, _))| {
-                let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-                (i, size)
-            })
-            .collect();
-        // Sort descending by size to find largest/smallest
-        indexed.sort_by(|a, b| b.1.cmp(&a.1));
-        let len = indexed.len();
-        let mut order: Vec<usize> = Vec::with_capacity(len);
-        if len >= 2 {
-            // 2 largest
-            order.push(indexed[0].0);
-            order.push(indexed[1].0);
-            // 2 smallest (from the end, if not already picked)
-            if len >= 4 {
-                order.push(indexed[len - 1].0);
-                order.push(indexed[len - 2].0);
-                // Rest in original order
-                let picked: HashSet<usize> = order.iter().copied().collect();
-                for i in 0..len {
-                    if !picked.contains(&i) {
-                        order.push(i);
-                    }
-                }
-            } else {
-                // 2-3 archives total, just add remaining
-                let picked: HashSet<usize> = order.iter().copied().collect();
-                for i in 0..len {
-                    if !picked.contains(&i) {
-                        order.push(i);
-                    }
-                }
-            }
-        } else {
-            for i in 0..len {
-                order.push(i);
-            }
-        }
-        let mut orig = extract_archives;
-        // Reorder: take() from orig by swapping with dummy, then collect in order
-        let mut slots: Vec<Option<_>> = orig.drain(..).map(Some).collect();
-        order.into_iter().filter_map(|i| slots[i].take()).collect::<Vec<_>>()
-    };
+    let sevenzip_count = sevenzip_archives.len();
+    let light_count = light_archives.len();
+    if sevenzip_count > 0 || light_count > 0 {
+        eprintln!(
+            "  Extract breakdown: {} 7z ({}->{} concurrent) + {} ZIP/RAR ({} concurrent)",
+            sevenzip_count, LZMA2_INITIAL, LZMA2_BOOSTED, light_count, num_cpus
+        );
+    }
 
     // Collect DDS jobs during extraction, process in parallel afterward.
     // The collector thread drains the channel into a Vec; after extraction completes,
@@ -738,8 +729,194 @@ pub fn process_fused_streaming(
         })
         };
 
-        // Extract archives: run in bounded pool (prevents OOM from too many decompressors)
-        let extract_handle = {
+        // Shared closure for processing a single archive in any pool.
+        // Returns a function that can be called from rayon::scope spawns.
+        let process_archive = |archive_hash: &String,
+                               directives: &Vec<ArchiveDirective>,
+                               archive_path: &PathBuf,
+                               extracted: &AtomicUsize,
+                               written: &AtomicUsize,
+                               skipped: &AtomicUsize,
+                               failed: &AtomicUsize,
+                               logged_failures: &Arc<AtomicUsize>,
+                               completed_archives: &AtomicUsize,
+                               overall_pb: &ProgressBar,
+                               archive_bar_style: &ProgressStyle,
+                               mp: &MultiProgress,
+                               adjusted_callback: &Option<ProgressCallback>,
+                               dds_tx: &std::sync::mpsc::SyncSender<DdsJob>,
+                               tex_d2: &HashMap<String, TextureLookupInner>,
+                               tex_d3: &HashMap<String, NestedTextureLookupInner>| {
+            let archive_name = archive_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| archive_hash.clone());
+            let display_name = truncate_name(&archive_name, 50);
+
+            let archive_pb = mp.insert_before(overall_pb, ProgressBar::new_spinner());
+            archive_pb.set_style(archive_bar_style.clone());
+            archive_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+            archive_pb.set_message(format!(
+                "{} ({} files) extracting...",
+                display_name,
+                directives.len(),
+            ));
+
+            let mut extra_paths: Vec<String> = Vec::new();
+            if let Some(d2) = tex_d2.get(archive_hash) {
+                for source_path in d2.keys() {
+                    extra_paths.push(source_path.clone());
+                }
+            }
+            if let Some(d3) = tex_d3.get(archive_hash) {
+                for bsa_name in d3.keys() {
+                    extra_paths.push(bsa_name.clone());
+                }
+            }
+
+            let result = process_single_archive_fused(
+                archive_path,
+                archive_hash,
+                directives,
+                ctx,
+                Some(1),
+                &extra_paths,
+            );
+
+            match result {
+                Ok(archive_result) => {
+                    extracted.fetch_add(
+                        archive_result.extracted_count + archive_result.patched_count,
+                        Ordering::Relaxed,
+                    );
+                    skipped.fetch_add(archive_result.skipped_count, Ordering::Relaxed);
+                    failed.fetch_add(archive_result.failed_count, Ordering::Relaxed);
+
+                    if let Some(d2) = tex_d2.get(archive_hash) {
+                        if !d2.is_empty() {
+                            extract_textures_from_temp_dir(
+                                archive_result.temp_dir.path(),
+                                d2,
+                                dds_tx,
+                            );
+                        }
+                    }
+                    if let Some(d3) = tex_d3.get(archive_hash) {
+                        if !d3.is_empty() {
+                            extract_textures_from_nested_bsas(
+                                archive_result.temp_dir.path(),
+                                d3,
+                                dds_tx,
+                            );
+                        }
+                    }
+
+                    archive_pb.set_message(format!(
+                        "{} ({} files) finalizing...",
+                        display_name,
+                        archive_result.staged_files.len()
+                    ));
+
+                    let fin_stats = finalize_archive(
+                        archive_result,
+                        &ctx.config.output_dir,
+                        logged_failures,
+                        adjusted_callback,
+                    );
+                    written.fetch_add(fin_stats.written, Ordering::Relaxed);
+                    skipped.fetch_add(fin_stats.skipped, Ordering::Relaxed);
+                    failed.fetch_add(fin_stats.failed, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                    if count < MAX_LOGGED_FAILURES {
+                        error!("FAIL: Archive {}: {:#}", archive_name, e);
+                    }
+                    failed.fetch_add(directives.len(), Ordering::Relaxed);
+                }
+            }
+
+            archive_pb.finish_and_clear();
+            completed_archives.fetch_add(1, Ordering::Relaxed);
+            let done = completed_archives.load(Ordering::Relaxed);
+            overall_pb.set_position(done as u64);
+            overall_pb.set_message(format!(
+                "OK:{} Skip:{} Fail:{}",
+                written.load(Ordering::Relaxed),
+                skipped.load(Ordering::Relaxed),
+                failed.load(Ordering::Relaxed)
+            ));
+        };
+
+        // 7z archives: gated pool, most-files first.
+        // Starts at 2 concurrent, boosts to 4 when BSA+ZIP/RAR finish.
+        let sevenzip_handle = {
+            let extracted = extracted.clone();
+            let written = written.clone();
+            let skipped = skipped.clone();
+            let failed = failed.clone();
+            let logged_failures = logged_failures.clone();
+            let completed_archives = completed_archives.clone();
+            let overall_pb = overall_pb.clone();
+            let mp = mp.clone();
+            let archive_bar_style = archive_bar_style.clone();
+            let adjusted_callback = adjusted_callback.clone();
+            let dds_tx = extract_dds_tx.clone();
+            let tex_d2 = ext_tex_d2.clone();
+            let tex_d3 = ext_tex_d3.clone();
+            let gate = lzma2_gate.clone();
+            thread_scope.spawn(move || {
+                sevenzip_pool.scope(|s| {
+                    for (archive_hash, directives, archive_path, _kind) in &sevenzip_archives {
+                        let extracted = &extracted;
+                        let written = &written;
+                        let skipped = &skipped;
+                        let failed = &failed;
+                        let logged_failures = &logged_failures;
+                        let completed_archives = &completed_archives;
+                        let overall_pb = &overall_pb;
+                        let archive_bar_style = &archive_bar_style;
+                        let mp = &mp;
+                        let adjusted_callback = &adjusted_callback;
+                        let dds_tx = &dds_tx;
+                        let tex_d2 = &tex_d2;
+                        let tex_d3 = &tex_d3;
+                        let gate = &gate;
+
+                        s.spawn(move |_| {
+                            // Acquire gate slot
+                            {
+                                let (lock, cvar) = &**gate;
+                                let mut state = lock.lock().expect("lzma2 gate lock");
+                                while state.0 >= state.1 {
+                                    state = cvar.wait(state).expect("lzma2 gate wait");
+                                }
+                                state.0 += 1;
+                            }
+
+                            process_archive(
+                                archive_hash, directives, archive_path,
+                                extracted, written, skipped, failed,
+                                logged_failures, completed_archives,
+                                overall_pb, archive_bar_style, mp,
+                                adjusted_callback, dds_tx, tex_d2, tex_d3,
+                            );
+
+                            // Release gate slot
+                            {
+                                let (lock, cvar) = &**gate;
+                                let mut state = lock.lock().expect("lzma2 gate unlock");
+                                state.0 -= 1;
+                                cvar.notify_one();
+                            }
+                        });
+                    }
+                });
+            })
+        };
+
+        // ZIP/RAR archives: full CPU pool, lightweight decompressors
+        let light_handle = {
             let extracted = extracted.clone();
             let written = written.clone();
             let skipped = skipped.clone();
@@ -754,8 +931,8 @@ pub fn process_fused_streaming(
                 let dds_tx = extract_dds_tx;
                 let tex_d2 = ext_tex_d2;
                 let tex_d3 = ext_tex_d3;
-                extract_pool.scope(|s| {
-                    for (archive_hash, directives, archive_path, _kind) in &extract_archives {
+                light_pool.scope(|s| {
+                    for (archive_hash, directives, archive_path, _kind) in &light_archives {
                         let extracted = &extracted;
                         let written = &written;
                         let skipped = &skipped;
@@ -769,123 +946,37 @@ pub fn process_fused_streaming(
                         let dds_tx = &dds_tx;
                         let tex_d2 = &tex_d2;
                         let tex_d3 = &tex_d3;
-                    let threads = Some(1);
 
-                    s.spawn(move |_| {
-                        let archive_name = archive_path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| archive_hash.clone());
-                        let display_name = truncate_name(&archive_name, 50);
-
-                        let archive_pb = mp.insert_before(overall_pb, ProgressBar::new_spinner());
-                        archive_pb.set_style(archive_bar_style.clone());
-                        archive_pb.enable_steady_tick(std::time::Duration::from_millis(100));
-                        archive_pb.set_message(format!(
-                            "{} ({} files) extracting...",
-                            display_name,
-                            directives.len(),
-                        ));
-
-                        // Build extra needed paths for texture source files
-                        let mut extra_paths: Vec<String> = Vec::new();
-                        if let Some(d2) = tex_d2.get(archive_hash) {
-                            for source_path in d2.keys() {
-                                extra_paths.push(source_path.clone());
-                            }
-                        }
-                        if let Some(d3) = tex_d3.get(archive_hash) {
-                            // For depth-3, we need the nested BSA files themselves
-                            for bsa_name in d3.keys() {
-                                extra_paths.push(bsa_name.clone());
-                            }
-                        }
-
-                        // Extract + Patch fused pipeline
-                        let result = process_single_archive_fused(
-                            archive_path,
-                            archive_hash,
-                            directives,
-                            ctx,
-                            threads,
-                            &extra_paths,
-                        );
-
-                        match result {
-                            Ok(archive_result) => {
-                                extracted.fetch_add(
-                                    archive_result.extracted_count + archive_result.patched_count,
-                                    Ordering::Relaxed,
-                                );
-                                skipped.fetch_add(archive_result.skipped_count, Ordering::Relaxed);
-                                failed.fetch_add(archive_result.failed_count, Ordering::Relaxed);
-
-                                // Grab texture source files from temp dir before finalization drops it
-                                // Depth-2: direct files in the extracted archive
-                                if let Some(d2) = tex_d2.get(archive_hash) {
-                                    if !d2.is_empty() {
-                                        extract_textures_from_temp_dir(
-                                            archive_result.temp_dir.path(),
-                                            d2,
-                                            dds_tx,
-                                        );
-                                    }
-                                }
-                                // Depth-3: files inside nested BSAs within the extracted archive
-                                if let Some(d3) = tex_d3.get(archive_hash) {
-                                    if !d3.is_empty() {
-                                        extract_textures_from_nested_bsas(
-                                            archive_result.temp_dir.path(),
-                                            d3,
-                                            dds_tx,
-                                        );
-                                    }
-                                }
-
-                                archive_pb.set_message(format!(
-                                    "{} ({} files) finalizing...",
-                                    display_name,
-                                    archive_result.staged_files.len()
-                                ));
-
-                                let fin_stats = finalize_archive(
-                                    archive_result,
-                                    &ctx.config.output_dir,
-                                    logged_failures,
-                                    adjusted_callback,
-                                );
-                                written.fetch_add(fin_stats.written, Ordering::Relaxed);
-                                skipped.fetch_add(fin_stats.skipped, Ordering::Relaxed);
-                                failed.fetch_add(fin_stats.failed, Ordering::Relaxed);
-                            }
-                            Err(e) => {
-                                let count = logged_failures.fetch_add(1, Ordering::Relaxed);
-                                if count < MAX_LOGGED_FAILURES {
-                                    error!("FAIL: Archive {}: {:#}", archive_name, e);
-                                }
-                                failed.fetch_add(directives.len(), Ordering::Relaxed);
-                            }
-                        }
-
-                        archive_pb.finish_and_clear();
-                        completed_archives.fetch_add(1, Ordering::Relaxed);
-                        let done = completed_archives.load(Ordering::Relaxed);
-                        overall_pb.set_position(done as u64);
-                        overall_pb.set_message(format!(
-                            "OK:{} Skip:{} Fail:{}",
-                            written.load(Ordering::Relaxed),
-                            skipped.load(Ordering::Relaxed),
-                            failed.load(Ordering::Relaxed)
-                        ));
-                    });
-                }
-            });
-        })
+                        s.spawn(move |_| {
+                            process_archive(
+                                archive_hash, directives, archive_path,
+                                extracted, written, skipped, failed,
+                                logged_failures, completed_archives,
+                                overall_pb, archive_bar_style, mp,
+                                adjusted_callback, dds_tx, tex_d2, tex_d3,
+                            );
+                        });
+                    }
+                });
+            })
         };
 
         bsa_handle.join().expect("BSA processing thread panicked");
-        extract_handle.join().expect("Extract processing thread panicked");
-        // Both bsa_dds_tx and extract_dds_tx are now dropped (moved into the threads above),
+        light_handle.join().expect("Light archive processing thread panicked");
+
+        // BSA + ZIP/RAR done — boost LZMA2 gate from 2 → 4 concurrent
+        {
+            let (lock, cvar) = &*lzma2_gate;
+            let mut state = lock.lock().expect("lzma2 gate boost lock");
+            if state.1 < LZMA2_BOOSTED {
+                eprintln!("BSA+ZIP/RAR complete, boosting 7z concurrency {} → {}", state.1, LZMA2_BOOSTED);
+                state.1 = LZMA2_BOOSTED;
+                cvar.notify_all(); // Wake any 7z tasks waiting for a slot
+            }
+        }
+
+        sevenzip_handle.join().expect("7z processing thread panicked");
+        // All dds_tx senders (bsa, 7z, light) are now dropped,
         // so the channel is closed and the collector will finish draining.
         let collected_count = if let Some(handle) = collector_handle {
             handle.join().expect("DDS collector thread panicked")
