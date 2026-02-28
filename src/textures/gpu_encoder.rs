@@ -4,7 +4,7 @@
 //! DirectXTex is only used for legacy format DECODING (L8, RGB565, etc.)
 
 use anyhow::{Context, Result};
-use block_compression::{BC7Settings, CompressionVariant, GpuBlockCompressor};
+use block_compression::{BC6HSettings, BC7Settings, CompressionVariant, GpuBlockCompressor};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 use wgpu::{
@@ -331,6 +331,132 @@ impl GpuEncoder {
         staging_buffer.unmap();
 
         debug!("GPU BC7 encode complete: {} bytes", result.len());
+        Ok(result)
+    }
+
+    /// Encode RGBA16F (half-float) data to BC6H using GPU
+    pub fn encode_bc6h(&mut self, rgba16f_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+        if rgba16f_data.len() != (width * height * 8) as usize {
+            anyhow::bail!(
+                "Invalid RGBA16F data size: expected {} bytes, got {}",
+                width * height * 8,
+                rgba16f_data.len()
+            );
+        }
+
+        if width % 4 != 0 || height % 4 != 0 {
+            anyhow::bail!(
+                "BC6H requires dimensions divisible by 4, got {}x{}",
+                width,
+                height
+            );
+        }
+
+        debug!("GPU encoding BC6H: {}x{}", width, height);
+
+        // Create GPU texture with Rgba16Float format
+        let texture = self.device.create_texture(&TextureDescriptor {
+            label: Some("BC6H source texture"),
+            size: Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba16Float,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba16f_data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 8), // 8 bytes per pixel (RGBA16F)
+                rows_per_image: Some(height),
+            },
+            Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let texture_view = texture.create_view(&TextureViewDescriptor::default());
+
+        let variant = CompressionVariant::BC6H(BC6HSettings::very_fast());
+        let output_size = variant.blocks_byte_size(width, height) as u64;
+
+        let output_buffer = self.device.create_buffer(&BufferDescriptor {
+            label: Some("BC6H output buffer"),
+            size: output_size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let staging_buffer = self.device.create_buffer(&BufferDescriptor {
+            label: Some("BC6H staging buffer"),
+            size: output_size,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        self.compressor.add_compression_task(
+            variant,
+            &texture_view,
+            width,
+            height,
+            &output_buffer,
+            None,
+            None,
+        );
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("BC6H compression encoder"),
+            });
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("BC6H compression pass"),
+                timestamp_writes: None,
+            });
+            self.compressor.compress(&mut compute_pass);
+        }
+
+        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_size);
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let buffer_slice = staging_buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        rx.recv()
+            .context("Channel closed")?
+            .context("Failed to map buffer")?;
+
+        let data = buffer_slice.get_mapped_range();
+        let result = data.to_vec();
+
+        drop(data);
+        staging_buffer.unmap();
+
+        debug!("GPU BC6H encode complete: {} bytes", result.len());
         Ok(result)
     }
 

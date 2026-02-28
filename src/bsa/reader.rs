@@ -241,6 +241,89 @@ pub fn extract_batch_parallel(
     Ok(results)
 }
 
+/// Parallel batch extraction: collect matching file references, then decompress
+/// and deliver via callback in parallel using rayon. Matches the fast BSA tool's approach.
+pub fn extract_batch_streaming<F>(
+    bsa_path: &Path,
+    file_paths: &[&str],
+    callback: F,
+) -> Result<usize>
+where
+    F: Fn(&str, Vec<u8>) -> Result<()> + Send + Sync,
+{
+    use ba2::tes4::File as BsaFile;
+
+    let (archive, options): (Archive, _) = Archive::read(bsa_path)
+        .with_context(|| format!("Failed to open BSA: {}", bsa_path.display()))?;
+
+    let compression_options: FileCompressionOptions = (&options).into();
+
+    let needed: HashSet<String> = file_paths
+        .iter()
+        .map(|p| p.replace('/', "\\").to_lowercase())
+        .collect();
+
+    let path_lookup: std::collections::HashMap<String, &str> = file_paths
+        .iter()
+        .map(|p| (p.replace('/', "\\").to_lowercase(), *p))
+        .collect();
+
+    // Phase 1: Collect matching file references (fast, no decompression)
+    let mut entries: Vec<(String, &BsaFile)> = Vec::new();
+    for (dir_key, folder) in archive.iter() {
+        let dir_name = String::from_utf8_lossy(dir_key.name().as_bytes()).to_lowercase();
+
+        for (file_key, file) in folder.iter() {
+            let file_name = String::from_utf8_lossy(file_key.name().as_bytes()).to_lowercase();
+            let full_path = if dir_name.is_empty() || dir_name == "." {
+                file_name.clone()
+            } else {
+                format!("{}\\{}", dir_name, file_name)
+            };
+
+            if needed.contains(&full_path) {
+                let original = path_lookup
+                    .get(&full_path)
+                    .map(|s| s.to_string())
+                    .unwrap_or(full_path);
+                entries.push((original, file));
+            }
+        }
+    }
+
+    // Phase 2: Decompress + deliver in parallel
+    let extracted = AtomicUsize::new(0);
+    entries
+        .par_iter()
+        .try_for_each(|(path, file)| -> Result<()> {
+            let data = if file.is_compressed() {
+                match file.decompress(&compression_options) {
+                    Ok(decompressed) => decompressed.as_bytes().to_vec(),
+                    Err(e) => {
+                        warn!("Failed to decompress {}: {}", path, e);
+                        return Ok(());
+                    }
+                }
+            } else {
+                file.as_bytes().to_vec()
+            };
+
+            callback(path, data)?;
+            extracted.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })?;
+
+    let count = extracted.load(Ordering::Relaxed);
+    debug!(
+        "Parallel extracted {}/{} files from BSA {}",
+        count,
+        file_paths.len(),
+        bsa_path.display()
+    );
+
+    Ok(count)
+}
+
 /// Check current memory pressure
 /// Returns true if available RAM is below 20% of total
 pub fn memory_pressure() -> bool {

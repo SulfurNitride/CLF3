@@ -133,3 +133,60 @@ pub fn extract_batch_parallel(
 
     Ok(results)
 }
+
+/// Streaming variant: deliver each matching file via callback immediately.
+pub fn extract_batch_streaming<F>(
+    bsa_path: &Path,
+    file_paths: &[&str],
+    callback: F,
+) -> Result<usize>
+where
+    F: Fn(&str, Vec<u8>) -> Result<()> + Send + Sync,
+{
+    let archive: Archive = Archive::read(bsa_path)
+        .with_context(|| format!("Failed to open TES3 BSA: {}", bsa_path.display()))?;
+
+    let needed: HashSet<String> = file_paths
+        .iter()
+        .map(|p| p.replace('/', "\\").to_lowercase())
+        .collect();
+
+    let path_lookup: std::collections::HashMap<String, &str> = file_paths
+        .iter()
+        .map(|p| (p.replace('/', "\\").to_lowercase(), *p))
+        .collect();
+
+    // Collect matching entries
+    let mut entries: Vec<(String, &ba2::tes3::File)> = Vec::new();
+    for (key, file) in archive.iter() {
+        let path_lower = String::from_utf8_lossy(key.name().as_bytes()).to_lowercase();
+
+        if needed.contains(&path_lower) {
+            let original = path_lookup
+                .get(&path_lower)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| path_lower.clone());
+            entries.push((original, file));
+        }
+    }
+
+    // Deliver in parallel
+    let extracted = AtomicUsize::new(0);
+    entries
+        .par_iter()
+        .try_for_each(|(path, file)| -> Result<()> {
+            callback(path, file.as_bytes().to_vec())?;
+            extracted.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })?;
+
+    let count = extracted.load(Ordering::Relaxed);
+    debug!(
+        "Parallel extracted {}/{} files from TES3 BSA {}",
+        count,
+        file_paths.len(),
+        bsa_path.display()
+    );
+
+    Ok(count)
+}

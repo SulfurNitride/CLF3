@@ -56,7 +56,7 @@ directxtex = "1.3.0"
 
 # GPU acceleration
 wgpu = "28.0"
-block_compression = { version = "0.8", features = ["wgpu", "bc7"] }
+block_compression = { version = "0.8", features = ["wgpu", "bc7", "bc6h"] }
 pollster = "0.4"
 
 # HTTP client

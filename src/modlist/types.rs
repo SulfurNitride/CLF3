@@ -269,7 +269,7 @@ pub struct RemappedInlineFileDirective {
 }
 
 /// Texture that needs transformation (resize/recompress)
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct TransformedTextureDirective {
     pub to: String,
@@ -279,7 +279,7 @@ pub struct TransformedTextureDirective {
     pub image_state: ImageState,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ImageState {
     pub width: u32,

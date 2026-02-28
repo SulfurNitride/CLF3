@@ -92,6 +92,7 @@ pub fn is_fallback_mode() -> bool {
 ///
 /// Takes source texture data (already extracted), processes it according to
 /// ImageState (width, height, format), and writes the result.
+#[allow(dead_code)] // Available for single-texture fallback path
 pub fn handle_transformed_texture(
     ctx: &ProcessContext,
     directive: &TransformedTextureDirective,

@@ -196,9 +196,10 @@ pub(crate) fn should_preload_patch_blobs() -> bool {
             return matches!(value.as_str(), "1" | "true" | "yes" | "on");
         }
 
-        // Default ON: preload delta blobs per-archive so parallel apply doesn't
-        // serialize on the shared wabbajack ZIP mutex.
-        true
+        // Default OFF: preloading all deltas into RAM per archive causes OOM when
+        // multiple archives extract concurrently. On-demand reading from the shared
+        // wabbajack ZIP is slower but uses negligible RAM.
+        false
     })
 }
 
@@ -280,143 +281,6 @@ fn list_rar_files(archive_path: &Path) -> Result<Vec<ArchiveFileEntry>> {
             file_size: e.size,
         })
         .collect())
-}
-
-/// Extract multiple files from an archive (extracts whole archive, returns needed files)
-fn extract_batch_rust(
-    archive_path: &Path,
-    file_paths: &[&str],
-    temp_base_dir: &Path,
-) -> Result<HashMap<String, Vec<u8>>> {
-    if file_paths.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let archive_type = detect_archive_type(archive_path)?;
-
-    // Create temp dir for extraction
-    let temp_dir =
-        tempfile::tempdir_in(temp_base_dir).context("Failed to create temp directory")?;
-
-    // Extract entire archive based on type
-    match archive_type {
-        ArchiveType::Zip => extract_zip_to_temp(archive_path, temp_dir.path())?,
-        ArchiveType::SevenZ => extract_7z_to_temp(archive_path, temp_dir.path())?,
-        ArchiveType::Rar => extract_rar_to_temp(archive_path, temp_dir.path())?,
-        ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2 => {
-            bail!("BSA/BA2 should not use batch extraction")
-        }
-        ArchiveType::Unknown => extract_zip_to_temp(archive_path, temp_dir.path())
-            .or_else(|_| extract_7z_to_temp(archive_path, temp_dir.path()))
-            .or_else(|_| extract_rar_to_temp(archive_path, temp_dir.path()))
-            .with_context(|| format!("Failed to extract: {}", archive_path.display()))?,
-    }
-
-    // Build set of normalized paths we need
-    let needed: std::collections::HashSet<String> = file_paths
-        .iter()
-        .map(|p| paths::normalize_for_lookup(p))
-        .collect();
-
-    // Walk temp dir and collect files we need
-    let mut results = HashMap::new();
-    collect_needed_files(temp_dir.path(), temp_dir.path(), &needed, &mut results)?;
-
-    Ok(results)
-}
-
-/// Extract entire ZIP to temp directory
-fn extract_zip_to_temp(archive_path: &Path, temp_dir: &Path) -> Result<()> {
-    let file = File::open(archive_path)?;
-    let reader = BufReader::new(file);
-    let mut archive = zip::ZipArchive::new(reader)?;
-
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        let entry_path = match entry.enclosed_name() {
-            Some(p) => p.to_path_buf(),
-            None => continue,
-        };
-
-        let output_path = temp_dir.join(&entry_path);
-
-        if entry.is_dir() {
-            fs::create_dir_all(&output_path)?;
-        } else {
-            if let Some(parent) = output_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut outfile = File::create(&output_path)?;
-            std::io::copy(&mut entry, &mut outfile)?;
-        }
-    }
-    Ok(())
-}
-
-/// Extract entire 7z to temp directory using 7z binary
-fn extract_7z_to_temp(archive_path: &Path, temp_dir: &Path) -> Result<()> {
-    crate::archive::sevenzip::extract_all(archive_path, temp_dir)
-        .map(|_| ())
-        .with_context(|| format!("Failed to extract 7z: {}", archive_path.display()))
-}
-
-/// Extract entire RAR to temp directory using 7z binary
-///
-/// The 7z binary handles RAR5 reference records correctly, unlike the unrar crate.
-fn extract_rar_to_temp(archive_path: &Path, temp_dir: &Path) -> Result<()> {
-    crate::archive::sevenzip::extract_all(archive_path, temp_dir)
-        .map(|_| ())
-        .with_context(|| format!("Failed to extract RAR: {}", archive_path.display()))
-}
-
-/// Recursively collect files from extracted archive
-fn collect_needed_files(
-    base: &Path,
-    current: &Path,
-    needed: &std::collections::HashSet<String>,
-    results: &mut HashMap<String, Vec<u8>>,
-) -> Result<()> {
-    if let Ok(entries) = fs::read_dir(current) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect_needed_files(base, &path, needed, results)?;
-            } else if path.is_file() {
-                // Get relative path from base
-                if let Ok(rel) = path.strip_prefix(base) {
-                    let rel_str = rel.to_string_lossy();
-                    let normalized = paths::normalize_for_lookup(&rel_str);
-
-                    // Log BSA/BA2 files we find for debugging
-                    if normalized.ends_with(".bsa") || normalized.ends_with(".ba2") {
-                        if needed.contains(&normalized) {
-                            tracing::warn!(
-                                "[DEBUG] Found and MATCHED BSA/BA2: '{}' -> '{}'",
-                                rel_str,
-                                normalized
-                            );
-                        } else {
-                            // Check if there's a similar path in needed set
-                            let similar: Vec<_> = needed
-                                .iter()
-                                .filter(|n| n.contains("textures.ba2") || n.contains("main.ba2"))
-                                .take(3)
-                                .collect();
-                            tracing::warn!("[DEBUG] Found BSA/BA2 NOT in needed: '{}' -> '{}', similar in needed: {:?}",
-                                rel_str, normalized, similar);
-                        }
-                    }
-
-                    if needed.contains(&normalized) {
-                        if let Ok(data) = fs::read(&path) {
-                            results.insert(normalized, data);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Index all archives that need indexing
@@ -831,6 +695,8 @@ pub struct ProcessContext<'a> {
     patch_basis_full_hash_cache: Mutex<HashMap<String, String>>,
     /// Persistent SQLite store for patch basis entries (scoped per modlist).
     patch_basis_store: Option<PatchBasisStore>,
+    /// Set of texture directive IDs already processed during extraction (by DDS handler thread)
+    pub textures_processed_during_install: Mutex<HashSet<i64>>,
 }
 
 impl<'a> ProcessContext<'a> {
@@ -919,6 +785,7 @@ impl<'a> ProcessContext<'a> {
             patch_basis_db: RwLock::new(preloaded_basis),
             patch_basis_full_hash_cache: Mutex::new(HashMap::new()),
             patch_basis_store,
+            textures_processed_during_install: Mutex::new(HashSet::new()),
         })
     }
 
@@ -1942,6 +1809,78 @@ pub(crate) fn preload_patch_blobs_by_name(
     Ok(blobs)
 }
 
+/// Extract archive to temp dir on disk (for 7z/RAR that don't support random access).
+/// Only extracts files, doesn't read them into memory.
+fn extract_to_temp_disk(archive_path: &Path, _needed_paths: &[&str], temp_dir: &Path) -> Result<()> {
+    let archive_type = detect_archive_type(archive_path)?;
+    match archive_type {
+        ArchiveType::SevenZ | ArchiveType::Rar | ArchiveType::Unknown => {
+            crate::archive::sevenzip::extract_all(archive_path, temp_dir)
+                .map(|_| ())
+                .with_context(|| format!("Failed to extract: {}", archive_path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Find a file in a temp extraction directory by normalized path lookup.
+fn find_file_in_temp_dir(temp_dir: &Path, file_path: &str) -> Option<PathBuf> {
+    let normalized_target = paths::normalize_for_lookup(file_path);
+
+    for entry in walkdir::WalkDir::new(temp_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        if let Ok(rel) = entry.path().strip_prefix(temp_dir) {
+            let rel_str = rel.to_string_lossy();
+            let normalized = paths::normalize_for_lookup(&rel_str);
+            if normalized == normalized_target {
+                return Some(entry.path().to_path_buf());
+            }
+        }
+    }
+    None
+}
+
+/// Read a single file from an archive without bulk extraction.
+/// Works for ZIP (iterate to find entry) and BSA/BA2 (direct file access).
+fn read_single_file_from_archive(
+    archive_path: &Path,
+    archive_type: ArchiveType,
+    file_path: &str,
+) -> Result<Vec<u8>> {
+    let normalized_target = paths::normalize_for_lookup(file_path);
+
+    match archive_type {
+        ArchiveType::Zip => {
+            let file = File::open(archive_path)
+                .with_context(|| format!("Failed to open ZIP: {}", archive_path.display()))?;
+            let mut archive = zip::ZipArchive::new(BufReader::new(file))
+                .with_context(|| format!("Failed to read ZIP: {}", archive_path.display()))?;
+
+            for i in 0..archive.len() {
+                if let Ok(mut entry) = archive.by_index(i) {
+                    let entry_name = entry.name().to_string();
+                    let normalized = paths::normalize_for_lookup(&entry_name);
+                    if normalized == normalized_target {
+                        let mut data = Vec::with_capacity(entry.size() as usize);
+                        std::io::Read::read_to_end(&mut entry, &mut data)?;
+                        return Ok(data);
+                    }
+                }
+            }
+            anyhow::bail!("File not found in ZIP: {}", file_path)
+        }
+        ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2 => {
+            bsa::extract_archive_file(archive_path, file_path)
+        }
+        _ => {
+            anyhow::bail!("Cannot read individual files from archive type {:?}", archive_type)
+        }
+    }
+}
+
 /// Process TransformedTexture directives with progress display
 fn process_transformed_texture(
     db: &ModlistDb,
@@ -1969,11 +1908,22 @@ fn process_transformed_texture(
         all_raw.len()
     ));
 
+    // Filter out textures already processed during install phase (DDS handler thread)
+    let already_done = ctx.textures_processed_during_install
+        .lock().expect("textures_processed lock")
+        .clone();
+    let pre_done = already_done.len();
+
     // Parse and group by archive
     let mut by_archive: HashMap<String, Vec<(i64, TransformedTextureDirective)>> = HashMap::new();
     let mut parse_failures = 0;
 
     for (id, json) in all_raw {
+        if already_done.contains(&id) {
+            completed.fetch_add(1, Ordering::Relaxed);
+            pb.inc(1);
+            continue;
+        }
         match serde_json::from_str::<Directive>(&json) {
             Ok(Directive::TransformedTexture(d)) => {
                 if let Some(hash) = d.archive_hash_path.first() {
@@ -1986,6 +1936,10 @@ fn process_transformed_texture(
                 pb.inc(1);
             }
         }
+    }
+
+    if pre_done > 0 {
+        eprintln!("{} textures already processed during install phase", pre_done);
     }
 
     if parse_failures > 0 {
@@ -2014,257 +1968,282 @@ fn process_transformed_texture(
         });
     }
 
+    use crate::textures::{OutputFormat, TextureJob, process_texture_batch, process_texture_with_fallback};
+
     let total_archives = by_archive.len();
     let total_directives: usize = by_archive.values().map(|v| v.len()).sum();
-    eprintln!(
-        "Processing {} textures across {} archives...",
-        total_directives, total_archives
-    );
 
-    // Reset progress bar for texture phase
+    // ── Pass 1: Stage all texture source files to disk in parallel ──
+    // Extract all needed source textures from all archives into a staging dir.
+    // Archives are extracted in parallel so slow 7z/RAR don't block everything.
+    let staging_dir = tempfile::tempdir_in(&ctx.config.output_dir)
+        .context("Failed to create texture staging dir")?;
+
+    pb.set_message("Staging texture source files...");
     pb.finish_and_clear();
     pb.reset();
-    pb.set_length(total_directives as u64);
+    pb.set_length(total_archives as u64);
     pb.set_position(0);
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let failure_tracker = failure_tracker.clone();
-    let reporter = reporter.clone();
+    eprintln!(
+        "Staging {} textures from {} archives...",
+        total_directives, total_archives
+    );
 
-    // Process archives in parallel
+    // Build flat list: (directive_id, directive, archive_hash, staged_path)
+    // Each texture gets a unique file in staging_dir named by directive ID.
+    struct StagedTexture {
+        id: i64,
+        directive: TransformedTextureDirective,
+        staged_path: PathBuf,
+    }
+
+    let staged_textures: Mutex<Vec<StagedTexture>> = Mutex::new(Vec::new());
+    let stage_skipped = AtomicUsize::new(0);
+    let stage_failed = AtomicUsize::new(0);
+
     let archives_vec: Vec<_> = by_archive.into_iter().collect();
 
+    // Extract archives in parallel — each archive writes needed textures to staging dir
     archives_vec.par_iter().for_each(|(archive_hash, directives)| {
         let archive_path = match ctx.get_archive_path(archive_hash) {
             Some(p) => p.clone(),
             None => {
-                // Archive not found - but check if outputs already exist first
-                let mut any_needed = false;
                 for (_, directive) in directives {
                     if output_dds_valid(ctx, &directive.to) {
-                        skipped.fetch_add(1, Ordering::Relaxed);
+                        stage_skipped.fetch_add(1, Ordering::Relaxed);
                     } else {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                        any_needed = true;
+                        stage_failed.fetch_add(1, Ordering::Relaxed);
                     }
-                    pb.inc(1);
-                    reporter.directive_completed();
                 }
-                if any_needed {
-                    pb.println(format!("WARN: Archive not found for textures: {}", archive_hash));
-                }
+                pb.inc(1);
                 return;
             }
         };
 
-        let archive_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-
-        // Filter to directives that need processing
-        // Use DDS header validation instead of size comparison because texture
-        // compression is not deterministic - output size may differ from expected
+        // Filter to directives that actually need processing
         let to_process: Vec<_> = directives
             .iter()
             .filter(|(_, d)| !output_dds_valid(ctx, &d.to))
             .collect();
 
-        // Count skipped and report progress
         let skip_count = directives.len() - to_process.len();
-        if skip_count > 0 {
-            skipped.fetch_add(skip_count, Ordering::Relaxed);
-            pb.inc(skip_count as u64);
-            for _ in 0..skip_count {
-                reporter.directive_completed();
-            }
-        }
+        stage_skipped.fetch_add(skip_count, Ordering::Relaxed);
 
         if to_process.is_empty() {
+            pb.inc(1);
             return;
         }
 
-        // Collect unique source paths needed from this archive
-        // Simple paths (len == 2): file directly in archive
-        // Nested BSA (len >= 3): BSA in archive, file in BSA
-        let mut simple_paths: HashMap<String, String> = HashMap::new();
-        let mut nested_bsas: HashMap<String, Vec<String>> = HashMap::new();
+        let archive_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let archive_type = detect_archive_type(&archive_path).unwrap_or(ArchiveType::Unknown);
 
-        for (_, directive) in &to_process {
-            if directive.archive_hash_path.len() == 2 {
+        // For 7z/RAR: extract entire archive to temp dir, then copy needed files to staging
+        let temp_extract = if matches!(archive_type, ArchiveType::SevenZ | ArchiveType::Rar | ArchiveType::Unknown) {
+            match tempfile::tempdir_in(&ctx.config.output_dir) {
+                Ok(td) => {
+                    if let Err(e) = extract_to_temp_disk(&archive_path, &[], td.path()) {
+                        pb.println(format!("WARN: Failed to extract {}: {}", archive_name, e));
+                    }
+                    Some(td)
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        // Handle nested BSAs: extract BSA files to temp
+        let mut nested_bsa_temps: HashMap<String, tempfile::NamedTempFile> = HashMap::new();
+        {
+            let mut needed_bsas: HashMap<String, HashSet<String>> = HashMap::new();
+            for (_, d) in &to_process {
+                if d.archive_hash_path.len() >= 3 {
+                    needed_bsas.entry(d.archive_hash_path[1].clone()).or_default()
+                        .insert(d.archive_hash_path[2].clone());
+                }
+            }
+            for (bsa_path, _) in &needed_bsas {
+                let bsa_data = if let Some(ref td) = temp_extract {
+                    find_file_in_temp_dir(td.path(), bsa_path)
+                        .and_then(|p| fs::read(&p).ok())
+                } else {
+                    read_single_file_from_archive(&archive_path, archive_type, bsa_path).ok()
+                };
+                if let Some(data) = bsa_data {
+                    let suffix = if bsa_path.to_lowercase().ends_with(".ba2") { ".ba2" } else { ".bsa" };
+                    if let Ok(temp_bsa) = tempfile::Builder::new()
+                        .prefix(".clf3_bsa_").suffix(suffix)
+                        .tempfile_in(&ctx.config.output_dir)
+                    {
+                        if fs::write(temp_bsa.path(), &data).is_ok() {
+                            nested_bsa_temps.insert(bsa_path.clone(), temp_bsa);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Stage each texture source file to disk
+        for (id, directive) in &to_process {
+            let source_data = if directive.archive_hash_path.len() == 2 {
                 let path = &directive.archive_hash_path[1];
-                let normalized = paths::normalize_for_lookup(path);
-                simple_paths.insert(normalized, path.clone());
+                if let Some(ref td) = temp_extract {
+                    find_file_in_temp_dir(td.path(), path)
+                        .and_then(|p| fs::read(&p).ok())
+                } else {
+                    read_single_file_from_archive(&archive_path, archive_type, path).ok()
+                }
             } else if directive.archive_hash_path.len() >= 3 {
                 let bsa_path = &directive.archive_hash_path[1];
                 let file_in_bsa = &directive.archive_hash_path[2];
-                nested_bsas.entry(bsa_path.clone()).or_default().push(file_in_bsa.clone());
-                // Also need to extract the BSA itself
-                let normalized = paths::normalize_for_lookup(bsa_path);
-                simple_paths.insert(normalized, bsa_path.clone());
-            }
-        }
-
-        // Batch extract all needed files from this archive
-        let mut extracted: HashMap<String, Vec<u8>> = HashMap::new();
-
-        if !simple_paths.is_empty() {
-            let archive_type = detect_archive_type(&archive_path).unwrap_or(ArchiveType::Unknown);
-            let batch_result = match archive_type {
-                ArchiveType::Zip => {
-                    let mut result = HashMap::new();
-                    // Log what BSA/BA2 we're looking for
-                    let bsa_keys: Vec<_> = simple_paths.keys()
-                        .filter(|k| k.ends_with(".ba2") || k.ends_with(".bsa"))
-                        .collect();
-                    if !bsa_keys.is_empty() {
-                        tracing::debug!("[DEBUG] ZIP extraction - looking for BSA/BA2: {:?}", bsa_keys);
-                    }
-                    if let Ok(file) = File::open(&archive_path) {
-                        if let Ok(mut archive) = zip::ZipArchive::new(BufReader::new(file)) {
-                            for i in 0..archive.len() {
-                                if let Ok(mut entry) = archive.by_index(i) {
-                                    let entry_name = entry.name().to_string();
-                                    let normalized = paths::normalize_for_lookup(&entry_name);
-                                    // Debug log for BSA/BA2 files
-                                    if normalized.ends_with(".ba2") || normalized.ends_with(".bsa") {
-                                        if simple_paths.contains_key(&normalized) {
-                                            tracing::debug!("[DEBUG] ZIP: Found and MATCHED BSA/BA2: '{}' -> '{}'", entry_name, normalized);
-                                        } else {
-                                            tracing::debug!("[DEBUG] ZIP: Found BSA/BA2 NOT in simple_paths: '{}' -> '{}'", entry_name, normalized);
-                                        }
-                                    }
-                                    if simple_paths.contains_key(&normalized) {
-                                        let mut data = Vec::with_capacity(entry.size() as usize);
-                                        if std::io::Read::read_to_end(&mut entry, &mut data).is_ok() {
-                                            result.insert(normalized, data);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    result
-                }
-                ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2 => {
-                    let mut result = HashMap::new();
-                    for (normalized, original) in &simple_paths {
-                        if let Ok(data) = bsa::extract_archive_file(&archive_path, original) {
-                            result.insert(normalized.clone(), data);
-                        }
-                    }
-                    result
-                }
-                _ => {
-                    // 7z/RAR/other: batch extract using pure Rust
-                    if let Ok(temp_dir) = tempfile::tempdir_in(&ctx.config.output_dir) {
-                        let paths_vec: Vec<&str> = simple_paths.values().map(|s| s.as_str()).collect();
-                        // Filter to show only BA2/BSA paths for debugging
-                        let bsa_paths: Vec<_> = paths_vec.iter()
-                            .filter(|p| p.to_lowercase().ends_with(".ba2") || p.to_lowercase().ends_with(".bsa"))
-                            .collect();
-                        if !bsa_paths.is_empty() {
-                            tracing::debug!("[DEBUG] Extracting from 7z/RAR, BSA/BA2 paths requested: {:?}", bsa_paths);
-                        }
-                        let result = match extract_batch_rust(&archive_path, &paths_vec, temp_dir.path()) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                tracing::debug!("[DEBUG] extract_batch_rust failed for {}: {}", archive_path.display(), e);
-                                HashMap::new()
-                            }
-                        };
-                        if !bsa_paths.is_empty() {
-                            let extracted_bsas: Vec<_> = result.keys()
-                                .filter(|k| k.ends_with(".ba2") || k.ends_with(".bsa"))
-                                .collect();
-                            tracing::debug!("[DEBUG] Extracted BSA/BA2 keys: {:?}", extracted_bsas);
-                        }
-                        result
-                    } else {
-                        HashMap::new()
-                    }
-                }
+                nested_bsa_temps.get(bsa_path)
+                    .and_then(|tb| bsa::extract_archive_file(tb.path(), file_in_bsa).ok())
+            } else {
+                None
             };
-            extracted.extend(batch_result);
-        }
 
-        // For nested BSAs: extract files from BSAs we just extracted
-        for (bsa_path, files_in_bsa) in &nested_bsas {
-            let bsa_normalized = paths::normalize_for_lookup(bsa_path);
-            tracing::debug!("[DEBUG] Looking for BSA/BA2: original='{}', normalized='{}'", bsa_path, bsa_normalized);
-            if let Some(bsa_data) = extracted.get(&bsa_normalized) {
-                tracing::debug!("[DEBUG] Found BSA/BA2 in cache, size={} bytes, extracting {} files", bsa_data.len(), files_in_bsa.len());
-                // Determine suffix from original path
-                let suffix = if bsa_path.to_lowercase().ends_with(".ba2") { ".ba2" } else { ".bsa" };
-                // Write BSA/BA2 to temp file and extract from it
-                if let Ok(temp_bsa) = tempfile::Builder::new()
-                    .prefix(".clf3_bsa_")
-                    .suffix(suffix)
-                    .tempfile_in(&ctx.config.downloads_dir)
-                {
-                    if fs::write(temp_bsa.path(), bsa_data).is_ok() {
-                        for file_path in files_in_bsa {
-                            match bsa::extract_archive_file(temp_bsa.path(), file_path) {
-                                Ok(file_data) => {
-                                    // Key: "bsa_path/file_path" normalized
-                                    let key = format!("{}/{}", bsa_path, file_path);
-                                    let normalized_key = paths::normalize_for_lookup(&key);
-                                    extracted.insert(normalized_key, file_data);
-                                }
-                                Err(e) => {
-                                    tracing::debug!("Failed to extract {} from {}: {}", file_path, bsa_path, e);
-                                }
-                            }
-                        }
-                    }
+            if let Some(data) = source_data {
+                let staged_path = staging_dir.path().join(format!("{}.dds", id));
+                if fs::write(&staged_path, &data).is_ok() {
+                    staged_textures.lock().expect("staged_textures").push(StagedTexture {
+                        id: *id,
+                        directive: directive.clone(),
+                        staged_path,
+                    });
+                } else {
+                    stage_failed.fetch_add(1, Ordering::Relaxed);
                 }
             } else {
-                tracing::debug!("BSA/BA2 not found in extracted archive: {} (normalized: {})", bsa_path, bsa_normalized);
-                tracing::debug!("Available keys: {:?}", extracted.keys().take(10).collect::<Vec<_>>());
+                stage_failed.fetch_add(1, Ordering::Relaxed);
             }
         }
 
-        // Process each texture using the extracted data
-        for (id, directive) in to_process {
-            let result: Result<()> = (|| {
-                // Get source data from extracted cache
-                let source_data = if directive.archive_hash_path.len() == 2 {
-                    // Simple: file directly in archive
-                    let path = &directive.archive_hash_path[1];
-                    let normalized = paths::normalize_for_lookup(path);
-                    extracted.get(&normalized)
-                        .ok_or_else(|| anyhow::anyhow!("Source texture not found: {}", path))?
-                } else if directive.archive_hash_path.len() >= 3 {
-                    // Nested BSA: file inside BSA inside archive
-                    let bsa_path = &directive.archive_hash_path[1];
-                    let file_in_bsa = &directive.archive_hash_path[2];
-                    let key = format!("{}/{}", bsa_path, file_in_bsa);
-                    let normalized = paths::normalize_for_lookup(&key);
-                    extracted.get(&normalized)
-                        .ok_or_else(|| anyhow::anyhow!("Source texture not found in BSA: {} / {}", bsa_path, file_in_bsa))?
-                } else {
-                    anyhow::bail!("Invalid archive_hash_path for texture");
-                };
+        pb.inc(1);
+        // temp_extract dropped here — archive temp dir cleaned up
+    });
 
-                // Process the texture
-                handlers::handle_transformed_texture(ctx, directive, source_data)?;
+    let mut staged = staged_textures.into_inner().expect("staged_textures");
+    let total_staged = staged.len();
+    let total_skipped = stage_skipped.load(Ordering::Relaxed);
+    let total_failed_stage = stage_failed.load(Ordering::Relaxed);
+    skipped.fetch_add(total_skipped, Ordering::Relaxed);
+    failed.fetch_add(total_failed_stage, Ordering::Relaxed);
 
-                Ok(())
-            })();
+    eprintln!(
+        "Staged {} textures ({} skipped, {} failed to read)",
+        total_staged, total_skipped, total_failed_stage
+    );
 
-            match result {
-                Ok(()) => {
-                    completed.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    failure_tracker.record_failure(&archive_name, &e.to_string());
-                    if failed.load(Ordering::Relaxed) <= 10 {
-                        pb.println(format!("FAIL [{}] texture: {:#}", id, e));
+    // ── Pass 2: Process all staged textures through GPU/CPU pipeline ──
+    // Group by format like Radium — process each format section fully parallel.
+    pb.finish_and_clear();
+    pb.reset();
+    pb.set_length(total_directives as u64);
+    pb.set_position((total_skipped + total_failed_stage) as u64);
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    pb.set_message("Processing textures...");
+
+    for _ in 0..total_skipped { reporter.directive_completed(); }
+    for _ in 0..total_failed_stage { reporter.directive_completed(); }
+
+    let failure_tracker = failure_tracker.clone();
+    let reporter = reporter.clone();
+
+    // Group by format
+    let mut by_format: HashMap<String, Vec<StagedTexture>> = HashMap::new();
+    for st in staged.drain(..) {
+        let fmt_str = st.directive.image_state.format.to_uppercase();
+        by_format.entry(fmt_str).or_default().push(st);
+    }
+
+    // Print format breakdown
+    let mut format_summary: Vec<_> = by_format.iter().map(|(f, j)| (f.clone(), j.len())).collect();
+    format_summary.sort_by(|a, b| b.1.cmp(&a.1));
+    let summary_str = format_summary.iter()
+        .map(|(f, n)| format!("{}: {}", f, n))
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!("Processing textures by format [{}]", summary_str);
+
+    // Initialize GPU for BC7
+    let _ = crate::textures::init_gpu();
+
+    // Process each format group
+    for (fmt_str, jobs) in &by_format {
+        let fmt = OutputFormat::from_str(fmt_str)
+            .unwrap_or(if handlers::texture::is_fallback_mode() { OutputFormat::BC1 } else { OutputFormat::BC7 });
+
+        if fmt == OutputFormat::BC7 {
+            // BC7: parallel CPU prep → GPU batch encode
+            pb.set_message(format!("BC7: {} textures (GPU+CPU)...", jobs.len()));
+
+            let tex_jobs: Vec<TextureJob> = jobs.iter().filter_map(|st| {
+                fs::read(&st.staged_path).ok().map(|data| TextureJob {
+                    data,
+                    width: st.directive.image_state.width,
+                    height: st.directive.image_state.height,
+                    format: OutputFormat::BC7,
+                    id: Some(format!("{}", st.id)),
+                })
+            }).collect();
+
+            let results = process_texture_batch(tex_jobs);
+
+            for (st, (_job_id, result)) in jobs.iter().zip(results.into_iter()) {
+                match result {
+                    Ok(processed) => {
+                        let output_path = ctx.resolve_output_path(&st.directive.to);
+                        if let Err(e) = paths::ensure_parent_dirs(&output_path)
+                            .and_then(|_| fs::write(&output_path, &processed.data).map_err(|e| e.into()))
+                        {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                            failure_tracker.record_failure("texture", &e.to_string());
+                        } else {
+                            completed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Err(e) => {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        failure_tracker.record_failure("texture", &format!("{:#}", e));
+                        if failed.load(Ordering::Relaxed) <= 10 {
+                            pb.println(format!("FAIL [{}] BC7 texture: {:#}", st.id, e));
+                        }
                     }
                 }
+                pb.inc(1);
+                reporter.directive_completed();
             }
-            pb.inc(1);
-            reporter.directive_completed();
+        } else {
+            // Non-BC7: full CPU parallelism (all cores, like Radium)
+            pb.set_message(format!("{}: {} textures (CPU parallel)...", fmt.name(), jobs.len()));
+
+            jobs.par_iter().for_each(|st| {
+                let result: Result<()> = (|| {
+                    let data = fs::read(&st.staged_path)
+                        .with_context(|| format!("Failed to read staged texture {}", st.id))?;
+                    let (processed, _) = process_texture_with_fallback(
+                        &data, st.directive.image_state.width, st.directive.image_state.height, fmt,
+                    )?;
+                    let output_path = ctx.resolve_output_path(&st.directive.to);
+                    paths::ensure_parent_dirs(&output_path)?;
+                    fs::write(&output_path, &processed.data)?;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => { completed.fetch_add(1, Ordering::Relaxed); }
+                    Err(e) => {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        failure_tracker.record_failure("texture", &e.to_string());
+                    }
+                }
+                pb.inc(1);
+                reporter.directive_completed();
+            });
         }
-    });
+    }
+    // staging_dir dropped here — all staged files cleaned up
 
     // Print failure summary
     failure_tracker.print_summary(pb);

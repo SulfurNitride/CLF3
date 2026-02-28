@@ -19,12 +19,16 @@ mod tes3_reader;
 mod writer;
 
 pub use cache::BsaCache;
-pub use reader::{extract_batch_parallel, extract_file, list_files, BsaFileEntry, BsaReader};
+pub use reader::{
+    extract_batch_parallel, extract_batch_streaming, extract_file, list_files, BsaFileEntry,
+    BsaReader,
+};
 pub use writer::{BsaBuilder, BsaWriterManager};
 
 // TES3 (Morrowind) support
 pub use tes3_reader::{
-    extract_batch_parallel as extract_tes3_batch_parallel, extract_file as extract_tes3_file,
+    extract_batch_parallel as extract_tes3_batch_parallel,
+    extract_batch_streaming as extract_tes3_batch_streaming, extract_file as extract_tes3_file,
     list_files as list_tes3_files,
 };
 
@@ -174,26 +178,15 @@ where
             extract_ba2_batch_parallel(archive_path, wanted, callback)
         }
         Some(ArchiveFormat::Bsa) => {
-            // TES4 BSA: use existing batch (already parallel decompress), deliver via callback
+            // TES4 BSA: streaming — decompress each file and deliver via callback immediately.
+            // No accumulation in memory.
             let paths_vec: Vec<&str> = wanted.iter().map(|s| s.as_str()).collect();
-            let results = extract_batch_parallel(archive_path, &paths_vec, None)?;
-            let mut count = 0;
-            for (path, data) in results {
-                callback(&path, data)?;
-                count += 1;
-            }
-            Ok(count)
+            extract_batch_streaming(archive_path, &paths_vec, callback)
         }
         Some(ArchiveFormat::Tes3Bsa) => {
-            // TES3: uncompressed, use existing batch then deliver via callback
+            // TES3: streaming — deliver each file via callback immediately.
             let paths_vec: Vec<&str> = wanted.iter().map(|s| s.as_str()).collect();
-            let results = extract_tes3_batch_parallel(archive_path, &paths_vec, None)?;
-            let mut count = 0;
-            for (path, data) in results {
-                callback(&path, data)?;
-                count += 1;
-            }
-            Ok(count)
+            extract_tes3_batch_streaming(archive_path, &paths_vec, callback)
         }
         None => bail!("Unknown archive format: {}", archive_path.display()),
     }

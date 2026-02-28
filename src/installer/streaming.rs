@@ -30,7 +30,10 @@ use crate::bsa;
 use crate::installer::handlers::from_archive::{
     detect_archive_type, ArchiveType as NestedArchiveType,
 };
-use crate::modlist::{Directive, FromArchiveDirective, ModlistDb, PatchedFromArchiveDirective};
+use crate::modlist::{
+    Directive, FromArchiveDirective, ModlistDb, PatchedFromArchiveDirective,
+    TransformedTextureDirective,
+};
 use crate::paths;
 
 use super::extract_strategy::should_use_selective_extraction;
@@ -101,6 +104,16 @@ struct FinalizeStats {
     failed: usize,
 }
 
+
+/// A DDS texture job sent from extraction threads to the DDS handler thread.
+struct DdsJob {
+    /// Directive ID
+    id: i64,
+    /// The directive with format/dimension info
+    directive: TransformedTextureDirective,
+    /// Raw source texture data (DDS)
+    data: Vec<u8>,
+}
 
 /// Configuration for extraction (simplified).
 #[derive(Debug, Clone, Default)]
@@ -282,6 +295,105 @@ pub fn process_fused_streaming(
         warn!("WARN: {} directives failed to parse", parse_failures);
     }
 
+    // === Load TransformedTexture directives for inline DDS processing ===
+    // Add texture-only archives to by_archive so they get extracted during install phase.
+    // Without this, archives referenced only by TransformedTexture are never extracted.
+    // Build lookup: (archive_hash, normalized_source_path) → Vec<(id, directive)>
+    // During extraction, when we encounter these source files, we feed them to
+    // a dedicated DDS handler thread instead of waiting for a separate phase.
+    let texture_raw = db.get_all_pending_directives_of_type("TransformedTexture")?;
+    let mut texture_by_archive: HashMap<String, Vec<(i64, TransformedTextureDirective)>> =
+        HashMap::new();
+    for (id, json) in texture_raw {
+        if let Ok(Directive::TransformedTexture(d)) = serde_json::from_str::<Directive>(&json) {
+            // Skip textures whose output already exists
+            let output_path = paths::join_windows_path(&ctx.config.output_dir, &d.to);
+            if output_path.exists() {
+                continue;
+            }
+            if let Some(hash) = d.archive_hash_path.first() {
+                texture_by_archive
+                    .entry(hash.clone())
+                    .or_default()
+                    .push((id, d));
+            }
+        }
+    }
+    let texture_count: usize = texture_by_archive.values().map(|v| v.len()).sum();
+
+    // Ensure archives that ONLY have TransformedTexture directives are included in
+    // the extraction pass. Without this, these archives are never extracted and the
+    // texture source files can't be captured during install phase.
+    let mut tex_only_count = 0usize;
+    for archive_hash in texture_by_archive.keys() {
+        if !by_archive.contains_key(archive_hash) {
+            by_archive.entry(archive_hash.clone()).or_default();
+            tex_only_count += 1;
+        }
+    }
+    if tex_only_count > 0 {
+        eprintln!(
+            "Added {} texture-only archives to extraction pass",
+            tex_only_count
+        );
+    }
+
+    // Build per-archive texture lookups:
+    // - depth2_lookup: archive_hash → { source_path → directives } (direct files in archive)
+    // - depth3_lookup: archive_hash → { nested_bsa_path → { file_in_bsa → directives } }
+    type TextureLookup = HashMap<String, Vec<(i64, TransformedTextureDirective)>>;
+    type NestedTextureLookup = HashMap<String, TextureLookup>; // bsa_name → { file_path → directives }
+    let texture_depth2: Arc<HashMap<String, TextureLookup>> = {
+        let mut by_hash: HashMap<String, TextureLookup> = HashMap::new();
+        for (hash, directives) in &texture_by_archive {
+            let lookup = by_hash.entry(hash.clone()).or_default();
+            for (id, d) in directives {
+                if d.archive_hash_path.len() == 2 {
+                    let source = d.archive_hash_path[1].replace('\\', "/").to_lowercase();
+                    lookup.entry(source).or_default().push((*id, d.clone()));
+                }
+            }
+        }
+        Arc::new(by_hash)
+    };
+    let texture_depth3: Arc<HashMap<String, NestedTextureLookup>> = {
+        let mut by_hash: HashMap<String, NestedTextureLookup> = HashMap::new();
+        for (hash, directives) in &texture_by_archive {
+            for (id, d) in directives {
+                if d.archive_hash_path.len() >= 3 {
+                    let bsa_name = d.archive_hash_path[1].replace('\\', "/").to_lowercase();
+                    let file_in_bsa = d.archive_hash_path[2].replace('\\', "/").to_lowercase();
+                    by_hash
+                        .entry(hash.clone())
+                        .or_default()
+                        .entry(bsa_name)
+                        .or_default()
+                        .entry(file_in_bsa)
+                        .or_default()
+                        .push((*id, d.clone()));
+                }
+            }
+        }
+        Arc::new(by_hash)
+    };
+
+    // DDS processing channel — extraction threads send texture data here,
+    // dedicated DDS handler thread processes them concurrently with extraction.
+    let (dds_tx, dds_rx) = std::sync::mpsc::sync_channel::<DdsJob>(32);
+
+    if texture_count > 0 {
+        let d2_count: usize = texture_depth2.values().map(|v| v.values().map(|d| d.len()).sum::<usize>()).sum();
+        let d3_count: usize = texture_depth3.values()
+            .map(|bsas| bsas.values().map(|files| files.values().map(|d| d.len()).sum::<usize>()).sum::<usize>()).sum();
+        let d2_archives: usize = texture_depth2.values().filter(|v| !v.is_empty()).count();
+        let d3_archives: usize = texture_depth3.values().filter(|v| !v.is_empty()).count();
+
+        eprintln!(
+            "DDS inline: {} textures ({} depth-2 in {} archives, {} depth-3 in {} archives)",
+            texture_count, d2_count, d2_archives, d3_count, d3_archives
+        );
+    }
+
     // Global counter for GUI progress — shared across all archives
     let global_written = Arc::new(AtomicUsize::new(0));
 
@@ -392,36 +504,135 @@ pub fn process_fused_streaming(
         .into_iter()
         .partition(|(_, _, _, kind)| matches!(kind, ArchiveKind::BsaDirect));
 
-    // Limit concurrent extractions: use a dedicated rayon pool with bounded threads.
-    // This prevents OOM from too many LZMA2 decoders running simultaneously.
-    // Each extraction gets threads_per_archive=2 internal threads, so effective
-    // thread count = max_concurrent_extractions * 2.
-    let max_concurrent_extractions = std::thread::available_parallelism()
-        .map(|n| n.get())
+    // Full CPU pool, 1 LZMA thread per archive
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get().max(2))
         .unwrap_or(4);
     let extract_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(max_concurrent_extractions)
+        .num_threads(num_cpus)
         .thread_name(|i| format!("extract-{}", i))
         .build()
         .expect("Failed to build extraction thread pool");
 
+    // Schedule order: 2 largest first, 2 smallest next, rest in original order.
+    // This gives big archives a head start while small ones fill gaps.
+    let extract_archives = {
+        let mut indexed: Vec<(usize, u64)> = extract_archives
+            .iter()
+            .enumerate()
+            .map(|(i, (_, _, path, _))| {
+                let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                (i, size)
+            })
+            .collect();
+        // Sort descending by size to find largest/smallest
+        indexed.sort_by(|a, b| b.1.cmp(&a.1));
+        let len = indexed.len();
+        let mut order: Vec<usize> = Vec::with_capacity(len);
+        if len >= 2 {
+            // 2 largest
+            order.push(indexed[0].0);
+            order.push(indexed[1].0);
+            // 2 smallest (from the end, if not already picked)
+            if len >= 4 {
+                order.push(indexed[len - 1].0);
+                order.push(indexed[len - 2].0);
+                // Rest in original order
+                let picked: HashSet<usize> = order.iter().copied().collect();
+                for i in 0..len {
+                    if !picked.contains(&i) {
+                        order.push(i);
+                    }
+                }
+            } else {
+                // 2-3 archives total, just add remaining
+                let picked: HashSet<usize> = order.iter().copied().collect();
+                for i in 0..len {
+                    if !picked.contains(&i) {
+                        order.push(i);
+                    }
+                }
+            }
+        } else {
+            for i in 0..len {
+                order.push(i);
+            }
+        }
+        let mut orig = extract_archives;
+        // Reorder: take() from orig by swapping with dummy, then collect in order
+        let mut slots: Vec<Option<_>> = orig.drain(..).map(Some).collect();
+        order.into_iter().filter_map(|i| slots[i].take()).collect::<Vec<_>>()
+    };
+
+    // Collect DDS jobs during extraction, process in parallel afterward.
+    // The collector thread drains the channel into a Vec; after extraction completes,
+    // all collected textures are processed in parallel with rayon.
+    let collected_dds_jobs: Arc<std::sync::Mutex<Vec<DdsJob>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
     // Process BSA-direct archives in main rayon pool (unlimited, they're fast)
     // and extract archives in bounded pool — concurrently via std::thread::scope.
     std::thread::scope(|thread_scope| {
+        // Spawn collector thread — drains DDS channel into a Vec (fast, no processing)
+        let collected_jobs = collected_dds_jobs.clone();
+        let collector_handle = if texture_count > 0 {
+            let rx = dds_rx;
+            Some(thread_scope.spawn(move || {
+                let mut jobs = Vec::new();
+                while let Ok(job) = rx.recv() {
+                    jobs.push(job);
+                }
+                let count = jobs.len();
+                collected_jobs.lock().expect("dds jobs lock").extend(jobs);
+                count
+            }))
+        } else {
+            drop(dds_rx);
+            None
+        };
+
+        // Clone sender for BSA and extract threads; original dropped after both finish
+        // to signal DDS handler to stop.
+        let bsa_dds_tx = dds_tx.clone();
+        let extract_dds_tx = dds_tx.clone();
+        drop(dds_tx); // Only clones remain — when both threads finish, channel closes
+
+        let bsa_tex_d2 = texture_depth2.clone();
+        let bsa_tex_d3 = texture_depth3.clone();
+        let ext_tex_d2 = texture_depth2.clone();
+        let ext_tex_d3 = texture_depth3.clone();
+
         // BSA-direct: spawn into main rayon pool
-        let bsa_handle = thread_scope.spawn(|| {
-            rayon::scope(|s| {
-                for (archive_hash, directives, archive_path, _kind) in &bsa_archives {
-                    let extracted = &extracted;
-                    let written = &written;
-                    let skipped = &skipped;
-                    let failed = &failed;
-                    let logged_failures = &logged_failures;
-                    let completed_archives = &completed_archives;
-                    let overall_pb = &overall_pb;
-                    let archive_bar_style = &archive_bar_style;
-                    let mp = &mp;
-                    let adjusted_callback = &adjusted_callback;
+        let bsa_handle = {
+            let extracted = extracted.clone();
+            let written = written.clone();
+            let skipped = skipped.clone();
+            let failed = failed.clone();
+            let logged_failures = logged_failures.clone();
+            let completed_archives = completed_archives.clone();
+            let overall_pb = overall_pb.clone();
+            let mp = mp.clone();
+            let archive_bar_style = archive_bar_style.clone();
+            let adjusted_callback = adjusted_callback.clone();
+            thread_scope.spawn(move || {
+                let dds_tx = bsa_dds_tx;
+                let tex_d2 = bsa_tex_d2;
+                let tex_d3 = bsa_tex_d3;
+                rayon::scope(|s| {
+                    for (archive_hash, directives, archive_path, _kind) in &bsa_archives {
+                        let extracted = &extracted;
+                        let written = &written;
+                        let skipped = &skipped;
+                        let failed = &failed;
+                        let logged_failures = &logged_failures;
+                        let completed_archives = &completed_archives;
+                        let overall_pb = &overall_pb;
+                        let archive_bar_style = &archive_bar_style;
+                        let mp = &mp;
+                        let adjusted_callback = &adjusted_callback;
+                        let dds_tx = &dds_tx;
+                        let tex_d2 = &tex_d2;
+                        let _tex_d3 = &tex_d3; // BSA-direct: no nested BSAs
 
                     s.spawn(move |_| {
                         let archive_name = archive_path
@@ -502,6 +713,15 @@ pub fn process_fused_streaming(
                             );
                         }
 
+                        // Extract texture source files from this BSA and send to DDS handler
+                        if let Some(d2) = tex_d2.get(archive_hash) {
+                            if !d2.is_empty() {
+                                extract_textures_from_bsa(
+                                    archive_path, d2, dds_tx,
+                                );
+                            }
+                        }
+
                         archive_pb.finish_and_clear();
                         completed_archives.fetch_add(1, Ordering::Relaxed);
                         let done = completed_archives.load(Ordering::Relaxed);
@@ -515,22 +735,41 @@ pub fn process_fused_streaming(
                     });
                 }
             });
-        });
+        })
+        };
 
         // Extract archives: run in bounded pool (prevents OOM from too many decompressors)
-        let extract_handle = thread_scope.spawn(|| {
-            extract_pool.scope(|s| {
-                for (archive_hash, directives, archive_path, _kind) in &extract_archives {
-                    let extracted = &extracted;
-                    let written = &written;
-                    let skipped = &skipped;
-                    let failed = &failed;
-                    let logged_failures = &logged_failures;
-                    let completed_archives = &completed_archives;
-                    let overall_pb = &overall_pb;
-                    let archive_bar_style = &archive_bar_style;
-                    let mp = &mp;
-                    let adjusted_callback = &adjusted_callback;
+        let extract_handle = {
+            let extracted = extracted.clone();
+            let written = written.clone();
+            let skipped = skipped.clone();
+            let failed = failed.clone();
+            let logged_failures = logged_failures.clone();
+            let completed_archives = completed_archives.clone();
+            let overall_pb = overall_pb.clone();
+            let mp = mp.clone();
+            let archive_bar_style = archive_bar_style.clone();
+            let adjusted_callback = adjusted_callback.clone();
+            thread_scope.spawn(move || {
+                let dds_tx = extract_dds_tx;
+                let tex_d2 = ext_tex_d2;
+                let tex_d3 = ext_tex_d3;
+                extract_pool.scope(|s| {
+                    for (archive_hash, directives, archive_path, _kind) in &extract_archives {
+                        let extracted = &extracted;
+                        let written = &written;
+                        let skipped = &skipped;
+                        let failed = &failed;
+                        let logged_failures = &logged_failures;
+                        let completed_archives = &completed_archives;
+                        let overall_pb = &overall_pb;
+                        let archive_bar_style = &archive_bar_style;
+                        let mp = &mp;
+                        let adjusted_callback = &adjusted_callback;
+                        let dds_tx = &dds_tx;
+                        let tex_d2 = &tex_d2;
+                        let tex_d3 = &tex_d3;
+                    let threads = Some(1);
 
                     s.spawn(move |_| {
                         let archive_name = archive_path
@@ -548,13 +787,28 @@ pub fn process_fused_streaming(
                             directives.len(),
                         ));
 
+                        // Build extra needed paths for texture source files
+                        let mut extra_paths: Vec<String> = Vec::new();
+                        if let Some(d2) = tex_d2.get(archive_hash) {
+                            for source_path in d2.keys() {
+                                extra_paths.push(source_path.clone());
+                            }
+                        }
+                        if let Some(d3) = tex_d3.get(archive_hash) {
+                            // For depth-3, we need the nested BSA files themselves
+                            for bsa_name in d3.keys() {
+                                extra_paths.push(bsa_name.clone());
+                            }
+                        }
+
                         // Extract + Patch fused pipeline
                         let result = process_single_archive_fused(
                             archive_path,
                             archive_hash,
                             directives,
                             ctx,
-                            Some(2),
+                            threads,
+                            &extra_paths,
                         );
 
                         match result {
@@ -565,6 +819,28 @@ pub fn process_fused_streaming(
                                 );
                                 skipped.fetch_add(archive_result.skipped_count, Ordering::Relaxed);
                                 failed.fetch_add(archive_result.failed_count, Ordering::Relaxed);
+
+                                // Grab texture source files from temp dir before finalization drops it
+                                // Depth-2: direct files in the extracted archive
+                                if let Some(d2) = tex_d2.get(archive_hash) {
+                                    if !d2.is_empty() {
+                                        extract_textures_from_temp_dir(
+                                            archive_result.temp_dir.path(),
+                                            d2,
+                                            dds_tx,
+                                        );
+                                    }
+                                }
+                                // Depth-3: files inside nested BSAs within the extracted archive
+                                if let Some(d3) = tex_d3.get(archive_hash) {
+                                    if !d3.is_empty() {
+                                        extract_textures_from_nested_bsas(
+                                            archive_result.temp_dir.path(),
+                                            d3,
+                                            dds_tx,
+                                        );
+                                    }
+                                }
 
                                 archive_pb.set_message(format!(
                                     "{} ({} files) finalizing...",
@@ -604,13 +880,125 @@ pub fn process_fused_streaming(
                     });
                 }
             });
-        });
+        })
+        };
 
         bsa_handle.join().expect("BSA processing thread panicked");
         extract_handle.join().expect("Extract processing thread panicked");
+        // Both bsa_dds_tx and extract_dds_tx are now dropped (moved into the threads above),
+        // so the channel is closed and the collector will finish draining.
+        let collected_count = if let Some(handle) = collector_handle {
+            handle.join().expect("DDS collector thread panicked")
+        } else {
+            0
+        };
+        if collected_count > 0 {
+            eprintln!("Collected {} texture jobs during extraction, processing in parallel...", collected_count);
+        }
     });
 
     overall_pb.finish_and_clear();
+
+    // Process collected DDS textures in parallel using rayon (all CPU cores).
+    // Group by format like Radium — process each format group fully parallel.
+    let dds_jobs = std::mem::take(&mut *collected_dds_jobs.lock().expect("dds jobs lock"));
+    if !dds_jobs.is_empty() {
+        use crate::textures::{OutputFormat, TextureJob, process_texture_batch, process_texture_with_fallback, init_gpu};
+        use crate::installer::handlers::texture::is_fallback_mode;
+
+        let total_tex = dds_jobs.len();
+
+        // Group by format
+        let mut by_format: HashMap<String, Vec<DdsJob>> = HashMap::new();
+        for job in dds_jobs {
+            let fmt_str = job.directive.image_state.format.to_uppercase();
+            by_format.entry(fmt_str).or_default().push(job);
+        }
+
+        // Print format breakdown
+        let mut format_summary: Vec<_> = by_format.iter().map(|(f, j)| (f.clone(), j.len())).collect();
+        format_summary.sort_by(|a, b| b.1.cmp(&a.1));
+        let summary_str = format_summary.iter()
+            .map(|(f, n)| format!("{}: {}", f, n))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("Processing {} textures in parallel [{}]", total_tex, summary_str);
+
+        // Initialize GPU for BC7
+        let _ = init_gpu();
+
+        let dds_ok = AtomicUsize::new(0);
+        let dds_fail = AtomicUsize::new(0);
+
+        // Process each format group. BC7 uses GPU batch pipeline, everything else uses CPU par_iter.
+        for (fmt_str, jobs) in by_format {
+            let fmt = OutputFormat::from_str(&fmt_str)
+                .unwrap_or(if is_fallback_mode() { OutputFormat::BC1 } else { OutputFormat::BC7 });
+
+            if fmt == OutputFormat::BC7 {
+                // BC7: parallel CPU prep → GPU batch encode
+                eprintln!("  BC7: {} textures (GPU+CPU pipeline)...", jobs.len());
+
+                let tex_jobs: Vec<TextureJob> = jobs.iter().map(|j| TextureJob {
+                    data: j.data.clone(),
+                    width: j.directive.image_state.width,
+                    height: j.directive.image_state.height,
+                    format: OutputFormat::BC7,
+                    id: Some(format!("{}", j.id)),
+                }).collect();
+
+                let results = process_texture_batch(tex_jobs);
+
+                for (job, (_job_id, result)) in jobs.iter().zip(results.into_iter()) {
+                    match result {
+                        Ok(processed) => {
+                            let out = paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
+                            if paths::ensure_parent_dirs(&out).is_ok() && fs::write(&out, &processed.data).is_ok() {
+                                dds_ok.fetch_add(1, Ordering::Relaxed);
+                                ctx.textures_processed_during_install.lock().expect("tex lock").insert(job.id);
+                            } else {
+                                dds_fail.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        Err(e) => {
+                            dds_fail.fetch_add(1, Ordering::Relaxed);
+                            warn!("DDS BC7 fail [{}]: {:#}", job.id, e);
+                        }
+                    }
+                }
+            } else {
+                // Non-BC7: full CPU parallelism (like Radium)
+                eprintln!("  {}: {} textures (CPU parallel)...", fmt.name(), jobs.len());
+
+                jobs.par_iter().for_each(|job| {
+                    let result: anyhow::Result<()> = (|| {
+                        let (tex, _) = process_texture_with_fallback(
+                            &job.data, job.directive.image_state.width,
+                            job.directive.image_state.height, fmt,
+                        )?;
+                        let out = paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
+                        paths::ensure_parent_dirs(&out)?;
+                        fs::write(&out, &tex.data)?;
+                        Ok(())
+                    })();
+                    match result {
+                        Ok(()) => {
+                            dds_ok.fetch_add(1, Ordering::Relaxed);
+                            ctx.textures_processed_during_install.lock().expect("tex lock").insert(job.id);
+                        }
+                        Err(e) => {
+                            dds_fail.fetch_add(1, Ordering::Relaxed);
+                            warn!("DDS {} fail [{}]: {}", fmt.name(), job.id, e);
+                        }
+                    }
+                });
+            }
+        }
+
+        let ok = dds_ok.load(Ordering::Relaxed);
+        let fail = dds_fail.load(Ordering::Relaxed);
+        eprintln!("DDS processing complete: {} OK, {} failed", ok, fail);
+    }
 
     let stats = StreamingStats {
         extracted: extracted.load(Ordering::Relaxed),
@@ -636,6 +1024,7 @@ fn process_single_archive_fused(
     directives: &[ArchiveDirective],
     ctx: &ProcessContext,
     threads_per_archive: Option<usize>,
+    extra_needed_paths: &[String],
 ) -> Result<ArchiveResult> {
     const MAX_LOGGED_FAILURES: usize = 100;
 
@@ -757,6 +1146,13 @@ fn process_single_archive_fused(
             if seen_needed.insert(normalize_archive_lookup_path(path)) {
                 needed_paths.push(path.clone());
             }
+        }
+    }
+
+    // Add extra needed paths (e.g. texture source files, nested BSAs for textures)
+    for path in extra_needed_paths {
+        if seen_needed.insert(normalize_archive_lookup_path(path)) {
+            needed_paths.push(path.clone());
         }
     }
 
@@ -1697,6 +2093,120 @@ fn process_whole_file_directives(
 
         extracted.fetch_add(1, Ordering::Relaxed);
     });
+}
+
+/// Extract texture source files from a BSA/BA2 archive and send to DDS handler channel.
+/// Called during the BSA-direct extraction path.
+type TextureLookupInner = HashMap<String, Vec<(i64, TransformedTextureDirective)>>;
+
+fn extract_textures_from_bsa(
+    archive_path: &Path,
+    tex_lookup: &TextureLookupInner,
+    dds_tx: &std::sync::mpsc::SyncSender<DdsJob>,
+) {
+    // Build wanted paths set from texture lookup
+    let wanted: HashSet<String> = tex_lookup.keys().cloned().collect();
+    if wanted.is_empty() {
+        return;
+    }
+
+    let tex_lookup = tex_lookup;
+    let _ = bsa::extract_archive_batch(archive_path, &wanted, |path, data| {
+        let lookup = path.replace('\\', "/").to_lowercase();
+        if let Some(directives) = tex_lookup.get(&lookup) {
+            for (id, directive) in directives {
+                // Send to DDS handler — clone data for each directive using this source
+                let _ = dds_tx.send(DdsJob {
+                    id: *id,
+                    directive: directive.clone(),
+                    data: data.clone(),
+                });
+            }
+        }
+        Ok(())
+    });
+}
+
+/// Extract texture source files from an already-extracted temp directory
+/// and send to DDS handler channel. Called for 7z/RAR/ZIP archives.
+fn extract_textures_from_temp_dir(
+    temp_dir: &Path,
+    tex_lookup: &TextureLookupInner,
+    dds_tx: &std::sync::mpsc::SyncSender<DdsJob>,
+) {
+    // Build a map of files in the temp dir
+    let file_map = build_extracted_file_map(temp_dir);
+
+    for (normalized_path, directives) in tex_lookup {
+        // Try to find the file in the temp dir
+        let found = file_map.get(normalized_path)
+            .or_else(|| {
+                // Also try backslash variant
+                let bs = normalized_path.replace('/', "\\");
+                file_map.get(&bs)
+            });
+
+        if let Some(file_path) = found {
+            if let Ok(data) = fs::read(file_path) {
+                for (id, directive) in directives {
+                    let _ = dds_tx.send(DdsJob {
+                        id: *id,
+                        directive: directive.clone(),
+                        data: data.clone(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Extract texture source files from nested BSAs within an extracted temp directory.
+/// For depth-3 paths: archive → nested BSA → file inside BSA.
+/// Finds the nested BSA in the temp dir, opens it, and extracts the needed texture files.
+type NestedTextureLookupInner = HashMap<String, TextureLookupInner>;
+
+fn extract_textures_from_nested_bsas(
+    temp_dir: &Path,
+    nested_lookup: &NestedTextureLookupInner,
+    dds_tx: &std::sync::mpsc::SyncSender<DdsJob>,
+) {
+    let file_map = build_extracted_file_map(temp_dir);
+
+    for (bsa_name, tex_lookup) in nested_lookup {
+        // Find the nested BSA file in the extracted temp dir
+        let bsa_path = file_map.get(bsa_name)
+            .or_else(|| {
+                let bs = bsa_name.replace('/', "\\");
+                file_map.get(&bs)
+            });
+
+        let Some(bsa_disk_path) = bsa_path else {
+            debug!("Nested BSA not found in temp dir: {}", bsa_name);
+            continue;
+        };
+
+        // Build wanted paths from the texture lookup
+        let wanted: HashSet<String> = tex_lookup.keys().cloned().collect();
+        if wanted.is_empty() {
+            continue;
+        }
+
+        // Extract texture files from the nested BSA
+        let tex_lookup = tex_lookup;
+        let _ = bsa::extract_archive_batch(bsa_disk_path, &wanted, |path, data| {
+            let lookup = path.replace('\\', "/").to_lowercase();
+            if let Some(directives) = tex_lookup.get(&lookup) {
+                for (id, directive) in directives {
+                    let _ = dds_tx.send(DdsJob {
+                        id: *id,
+                        directive: directive.clone(),
+                        data: data.clone(),
+                    });
+                }
+            }
+            Ok(())
+        });
+    }
 }
 
 /// Process a BSA/BA2 archive directly using batch extraction.

@@ -504,8 +504,10 @@ pub fn process_texture(
     })
 }
 
-/// Process BC6H texture entirely via DirectXTex (load → resize → compress → save).
-/// Preserves HDR data instead of falling back to BC1.
+/// Process BC6H texture using GPU (block_compression crate) with DirectXTex fallback.
+///
+/// Pipeline: DirectXTex decode → resize → RGBA16F → GPU BC6H encode → DDS output.
+/// DirectXTex handles HDR format decoding/resize; GPU handles fast BC6H compression.
 fn process_texture_bc6h_directxtex(
     input_data: &[u8],
     target_width: u32,
@@ -519,11 +521,19 @@ fn process_texture_bc6h_directxtex(
     let current_w = metadata.width as u32;
     let current_h = metadata.height as u32;
 
-    // Decompress to float if currently compressed
+    // Decompress to RGBA16F (half-float) for HDR preservation
     let decompressed = if metadata.format.is_compressed() {
         scratch
             .decompress(DXGI_FORMAT::DXGI_FORMAT_R16G16B16A16_FLOAT)
             .context("DirectXTex: failed to decompress for BC6H")?
+    } else if metadata.format != DXGI_FORMAT::DXGI_FORMAT_R16G16B16A16_FLOAT {
+        scratch
+            .convert(
+                DXGI_FORMAT::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                TEX_FILTER_FLAGS::TEX_FILTER_DEFAULT,
+                0.5,
+            )
+            .context("DirectXTex: failed to convert to RGBA16F for BC6H")?
     } else {
         scratch
     };
@@ -531,7 +541,7 @@ fn process_texture_bc6h_directxtex(
     // Resize if needed
     let resized = if current_w != target_width || current_h != target_height {
         debug!(
-            "DirectXTex BC6H: resizing {}x{} -> {}x{}",
+            "BC6H: resizing {}x{} -> {}x{}",
             current_w, current_h, target_width, target_height
         );
         decompressed
@@ -545,12 +555,40 @@ fn process_texture_bc6h_directxtex(
         decompressed
     };
 
-    // Generate mipmaps
+    // Generate mipmap chain in RGBA16F
     let with_mips = resized
         .generate_mip_maps(TEX_FILTER_FLAGS::TEX_FILTER_DEFAULT, 0)
         .unwrap_or(resized);
 
-    // Compress to BC6H_UF16
+    // Try GPU encoding first (block_compression crate — instant vs 60s+ CPU)
+    if let Some(encoder_arc) = get_gpu_encoder() {
+        if let Ok(mut guard) = encoder_arc.lock() {
+            if let Some(ref mut encoder) = *guard {
+                match encode_bc6h_gpu(encoder, &with_mips, target_width, target_height) {
+                    Ok(dds_data) => {
+                        info!(
+                            "GPU BC6H: {}x{} -> {} bytes",
+                            target_width,
+                            target_height,
+                            dds_data.len()
+                        );
+                        return Ok(ProcessedTexture {
+                            data: dds_data,
+                            width: target_width,
+                            height: target_height,
+                            format: OutputFormat::BC6H,
+                        });
+                    }
+                    Err(e) => {
+                        warn!("GPU BC6H failed, falling back to DirectXTex CPU: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    // CPU fallback: DirectXTex single-threaded BC6H compression (very slow)
+    warn!("BC6H CPU fallback — this will be slow for large textures");
     let compressed = with_mips
         .compress(
             DXGI_FORMAT::DXGI_FORMAT_BC6H_UF16,
@@ -559,14 +597,13 @@ fn process_texture_bc6h_directxtex(
         )
         .context("DirectXTex: failed to compress to BC6H")?;
 
-    // Save to DDS
     let blob = compressed
         .save_dds(DDS_FLAGS::default())
         .context("DirectXTex: failed to save BC6H DDS")?;
     let output_data = blob.buffer().to_vec();
 
     info!(
-        "DirectXTex BC6H: {}x{} -> {} bytes",
+        "DirectXTex BC6H (CPU): {}x{} -> {} bytes",
         target_width,
         target_height,
         output_data.len()
@@ -578,6 +615,87 @@ fn process_texture_bc6h_directxtex(
         height: target_height,
         format: OutputFormat::BC6H,
     })
+}
+
+/// Encode all mip levels of a BC6H texture on GPU.
+/// Input: DirectXTex ScratchImage with mipmap chain in RGBA16F format.
+fn encode_bc6h_gpu(
+    encoder: &mut super::gpu_encoder::GpuEncoder,
+    scratch: &ScratchImage,
+    base_width: u32,
+    base_height: u32,
+) -> Result<Vec<u8>> {
+    use image_dds::ddsfile::{AlphaMode, D3D10ResourceDimension, Dds, DxgiFormat, NewDxgiParams};
+
+    let images = scratch.images();
+    let mip_count = images.len() as u32;
+
+    debug!("GPU BC6H encoding {}x{} with {} mip levels", base_width, base_height, mip_count);
+
+    let mut all_bc6h_data: Vec<Vec<u8>> = Vec::with_capacity(mip_count as usize);
+
+    for image in images {
+        let w = image.width as u32;
+        let h = image.height as u32;
+
+        // Pad to multiple of 4 if needed
+        let encode_w = w.max(4).next_multiple_of(4);
+        let encode_h = h.max(4).next_multiple_of(4);
+
+        // Get raw RGBA16F pixel data
+        let pixel_data = unsafe { std::slice::from_raw_parts(image.pixels, image.slice_pitch) };
+
+        // Pad if dimensions don't align to 4
+        let input_data = if w != encode_w || h != encode_h {
+            // Edge-replicate pad for RGBA16F (8 bytes per pixel)
+            let mut padded = vec![0u8; (encode_w * encode_h * 8) as usize];
+            for y in 0..encode_h {
+                let sy = y.min(h.saturating_sub(1));
+                for x in 0..encode_w {
+                    let sx = x.min(w.saturating_sub(1));
+                    let src_idx = ((sy * w + sx) * 8) as usize;
+                    let dst_idx = ((y * encode_w + x) * 8) as usize;
+                    if src_idx + 8 <= pixel_data.len() {
+                        padded[dst_idx..dst_idx + 8].copy_from_slice(&pixel_data[src_idx..src_idx + 8]);
+                    }
+                }
+            }
+            padded
+        } else {
+            pixel_data.to_vec()
+        };
+
+        let bc6h_data = encoder.encode_bc6h(&input_data, encode_w, encode_h)?;
+        all_bc6h_data.push(bc6h_data);
+    }
+
+    // Assemble DDS file with BC6H data
+    let params = NewDxgiParams {
+        width: base_width,
+        height: base_height,
+        depth: None,
+        format: DxgiFormat::BC6H_UF16,
+        mipmap_levels: Some(mip_count),
+        array_layers: None,
+        caps2: None,
+        is_cubemap: false,
+        resource_dimension: D3D10ResourceDimension::Texture2D,
+        alpha_mode: AlphaMode::Unknown,
+    };
+
+    let mut dds = Dds::new_dxgi(params).context("Failed to create BC6H DDS header")?;
+
+    let total_size: usize = all_bc6h_data.iter().map(|m| m.len()).sum();
+    let mut combined = Vec::with_capacity(total_size);
+    for mip in all_bc6h_data {
+        combined.extend(mip);
+    }
+    dds.data = combined;
+
+    let mut output = Vec::new();
+    dds.write(&mut output).context("Failed to write BC6H DDS")?;
+
+    Ok(output)
 }
 
 /// Process texture to BC7 using GPU encoder with edge-replication padding.
@@ -1020,5 +1138,129 @@ mod tests {
         assert_eq!(OutputFormat::BC7.name(), "BC7");
         assert_eq!(OutputFormat::BC1.name(), "BC1");
         assert_eq!(OutputFormat::Rgba.name(), "RGBA");
+    }
+
+    /// Benchmark BC6H texture processing on real textures from the Tuxborn modlist.
+    /// Extracts 3 BC6H textures from their source archives and times the DirectXTex
+    /// parallel compression.
+    ///
+    /// Run with: cargo test --release test_bc6h_benchmark -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_bc6h_benchmark() {
+        use std::path::Path;
+        use std::time::Instant;
+
+        // BC6H textures from Tuxborn modlist
+        struct Bc6hTestCase {
+            archive: &'static str,
+            path_in_archive: &'static str,
+            width: u32,
+            height: u32,
+            label: &'static str,
+        }
+
+        let cases = [
+            Bc6hTestCase {
+                archive: "/home/luke/Games/Tuxborn/downloads/1_Unique Armors and Weapons Retexture SE - Half Res-105771-1-0-1-1701992497.rar",
+                path_in_archive: "Unique Armors and Weapons Retexture SE - HalfRes/00 Data/SaviorHide-MeshReplacer/textures/armor/savior's hide/savior'shideUndershirt.dds",
+                width: 2048,
+                height: 2048,
+                label: "savior'shideUndershirt (2048x2048)",
+            },
+            Bc6hTestCase {
+                archive: "/home/luke/Games/Tuxborn/downloads/Vigilant Armors and Weapons Retexture SE - Mid Res 2k-1k (recommended)-45735-4-0-1668558775.rar",
+                path_in_archive: "Vigilant Armors and Weapons Retexture SE 4.0 - 2k-1k/Data/textures/armor/aom/aredhel/aredhelcuirass_d.dds",
+                width: 1024,
+                height: 1024,
+                label: "aredhelcuirass_d (1024x1024)",
+            },
+            Bc6hTestCase {
+                archive: "/home/luke/Games/Tuxborn/downloads/Vigilant Armors and Weapons Retexture SE - Mid Res 2k-1k (recommended)-45735-4-0-1668558775.rar",
+                path_in_archive: "Vigilant Armors and Weapons Retexture SE 4.0 - 2k-1k/Data/textures/armor/aom/gloom/gloomcuirass_d.dds",
+                width: 1024,
+                height: 1024,
+                label: "gloomcuirass_d (1024x1024)",
+            },
+        ];
+
+        // Initialize GPU encoder
+        init_gpu().expect("Failed to init GPU");
+        eprintln!("GPU encoder initialized: {:?}", get_gpu_encoder().is_some());
+
+        let overall_start = Instant::now();
+
+        for case in &cases {
+            let archive_path = Path::new(case.archive);
+            if !archive_path.exists() {
+                eprintln!("SKIP: archive not found: {}", case.archive);
+                continue;
+            }
+
+            // Extract source DDS from RAR archive
+            eprintln!("Extracting {} from {}...", case.label, archive_path.file_name().unwrap().to_string_lossy());
+            let extract_start = Instant::now();
+
+            let source_data: Vec<u8> = match crate::archive::sevenzip::extract_file_case_insensitive(
+                archive_path,
+                case.path_in_archive,
+            ) {
+                Ok(data) => {
+                    eprintln!("  Extracted {} bytes in {:.1}s", data.len(), extract_start.elapsed().as_secs_f64());
+                    data
+                }
+                Err(e) => {
+                    eprintln!("  FAIL: extract error: {}", e);
+                    continue;
+                }
+            };
+
+            // Test GPU BC6H directly
+            eprintln!("  Step 1: DirectXTex load + decompress to RGBA16F...");
+            let step1 = Instant::now();
+            let dds_flags = DDS_FLAGS::DDS_FLAGS_ALLOW_LARGE_FILES;
+            let scratch = ScratchImage::load_dds(&source_data, dds_flags, None, None).unwrap();
+            let meta = scratch.metadata();
+            let current_w = meta.width as u32;
+            let current_h = meta.height as u32;
+            let decompressed = if meta.format.is_compressed() {
+                scratch.decompress(DXGI_FORMAT::DXGI_FORMAT_R16G16B16A16_FLOAT).unwrap()
+            } else {
+                scratch
+            };
+            let resized = if current_w != case.width || current_h != case.height {
+                decompressed.resize(case.width as usize, case.height as usize, TEX_FILTER_FLAGS::TEX_FILTER_DEFAULT).unwrap()
+            } else {
+                decompressed
+            };
+            let with_mips = resized.generate_mip_maps(TEX_FILTER_FLAGS::TEX_FILTER_DEFAULT, 0).unwrap_or(resized);
+            eprintln!("    Done in {:.2}s, {} mip levels", step1.elapsed().as_secs_f64(), with_mips.images().len());
+
+            // Try GPU encoding directly
+            eprintln!("  Step 2: GPU BC6H encoding...");
+            let step2 = Instant::now();
+            let encoder_arc = get_gpu_encoder();
+            match encoder_arc {
+                Some(arc) => {
+                    let mut guard = arc.lock().expect("GPU encoder lock");
+                    match guard.as_mut() {
+                        Some(enc) => {
+                            match encode_bc6h_gpu(enc, &with_mips, case.width, case.height) {
+                                Ok(dds_data) => {
+                                    eprintln!("    GPU OK: {} bytes in {:.2}s", dds_data.len(), step2.elapsed().as_secs_f64());
+                                }
+                                Err(e) => {
+                                    eprintln!("    GPU FAIL: {:#}", e);
+                                }
+                            }
+                        }
+                        None => eprintln!("    GPU encoder is None"),
+                    }
+                }
+                None => eprintln!("    No GPU encoder available"),
+            }
+        }
+
+        eprintln!("\nTotal: {:.2}s for {} BC6H textures", overall_start.elapsed().as_secs_f64(), cases.len());
     }
 }
