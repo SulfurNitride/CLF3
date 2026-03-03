@@ -106,15 +106,32 @@ struct FinalizeStats {
 
 
 /// A DDS texture job sent from extraction threads to the DDS handler thread.
+/// During extraction, `data` holds the raw bytes. The collector thread spills
+/// them to temp files on disk so they don't accumulate in RAM.
 struct DdsJob {
     /// Directive ID
     id: i64,
     /// The directive with format/dimension info
     directive: TransformedTextureDirective,
-    /// Raw source texture data (DDS)
+    /// Raw source texture data (DDS) — present when sent through channel
     data: Vec<u8>,
 }
 
+/// A DDS job with data spilled to a temp file on disk.
+/// Keeps only metadata in RAM (~100 bytes vs megabytes per texture).
+struct SpilledDdsJob {
+    id: i64,
+    directive: TransformedTextureDirective,
+    /// Path to temp file containing the raw DDS data
+    data_path: PathBuf,
+}
+
+impl SpilledDdsJob {
+    /// Read the texture data back from disk.
+    fn read_data(&self) -> std::io::Result<Vec<u8>> {
+        fs::read(&self.data_path)
+    }
+}
 
 
 /// Configuration for extraction (simplified).
@@ -531,16 +548,11 @@ pub fn process_fused_streaming(
         .map(|n| n.get().max(2))
         .unwrap_or(4);
 
-    // 7z pool: 4 threads, gated to 2 concurrent initially.
-    // When BSA + ZIP/RAR work finishes, gate opens to 4.
-    const LZMA2_INITIAL: usize = 2;
-    const LZMA2_BOOSTED: usize = 4;
-    let lzma2_gate = Arc::new((
-        std::sync::Mutex::new((0usize, LZMA2_INITIAL)), // (active, max)
-        std::sync::Condvar::new(),
-    ));
+    // 7z pool: full CPU parallelism. Each LZMA2 decompressor only uses ~32-64MB
+    // (confirmed via real-world profiling), so even 16 concurrent = ~1GB max.
+    // The earlier OOM was from DDS texture accumulation, not 7z decompressors.
     let sevenzip_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(LZMA2_BOOSTED)
+        .num_threads(num_cpus)
         .thread_name(|i| format!("7z-extract-{}", i))
         .build()
         .expect("Failed to build 7z extraction thread pool");
@@ -556,28 +568,42 @@ pub fn process_fused_streaming(
     let light_count = light_archives.len();
     if sevenzip_count > 0 || light_count > 0 {
         eprintln!(
-            "  Extract breakdown: {} 7z ({}->{} concurrent) + {} ZIP/RAR ({} concurrent)",
-            sevenzip_count, LZMA2_INITIAL, LZMA2_BOOSTED, light_count, num_cpus
+            "  Extract breakdown: {} 7z + {} ZIP/RAR ({} concurrent each)",
+            sevenzip_count, light_count, num_cpus
         );
     }
 
-    // Collect DDS jobs during extraction, process in parallel afterward.
-    // The collector thread drains the channel into a Vec; after extraction completes,
-    // all collected textures are processed in parallel with rayon.
-    let collected_dds_jobs: Arc<std::sync::Mutex<Vec<DdsJob>>> =
+    // Collect DDS jobs during extraction by spilling texture data to temp files.
+    // Only metadata is kept in RAM (~100 bytes each). Data is read back when processing.
+    let dds_spill_dir = ctx.config.output_dir.join(".clf3_dds_spill");
+    let _ = fs::create_dir_all(&dds_spill_dir);
+    let collected_dds_jobs: Arc<std::sync::Mutex<Vec<SpilledDdsJob>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
 
     // Process BSA-direct archives in main rayon pool (unlimited, they're fast)
     // and extract archives in bounded pool — concurrently via std::thread::scope.
     std::thread::scope(|thread_scope| {
-        // Spawn collector thread — drains DDS channel into a Vec (fast, no processing)
+        // Spawn collector thread — receives DDS jobs and spills data to disk
         let collected_jobs = collected_dds_jobs.clone();
+        let spill_dir = dds_spill_dir.clone();
         let collector_handle = if texture_count > 0 {
             let rx = dds_rx;
             Some(thread_scope.spawn(move || {
                 let mut jobs = Vec::new();
+                let mut idx = 0u64;
                 while let Ok(job) = rx.recv() {
-                    jobs.push(job);
+                    // Write data to temp file, keep only path in memory
+                    let data_path = spill_dir.join(format!("dds_{}.tmp", idx));
+                    if let Err(e) = fs::write(&data_path, &job.data) {
+                        warn!("DDS spill write failed: {}", e);
+                        continue;
+                    }
+                    jobs.push(SpilledDdsJob {
+                        id: job.id,
+                        directive: job.directive,
+                        data_path,
+                    });
+                    idx += 1;
                 }
                 let count = jobs.len();
                 collected_jobs.lock().expect("dds jobs lock").extend(jobs);
@@ -870,8 +896,7 @@ pub fn process_fused_streaming(
             ));
         };
 
-        // 7z archives: gated pool, most-files first.
-        // Starts at 2 concurrent, boosts to 4 when BSA+ZIP/RAR finish.
+        // 7z archives: full CPU pool, most-files first.
         let sevenzip_handle = {
             let extracted = extracted.clone();
             let written = written.clone();
@@ -886,7 +911,6 @@ pub fn process_fused_streaming(
             let dds_tx = extract_dds_tx.clone();
             let tex_d2 = ext_tex_d2.clone();
             let tex_d3 = ext_tex_d3.clone();
-            let gate = lzma2_gate.clone();
             let failed_hashes = failed_archive_hashes.clone();
             thread_scope.spawn(move || {
                 sevenzip_pool.scope(|s| {
@@ -904,20 +928,9 @@ pub fn process_fused_streaming(
                         let dds_tx = &dds_tx;
                         let tex_d2 = &tex_d2;
                         let tex_d3 = &tex_d3;
-                        let gate = &gate;
                         let failed_hashes = &failed_hashes;
 
                         s.spawn(move |_| {
-                            // Acquire gate slot
-                            {
-                                let (lock, cvar) = &**gate;
-                                let mut state = lock.lock().expect("lzma2 gate lock");
-                                while state.0 >= state.1 {
-                                    state = cvar.wait(state).expect("lzma2 gate wait");
-                                }
-                                state.0 += 1;
-                            }
-
                             process_archive(
                                 archive_hash, directives, archive_path,
                                 extracted, written, skipped, failed,
@@ -926,14 +939,6 @@ pub fn process_fused_streaming(
                                 adjusted_callback, dds_tx, tex_d2, tex_d3,
                                 failed_hashes,
                             );
-
-                            // Release gate slot
-                            {
-                                let (lock, cvar) = &**gate;
-                                let mut state = lock.lock().expect("lzma2 gate unlock");
-                                state.0 -= 1;
-                                cvar.notify_one();
-                            }
                         });
                     }
                 });
@@ -990,20 +995,8 @@ pub fn process_fused_streaming(
         };
 
         bsa_handle.join().expect("BSA processing thread panicked");
-        light_handle.join().expect("Light archive processing thread panicked");
-
-        // BSA + ZIP/RAR done — boost LZMA2 gate from 2 → 4 concurrent
-        {
-            let (lock, cvar) = &*lzma2_gate;
-            let mut state = lock.lock().expect("lzma2 gate boost lock");
-            if state.1 < LZMA2_BOOSTED {
-                eprintln!("BSA+ZIP/RAR complete, boosting 7z concurrency {} → {}", state.1, LZMA2_BOOSTED);
-                state.1 = LZMA2_BOOSTED;
-                cvar.notify_all(); // Wake any 7z tasks waiting for a slot
-            }
-        }
-
         sevenzip_handle.join().expect("7z processing thread panicked");
+        light_handle.join().expect("Light archive processing thread panicked");
         // All dds_tx senders (bsa, 7z, light) are now dropped,
         // so the channel is closed and the collector will finish draining.
         let collected_count = if let Some(handle) = collector_handle {
@@ -1019,7 +1012,7 @@ pub fn process_fused_streaming(
     overall_pb.finish_and_clear();
 
     // Process collected DDS textures in parallel using rayon (all CPU cores).
-    // Group by format like Radium — process each format group fully parallel.
+    // Data was spilled to temp files during extraction — read back on demand.
     let dds_jobs = std::mem::take(&mut *collected_dds_jobs.lock().expect("dds jobs lock"));
     if !dds_jobs.is_empty() {
         use crate::textures::{OutputFormat, TextureJob, process_texture_batch, process_texture_with_fallback, init_gpu};
@@ -1028,7 +1021,7 @@ pub fn process_fused_streaming(
         let total_tex = dds_jobs.len();
 
         // Group by format
-        let mut by_format: HashMap<String, Vec<DdsJob>> = HashMap::new();
+        let mut by_format: HashMap<String, Vec<SpilledDdsJob>> = HashMap::new();
         for job in dds_jobs {
             let fmt_str = job.directive.image_state.format.to_uppercase();
             by_format.entry(fmt_str).or_default().push(job);
@@ -1058,12 +1051,14 @@ pub fn process_fused_streaming(
                 // BC7: parallel CPU prep → GPU batch encode
                 eprintln!("  BC7: {} textures (GPU+CPU pipeline)...", jobs.len());
 
-                let tex_jobs: Vec<TextureJob> = jobs.iter().map(|j| TextureJob {
-                    data: j.data.clone(),
-                    width: j.directive.image_state.width,
-                    height: j.directive.image_state.height,
-                    format: OutputFormat::BC7,
-                    id: Some(format!("{}", j.id)),
+                let tex_jobs: Vec<TextureJob> = jobs.iter().filter_map(|j| {
+                    j.read_data().ok().map(|data| TextureJob {
+                        data,
+                        width: j.directive.image_state.width,
+                        height: j.directive.image_state.height,
+                        format: OutputFormat::BC7,
+                        id: Some(format!("{}", j.id)),
+                    })
                 }).collect();
 
                 let results = process_texture_batch(tex_jobs);
@@ -1091,8 +1086,9 @@ pub fn process_fused_streaming(
 
                 jobs.par_iter().for_each(|job| {
                     let result: anyhow::Result<()> = (|| {
+                        let data = job.read_data()?;
                         let (tex, _) = process_texture_with_fallback(
-                            &job.data, job.directive.image_state.width,
+                            &data, job.directive.image_state.width,
                             job.directive.image_state.height, fmt,
                         )?;
                         let out = paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
@@ -1117,6 +1113,11 @@ pub fn process_fused_streaming(
         let ok = dds_ok.load(Ordering::Relaxed);
         let fail = dds_fail.load(Ordering::Relaxed);
         eprintln!("DDS processing complete: {} OK, {} failed", ok, fail);
+    }
+
+    // Clean up DDS spill directory
+    if let Err(e) = fs::remove_dir_all(&dds_spill_dir) {
+        debug!("DDS spill cleanup: {}", e);
     }
 
     // Re-verify archives that had extraction failures — detect corrupted downloads.
