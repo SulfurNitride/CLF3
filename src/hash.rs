@@ -36,7 +36,7 @@ pub fn compute_file_hash(path: &Path) -> Result<String> {
 
     // Convert to base64 (little-endian bytes, like Wabbajack)
     let hash_bytes = hash.to_le_bytes();
-    let base64_hash = STANDARD.encode(&hash_bytes);
+    let base64_hash = STANDARD.encode(hash_bytes);
 
     Ok(base64_hash)
 }

@@ -178,15 +178,12 @@ where
             extract_ba2_batch_parallel(archive_path, wanted, callback)
         }
         Some(ArchiveFormat::Bsa) => {
-            // TES4 BSA: streaming — decompress each file and deliver via callback immediately.
-            // No accumulation in memory.
-            let paths_vec: Vec<&str> = wanted.iter().map(|s| s.as_str()).collect();
-            extract_batch_streaming(archive_path, &paths_vec, callback)
+            // TES4 BSA: wanted-set batch path (matches standalone BSA/BA2 tool behavior).
+            extract_batch_streaming(archive_path, wanted, callback)
         }
         Some(ArchiveFormat::Tes3Bsa) => {
-            // TES3: streaming — deliver each file via callback immediately.
-            let paths_vec: Vec<&str> = wanted.iter().map(|s| s.as_str()).collect();
-            extract_tes3_batch_streaming(archive_path, &paths_vec, callback)
+            // TES3: wanted-set batch path.
+            extract_tes3_batch_streaming(archive_path, wanted, callback)
         }
         None => bail!("Unknown archive format: {}", archive_path.display()),
     }

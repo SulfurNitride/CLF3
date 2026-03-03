@@ -138,8 +138,8 @@ pub fn extract_file(archive_path: &Path, file_path: &str) -> Result<Vec<u8>> {
     match archive_type {
         ArchiveType::Zip => extract_zip_file(archive_path, file_path)
             .or_else(|_| extract_file_7z_binary(archive_path, file_path)),
-        ArchiveType::SevenZ => extract_7z_file_native(archive_path, file_path)
-            .or_else(|_| extract_file_7z_binary(archive_path, file_path)),
+        // Match Wabbajack behavior: use external 7z process for 7z extraction.
+        ArchiveType::SevenZ => extract_file_7z_binary(archive_path, file_path),
         ArchiveType::Rar => extract_rar_file(archive_path, file_path)
             .or_else(|_| extract_file_7z_binary(archive_path, file_path)),
         _ => extract_file_7z_binary(archive_path, file_path),
@@ -177,8 +177,8 @@ pub fn extract_files(archive_path: &Path, files: &[&str], output_dir: &Path) -> 
     match archive_type {
         ArchiveType::Zip => extract_zip_files(archive_path, files, output_dir)
             .or_else(|_| extract_files_7z_binary(archive_path, files, output_dir)),
-        ArchiveType::SevenZ => extract_7z_files_native(archive_path, files, output_dir)
-            .or_else(|_| extract_files_7z_binary(archive_path, files, output_dir)),
+        // Match Wabbajack behavior: use external 7z process for 7z extraction.
+        ArchiveType::SevenZ => extract_files_7z_binary(archive_path, files, output_dir),
 
         ArchiveType::Rar => extract_rar_files(archive_path, files, output_dir)
             .or_else(|_| extract_files_7z_binary(archive_path, files, output_dir)),
@@ -250,11 +250,8 @@ pub fn extract_all_with_threads(
                 tracing::warn!("Native ZIP extraction failed, falling back to 7z binary: {}", e);
                 extract_all_7z_binary(archive_path, output_dir, threads)
             }),
-        ArchiveType::SevenZ => extract_7z_all_native(archive_path, output_dir, threads)
-            .or_else(|e| {
-                tracing::warn!("Native 7z extraction failed, falling back to 7z binary: {}", e);
-                extract_all_7z_binary(archive_path, output_dir, threads)
-            }),
+        // Match Wabbajack behavior: use external 7z process for 7z extraction.
+        ArchiveType::SevenZ => extract_all_7z_binary(archive_path, output_dir, threads),
 
         ArchiveType::Rar => extract_rar_all(archive_path, output_dir)
             .or_else(|e| {
@@ -347,10 +344,7 @@ pub fn get_innoextract_path() -> Result<PathBuf> {
 
 /// Normalize a path for case-insensitive comparison.
 fn normalize_path(path: &str) -> String {
-    // Wabbajack sometimes appends variant markers like "#plus"/"#basic"
-    // to archive paths. These are not part of the actual path in archives.
-    let base = path.split('#').next().unwrap_or(path);
-    base.to_lowercase()
+    path.to_lowercase()
         .replace('\\', "/")
         .trim_matches('/')
         .to_string()
@@ -905,6 +899,8 @@ fn extract_file_7z_binary(archive_path: &Path, file_path: &str) -> Result<Vec<u8
         .arg("-y")
         .arg("-spd")
         .arg("-scsUTF-8")
+        // Match Wabbajack behavior: disable 7z internal multithreading per process.
+        .arg("-mmt=off")
         .arg(archive_path)
         .arg(&normalized_path)
         .output()
@@ -960,6 +956,8 @@ fn extract_files_7z_binary(archive_path: &Path, files: &[&str], output_dir: &Pat
         .arg("-y")
         .arg("-aoa")
         .arg("-scsUTF-8")
+        // Match Wabbajack behavior: disable 7z internal multithreading per process.
+        .arg("-mmt=off")
         .arg(format!("-o{}", output_dir.display()))
         .arg(archive_path)
         .arg("--");
@@ -980,6 +978,7 @@ fn extract_files_7z_binary(archive_path: &Path, files: &[&str], output_dir: &Pat
         if !reparse_paths.is_empty() {
             let mut retry = Command::new(&sz_path);
             retry.arg("x").arg("-y").arg("-aoa").arg("-scsUTF-8")
+                .arg("-mmt=off")
                 .arg(format!("-o{}", output_dir.display()));
 
             for path in &reparse_paths {
@@ -1035,9 +1034,16 @@ fn extract_all_7z_binary(
     cmd.arg("x").arg("-y").arg("-aoa").arg("-scsUTF-8");
 
     match threads {
-        Some(1) => { cmd.arg("-mmt=1"); }
-        Some(n) if n > 1 => { cmd.arg(format!("-mmt={}", n)); }
-        _ => { cmd.arg("-mmt=on"); }
+        Some(1) => {
+            // Wabbajack parity: explicitly disable 7z internal MT for one-thread mode.
+            cmd.arg("-mmt=off");
+        }
+        Some(n) if n > 1 => {
+            cmd.arg(format!("-mmt={}", n));
+        }
+        _ => {
+            cmd.arg("-mmt=on");
+        }
     }
 
     cmd.arg(format!("-o{}", output_dir.display()))
@@ -1057,9 +1063,15 @@ fn extract_all_7z_binary(
             retry.arg("x").arg("-y").arg("-aoa").arg("-scsUTF-8");
 
             match threads {
-                Some(1) => { retry.arg("-mmt=1"); }
-                Some(n) if n > 1 => { retry.arg(format!("-mmt={}", n)); }
-                _ => { retry.arg("-mmt=on"); }
+                Some(1) => {
+                    retry.arg("-mmt=off");
+                }
+                Some(n) if n > 1 => {
+                    retry.arg(format!("-mmt={}", n));
+                }
+                _ => {
+                    retry.arg("-mmt=on");
+                }
             }
 
             retry.arg(format!("-o{}", output_dir.display()));
@@ -1397,6 +1409,40 @@ mod tests {
         );
         assert_eq!(normalize_path("/foo/bar/"), "foo/bar");
         assert_eq!(normalize_path("FOO\\BAR\\BAZ.TXT"), "foo/bar/baz.txt");
+        assert_eq!(
+            normalize_path("Nemesis_Engine/mod/colis/0_master/#colis$15.txt"),
+            "nemesis_engine/mod/colis/0_master/#colis$15.txt"
+        );
+    }
+
+    #[test]
+    fn test_build_path_lookup_keeps_hash_filenames_distinct() {
+        let entries = vec![
+            ArchiveEntry {
+                path: "Nemesis_Engine/mod/colis/0_master/#colis$15.txt".to_string(),
+                size: 1,
+                is_dir: false,
+            },
+            ArchiveEntry {
+                path: "Nemesis_Engine/mod/colis/0_master/#colis$16.txt".to_string(),
+                size: 1,
+                is_dir: false,
+            },
+        ];
+
+        let lookup = build_path_lookup(&entries);
+        assert_eq!(
+            lookup
+                .get("nemesis_engine/mod/colis/0_master/#colis$15.txt")
+                .map(String::as_str),
+            Some("Nemesis_Engine/mod/colis/0_master/#colis$15.txt")
+        );
+        assert_eq!(
+            lookup
+                .get("nemesis_engine/mod/colis/0_master/#colis$16.txt")
+                .map(String::as_str),
+            Some("Nemesis_Engine/mod/colis/0_master/#colis$16.txt")
+        );
     }
 
     #[test]
@@ -1766,12 +1812,12 @@ Listing "Example"
 
         // 7z magic bytes
         let sz_path = dir.path().join("test.7z");
-        fs::write(&sz_path, &[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0x00, 0x00])?;
+        fs::write(&sz_path, [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0x00, 0x00])?;
         assert_eq!(detect_archive_type(&sz_path)?, ArchiveType::SevenZ);
 
         // RAR magic bytes
         let rar_path = dir.path().join("test.rar");
-        fs::write(&rar_path, &[0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00, 0x00])?;
+        fs::write(&rar_path, [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00, 0x00])?;
         assert_eq!(detect_archive_type(&rar_path)?, ArchiveType::Rar);
 
         Ok(())

@@ -1067,6 +1067,7 @@ dependencies = [
  "image",
  "image_dds",
  "indicatif",
+ "libc",
  "md5",
  "memmap2",
  "once_cell",

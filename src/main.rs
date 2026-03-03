@@ -63,6 +63,18 @@ enum Commands {
         #[arg(short, long)]
         concurrent: Option<usize>,
 
+        /// Maximum parallel workers for extraction/install phase
+        #[arg(long)]
+        install_workers: Option<usize>,
+
+        /// Maximum number of BSA/BA2 archives processed concurrently (default: 1)
+        #[arg(long)]
+        bsa_workers: Option<usize>,
+
+        /// Maximum number of 7z archives processed concurrently (default: 1)
+        #[arg(long)]
+        sevenzip_workers: Option<usize>,
+
         /// Use NXM browser mode instead of direct API (avoids rate limits)
         #[arg(long)]
         nxm_mode: bool,
@@ -189,6 +201,9 @@ async fn main() -> Result<()> {
             game,
             nexus_key,
             concurrent,
+            install_workers,
+            bsa_workers,
+            sevenzip_workers,
             nxm_mode,
             browser,
         }) => {
@@ -196,10 +211,18 @@ async fn main() -> Result<()> {
             let thread_count = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4);
-            let concurrent = concurrent.unwrap_or(thread_count);
+            let concurrent = concurrent.unwrap_or(thread_count).max(1);
+            let install_workers = install_workers.unwrap_or(thread_count).max(1);
+            let bsa_workers = bsa_workers.unwrap_or(1).max(1);
+            let sevenzip_workers = sevenzip_workers.unwrap_or(thread_count).max(1);
 
             println!("CLF3 - Wabbajack Modlist Installer");
             println!("Concurrent downloads: {}", concurrent);
+            println!(
+                "Install workers: {} (BSA archives in parallel: {})",
+                install_workers, bsa_workers
+            );
+            println!("7z archives in parallel: {}", sevenzip_workers);
             if nxm_mode {
                 println!("NXM Mode: enabled (browser-based downloads)");
             }
@@ -212,6 +235,9 @@ async fn main() -> Result<()> {
                 game_dir: game,
                 nexus_api_key: nexus_key,
                 max_concurrent_downloads: concurrent,
+                max_install_workers: install_workers,
+                max_parallel_bsa_archives: bsa_workers,
+                max_parallel_7z_archives: sevenzip_workers,
                 nxm_mode,
                 browser,
                 patch_cache_dir: None,
@@ -219,9 +245,7 @@ async fn main() -> Result<()> {
             };
 
             let mut installer = Installer::new(config)?;
-            // Use streaming pipeline with 8 extraction + 8 mover workers
-            // Processes archives in batches: ZIP (fastest) -> RAR -> 7z (slowest)
-            let stats = installer.run_streaming(8, 8).await?;
+            let stats = installer.run_streaming().await?;
 
             let total_processed =
                 stats.directives_completed + stats.directives_skipped + stats.directives_failed;

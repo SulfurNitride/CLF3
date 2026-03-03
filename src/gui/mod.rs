@@ -3816,7 +3816,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                     }
                 }
                 let mut game_names: Vec<String> = seen_games.into_values().collect();
-                game_names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+                game_names.sort_by_key(|a| a.to_lowercase());
                 games.extend(game_names);
 
                 // Convert to UI model
@@ -4097,8 +4097,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
                         let images = loaded_images.lock().unwrap();
                         let filtered = filter_and_create_model(
                             &all_modlists,
-                            &query.to_string(),
-                            &dialog.get_selected_game().to_string(),
+                            query.as_ref(),
+                            dialog.get_selected_game().as_ref(),
                             dialog.get_show_unofficial(),
                             dialog.get_show_nsfw(),
                             dialog.get_show_unavailable(),
@@ -4121,8 +4121,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
                         let images = loaded_images.lock().unwrap();
                         let filtered = filter_and_create_model(
                             &all_modlists,
-                            &dialog.get_search_text().to_string(),
-                            &game.to_string(),
+                            dialog.get_search_text().as_ref(),
+                            game.as_ref(),
                             dialog.get_show_unofficial(),
                             dialog.get_show_nsfw(),
                             dialog.get_show_unavailable(),
@@ -4145,8 +4145,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
                         let images = loaded_images.lock().unwrap();
                         let filtered = filter_and_create_model(
                             &all_modlists,
-                            &dialog.get_search_text().to_string(),
-                            &dialog.get_selected_game().to_string(),
+                            dialog.get_search_text().as_ref(),
+                            dialog.get_selected_game().as_ref(),
                             show_unofficial,
                             show_nsfw,
                             show_unavailable,
@@ -4345,7 +4345,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                                                 }
                                             }
                                             let mut game_names: Vec<String> = seen_games.into_values().collect();
-                                            game_names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+                                            game_names.sort_by_key(|a| a.to_lowercase());
                                             games.extend(game_names);
 
                                             // Apply current filters with visibility flags
@@ -5883,6 +5883,9 @@ async fn run_wabbajack_install(
         game_dir,
         nexus_api_key: api_key.to_string(),
         max_concurrent_downloads: thread_count,
+        max_install_workers: thread_count,
+        max_parallel_bsa_archives: 1,
+        max_parallel_7z_archives: thread_count,
         nxm_mode: non_premium,
         browser: "xdg-open".to_string(),
         patch_cache_dir: patch_cache_dir.map(PathBuf::from),
@@ -5930,7 +5933,7 @@ async fn run_wabbajack_install(
     .ok();
 
     // Use streaming pipeline for better performance
-    let stats = match installer.run_streaming(8, 8).await {
+    let stats = match installer.run_streaming().await {
         Ok(s) => s,
         Err(e) => {
             tx.send(ProgressUpdate::Error(format!("Installation failed: {}", e)))

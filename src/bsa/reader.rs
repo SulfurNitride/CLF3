@@ -245,7 +245,7 @@ pub fn extract_batch_parallel(
 /// and deliver via callback in parallel using rayon. Matches the fast BSA tool's approach.
 pub fn extract_batch_streaming<F>(
     bsa_path: &Path,
-    file_paths: &[&str],
+    wanted: &HashSet<String>,
     callback: F,
 ) -> Result<usize>
 where
@@ -257,16 +257,6 @@ where
         .with_context(|| format!("Failed to open BSA: {}", bsa_path.display()))?;
 
     let compression_options: FileCompressionOptions = (&options).into();
-
-    let needed: HashSet<String> = file_paths
-        .iter()
-        .map(|p| p.replace('/', "\\").to_lowercase())
-        .collect();
-
-    let path_lookup: std::collections::HashMap<String, &str> = file_paths
-        .iter()
-        .map(|p| (p.replace('/', "\\").to_lowercase(), *p))
-        .collect();
 
     // Phase 1: Collect matching file references (fast, no decompression)
     let mut entries: Vec<(String, &BsaFile)> = Vec::new();
@@ -281,12 +271,8 @@ where
                 format!("{}\\{}", dir_name, file_name)
             };
 
-            if needed.contains(&full_path) {
-                let original = path_lookup
-                    .get(&full_path)
-                    .map(|s| s.to_string())
-                    .unwrap_or(full_path);
-                entries.push((original, file));
+            if wanted.contains(&full_path) {
+                entries.push((full_path, file));
             }
         }
     }
@@ -317,7 +303,7 @@ where
     debug!(
         "Parallel extracted {}/{} files from BSA {}",
         count,
-        file_paths.len(),
+        wanted.len(),
         bsa_path.display()
     );
 

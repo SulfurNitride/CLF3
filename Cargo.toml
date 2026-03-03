@@ -99,6 +99,7 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 base64 = "0.22"
 
 dirs = "6.0.0"
+libc = "0.2"
 
 # GUI
 slint = "1.14.1"

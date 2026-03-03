@@ -67,7 +67,7 @@ pub fn find_steam_protons() -> Vec<SteamProton> {
     protons.retain(is_proton_10_or_newer);
 
     // Filter to only Protons with valid wine binaries
-    protons.retain(|p| has_wine_binary(p));
+    protons.retain(has_wine_binary);
 
     // Sort: Experimental first, then by name descending (newest first)
     protons.sort_by(|a, b| {

@@ -72,6 +72,17 @@ pub struct InstallConfig {
     /// Maximum concurrent downloads
     pub max_concurrent_downloads: usize,
 
+    /// Maximum parallel workers for archive extraction/install phase
+    pub max_install_workers: usize,
+
+    /// Maximum number of BSA/BA2 archives processed concurrently.
+    /// Keep this low because each BSA extraction uses rayon internally.
+    pub max_parallel_bsa_archives: usize,
+
+    /// Maximum number of 7z archives processed concurrently.
+    /// Each 7z archive runs in its own external 7z process.
+    pub max_parallel_7z_archives: usize,
+
     /// Use NXM browser mode instead of direct API
     pub nxm_mode: bool,
 
@@ -94,6 +105,9 @@ impl std::fmt::Debug for InstallConfig {
             .field("game_dir", &self.game_dir)
             .field("nexus_api_key", &"[REDACTED]")
             .field("max_concurrent_downloads", &self.max_concurrent_downloads)
+            .field("max_install_workers", &self.max_install_workers)
+            .field("max_parallel_bsa_archives", &self.max_parallel_bsa_archives)
+            .field("max_parallel_7z_archives", &self.max_parallel_7z_archives)
             .field("nxm_mode", &self.nxm_mode)
             .field("browser", &self.browser)
             .field("patch_cache_dir", &self.patch_cache_dir)
@@ -140,6 +154,26 @@ impl InstallConfig {
         if self.nexus_api_key.is_empty() {
             return Err(ConfigError::MissingNexusKey);
         }
+        if self.max_concurrent_downloads == 0 {
+            return Err(ConfigError::InvalidConcurrency(
+                "max_concurrent_downloads must be >= 1",
+            ));
+        }
+        if self.max_install_workers == 0 {
+            return Err(ConfigError::InvalidConcurrency(
+                "max_install_workers must be >= 1",
+            ));
+        }
+        if self.max_parallel_bsa_archives == 0 {
+            return Err(ConfigError::InvalidConcurrency(
+                "max_parallel_bsa_archives must be >= 1",
+            ));
+        }
+        if self.max_parallel_7z_archives == 0 {
+            return Err(ConfigError::InvalidConcurrency(
+                "max_parallel_7z_archives must be >= 1",
+            ));
+        }
 
         Ok(())
     }
@@ -156,4 +190,7 @@ pub enum ConfigError {
 
     #[error("Nexus API key is required (premium account needed)")]
     MissingNexusKey,
+
+    #[error("Invalid concurrency setting: {0}")]
+    InvalidConcurrency(&'static str),
 }

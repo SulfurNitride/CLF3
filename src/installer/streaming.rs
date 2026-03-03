@@ -36,7 +36,6 @@ use crate::modlist::{
 };
 use crate::paths;
 
-use super::extract_strategy::should_use_selective_extraction;
 use super::processor::{
     apply_patch_to_temp, build_patch_basis_key, build_patch_basis_key_from_archive_hash_path,
     output_exists, preload_patch_blobs_by_name, restore_patched_output_from_cache,
@@ -97,6 +96,14 @@ enum ArchiveDirective {
     },
 }
 
+impl ArchiveDirective {
+    fn id(&self) -> i64 {
+        match self {
+            Self::FromArchive { id, .. } | Self::Patched { id, .. } => *id,
+        }
+    }
+}
+
 /// Statistics from finalization of one archive.
 struct FinalizeStats {
     written: usize,
@@ -134,9 +141,20 @@ impl SpilledDdsJob {
 }
 
 
-/// Configuration for extraction (simplified).
+/// Configuration for fused extraction/patch scheduling.
 #[derive(Debug, Clone, Default)]
-pub struct StreamingConfig;
+pub struct StreamingConfig {
+    /// Max worker threads for non-BSA archive extraction.
+    /// `None` => auto-detect from CPU count.
+    pub max_extract_workers: Option<usize>,
+    /// Max number of 7z archives processed concurrently.
+    /// `None` => default 1.
+    pub max_parallel_7z_archives: Option<usize>,
+    /// Max number of BSA/BA2 archives processed concurrently.
+    /// Each BSA extraction uses rayon internally, so low values are usually better.
+    /// `None` => default 1.
+    pub max_parallel_bsa_archives: Option<usize>,
+}
 
 /// Statistics from the extraction pipeline.
 #[derive(Debug, Default)]
@@ -181,11 +199,10 @@ pub fn cleanup_temp_dirs(downloads_dir: &std::path::Path) -> usize {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             // tempfile creates dirs like .tmpXXXXXX
-            if name_str.starts_with(".tmp") && entry.path().is_dir() {
-                if fs::remove_dir_all(entry.path()).is_ok() {
+            if name_str.starts_with(".tmp") && entry.path().is_dir()
+                && fs::remove_dir_all(entry.path()).is_ok() {
                     cleaned += 1;
                 }
-            }
         }
     }
     if cleaned > 0 {
@@ -207,7 +224,7 @@ pub type ProgressCallback = Arc<dyn Fn(usize) + Send + Sync>;
 pub fn process_fused_streaming(
     db: &ModlistDb,
     ctx: &ProcessContext,
-    _config: StreamingConfig,
+    config: StreamingConfig,
     pb: &ProgressBar,
     progress_callback: Option<ProgressCallback>,
 ) -> Result<StreamingStats> {
@@ -431,7 +448,9 @@ pub fn process_fused_streaming(
     });
 
     // Classify archives by type
-    let archives: Vec<_> = by_archive.into_iter().collect();
+    let mut archives: Vec<_> = by_archive.into_iter().collect();
+    // Match Wabbajack's effective behavior: stable progression in directive insertion order.
+    archives.sort_by_key(|(_, directives)| directives.iter().map(ArchiveDirective::id).min().unwrap_or(i64::MAX));
     let archive_count = archives.len();
 
     // Unified list of all archives to process, with type tag
@@ -468,15 +487,6 @@ pub fn process_fused_streaming(
             all_archives.push((archive_hash, directives, archive_path, ArchiveKind::Extract));
         }
     }
-
-    // Sort by file size descending so large archives start first and don't become
-    // tail stragglers. Directive count as tiebreak. An 8 GB solid 7z with 199 files
-    // must start before a 50 MB zip with 2000 files.
-    all_archives.sort_by(|a, b| {
-        let size_a = std::fs::metadata(&a.2).map(|m| m.len()).unwrap_or(0);
-        let size_b = std::fs::metadata(&b.2).map(|m| m.len()).unwrap_or(0);
-        size_b.cmp(&size_a).then_with(|| b.1.len().cmp(&a.1.len()))
-    });
 
     let total_archives = all_archives.len();
     let total_files: usize = all_archives.iter().map(|(_, d, _, _)| d.len()).sum();
@@ -527,10 +537,8 @@ pub fn process_fused_streaming(
         .into_iter()
         .partition(|(_, _, _, kind)| matches!(kind, ArchiveKind::BsaDirect));
 
-    // Further split extract archives: 7z (LZMA2, heavy) vs ZIP/RAR (lightweight).
-    // 7z decompressors hold 64MB+ dictionary buffers each — limit to 2 concurrent.
-    // ZIP/RAR are cheap and run freely with full CPU parallelism.
-    let (mut sevenzip_archives, light_archives): (Vec<_>, Vec<_>) = extract_archives
+    // Split extract archives into 7z and non-7z so 7z process concurrency can be capped.
+    let (sevenzip_archives, other_extract_archives): (Vec<_>, Vec<_>) = extract_archives
         .into_iter()
         .partition(|(_, _, path, _)| {
             detect_archive_type(path)
@@ -538,38 +546,56 @@ pub fn process_fused_streaming(
                 .unwrap_or(false)
         });
 
-    // 7z: sort by directive count descending (most files first).
-    // Every entry in a solid 7z must be decompressed regardless, so archives
-    // with more files take longer. Start the biggest jobs first to avoid
-    // tail stragglers.
-    sevenzip_archives.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    let extract_workers = config.max_extract_workers.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get().max(2))
+            .unwrap_or(4)
+    });
+    let sevenzip_archive_workers = config
+        .max_parallel_7z_archives
+        .unwrap_or(extract_workers)
+        .max(1);
+    let bsa_archive_workers = config.max_parallel_bsa_archives.unwrap_or(1).max(1);
 
-    let num_cpus = std::thread::available_parallelism()
-        .map(|n| n.get().max(2))
-        .unwrap_or(4);
-
-    // 7z pool: full CPU parallelism. Each LZMA2 decompressor only uses ~32-64MB
-    // (confirmed via real-world profiling), so even 16 concurrent = ~1GB max.
-    // The earlier OOM was from DDS texture accumulation, not 7z decompressors.
-    let sevenzip_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(num_cpus)
-        .thread_name(|i| format!("7z-extract-{}", i))
-        .build()
-        .expect("Failed to build 7z extraction thread pool");
-
-    // ZIP/RAR pool: full CPU parallelism (lightweight decompressors)
-    let light_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(num_cpus)
+    // Non-7z extraction pool.
+    let extract_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(extract_workers)
         .thread_name(|i| format!("extract-{}", i))
         .build()
         .expect("Failed to build extraction thread pool");
 
-    let sevenzip_count = sevenzip_archives.len();
-    let light_count = light_archives.len();
-    if sevenzip_count > 0 || light_count > 0 {
+    // 7z extraction pool (external 7z processes). Keep concurrency low to control memory.
+    let sevenzip_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(sevenzip_archive_workers)
+        .thread_name(|i| format!("extract-7z-{}", i))
+        .build()
+        .expect("Failed to build 7z extraction thread pool");
+
+    let bsa_archive_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(bsa_archive_workers)
+        .thread_name(|i| format!("bsa-archive-{}", i))
+        .build()
+        .expect("Failed to build BSA archive pool");
+
+    if !other_extract_archives.is_empty() {
         eprintln!(
-            "  Extract breakdown: {} 7z + {} ZIP/RAR ({} concurrent each)",
-            sevenzip_count, light_count, num_cpus
+            "  Extract queue (non-7z): {} archives ({} concurrent workers)",
+            other_extract_archives.len(),
+            extract_workers
+        );
+    }
+    if !sevenzip_archives.is_empty() {
+        eprintln!(
+            "  Extract queue (7z): {} archives ({} concurrent workers)",
+            sevenzip_archives.len(),
+            sevenzip_archive_workers
+        );
+    }
+    if !bsa_archives.is_empty() {
+        eprintln!(
+            "  BSA queue: {} archives ({} concurrent archive workers)",
+            bsa_archives.len(),
+            bsa_archive_workers
         );
     }
 
@@ -641,7 +667,7 @@ pub fn process_fused_streaming(
                 let dds_tx = bsa_dds_tx;
                 let tex_d2 = bsa_tex_d2;
                 let tex_d3 = bsa_tex_d3;
-                rayon::scope(|s| {
+                bsa_archive_pool.scope(|s| {
                     for (archive_hash, directives, archive_path, _kind) in &bsa_archives {
                         let extracted = &extracted;
                         let written = &written;
@@ -896,7 +922,7 @@ pub fn process_fused_streaming(
             ));
         };
 
-        // 7z archives: full CPU pool, most-files first.
+        // 7z archives: dedicated capped pool.
         let sevenzip_handle = {
             let extracted = extracted.clone();
             let written = written.clone();
@@ -908,10 +934,10 @@ pub fn process_fused_streaming(
             let mp = mp.clone();
             let archive_bar_style = archive_bar_style.clone();
             let adjusted_callback = adjusted_callback.clone();
+            let failed_hashes = failed_archive_hashes.clone();
             let dds_tx = extract_dds_tx.clone();
             let tex_d2 = ext_tex_d2.clone();
             let tex_d3 = ext_tex_d3.clone();
-            let failed_hashes = failed_archive_hashes.clone();
             thread_scope.spawn(move || {
                 sevenzip_pool.scope(|s| {
                     for (archive_hash, directives, archive_path, _kind) in &sevenzip_archives {
@@ -945,8 +971,8 @@ pub fn process_fused_streaming(
             })
         };
 
-        // ZIP/RAR archives: full CPU pool, lightweight decompressors
-        let light_handle = {
+        // Non-7z extract archives.
+        let extract_handle = {
             let extracted = extracted.clone();
             let written = written.clone();
             let skipped = skipped.clone();
@@ -962,8 +988,8 @@ pub fn process_fused_streaming(
                 let dds_tx = extract_dds_tx;
                 let tex_d2 = ext_tex_d2;
                 let tex_d3 = ext_tex_d3;
-                light_pool.scope(|s| {
-                    for (archive_hash, directives, archive_path, _kind) in &light_archives {
+                extract_pool.scope(|s| {
+                    for (archive_hash, directives, archive_path, _kind) in &other_extract_archives {
                         let extracted = &extracted;
                         let written = &written;
                         let skipped = &skipped;
@@ -995,9 +1021,9 @@ pub fn process_fused_streaming(
         };
 
         bsa_handle.join().expect("BSA processing thread panicked");
-        sevenzip_handle.join().expect("7z processing thread panicked");
-        light_handle.join().expect("Light archive processing thread panicked");
-        // All dds_tx senders (bsa, 7z, light) are now dropped,
+        sevenzip_handle.join().expect("7z extract processing thread panicked");
+        extract_handle.join().expect("Extract processing thread panicked");
+        // All dds_tx senders (bsa + extract) are now dropped,
         // so the channel is closed and the collector will finish draining.
         let collected_count = if let Some(handle) = collector_handle {
             handle.join().expect("DDS collector thread panicked")
@@ -1785,49 +1811,38 @@ fn extract_archive_to_temp(
     temp_dir: &Path,
     threads: Option<usize>,
 ) -> Result<()> {
-    let selective = should_use_selective_extraction(archive_path, needed_paths.len());
+    if needed_paths.is_empty() {
+        debug!(
+            "Extraction strategy: archive={}, needed_files=0, mode=full",
+            archive_path.display()
+        );
+        return sevenzip::extract_all_with_threads(archive_path, temp_dir, threads).map(|_| ());
+    }
+
     debug!(
-        "Extraction strategy: archive={}, needed_files={}, mode={}",
+        "Extraction strategy: archive={}, needed_files={}, mode=selective-first",
         archive_path.display(),
-        needed_paths.len(),
-        if selective { "selective" } else { "full" }
+        needed_paths.len()
     );
 
-    if selective {
-        sevenzip::extract_files_case_insensitive(archive_path, needed_paths, temp_dir)
-            .map(|_| ())
-            .or_else(|e| {
-                warn!(
-                    "Selective extraction failed for {}, falling back to full: {}",
-                    archive_path.display(),
-                    e
-                );
-                sevenzip::extract_all_with_threads(archive_path, temp_dir, threads).map(|_| ())
-            })
-    } else {
-        sevenzip::extract_all_with_threads(archive_path, temp_dir, threads)
-            .map(|_| ())
-            .or_else(|full_err| {
-                if needed_paths.is_empty() {
-                    return Err(full_err);
-                }
-                warn!(
-                    "Full extraction failed for {}, retrying selective of {} files: {}",
-                    archive_path.display(),
-                    needed_paths.len(),
-                    full_err
-                );
-                sevenzip::extract_files_case_insensitive(archive_path, needed_paths, temp_dir)
-                    .map(|_| ())
-                    .map_err(|selective_err| {
-                        anyhow::anyhow!(
-                            "full extraction failed: {}; selective fallback failed: {}",
-                            full_err,
-                            selective_err
-                        )
-                    })
-            })
-    }
+    sevenzip::extract_files_case_insensitive(archive_path, needed_paths, temp_dir)
+        .map(|_| ())
+        .or_else(|selective_err| {
+            warn!(
+                "Selective extraction failed for {}, falling back to full: {}",
+                archive_path.display(),
+                selective_err
+            );
+            sevenzip::extract_all_with_threads(archive_path, temp_dir, threads)
+                .map(|_| ())
+                .map_err(|full_err| {
+                    anyhow::anyhow!(
+                        "selective extraction failed: {}; full fallback failed: {}",
+                        selective_err,
+                        full_err
+                    )
+                })
+        })
 }
 
 /// Finalize staged files: reflink/copy to output, verify size, cleanup temp.

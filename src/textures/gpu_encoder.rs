@@ -208,7 +208,7 @@ impl GpuEncoder {
         }
 
         // BC7 requires dimensions to be multiples of 4
-        if width % 4 != 0 || height % 4 != 0 {
+        if !width.is_multiple_of(4) || !height.is_multiple_of(4) {
             anyhow::bail!(
                 "BC7 requires dimensions divisible by 4, got {}x{}",
                 width,
@@ -344,7 +344,7 @@ impl GpuEncoder {
             );
         }
 
-        if width % 4 != 0 || height % 4 != 0 {
+        if !width.is_multiple_of(4) || !height.is_multiple_of(4) {
             anyhow::bail!(
                 "BC6H requires dimensions divisible by 4, got {}x{}",
                 width,
@@ -484,7 +484,7 @@ impl GpuEncoder {
             );
         }
 
-        if width % 4 != 0 || height % 4 != 0 {
+        if !width.is_multiple_of(4) || !height.is_multiple_of(4) {
             anyhow::bail!(
                 "BC7 requires dimensions divisible by 4, got {}x{}",
                 width,

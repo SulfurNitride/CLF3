@@ -12,7 +12,6 @@
 pub mod config;
 pub mod config_cache;
 pub mod downloader;
-pub mod extract_strategy;
 pub mod handlers;
 pub mod processor;
 pub mod streaming;
@@ -49,6 +48,18 @@ fn log_phase_metrics(phase: &str, started: Instant) {
         phase, elapsed_ms, rss_kb
     );
 }
+
+#[cfg(target_os = "linux")]
+fn trim_allocator_rss(reason: &str) {
+    // Return free arena memory to the OS when large temporary allocations are dropped.
+    let released = unsafe { libc::malloc_trim(0) };
+    if released != 0 {
+        info!("malloc_trim released memory after {}", reason);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn trim_allocator_rss(_reason: &str) {}
 
 /// Installation statistics
 #[derive(Debug, Default, Clone)]
@@ -232,8 +243,6 @@ impl Installer {
     /// 5. Patch → 6. DDS Transform → 7. BSA Build → 8. Cleanup
     pub async fn run_streaming(
         &mut self,
-        _extraction_workers: usize,
-        _mover_workers: usize,
     ) -> Result<InstallStats> {
         let mut stats = InstallStats::default();
 
@@ -351,6 +360,7 @@ impl Installer {
             message: "Installing + patching files...".to_string(),
         });
         dp.install_phase()?;
+        trim_allocator_rss("install phase");
         log_phase_metrics("Install+Patch", install_start);
 
         // Check for install failures — abort early so user can fix and retry
@@ -369,6 +379,7 @@ impl Installer {
             phase: "DDS Transform".to_string(),
         });
         dp.texture_phase()?;
+        trim_allocator_rss("texture phase");
         log_phase_metrics("DDS Transform", dds_start);
 
         // === Phase 6: BSA Building ===
@@ -378,6 +389,7 @@ impl Installer {
             phase: "BSA Build".to_string(),
         });
         dp.bsa_phase()?;
+        trim_allocator_rss("bsa build phase");
         log_phase_metrics("BSA Build", bsa_start);
 
         // === Phase 7: Cleanup ===
@@ -387,6 +399,7 @@ impl Installer {
             phase: "Cleanup".to_string(),
         });
         dp.cleanup_phase()?;
+        trim_allocator_rss("cleanup phase");
         log_phase_metrics("Cleanup", cleanup_start);
 
         let process_stats = dp.finish();

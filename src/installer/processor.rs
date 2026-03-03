@@ -169,11 +169,10 @@ pub(crate) fn store_patched_output_in_cache(
 
     if cache_path.exists() {
         if let Ok(meta) = fs::metadata(&cache_path) {
-            if meta.len() == directive.size {
-                if verify_file_hash(&cache_path, &directive.hash).unwrap_or(false) {
+            if meta.len() == directive.size
+                && verify_file_hash(&cache_path, &directive.hash).unwrap_or(false) {
                     return Ok(());
                 }
-            }
         }
         let _ = fs::remove_file(&cache_path);
     }
@@ -1395,7 +1394,11 @@ impl<'a> DirectiveProcessor<'a> {
         let pb = self.make_progress_bar(install_total as u64);
 
         // FromArchive + PatchedFromArchive (fused streaming pipeline)
-        let streaming_config = super::streaming::StreamingConfig::default();
+        let streaming_config = super::streaming::StreamingConfig {
+            max_extract_workers: Some(self.ctx.config.max_install_workers),
+            max_parallel_7z_archives: Some(self.ctx.config.max_parallel_7z_archives),
+            max_parallel_bsa_archives: Some(self.ctx.config.max_parallel_bsa_archives),
+        };
         pb.set_message("Processing FromArchive + PatchedFromArchive (fused)...");
         self.reporter
             .phase_started("FromArchive+Patch", from_archive_count + patched_count);
@@ -1538,7 +1541,7 @@ impl<'a> DirectiveProcessor<'a> {
     /// Cleanup phase: extra files + BSA temp dirs
     pub fn cleanup_phase(&self) -> Result<()> {
         cleanup_extra_files(self.db, &self.ctx)?;
-        cleanup_bsa_temp_dirs(&self.ctx.config)?;
+        cleanup_bsa_temp_dirs(self.ctx.config)?;
         Ok(())
     }
 
@@ -1811,13 +1814,26 @@ pub(crate) fn preload_patch_blobs_by_name(
 
 /// Extract archive to temp dir on disk (for 7z/RAR that don't support random access).
 /// Only extracts files, doesn't read them into memory.
-fn extract_to_temp_disk(archive_path: &Path, _needed_paths: &[&str], temp_dir: &Path) -> Result<()> {
+fn extract_to_temp_disk(archive_path: &Path, needed_paths: &[&str], temp_dir: &Path) -> Result<()> {
     let archive_type = detect_archive_type(archive_path)?;
     match archive_type {
         ArchiveType::SevenZ | ArchiveType::Rar | ArchiveType::Unknown => {
-            crate::archive::sevenzip::extract_all(archive_path, temp_dir)
-                .map(|_| ())
-                .with_context(|| format!("Failed to extract: {}", archive_path.display()))
+            if needed_paths.is_empty() {
+                crate::archive::sevenzip::extract_all(archive_path, temp_dir)
+                    .map(|_| ())
+                    .with_context(|| format!("Failed to extract: {}", archive_path.display()))
+            } else {
+                let needed: Vec<String> = needed_paths.iter().map(|p| (*p).to_string()).collect();
+                crate::archive::sevenzip::extract_files_case_insensitive(archive_path, &needed, temp_dir)
+                    .map(|_| ())
+                    .with_context(|| {
+                        format!(
+                            "Failed to selectively extract {} files from {}",
+                            needed_paths.len(),
+                            archive_path.display()
+                        )
+                    })
+            }
         }
         _ => Ok(()),
     }
@@ -2041,9 +2057,19 @@ fn process_transformed_texture(
 
         // For 7z/RAR: extract entire archive to temp dir, then copy needed files to staging
         let temp_extract = if matches!(archive_type, ArchiveType::SevenZ | ArchiveType::Rar | ArchiveType::Unknown) {
+            let mut needed_paths = Vec::new();
+            let mut seen_paths = HashSet::new();
+            for (_, d) in &to_process {
+                if let Some(path) = d.archive_hash_path.get(1) {
+                    let normalized = paths::normalize_for_lookup(path);
+                    if seen_paths.insert(normalized) {
+                        needed_paths.push(path.as_str());
+                    }
+                }
+            }
             match tempfile::tempdir_in(&ctx.config.output_dir) {
                 Ok(td) => {
-                    if let Err(e) = extract_to_temp_disk(&archive_path, &[], td.path()) {
+                    if let Err(e) = extract_to_temp_disk(&archive_path, &needed_paths, td.path()) {
                         pb.println(format!("WARN: Failed to extract {}: {}", archive_name, e));
                     }
                     Some(td)
@@ -2064,7 +2090,7 @@ fn process_transformed_texture(
                         .insert(d.archive_hash_path[2].clone());
                 }
             }
-            for (bsa_path, _) in &needed_bsas {
+            for bsa_path in needed_bsas.keys() {
                 let bsa_data = if let Some(ref td) = temp_extract {
                     find_file_in_temp_dir(td.path(), bsa_path)
                         .and_then(|p| fs::read(&p).ok())
@@ -2196,7 +2222,7 @@ fn process_transformed_texture(
                     Ok(processed) => {
                         let output_path = ctx.resolve_output_path(&st.directive.to);
                         if let Err(e) = paths::ensure_parent_dirs(&output_path)
-                            .and_then(|_| fs::write(&output_path, &processed.data).map_err(|e| e.into()))
+                            .and_then(|_| fs::write(&output_path, &processed.data))
                         {
                             failed.fetch_add(1, Ordering::Relaxed);
                             failure_tracker.record_failure("texture", &e.to_string());
@@ -2294,57 +2320,64 @@ fn process_create_bsa(
         )
         .collect();
 
-    // Sort by file count (smallest first) for faster progress feedback
+    // Sort by file count (smallest first) for faster feedback.
     directives.sort_by_key(|(_, d)| d.file_states.len());
 
+    let workers = ctx.config.max_parallel_bsa_archives.max(1);
     eprintln!(
-        "Processing {} BSA/BA2 archives sequentially (full CPU per archive)",
-        directives.len()
+        "Processing {} BSA/BA2 archives with {} worker(s)",
+        directives.len(),
+        workers
     );
 
-    // Process ALL BSAs sequentially — one at a time with full CPU usage.
-    // Each BSA build uses rayon internally for parallel compression,
-    // so running multiple concurrently causes RAM spikes.
-    for (id, directive) in directives {
-        if handlers::output_bsa_valid(ctx, &directive) {
-            skipped.fetch_add(1, Ordering::Relaxed);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .thread_name(|i| format!("bsa-build-{}", i))
+        .build()
+        .context("Failed to build BSA creation thread pool")?;
+
+    pool.install(|| {
+        directives.into_par_iter().for_each(|(id, directive)| {
+            if handlers::output_bsa_valid(ctx, &directive) {
+                skipped.fetch_add(1, Ordering::Relaxed);
+                pb.inc(1);
+                reporter.directive_completed();
+                return;
+            }
+
+            let bsa_name = std::path::Path::new(&directive.to)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| directive.to.clone());
+
+            let archive_type = match &directive.state {
+                crate::modlist::BSAState::BSA(_) => "BSA",
+                crate::modlist::BSAState::BA2(_) => "BA2",
+            };
+
+            match handlers::handle_create_bsa(ctx, &directive) {
+                Ok(()) => {
+                    completed.fetch_add(1, Ordering::Relaxed);
+                    pb.println(format!(
+                        "Created {}: {} ({} files)",
+                        archive_type,
+                        bsa_name,
+                        directive.file_states.len()
+                    ));
+                }
+                Err(e) => {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    pb.println(format!(
+                        "FAIL [{}] create {} {}: {:#}",
+                        id, archive_type, bsa_name, e
+                    ));
+                }
+            }
+
             pb.inc(1);
             reporter.directive_completed();
-            continue;
-        }
-
-        let bsa_name = std::path::Path::new(&directive.to)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| directive.to.clone());
-
-        let archive_type = match &directive.state {
-            crate::modlist::BSAState::BSA(_) => "BSA",
-            crate::modlist::BSAState::BA2(_) => "BA2",
-        };
-
-        pb.set_message(format!(
-            "{} ({} files)",
-            bsa_name,
-            directive.file_states.len()
-        ));
-
-        match handlers::handle_create_bsa(ctx, &directive) {
-            Ok(()) => {
-                completed.fetch_add(1, Ordering::Relaxed);
-                pb.println(format!("Created {}: {}", archive_type, bsa_name));
-            }
-            Err(e) => {
-                failed.fetch_add(1, Ordering::Relaxed);
-                pb.println(format!(
-                    "FAIL [{}] create {} {}: {:#}",
-                    id, archive_type, bsa_name, e
-                ));
-            }
-        }
-        pb.inc(1);
-        reporter.directive_completed();
-    }
+        });
+    });
 
     Ok(())
 }

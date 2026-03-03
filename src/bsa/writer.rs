@@ -438,8 +438,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let f1 = dir.path().join("test.dds");
         let f2 = dir.path().join("test2.dds");
-        fs::write(&f1, &[1, 2, 3]).unwrap();
-        fs::write(&f2, &[4, 5, 6]).unwrap();
+        fs::write(&f1, [1, 2, 3]).unwrap();
+        fs::write(&f2, [4, 5, 6]).unwrap();
 
         let mut builder = BsaBuilder::new();
         builder.add_file("textures/test.dds", f1);

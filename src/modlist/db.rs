@@ -391,7 +391,8 @@ impl ModlistDb {
     ) -> Result<Vec<(i64, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, data_json FROM directives
-             WHERE directive_type = ?1 AND status = 'pending'",
+             WHERE directive_type = ?1 AND status = 'pending'
+             ORDER BY id ASC",
         )?;
 
         let rows = stmt.query_map([directive_type], |row| {

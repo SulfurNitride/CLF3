@@ -847,7 +847,7 @@ fn process_bc7_batch_gpu(
     // Phase 1: Prepare all textures on CPU in parallel (decode + resize + generate mips)
     let prepared: Vec<Result<PreparedBc7Texture>> = jobs
         .par_iter()
-        .map(|job| prepare_bc7_texture(job))
+        .map(prepare_bc7_texture)
         .collect();
 
     // Separate successful preparations from failures

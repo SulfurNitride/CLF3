@@ -454,13 +454,11 @@ where
     // Read any remaining stderr
     if let Some(stderr) = stderr {
         let reader = BufReader::new(stderr);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    warn!("[TTW] {}", trimmed);
-                    progress_callback(&format!("Warning: {}", trimmed));
-                }
+        for line in reader.lines().flatten() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                warn!("[TTW] {}", trimmed);
+                progress_callback(&format!("Warning: {}", trimmed));
             }
         }
     }

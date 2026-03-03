@@ -129,9 +129,7 @@ fn fix_single_ini_file(path: &Path, gpu_name: &str) -> Result<bool> {
         // Check for sD3DDevice= (case insensitive)
         if trimmed.to_lowercase().starts_with("sd3ddevice=") {
             // Extract current value
-            let current_value = trimmed
-                .splitn(2, '=')
-                .nth(1)
+            let current_value = trimmed.split_once('=').map(|x| x.1)
                 .unwrap_or("")
                 .trim()
                 .trim_matches('"');
@@ -139,7 +137,7 @@ fn fix_single_ini_file(path: &Path, gpu_name: &str) -> Result<bool> {
             // Check if it needs updating
             if current_value != gpu_name {
                 // Preserve the original key casing
-                let key = trimmed.splitn(2, '=').next().unwrap_or("sD3DDevice");
+                let key = trimmed.split('=').next().unwrap_or("sD3DDevice");
                 let new_line = format!("{}={}", key, gpu_name);
 
                 info!("  {} : {} -> {}", path.display(), current_value, gpu_name);

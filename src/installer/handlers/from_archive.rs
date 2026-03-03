@@ -303,7 +303,7 @@ mod tests {
             0x00, 0x00, // File name length
             0x00, 0x00, // Extra field length
         ];
-        fs::write(&zip_path, &zip_data)?;
+        fs::write(&zip_path, zip_data)?;
 
         assert_eq!(detect_archive_type(&zip_path)?, ArchiveType::Zip);
         Ok(())
@@ -316,7 +316,7 @@ mod tests {
 
         // 7z files start with 7z\xBC\xAF\x27\x1C
         let sz_data = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0x00, 0x00];
-        fs::write(&sz_path, &sz_data)?;
+        fs::write(&sz_path, sz_data)?;
 
         assert_eq!(detect_archive_type(&sz_path)?, ArchiveType::SevenZ);
         Ok(())
@@ -329,7 +329,7 @@ mod tests {
 
         // RAR files start with Rar!
         let rar_data = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00, 0x00];
-        fs::write(&rar_path, &rar_data)?;
+        fs::write(&rar_path, rar_data)?;
 
         assert_eq!(detect_archive_type(&rar_path)?, ArchiveType::Rar);
         Ok(())
@@ -342,7 +342,7 @@ mod tests {
 
         // TES4 BSA files start with BSA\x00
         let bsa_data = [0x42, 0x53, 0x41, 0x00, 0x68, 0x00, 0x00, 0x00];
-        fs::write(&bsa_path, &bsa_data)?;
+        fs::write(&bsa_path, bsa_data)?;
 
         assert_eq!(detect_archive_type(&bsa_path)?, ArchiveType::Bsa);
         Ok(())
@@ -360,7 +360,7 @@ mod tests {
             0x0C, 0x00, 0x00, 0x00, // Hash offset (12 = header size for empty archive)
             0x00, 0x00, 0x00, 0x00, // File count (0)
         ];
-        fs::write(&bsa_path, &bsa_data)?;
+        fs::write(&bsa_path, bsa_data)?;
 
         assert_eq!(detect_archive_type(&bsa_path)?, ArchiveType::Tes3Bsa);
         Ok(())
@@ -373,7 +373,7 @@ mod tests {
 
         // BA2 files start with BTDX
         let ba2_data = [0x42, 0x54, 0x44, 0x58, 0x01, 0x00, 0x00, 0x00];
-        fs::write(&ba2_path, &ba2_data)?;
+        fs::write(&ba2_path, ba2_data)?;
 
         assert_eq!(detect_archive_type(&ba2_path)?, ArchiveType::Ba2);
         Ok(())
@@ -386,7 +386,7 @@ mod tests {
         // Create a file with ZIP magic but .rar extension
         let fake_rar_path = dir.path().join("mislabeled.rar");
         let zip_data = [0x50, 0x4B, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00];
-        fs::write(&fake_rar_path, &zip_data)?;
+        fs::write(&fake_rar_path, zip_data)?;
 
         // Magic byte detection should identify it as ZIP despite .rar extension
         assert_eq!(detect_archive_type(&fake_rar_path)?, ArchiveType::Zip);
