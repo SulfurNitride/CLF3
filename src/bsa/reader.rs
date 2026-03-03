@@ -261,14 +261,19 @@ where
     // Phase 1: Collect matching file references (fast, no decompression)
     let mut entries: Vec<(String, &BsaFile)> = Vec::new();
     for (dir_key, folder) in archive.iter() {
-        let dir_name = String::from_utf8_lossy(dir_key.name().as_bytes()).to_lowercase();
+        let dir_name = String::from_utf8_lossy(dir_key.name().as_bytes())
+            .to_lowercase()
+            .replace('\\', "/");
 
         for (file_key, file) in folder.iter() {
-            let file_name = String::from_utf8_lossy(file_key.name().as_bytes()).to_lowercase();
+            let file_name = String::from_utf8_lossy(file_key.name().as_bytes())
+                .to_lowercase()
+                .replace('\\', "/");
+            // wanted-set uses lowercase forward-slash paths.
             let full_path = if dir_name.is_empty() || dir_name == "." {
                 file_name.clone()
             } else {
-                format!("{}\\{}", dir_name, file_name)
+                format!("{}/{}", dir_name, file_name)
             };
 
             if wanted.contains(&full_path) {

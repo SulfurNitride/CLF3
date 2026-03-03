@@ -93,6 +93,7 @@ enum ArchiveDirective {
     Patched {
         id: i64,
         directive: PatchedFromArchiveDirective,
+        resolved_path: Option<String>,
     },
 }
 
@@ -315,10 +316,20 @@ pub fn process_fused_streaming(
                 }
 
                 if let Some(hash) = d.archive_hash_path.first() {
+                    let resolved_path = if d.archive_hash_path.len() >= 2 {
+                        let requested_path = &d.archive_hash_path[1];
+                        db.lookup_archive_file(hash, requested_path).ok().flatten()
+                    } else {
+                        None
+                    };
                     by_archive
                         .entry(hash.clone())
                         .or_default()
-                        .push(ArchiveDirective::Patched { id, directive: d });
+                        .push(ArchiveDirective::Patched {
+                            id,
+                            directive: d,
+                            resolved_path,
+                        });
                 }
             }
             _ => {
@@ -726,7 +737,11 @@ pub fn process_fused_streaming(
                         let bsa_patched: Vec<(i64, &PatchedFromArchiveDirective)> = directives
                             .iter()
                             .filter_map(|d| match d {
-                                ArchiveDirective::Patched { id, directive } => {
+                                ArchiveDirective::Patched {
+                                    id,
+                                    directive,
+                                    resolved_path: _,
+                                } => {
                                     Some((*id, directive))
                                 }
                                 _ => None,
@@ -1244,7 +1259,8 @@ fn process_single_archive_fused(
     // Separate directive types
     let mut from_simple: Vec<(i64, &FromArchiveDirective, Option<&str>)> = Vec::new();
     let mut from_nested: Vec<(i64, &FromArchiveDirective, Option<&str>, &str)> = Vec::new();
-    let mut patched_directives: Vec<(i64, &PatchedFromArchiveDirective)> = Vec::new();
+    let mut patched_directives: Vec<(i64, &PatchedFromArchiveDirective, Option<&str>)> =
+        Vec::new();
 
     for d in directives {
         match d {
@@ -1261,18 +1277,23 @@ fn process_single_archive_fused(
                     from_simple.push((*id, directive, resolved));
                 }
             }
-            ArchiveDirective::Patched { id, directive } => {
-                patched_directives.push((*id, directive));
+            ArchiveDirective::Patched {
+                id,
+                directive,
+                resolved_path,
+            } => {
+                patched_directives.push((*id, directive, resolved_path.as_deref()));
             }
         }
     }
 
     // Filter patched directives: check cache and existing outputs first
-    let mut patched_to_process: Vec<(i64, &PatchedFromArchiveDirective)> = Vec::new();
+    let mut patched_to_process: Vec<(i64, &PatchedFromArchiveDirective, Option<&str>)> =
+        Vec::new();
     let mut patched_skipped = 0usize;
     let mut patched_cache_completed = 0usize;
 
-    for (id, directive) in &patched_directives {
+    for (id, directive, resolved_path) in &patched_directives {
         if output_exists(ctx, &directive.to, directive.size) {
             patched_skipped += 1;
             continue;
@@ -1292,14 +1313,14 @@ fn process_single_archive_fused(
             }
         }
 
-        patched_to_process.push((*id, directive));
+        patched_to_process.push((*id, directive, *resolved_path));
     }
 
     // Build verified local basis for patched directives
     let mut verified_local_basis: HashMap<String, PathBuf> = HashMap::new();
     let mut needs_extraction: Vec<(i64, &PatchedFromArchiveDirective)> = Vec::new();
 
-    for (id, directive) in &patched_to_process {
+    for (id, directive, _) in &patched_to_process {
         let basis_key =
             build_patch_basis_key_from_archive_hash_path(&directive.archive_hash_path);
         if let Some(key) = basis_key.as_deref() {
@@ -1341,7 +1362,7 @@ fn process_single_archive_fused(
     }
 
     // For patched directives, include their source paths (unless served by local basis)
-    for (_, directive) in &patched_to_process {
+    for (_, directive, resolved_path) in &patched_to_process {
         let basis_key =
             build_patch_basis_key_from_archive_hash_path(&directive.archive_hash_path);
         if basis_key
@@ -1352,9 +1373,11 @@ fn process_single_archive_fused(
         }
 
         if directive.archive_hash_path.len() >= 2 {
-            let path = &directive.archive_hash_path[1];
+            let path = resolved_path
+                .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
+                .unwrap_or("");
             if seen_needed.insert(normalize_archive_lookup_path(path)) {
-                needed_paths.push(path.clone());
+                needed_paths.push(path.to_string());
             }
         }
     }
@@ -1385,7 +1408,7 @@ fn process_single_archive_fused(
             if preload_enabled {
                 let patch_names: HashSet<String> = patched_to_process
                     .iter()
-                    .map(|(_, d)| d.patch_id.to_string())
+                    .map(|(_, d, _)| d.patch_id.to_string())
                     .collect();
                 preload_patch_blobs_by_name(&wabbajack_path, &patch_names).unwrap_or_else(|e| {
                     debug!("Patch preload failed (falling back to shared reader): {}", e);
@@ -1423,7 +1446,7 @@ fn process_single_archive_fused(
         // Collect needed files grouped by their BSA/BA2 container path
         let mut by_bsa_container: HashMap<PathBuf, Vec<(String, String)>> = HashMap::new();
 
-        for (_, directive) in &patched_to_process {
+        for (_, directive, resolved_path) in &patched_to_process {
             if directive.archive_hash_path.len() < 3 {
                 continue;
             }
@@ -1436,7 +1459,9 @@ fn process_single_archive_fused(
                 continue;
             }
 
-            let bsa_path = &directive.archive_hash_path[1];
+            let bsa_path = resolved_path
+                .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
+                .unwrap_or("");
             let file_in_bsa = &directive.archive_hash_path[2];
             let combined_key = format!("{}/{}", bsa_path, file_in_bsa);
             let combined_normalized = paths::normalize_for_lookup(&combined_key);
@@ -1648,13 +1673,14 @@ fn process_single_archive_fused(
     // Use parallel processing for patch application
     let patch_results: Vec<_> = patched_to_process
         .par_iter()
-        .map(|(id, directive)| {
+        .map(|(id, directive, resolved_path)| {
             let patch_name = directive.patch_id.to_string();
             let preloaded_delta = preloaded_patches.get(&patch_name).map(|v| v.as_slice());
 
             // Find source path
             let source_path = resolve_patch_source(
                 directive,
+                *resolved_path,
                 &verified_local_basis,
                 &extracted_map,
                 archive_path,
@@ -1728,6 +1754,7 @@ fn process_single_archive_fused(
 /// Priority: verified local basis → extracted file map → archive itself (len==1)
 fn resolve_patch_source(
     directive: &PatchedFromArchiveDirective,
+    resolved_path: Option<&str>,
     verified_local_basis: &HashMap<String, PathBuf>,
     extracted_map: &HashMap<String, PathBuf>,
     archive_path: &Path,
@@ -1747,7 +1774,9 @@ fn resolve_patch_source(
     }
 
     if directive.archive_hash_path.len() == 2 {
-        let path = &directive.archive_hash_path[1];
+        let path = resolved_path
+            .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
+            .unwrap_or("");
         let normalized = normalize_archive_lookup_path(path);
         return extracted_map
             .get(&normalized)
@@ -1756,7 +1785,9 @@ fn resolve_patch_source(
     }
 
     if directive.archive_hash_path.len() >= 3 {
-        let bsa_path = &directive.archive_hash_path[1];
+        let bsa_path = resolved_path
+            .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
+            .unwrap_or("");
         let file_in_bsa = &directive.archive_hash_path[2];
         // Try combined key first (inserted by nested BSA extraction above)
         for bsa_candidate in archive_lookup_candidates(bsa_path) {
