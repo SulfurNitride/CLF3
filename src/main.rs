@@ -6,6 +6,7 @@
 mod archive;
 mod bsa;
 mod downloaders;
+mod error;
 mod hash;
 mod installer;
 mod modlist;
@@ -140,7 +141,15 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(e) = run().await {
+        let (message, exit_code) = error::format_anyhow_error(&e, std::env::var("RUST_LOG").is_ok());
+        eprintln!("{}", message);
+        std::process::exit(exit_code);
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // Set up file logging (always enabled) next to the executable

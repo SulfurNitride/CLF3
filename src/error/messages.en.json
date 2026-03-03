@@ -1,0 +1,156 @@
+{
+  "version": "1.0.0",
+  "language": "en",
+  "messages": [
+    {
+      "errorCode": "NETWORK_CONNECTION_FAILED",
+      "userMessage": "Unable to connect to the server",
+      "troubleshooting": [
+        "Check your internet connection",
+        "Verify the server address is correct",
+        "Try again later if the server may be down"
+      ],
+      "isRetryable": true
+    },
+    {
+      "errorCode": "NETWORK_TIMEOUT",
+      "userMessage": "The request took too long to complete",
+      "troubleshooting": [
+        "Check your internet connection speed",
+        "Try again - this may be a temporary issue",
+        "If the problem persists, the server may be busy"
+      ],
+      "isRetryable": true
+    },
+    {
+      "errorCode": "NETWORK_DNS_ERROR",
+      "userMessage": "Could not find the server address",
+      "troubleshooting": [
+        "Check that the URL is spelled correctly",
+        "Verify your DNS settings are correct",
+        "Try using a different DNS server"
+      ],
+      "isRetryable": false
+    },
+    {
+      "errorCode": "FS_FILE_NOT_FOUND",
+      "userMessage": "The requested file could not be found",
+      "troubleshooting": [
+        "Verify the file path is correct",
+        "Check if the file was moved or deleted",
+        "Use 'ls' to verify the file exists"
+      ],
+      "isRetryable": false
+    },
+    {
+      "errorCode": "FS_PERMISSION_DENIED",
+      "userMessage": "You don't have permission to access this file or folder",
+      "troubleshooting": [
+        "Check file permissions with: ls -la",
+        "Verify you have read/write access to the location",
+        "Try running with elevated permissions if needed"
+      ],
+      "isRetryable": false
+    },
+    {
+      "errorCode": "FS_DISK_FULL",
+      "userMessage": "Not enough disk space available",
+      "troubleshooting": [
+        "Free up space on your disk",
+        "Delete temporary files or old installations",
+        "Choose a different location with more space"
+      ],
+      "isRetryable": false
+    },
+    {
+      "errorCode": "CONFIG_INVALID",
+      "userMessage": "The configuration file contains invalid settings",
+      "troubleshooting": [
+        "Check the configuration file for typos",
+        "Verify all required settings are present",
+        "Use the default configuration as a reference"
+      ],
+      "isRetryable": false
+    },
+    {
+      "errorCode": "CONFIG_MISSING_KEY",
+      "userMessage": "A required configuration setting is missing",
+      "troubleshooting": [
+        "Add the missing key to your configuration file",
+        "Check the documentation for required settings",
+        "Use 'clf3 init' to create a new configuration"
+      ],
+      "isRetryable": false
+    },
+    {
+      "errorCode": "AUTH_LOGIN_FAILED",
+      "userMessage": "Login failed - incorrect username or password",
+      "troubleshooting": [
+        "Verify your username and password are correct",
+        "Check if your account is locked",
+        "Reset your password if you've forgotten it"
+      ],
+      "isRetryable": false
+    },
+    {
+      "errorCode": "AUTH_TOKEN_EXPIRED",
+      "userMessage": "Your session has expired",
+      "troubleshooting": [
+        "Log in again to start a new session",
+        "Check if your account is still active",
+        "Contact support if the problem persists"
+      ],
+      "isRetryable": true
+    },
+    {
+      "errorCode": "ARCHIVE_CORRUPT",
+      "userMessage": "The archive file appears to be damaged",
+      "troubleshooting": [
+        "Download the file again",
+        "Verify the file checksum if available",
+        "Try extracting with a different tool"
+      ],
+      "isRetryable": false
+    },
+    {
+      "errorCode": "ARCHIVE_UNSUPPORTED",
+      "userMessage": "This archive format is not supported",
+      "troubleshooting": [
+        "Verify the file is a supported archive format",
+        "Check the documentation for supported formats",
+        "Convert the archive to a supported format"
+      ],
+      "isRetryable": false
+    },
+    {
+      "errorCode": "INSTALL_DISK_SPACE",
+      "userMessage": "Not enough space to complete installation",
+      "troubleshooting": [
+        "Free up at least the required amount of space",
+        "Choose a different installation location",
+        "Remove unused programs or files"
+      ],
+      "isRetryable": false
+    },
+    {
+      "errorCode": "INSTALL_FILE_LOCKED",
+      "userMessage": "A file is in use and cannot be modified",
+      "troubleshooting": [
+        "Close any programs that may be using the file",
+        "Restart your computer if necessary",
+        "Try again once the file is available"
+      ],
+      "isRetryable": true
+    },
+    {
+      "errorCode": "GENERAL_UNKNOWN",
+      "userMessage": "An unexpected error occurred",
+      "troubleshooting": [
+        "Try running the command again",
+        "Check the logs for more details",
+        "Report this issue if it persists"
+      ],
+      "isRetryable": true
+    }
+  ]
+}

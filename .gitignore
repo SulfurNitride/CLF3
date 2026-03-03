@@ -1,6 +1,24 @@
+# Rust build outputs
 /target
 /bin
 /release
+/debug
+
+# Rust artifacts
+*.rs.bk
+*.rlib
+*.prof*
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Environment
+*.log
+.env*
+
+# Database
 *.db
 *.db-journal
 
