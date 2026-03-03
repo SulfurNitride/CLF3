@@ -1445,8 +1445,7 @@ fn process_single_archive_fused(
                 continue;
             }
 
-            let bsa_normalized = normalize_archive_lookup_path(bsa_path);
-            if let Some(disk_path) = extracted_map.get(&bsa_normalized) {
+            if let Some(disk_path) = find_archive_in_extracted_map(&extracted_map, bsa_path) {
                 by_bsa_container
                     .entry(disk_path.clone())
                     .or_default()
@@ -1760,10 +1759,12 @@ fn resolve_patch_source(
         let bsa_path = &directive.archive_hash_path[1];
         let file_in_bsa = &directive.archive_hash_path[2];
         // Try combined key first (inserted by nested BSA extraction above)
-        let combined_key = format!("{}/{}", bsa_path, file_in_bsa);
-        let combined_normalized = paths::normalize_for_lookup(&combined_key);
-        if let Some(path) = extracted_map.get(&combined_normalized) {
-            return Ok(path.clone());
+        for bsa_candidate in archive_lookup_candidates(bsa_path) {
+            let combined_key = format!("{}/{}", bsa_candidate, file_in_bsa);
+            let combined_normalized = paths::normalize_for_lookup(&combined_key);
+            if let Some(path) = extracted_map.get(&combined_normalized) {
+                return Ok(path.clone());
+            }
         }
         // Also try just the inner file path (in case it was extracted differently)
         let inner_normalized = normalize_archive_lookup_path(file_in_bsa);
@@ -1986,9 +1987,7 @@ fn process_nested_bsa_directives_staged(
     let results = std::sync::Mutex::new(Vec::new());
 
     for (archive_path_in_outer, directives) in by_archive {
-        let normalized_archive = normalize_archive_lookup_path(&archive_path_in_outer);
-
-        let archive_disk_path = match extracted_map.get(&normalized_archive) {
+        let archive_disk_path = match find_archive_in_extracted_map(extracted_map, &archive_path_in_outer) {
             Some(p) => p.clone(),
             None => {
                 for (id, _, _) in &directives {
@@ -2214,6 +2213,45 @@ fn process_nested_bsa_directives_staged(
 
 fn normalize_archive_lookup_path(path: &str) -> String {
     paths::normalize_for_lookup(path)
+}
+
+fn archive_lookup_candidates(path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    let normalized = normalize_archive_lookup_path(path);
+    if seen.insert(normalized.clone()) {
+        out.push(normalized.clone());
+    }
+
+    let trimmed = normalized
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string();
+    if seen.insert(trimmed.clone()) {
+        out.push(trimmed.clone());
+    }
+
+    if let Some(stripped) = trimmed.strip_prefix("data/") {
+        let stripped = stripped.to_string();
+        if seen.insert(stripped.clone()) {
+            out.push(stripped);
+        }
+    }
+
+    out
+}
+
+fn find_archive_in_extracted_map<'a>(
+    extracted_map: &'a HashMap<String, PathBuf>,
+    archive_path: &str,
+) -> Option<&'a PathBuf> {
+    for candidate in archive_lookup_candidates(archive_path) {
+        if let Some(path) = extracted_map.get(&candidate) {
+            return Some(path);
+        }
+    }
+    None
 }
 
 /// Truncate a name to max_len characters, adding "..." if needed.

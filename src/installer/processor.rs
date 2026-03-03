@@ -2325,59 +2325,57 @@ fn process_create_bsa(
 
     let workers = ctx.config.max_parallel_bsa_archives.max(1);
     eprintln!(
-        "Processing {} BSA/BA2 archives with {} worker(s)",
+        "Processing {} BSA/BA2 archives one-at-a-time (configured workers: {}, inner compression stays fully threaded)",
         directives.len(),
         workers
     );
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(workers)
-        .thread_name(|i| format!("bsa-build-{}", i))
-        .build()
-        .context("Failed to build BSA creation thread pool")?;
-
-    pool.install(|| {
-        directives.into_par_iter().for_each(|(id, directive)| {
-            if handlers::output_bsa_valid(ctx, &directive) {
-                skipped.fetch_add(1, Ordering::Relaxed);
-                pb.inc(1);
-                reporter.directive_completed();
-                return;
-            }
-
-            let bsa_name = std::path::Path::new(&directive.to)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| directive.to.clone());
-
-            let archive_type = match &directive.state {
-                crate::modlist::BSAState::BSA(_) => "BSA",
-                crate::modlist::BSAState::BA2(_) => "BA2",
-            };
-
-            match handlers::handle_create_bsa(ctx, &directive) {
-                Ok(()) => {
-                    completed.fetch_add(1, Ordering::Relaxed);
-                    pb.println(format!(
-                        "Created {}: {} ({} files)",
-                        archive_type,
-                        bsa_name,
-                        directive.file_states.len()
-                    ));
-                }
-                Err(e) => {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    pb.println(format!(
-                        "FAIL [{}] create {} {}: {:#}",
-                        id, archive_type, bsa_name, e
-                    ));
-                }
-            }
-
+    let process_one = |id: i64, directive: CreateBSADirective| {
+        if handlers::output_bsa_valid(ctx, &directive) {
+            skipped.fetch_add(1, Ordering::Relaxed);
             pb.inc(1);
             reporter.directive_completed();
-        });
-    });
+            return;
+        }
+
+        let bsa_name = std::path::Path::new(&directive.to)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| directive.to.clone());
+
+        let archive_type = match &directive.state {
+            crate::modlist::BSAState::BSA(_) => "BSA",
+            crate::modlist::BSAState::BA2(_) => "BA2",
+        };
+
+        match handlers::handle_create_bsa(ctx, &directive) {
+            Ok(()) => {
+                completed.fetch_add(1, Ordering::Relaxed);
+                pb.println(format!(
+                    "Created {}: {} ({} files)",
+                    archive_type,
+                    bsa_name,
+                    directive.file_states.len()
+                ));
+            }
+            Err(e) => {
+                failed.fetch_add(1, Ordering::Relaxed);
+                pb.println(format!(
+                    "FAIL [{}] create {} {}: {:#}",
+                    id, archive_type, bsa_name, e
+                ));
+            }
+        }
+
+        pb.inc(1);
+        reporter.directive_completed();
+    };
+
+    // Always process one archive at a time. This avoids nested rayon pool throttling
+    // while still letting BSA/BA2 builders use full parallelism internally.
+    for (id, directive) in directives {
+        process_one(id, directive);
+    }
 
     Ok(())
 }
