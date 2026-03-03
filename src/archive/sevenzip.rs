@@ -899,8 +899,8 @@ fn extract_file_7z_binary(archive_path: &Path, file_path: &str) -> Result<Vec<u8
         .arg("-y")
         .arg("-spd")
         .arg("-scsUTF-8")
-        // Use two 7z worker threads per process for better CPU utilization.
-        .arg("-mmt=2")
+        // Use one 7z worker thread per process.
+        .arg("-mmt=1")
         .arg(archive_path)
         .arg(&normalized_path)
         .output()
@@ -956,8 +956,8 @@ fn extract_files_7z_binary(archive_path: &Path, files: &[&str], output_dir: &Pat
         .arg("-y")
         .arg("-aoa")
         .arg("-scsUTF-8")
-        // Use two 7z worker threads per process for better CPU utilization.
-        .arg("-mmt=2")
+        // Use one 7z worker thread per process.
+        .arg("-mmt=1")
         .arg(format!("-o{}", output_dir.display()))
         .arg(archive_path)
         .arg("--");
@@ -978,7 +978,7 @@ fn extract_files_7z_binary(archive_path: &Path, files: &[&str], output_dir: &Pat
         if !reparse_paths.is_empty() {
             let mut retry = Command::new(&sz_path);
             retry.arg("x").arg("-y").arg("-aoa").arg("-scsUTF-8")
-                .arg("-mmt=2")
+                .arg("-mmt=1")
                 .arg(format!("-o{}", output_dir.display()));
 
             for path in &reparse_paths {
