@@ -128,6 +128,10 @@ pub struct StreamingStats {
     pub written: usize,
     pub skipped: usize,
     pub failed: usize,
+    /// Archive hashes that had extraction/finalization failures.
+    /// Re-verified after extraction; corrupted ones are marked for re-download.
+    #[allow(dead_code)] // Available for callers to inspect
+    pub failed_archive_hashes: Vec<String>,
 }
 
 /// Get the large archive threshold based on system RAM.
@@ -472,6 +476,8 @@ pub fn process_fused_streaming(
     let failed = Arc::new(AtomicUsize::new(0));
     let logged_failures = Arc::new(AtomicUsize::new(0));
     let completed_archives = Arc::new(AtomicUsize::new(0));
+    let failed_archive_hashes: Arc<std::sync::Mutex<HashSet<String>>> =
+        Arc::new(std::sync::Mutex::new(HashSet::new()));
 
     // Multi-progress display: overall bar + per-archive spinner bars
     let mp = MultiProgress::new();
@@ -746,7 +752,8 @@ pub fn process_fused_streaming(
                                adjusted_callback: &Option<ProgressCallback>,
                                dds_tx: &std::sync::mpsc::SyncSender<DdsJob>,
                                tex_d2: &HashMap<String, TextureLookupInner>,
-                               tex_d3: &HashMap<String, NestedTextureLookupInner>| {
+                               tex_d3: &HashMap<String, NestedTextureLookupInner>,
+                               failed_archive_hashes: &std::sync::Mutex<HashSet<String>>| {
             let archive_name = archive_path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -792,6 +799,12 @@ pub fn process_fused_streaming(
                     skipped.fetch_add(archive_result.skipped_count, Ordering::Relaxed);
                     failed.fetch_add(archive_result.failed_count, Ordering::Relaxed);
 
+                    if archive_result.failed_count > 0 {
+                        failed_archive_hashes
+                            .lock().expect("failed hashes lock")
+                            .insert(archive_hash.clone());
+                    }
+
                     if let Some(d2) = tex_d2.get(archive_hash) {
                         if !d2.is_empty() {
                             extract_textures_from_temp_dir(
@@ -826,6 +839,12 @@ pub fn process_fused_streaming(
                     written.fetch_add(fin_stats.written, Ordering::Relaxed);
                     skipped.fetch_add(fin_stats.skipped, Ordering::Relaxed);
                     failed.fetch_add(fin_stats.failed, Ordering::Relaxed);
+
+                    if fin_stats.failed > 0 {
+                        failed_archive_hashes
+                            .lock().expect("failed hashes lock")
+                            .insert(archive_hash.clone());
+                    }
                 }
                 Err(e) => {
                     let count = logged_failures.fetch_add(1, Ordering::Relaxed);
@@ -833,6 +852,9 @@ pub fn process_fused_streaming(
                         error!("FAIL: Archive {}: {:#}", archive_name, e);
                     }
                     failed.fetch_add(directives.len(), Ordering::Relaxed);
+                    failed_archive_hashes
+                        .lock().expect("failed hashes lock")
+                        .insert(archive_hash.clone());
                 }
             }
 
@@ -865,6 +887,7 @@ pub fn process_fused_streaming(
             let tex_d2 = ext_tex_d2.clone();
             let tex_d3 = ext_tex_d3.clone();
             let gate = lzma2_gate.clone();
+            let failed_hashes = failed_archive_hashes.clone();
             thread_scope.spawn(move || {
                 sevenzip_pool.scope(|s| {
                     for (archive_hash, directives, archive_path, _kind) in &sevenzip_archives {
@@ -882,6 +905,7 @@ pub fn process_fused_streaming(
                         let tex_d2 = &tex_d2;
                         let tex_d3 = &tex_d3;
                         let gate = &gate;
+                        let failed_hashes = &failed_hashes;
 
                         s.spawn(move |_| {
                             // Acquire gate slot
@@ -900,6 +924,7 @@ pub fn process_fused_streaming(
                                 logged_failures, completed_archives,
                                 overall_pb, archive_bar_style, mp,
                                 adjusted_callback, dds_tx, tex_d2, tex_d3,
+                                failed_hashes,
                             );
 
                             // Release gate slot
@@ -927,6 +952,7 @@ pub fn process_fused_streaming(
             let mp = mp.clone();
             let archive_bar_style = archive_bar_style.clone();
             let adjusted_callback = adjusted_callback.clone();
+            let failed_hashes = failed_archive_hashes.clone();
             thread_scope.spawn(move || {
                 let dds_tx = extract_dds_tx;
                 let tex_d2 = ext_tex_d2;
@@ -946,6 +972,7 @@ pub fn process_fused_streaming(
                         let dds_tx = &dds_tx;
                         let tex_d2 = &tex_d2;
                         let tex_d3 = &tex_d3;
+                        let failed_hashes = &failed_hashes;
 
                         s.spawn(move |_| {
                             process_archive(
@@ -954,6 +981,7 @@ pub fn process_fused_streaming(
                                 logged_failures, completed_archives,
                                 overall_pb, archive_bar_style, mp,
                                 adjusted_callback, dds_tx, tex_d2, tex_d3,
+                                failed_hashes,
                             );
                         });
                     }
@@ -1091,11 +1119,75 @@ pub fn process_fused_streaming(
         eprintln!("DDS processing complete: {} OK, {} failed", ok, fail);
     }
 
+    // Re-verify archives that had extraction failures — detect corrupted downloads.
+    let bad_hashes = failed_archive_hashes
+        .lock()
+        .expect("failed hashes lock")
+        .clone();
+
+    if !bad_hashes.is_empty() {
+        eprintln!(
+            "\n{} archive(s) had failures — re-verifying hashes...",
+            bad_hashes.len()
+        );
+        let mut corrupted = Vec::new();
+        for hash in &bad_hashes {
+            if let Some(archive_path) = ctx.get_archive_path(hash) {
+                match crate::hash::compute_file_hash(archive_path) {
+                    Ok(actual_hash) => {
+                        if actual_hash != *hash {
+                            let name = archive_path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| hash.clone());
+                            eprintln!(
+                                "  CORRUPTED: {} (expected {}, got {})",
+                                name, hash, actual_hash
+                            );
+                            corrupted.push(hash.clone());
+                            // Reset download status so next run re-downloads
+                            if let Some(archive_name) = archive_path.file_name() {
+                                let name_str = archive_name.to_string_lossy();
+                                if let Err(e) = db.reset_archive_download_status(&name_str) {
+                                    warn!("Failed to reset download status for {}: {}", name_str, e);
+                                } else {
+                                    eprintln!(
+                                        "  → Marked {} for re-download on next run",
+                                        name_str
+                                    );
+                                }
+                            }
+                        } else {
+                            // Hash matches — failures were from content issues, not corruption
+                            let name = archive_path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| hash.clone());
+                            eprintln!("  OK (hash valid): {} — content mismatch in modlist?", name);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  ERROR: could not re-hash {}: {}", hash, e);
+                    }
+                }
+            }
+        }
+        if !corrupted.is_empty() {
+            eprintln!(
+                "\n{} corrupted archive(s) marked for re-download. Re-run to fix.",
+                corrupted.len()
+            );
+        }
+        // Only keep the hashes that had failures (corrupted or content mismatch)
+        // in the returned stats for the caller to act on.
+    }
+
     let stats = StreamingStats {
         extracted: extracted.load(Ordering::Relaxed),
         written: written.load(Ordering::Relaxed),
         skipped: skipped.load(Ordering::Relaxed) + parse_failures + pre_skipped,
         failed: failed.load(Ordering::Relaxed),
+        failed_archive_hashes: bad_hashes.into_iter().collect(),
     };
 
     eprintln!(
