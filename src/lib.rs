@@ -6,6 +6,7 @@
 pub mod archive;
 pub mod bsa;
 pub mod downloaders;
+pub mod error;
 pub mod game_finder;
 pub mod gpu;
 pub mod gui;
