@@ -53,37 +53,37 @@ use std::sync::Arc;
 use tracing::{debug, error, warn};
 
 /// A file staged in a temp directory, ready to be finalized to its output path.
-struct StagedFile {
+pub(crate) struct StagedFile {
     /// Path to the file in the temp directory
-    temp_path: PathBuf,
+    pub(crate) temp_path: PathBuf,
     /// Final output path
-    output_path: PathBuf,
+    pub(crate) output_path: PathBuf,
     /// Expected file size for verification
-    expected_size: u64,
+    pub(crate) expected_size: u64,
     /// Directive ID for error reporting
-    directive_id: i64,
+    pub(crate) directive_id: i64,
 }
 
 /// Result of processing a single archive (extract + patch).
-struct ArchiveResult {
+pub(crate) struct ArchiveResult {
     /// All files staged for finalization
-    staged_files: Vec<StagedFile>,
+    pub(crate) staged_files: Vec<StagedFile>,
     /// Temp directory holding staged files (dropped after finalization to clean up)
-    temp_dir: tempfile::TempDir,
+    pub(crate) temp_dir: tempfile::TempDir,
     /// Additional temp directories for nested archive extraction (dropped after finalization)
-    nested_temp_dirs: Vec<tempfile::TempDir>,
+    pub(crate) nested_temp_dirs: Vec<tempfile::TempDir>,
     /// Number of directives skipped (cache hits, already exist)
-    skipped_count: usize,
+    pub(crate) skipped_count: usize,
     /// Number of FromArchive files extracted
-    extracted_count: usize,
+    pub(crate) extracted_count: usize,
     /// Number of PatchedFromArchive files patched
-    patched_count: usize,
+    pub(crate) patched_count: usize,
     /// Number of directives that failed
-    failed_count: usize,
+    pub(crate) failed_count: usize,
 }
 
 /// Unified directive enum for grouping both types by archive.
-enum ArchiveDirective {
+pub(crate) enum ArchiveDirective {
     FromArchive {
         id: i64,
         directive: FromArchiveDirective,
@@ -98,7 +98,7 @@ enum ArchiveDirective {
 }
 
 impl ArchiveDirective {
-    fn id(&self) -> i64 {
+    pub(crate) fn id(&self) -> i64 {
         match self {
             Self::FromArchive { id, .. } | Self::Patched { id, .. } => *id,
         }
@@ -106,37 +106,37 @@ impl ArchiveDirective {
 }
 
 /// Statistics from finalization of one archive.
-struct FinalizeStats {
-    written: usize,
-    skipped: usize,
-    failed: usize,
+pub(crate) struct FinalizeStats {
+    pub(crate) written: usize,
+    pub(crate) skipped: usize,
+    pub(crate) failed: usize,
 }
 
 
 /// A DDS texture job sent from extraction threads to the DDS handler thread.
 /// During extraction, `data` holds the raw bytes. The collector thread spills
 /// them to temp files on disk so they don't accumulate in RAM.
-struct DdsJob {
+pub(crate) struct DdsJob {
     /// Directive ID
-    id: i64,
+    pub(crate) id: i64,
     /// The directive with format/dimension info
-    directive: TransformedTextureDirective,
+    pub(crate) directive: TransformedTextureDirective,
     /// Raw source texture data (DDS) — present when sent through channel
-    data: Vec<u8>,
+    pub(crate) data: Vec<u8>,
 }
 
 /// A DDS job with data spilled to a temp file on disk.
 /// Keeps only metadata in RAM (~100 bytes vs megabytes per texture).
-struct SpilledDdsJob {
-    id: i64,
-    directive: TransformedTextureDirective,
+pub(crate) struct SpilledDdsJob {
+    pub(crate) id: i64,
+    pub(crate) directive: TransformedTextureDirective,
     /// Path to temp file containing the raw DDS data
-    data_path: PathBuf,
+    pub(crate) data_path: PathBuf,
 }
 
 impl SpilledDdsJob {
     /// Read the texture data back from disk.
-    fn read_data(&self) -> std::io::Result<Vec<u8>> {
+    pub(crate) fn read_data(&self) -> std::io::Result<Vec<u8>> {
         fs::read(&self.data_path)
     }
 }
@@ -1055,106 +1055,7 @@ pub fn process_fused_streaming(
     // Process collected DDS textures in parallel using rayon (all CPU cores).
     // Data was spilled to temp files during extraction — read back on demand.
     let dds_jobs = std::mem::take(&mut *collected_dds_jobs.lock().expect("dds jobs lock"));
-    if !dds_jobs.is_empty() {
-        use crate::textures::{OutputFormat, TextureJob, process_texture_batch, process_texture_with_fallback, init_gpu};
-        use crate::installer::handlers::texture::is_fallback_mode;
-
-        let total_tex = dds_jobs.len();
-
-        // Group by format
-        let mut by_format: HashMap<String, Vec<SpilledDdsJob>> = HashMap::new();
-        for job in dds_jobs {
-            let fmt_str = job.directive.image_state.format.to_uppercase();
-            by_format.entry(fmt_str).or_default().push(job);
-        }
-
-        // Print format breakdown
-        let mut format_summary: Vec<_> = by_format.iter().map(|(f, j)| (f.clone(), j.len())).collect();
-        format_summary.sort_by(|a, b| b.1.cmp(&a.1));
-        let summary_str = format_summary.iter()
-            .map(|(f, n)| format!("{}: {}", f, n))
-            .collect::<Vec<_>>()
-            .join(", ");
-        eprintln!("Processing {} textures in parallel [{}]", total_tex, summary_str);
-
-        // Initialize GPU for BC7
-        let _ = init_gpu();
-
-        let dds_ok = AtomicUsize::new(0);
-        let dds_fail = AtomicUsize::new(0);
-
-        // Process each format group. BC7 uses GPU batch pipeline, everything else uses CPU par_iter.
-        for (fmt_str, jobs) in by_format {
-            let fmt = OutputFormat::from_str(&fmt_str)
-                .unwrap_or(if is_fallback_mode() { OutputFormat::BC1 } else { OutputFormat::BC7 });
-
-            if fmt == OutputFormat::BC7 {
-                // BC7: parallel CPU prep → GPU batch encode
-                eprintln!("  BC7: {} textures (GPU+CPU pipeline)...", jobs.len());
-
-                let tex_jobs: Vec<TextureJob> = jobs.iter().filter_map(|j| {
-                    j.read_data().ok().map(|data| TextureJob {
-                        data,
-                        width: j.directive.image_state.width,
-                        height: j.directive.image_state.height,
-                        format: OutputFormat::BC7,
-                        id: Some(format!("{}", j.id)),
-                    })
-                }).collect();
-
-                let results = process_texture_batch(tex_jobs);
-
-                for (job, (_job_id, result)) in jobs.iter().zip(results.into_iter()) {
-                    match result {
-                        Ok(processed) => {
-                            let out = paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
-                            if paths::ensure_parent_dirs(&out).is_ok() && fs::write(&out, &processed.data).is_ok() {
-                                dds_ok.fetch_add(1, Ordering::Relaxed);
-                                ctx.textures_processed_during_install.lock().expect("tex lock").insert(job.id);
-                            } else {
-                                dds_fail.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        Err(e) => {
-                            dds_fail.fetch_add(1, Ordering::Relaxed);
-                            warn!("DDS BC7 fail [{}]: {:#}", job.id, e);
-                        }
-                    }
-                }
-            } else {
-                // Non-BC7: full CPU parallelism (like Radium)
-                eprintln!("  {}: {} textures (CPU parallel)...", fmt.name(), jobs.len());
-
-                jobs.par_iter().for_each(|job| {
-                    let result: anyhow::Result<()> = (|| {
-                        let data = job.read_data()?;
-                        let (tex, _) = process_texture_with_fallback(
-                            &data, job.directive.image_state.width,
-                            job.directive.image_state.height, fmt,
-                        )?;
-                        let out = paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
-                        paths::ensure_parent_dirs(&out)?;
-                        fs::write(&out, &tex.data)?;
-                        Ok(())
-                    })();
-                    match result {
-                        Ok(()) => {
-                            dds_ok.fetch_add(1, Ordering::Relaxed);
-                            ctx.textures_processed_during_install.lock().expect("tex lock").insert(job.id);
-                        }
-                        Err(e) => {
-                            dds_fail.fetch_add(1, Ordering::Relaxed);
-                            warn!("DDS {} fail [{}]: {}", fmt.name(), job.id, e);
-                        }
-                    }
-                });
-            }
-        }
-
-        let ok = dds_ok.load(Ordering::Relaxed);
-        let fail = dds_fail.load(Ordering::Relaxed);
-        eprintln!("DDS processing complete: {} OK, {} failed", ok, fail);
-    }
+    process_spilled_dds_jobs(dds_jobs, ctx);
 
     // Clean up DDS spill directory
     if let Err(e) = fs::remove_dir_all(&dds_spill_dir) {
@@ -1175,7 +1076,7 @@ pub fn process_fused_streaming(
         let mut corrupted = Vec::new();
         for hash in &bad_hashes {
             if let Some(archive_path) = ctx.get_archive_path(hash) {
-                match crate::hash::compute_file_hash(archive_path) {
+                match crate::hash::compute_file_hash(&archive_path) {
                     Ok(actual_hash) => {
                         if actual_hash != *hash {
                             let name = archive_path
@@ -1243,7 +1144,7 @@ pub fn process_fused_streaming(
 /// Process a single archive: extract to temp, apply patches, return staged files.
 ///
 /// Handles both FromArchive and PatchedFromArchive directives in one extraction pass.
-fn process_single_archive_fused(
+pub(crate) fn process_single_archive_fused(
     archive_path: &Path,
     _archive_hash: &str,
     directives: &[ArchiveDirective],
@@ -1878,7 +1779,7 @@ fn extract_archive_to_temp(
 }
 
 /// Finalize staged files: reflink/copy to output, verify size, cleanup temp.
-fn finalize_archive(
+pub(crate) fn finalize_archive(
     result: ArchiveResult,
     _output_dir: &Path,
     logged_failures: &Arc<AtomicUsize>,
@@ -2286,7 +2187,7 @@ fn find_archive_in_extracted_map<'a>(
 }
 
 /// Truncate a name to max_len characters, adding "..." if needed.
-fn truncate_name(name: &str, max_len: usize) -> String {
+pub(crate) fn truncate_name(name: &str, max_len: usize) -> String {
     if name.len() <= max_len {
         name.to_string()
     } else {
@@ -2295,7 +2196,7 @@ fn truncate_name(name: &str, max_len: usize) -> String {
 }
 
 /// Process whole-file directives (archive IS the file, just copy it).
-fn process_whole_file_directives(
+pub(crate) fn process_whole_file_directives(
     directives: &[(i64, FromArchiveDirective)],
     ctx: &ProcessContext,
     extracted: &Arc<AtomicUsize>,
@@ -2321,7 +2222,7 @@ fn process_whole_file_directives(
             }
         };
 
-        let archive_size = match fs::metadata(archive_path) {
+        let archive_size = match fs::metadata(&archive_path) {
             Ok(m) => m.len(),
             Err(_) => {
                 failed.fetch_add(1, Ordering::Relaxed);
@@ -2345,7 +2246,7 @@ fn process_whole_file_directives(
             return;
         }
 
-        if let Err(e) = fs::copy(archive_path, &output_path) {
+        if let Err(e) = fs::copy(&archive_path, &output_path) {
             failed.fetch_add(1, Ordering::Relaxed);
             error!("FAIL [{}]: copy failed: {}", id, e);
             return;
@@ -2354,7 +2255,7 @@ fn process_whole_file_directives(
         ctx.record_patch_basis_candidate_path_dual(
             &basis_key,
             &directive.archive_hash_path,
-            archive_path,
+            &archive_path,
             &output_path,
             directive.size,
         );
@@ -2365,9 +2266,9 @@ fn process_whole_file_directives(
 
 /// Extract texture source files from a BSA/BA2 archive and send to DDS handler channel.
 /// Called during the BSA-direct extraction path.
-type TextureLookupInner = HashMap<String, Vec<(i64, TransformedTextureDirective)>>;
+pub(crate) type TextureLookupInner = HashMap<String, Vec<(i64, TransformedTextureDirective)>>;
 
-fn extract_textures_from_bsa(
+pub(crate) fn extract_textures_from_bsa(
     archive_path: &Path,
     tex_lookup: &TextureLookupInner,
     dds_tx: &std::sync::mpsc::SyncSender<DdsJob>,
@@ -2397,7 +2298,7 @@ fn extract_textures_from_bsa(
 
 /// Extract texture source files from an already-extracted temp directory
 /// and send to DDS handler channel. Called for 7z/RAR/ZIP archives.
-fn extract_textures_from_temp_dir(
+pub(crate) fn extract_textures_from_temp_dir(
     temp_dir: &Path,
     tex_lookup: &TextureLookupInner,
     dds_tx: &std::sync::mpsc::SyncSender<DdsJob>,
@@ -2431,9 +2332,9 @@ fn extract_textures_from_temp_dir(
 /// Extract texture source files from nested BSAs within an extracted temp directory.
 /// For depth-3 paths: archive → nested BSA → file inside BSA.
 /// Finds the nested BSA in the temp dir, opens it, and extracts the needed texture files.
-type NestedTextureLookupInner = HashMap<String, TextureLookupInner>;
+pub(crate) type NestedTextureLookupInner = HashMap<String, TextureLookupInner>;
 
-fn extract_textures_from_nested_bsas(
+pub(crate) fn extract_textures_from_nested_bsas(
     temp_dir: &Path,
     nested_lookup: &NestedTextureLookupInner,
     dds_tx: &std::sync::mpsc::SyncSender<DdsJob>,
@@ -2477,10 +2378,215 @@ fn extract_textures_from_nested_bsas(
     }
 }
 
+/// Collect texture source files from a BSA/BA2 archive into a Vec (no channel).
+pub(crate) fn collect_textures_from_bsa(
+    archive_path: &Path,
+    tex_lookup: &TextureLookupInner,
+) -> Vec<DdsJob> {
+    let wanted: HashSet<String> = tex_lookup.keys().cloned().collect();
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+
+    let jobs = std::sync::Mutex::new(Vec::new());
+    let _ = bsa::extract_archive_batch(archive_path, &wanted, |path, data| {
+        let lookup = path.replace('\\', "/").to_lowercase();
+        if let Some(directives) = tex_lookup.get(&lookup) {
+            for (id, directive) in directives {
+                jobs.lock().expect("dds jobs lock").push(DdsJob {
+                    id: *id,
+                    directive: directive.clone(),
+                    data: data.clone(),
+                });
+            }
+        }
+        Ok(())
+    });
+
+    jobs.into_inner().expect("dds jobs lock")
+}
+
+/// Collect texture source files from a temp directory into a Vec (no channel).
+pub(crate) fn collect_textures_from_temp_dir(
+    temp_dir: &Path,
+    tex_lookup: &TextureLookupInner,
+) -> Vec<DdsJob> {
+    let file_map = build_extracted_file_map(temp_dir);
+    let mut jobs = Vec::new();
+
+    for (normalized_path, directives) in tex_lookup {
+        let found = file_map
+            .get(normalized_path)
+            .or_else(|| {
+                let bs = normalized_path.replace('/', "\\");
+                file_map.get(&bs)
+            });
+
+        if let Some(file_path) = found {
+            if let Ok(data) = fs::read(file_path) {
+                for (id, directive) in directives {
+                    jobs.push(DdsJob {
+                        id: *id,
+                        directive: directive.clone(),
+                        data: data.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    jobs
+}
+
+/// Collect texture source files from nested BSAs within a temp directory (no channel).
+pub(crate) fn collect_textures_from_nested_bsas(
+    temp_dir: &Path,
+    nested_lookup: &NestedTextureLookupInner,
+) -> Vec<DdsJob> {
+    let file_map = build_extracted_file_map(temp_dir);
+    let mut jobs = Vec::new();
+
+    for (bsa_name, tex_lookup) in nested_lookup {
+        let bsa_path = file_map
+            .get(bsa_name)
+            .or_else(|| {
+                let bs = bsa_name.replace('/', "\\");
+                file_map.get(&bs)
+            });
+
+        let Some(bsa_disk_path) = bsa_path else {
+            debug!("Nested BSA not found in temp dir: {}", bsa_name);
+            continue;
+        };
+
+        let wanted: HashSet<String> = tex_lookup.keys().cloned().collect();
+        if wanted.is_empty() {
+            continue;
+        }
+
+        let nested_jobs = std::sync::Mutex::new(Vec::new());
+        let _ = bsa::extract_archive_batch(bsa_disk_path, &wanted, |path, data| {
+            let lookup = path.replace('\\', "/").to_lowercase();
+            if let Some(directives) = tex_lookup.get(&lookup) {
+                for (id, directive) in directives {
+                    nested_jobs.lock().expect("dds jobs lock").push(DdsJob {
+                        id: *id,
+                        directive: directive.clone(),
+                        data: data.clone(),
+                    });
+                }
+            }
+            Ok(())
+        });
+
+        jobs.extend(nested_jobs.into_inner().expect("dds jobs lock"));
+    }
+
+    jobs
+}
+
+/// Process DDS texture jobs inline (no spill to disk).
+/// Groups by format, uses GPU batch for BC7, CPU parallel for others.
+pub(crate) fn process_dds_jobs_inline(jobs: Vec<DdsJob>, ctx: &ProcessContext) -> (usize, usize) {
+    if jobs.is_empty() {
+        return (0, 0);
+    }
+
+    use crate::installer::handlers::texture::is_fallback_mode;
+    use crate::textures::{process_texture_batch, process_texture_with_fallback, OutputFormat, TextureJob};
+
+    let ok_count = AtomicUsize::new(0);
+    let fail_count = AtomicUsize::new(0);
+
+    // Group by format
+    let mut by_format: HashMap<String, Vec<DdsJob>> = HashMap::new();
+    for job in jobs {
+        let fmt_str = job.directive.image_state.format.to_uppercase();
+        by_format.entry(fmt_str).or_default().push(job);
+    }
+
+    for (fmt_str, jobs) in by_format {
+        let fmt = OutputFormat::from_str(&fmt_str).unwrap_or(if is_fallback_mode() {
+            OutputFormat::BC1
+        } else {
+            OutputFormat::BC7
+        });
+
+        if fmt == OutputFormat::BC7 {
+            let tex_jobs: Vec<TextureJob> = jobs
+                .iter()
+                .map(|j| TextureJob {
+                    data: j.data.clone(),
+                    width: j.directive.image_state.width,
+                    height: j.directive.image_state.height,
+                    format: OutputFormat::BC7,
+                    id: Some(format!("{}", j.id)),
+                })
+                .collect();
+
+            let results = process_texture_batch(tex_jobs);
+
+            for (job, (_job_id, result)) in jobs.iter().zip(results.into_iter()) {
+                match result {
+                    Ok(processed) => {
+                        let out =
+                            paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
+                        if paths::ensure_parent_dirs(&out).is_ok()
+                            && fs::write(&out, &processed.data).is_ok()
+                        {
+                            ok_count.fetch_add(1, Ordering::Relaxed);
+                            ctx.textures_processed_during_install
+                                .lock()
+                                .expect("tex lock")
+                                .insert(job.id);
+                        } else {
+                            fail_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Err(e) => {
+                        fail_count.fetch_add(1, Ordering::Relaxed);
+                        warn!("DDS BC7 fail [{}]: {:#}", job.id, e);
+                    }
+                }
+            }
+        } else {
+            jobs.par_iter().for_each(|job| {
+                let result: anyhow::Result<()> = (|| {
+                    let (tex, _) = process_texture_with_fallback(
+                        &job.data,
+                        job.directive.image_state.width,
+                        job.directive.image_state.height,
+                        fmt,
+                    )?;
+                    let out = paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
+                    paths::ensure_parent_dirs(&out)?;
+                    fs::write(&out, &tex.data)?;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => {
+                        ok_count.fetch_add(1, Ordering::Relaxed);
+                        ctx.textures_processed_during_install
+                            .lock()
+                            .expect("tex lock")
+                            .insert(job.id);
+                    }
+                    Err(e) => {
+                        fail_count.fetch_add(1, Ordering::Relaxed);
+                        warn!("DDS {} fail [{}]: {}", fmt.name(), job.id, e);
+                    }
+                }
+            });
+        }
+    }
+
+    (ok_count.load(Ordering::Relaxed), fail_count.load(Ordering::Relaxed))
+}
+
 /// Process a BSA/BA2 archive directly using batch extraction.
 /// Opens the archive ONCE and decompresses all files in parallel via callback.
 #[allow(clippy::too_many_arguments)]
-fn process_bsa_archive(
+pub(crate) fn process_bsa_archive(
     archive_path: &PathBuf,
     directives: &[(i64, FromArchiveDirective, Option<String>, Option<String>)],
     ctx: &ProcessContext,
@@ -2606,7 +2712,7 @@ fn process_bsa_archive(
 /// Process PatchedFromArchive directives where the basis file is inside a BSA/BA2.
 /// Reads basis directly from BSA, writes to temp, applies patch, writes final output.
 /// Much faster than extracting the entire BSA via 7z.
-fn process_bsa_patched_directives(
+pub(crate) fn process_bsa_patched_directives(
     archive_path: &PathBuf,
     _archive_hash: &str,
     directives: &[(i64, &PatchedFromArchiveDirective)],
@@ -2802,6 +2908,142 @@ fn find_file_case_insensitive(base: &Path, normalized_rel: &str) -> Option<PathB
         }
     }
     None
+}
+
+/// Process spilled DDS texture jobs through the GPU/CPU texture pipeline.
+///
+/// This is shared between the streaming and pipelined install flows.
+/// Successfully processed textures are recorded in `ctx.textures_processed_during_install`
+/// so that the subsequent `texture_phase()` can skip them.
+pub(crate) fn process_spilled_dds_jobs(dds_jobs: Vec<SpilledDdsJob>, ctx: &ProcessContext) {
+    if dds_jobs.is_empty() {
+        return;
+    }
+
+    use crate::installer::handlers::texture::is_fallback_mode;
+    use crate::textures::{
+        init_gpu, process_texture_batch, process_texture_with_fallback, OutputFormat, TextureJob,
+    };
+
+    let total_tex = dds_jobs.len();
+
+    // Group by format
+    let mut by_format: HashMap<String, Vec<SpilledDdsJob>> = HashMap::new();
+    for job in dds_jobs {
+        let fmt_str = job.directive.image_state.format.to_uppercase();
+        by_format.entry(fmt_str).or_default().push(job);
+    }
+
+    // Print format breakdown
+    let mut format_summary: Vec<_> = by_format
+        .iter()
+        .map(|(f, j)| (f.clone(), j.len()))
+        .collect();
+    format_summary.sort_by(|a, b| b.1.cmp(&a.1));
+    let summary_str = format_summary
+        .iter()
+        .map(|(f, n)| format!("{}: {}", f, n))
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!(
+        "Processing {} textures in parallel [{}]",
+        total_tex, summary_str
+    );
+
+    // Initialize GPU for BC7
+    let _ = init_gpu();
+
+    let dds_ok = AtomicUsize::new(0);
+    let dds_fail = AtomicUsize::new(0);
+
+    // Process each format group. BC7 uses GPU batch pipeline, everything else uses CPU par_iter.
+    for (fmt_str, jobs) in by_format {
+        let fmt = OutputFormat::from_str(&fmt_str).unwrap_or(if is_fallback_mode() {
+            OutputFormat::BC1
+        } else {
+            OutputFormat::BC7
+        });
+
+        if fmt == OutputFormat::BC7 {
+            // BC7: parallel CPU prep → GPU batch encode
+            eprintln!("  BC7: {} textures (GPU+CPU pipeline)...", jobs.len());
+
+            let tex_jobs: Vec<TextureJob> = jobs
+                .iter()
+                .filter_map(|j| {
+                    j.read_data().ok().map(|data| TextureJob {
+                        data,
+                        width: j.directive.image_state.width,
+                        height: j.directive.image_state.height,
+                        format: OutputFormat::BC7,
+                        id: Some(format!("{}", j.id)),
+                    })
+                })
+                .collect();
+
+            let results = process_texture_batch(tex_jobs);
+
+            for (job, (_job_id, result)) in jobs.iter().zip(results.into_iter()) {
+                match result {
+                    Ok(processed) => {
+                        let out =
+                            paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
+                        if paths::ensure_parent_dirs(&out).is_ok()
+                            && fs::write(&out, &processed.data).is_ok()
+                        {
+                            dds_ok.fetch_add(1, Ordering::Relaxed);
+                            ctx.textures_processed_during_install
+                                .lock()
+                                .expect("tex lock")
+                                .insert(job.id);
+                        } else {
+                            dds_fail.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Err(e) => {
+                        dds_fail.fetch_add(1, Ordering::Relaxed);
+                        warn!("DDS BC7 fail [{}]: {:#}", job.id, e);
+                    }
+                }
+            }
+        } else {
+            // Non-BC7: full CPU parallelism (like Radium)
+            eprintln!("  {}: {} textures (CPU parallel)...", fmt.name(), jobs.len());
+
+            jobs.par_iter().for_each(|job| {
+                let result: anyhow::Result<()> = (|| {
+                    let data = job.read_data()?;
+                    let (tex, _) = process_texture_with_fallback(
+                        &data,
+                        job.directive.image_state.width,
+                        job.directive.image_state.height,
+                        fmt,
+                    )?;
+                    let out = paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
+                    paths::ensure_parent_dirs(&out)?;
+                    fs::write(&out, &tex.data)?;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => {
+                        dds_ok.fetch_add(1, Ordering::Relaxed);
+                        ctx.textures_processed_during_install
+                            .lock()
+                            .expect("tex lock")
+                            .insert(job.id);
+                    }
+                    Err(e) => {
+                        dds_fail.fetch_add(1, Ordering::Relaxed);
+                        warn!("DDS {} fail [{}]: {}", fmt.name(), job.id, e);
+                    }
+                }
+            });
+        }
+    }
+
+    let ok = dds_ok.load(Ordering::Relaxed);
+    let fail = dds_fail.load(Ordering::Relaxed);
+    eprintln!("DDS processing complete: {} OK, {} failed", ok, fail);
 }
 
 #[cfg(test)]

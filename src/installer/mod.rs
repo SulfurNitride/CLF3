@@ -13,6 +13,7 @@ pub mod config;
 pub mod config_cache;
 pub mod downloader;
 pub mod handlers;
+pub mod pipeline;
 pub mod processor;
 pub mod streaming;
 
@@ -406,6 +407,198 @@ impl Installer {
         stats.directives_completed = process_stats.completed;
         stats.directives_skipped = process_stats.skipped;
         stats.directives_failed = process_stats.failed;
+
+        if stats.directives_failed > 0 {
+            println!(
+                "\nDirective processing incomplete. {} failures.",
+                stats.directives_failed
+            );
+        } else {
+            println!("\nInstallation complete!");
+        }
+
+        Ok(stats)
+    }
+
+    /// Run pipelined installation: download and extract in parallel.
+    ///
+    /// Instead of downloading all archives first, this processes each archive
+    /// as soon as it finishes downloading. Texture and BSA phases still run
+    /// sequentially after all extraction completes (Phase 1 MVP).
+    pub async fn run_pipelined(&mut self) -> Result<InstallStats> {
+        let mut stats = InstallStats::default();
+
+        // === Phase 1: Game Check ===
+        let game_check_start = Instant::now();
+        println!("=== Phase 1: Game Check ===\n");
+        self.report_progress(ProgressEvent::PhaseChange {
+            phase: "Game Check".to_string(),
+        });
+        println!("Game directory: {}", self.config.game_dir.display());
+        if !self.config.game_dir.exists() {
+            bail!(
+                "Game directory does not exist: {}",
+                self.config.game_dir.display()
+            );
+        }
+        println!("Game directory validated\n");
+        log_phase_metrics("Game Check", game_check_start);
+
+        // === Phase 2: Pipelined Download + Extract ===
+        let pipeline_start = Instant::now();
+        println!("=== Phase 2: Pipelined Download + Extract ===\n");
+        self.report_progress(ProgressEvent::PhaseChange {
+            phase: "Downloading + Installing".to_string(),
+        });
+
+        // Create the directive processor early (needs DB + config)
+        let dp = processor::DirectiveProcessor::new(&self.db, &self.config)?;
+
+        // Pre-load and group all directives by archive hash (no index needed yet)
+        let grouped = pipeline::load_and_group_directives(&self.db, &dp.ctx)?;
+        let total_from = grouped.from_archive.values().map(|v| v.len()).sum::<usize>();
+        let total_patched = grouped.patched.values().map(|v| v.len()).sum::<usize>();
+        let total_textures = grouped.textures.values().map(|v| v.len()).sum::<usize>();
+        let total_whole = grouped.whole_file.len();
+        println!(
+            "Grouped directives: {} FromArchive, {} Patched, {} Textures, {} whole-file ({} pre-skipped)",
+            total_from, total_patched, total_textures, total_whole, grouped.pre_skipped
+        );
+
+        // Create channel for archive events
+        let (tx, rx) = std::sync::mpsc::sync_channel::<downloader::ArchiveEvent>(32);
+
+        let streaming_config = streaming::StreamingConfig {
+            max_extract_workers: Some(self.config.max_install_workers),
+            max_parallel_7z_archives: Some(self.config.max_parallel_7z_archives),
+            max_parallel_bsa_archives: Some(self.config.max_parallel_bsa_archives),
+        };
+
+        // Progress callback
+        let progress_callback: Option<streaming::ProgressCallback> =
+            if let Some(ref callback) = self.config.progress_callback {
+                let cb = callback.clone();
+                Some(std::sync::Arc::new(move |count: usize| {
+                    cb(ProgressEvent::DirectiveComplete {
+                        index: count,
+                        total: 0, // Will be set properly later
+                    });
+                }))
+            } else {
+                None
+            };
+
+        // Run download + extraction concurrently:
+        // - Main thread: runs the processing loop (has &self.db, which is !Send)
+        // - Download thread: opens its own DB connection for download status updates
+        let db_path = self.config.db_path();
+        let config_clone = self.config.clone();
+        let priority_map = grouped.priority.clone();
+
+        // Spawn the download on a dedicated thread with its own tokio runtime + DB connection
+        let download_handle = std::thread::spawn(move || {
+            let download_db = crate::modlist::ModlistDb::open_shared(&db_path)
+                .expect("Failed to open download DB connection");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to build tokio runtime for download thread");
+            rt.block_on(async {
+                downloader::download_archives_streaming(
+                    &download_db,
+                    &config_clone,
+                    &tx,
+                    Some(&priority_map),
+                )
+                .await
+            })
+        });
+
+        // Run the processing loop on the main thread (owns &self.db)
+        let streaming_stats = pipeline::run_processing_loop(
+            &self.db,
+            &dp.ctx,
+            &rx,
+            &grouped,
+            streaming_config,
+            progress_callback,
+        )?;
+
+        // Wait for download thread to finish
+        let download_stats = download_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("Download thread panicked"))??;
+
+        stats.archives_downloaded = download_stats.downloaded;
+        stats.archives_skipped = download_stats.skipped;
+        stats.archives_failed = download_stats.failed;
+        stats.archives_manual = download_stats.manual;
+        stats.failed_downloads = download_stats.failed_downloads;
+        stats.manual_downloads = download_stats.manual_downloads;
+
+        stats.directives_completed = streaming_stats.extracted + streaming_stats.written;
+        stats.directives_skipped = streaming_stats.skipped;
+        stats.directives_failed = streaming_stats.failed;
+
+        if stats.archives_manual > 0 || stats.archives_failed > 0 {
+            log_phase_metrics("Pipelined Download+Extract", pipeline_start);
+            return Ok(stats);
+        }
+
+        // Check for extraction failures — abort early
+        if streaming_stats.failed > 0 {
+            log_phase_metrics("Pipelined Download+Extract", pipeline_start);
+            bail!(
+                "Pipelined install had {} failures. Please fix the issues above and re-run.",
+                streaming_stats.failed
+            );
+        }
+        log_phase_metrics("Pipelined Download+Extract", pipeline_start);
+
+        // === Phase 3: InlineFile + RemappedInlineFile ===
+        let inline_start = Instant::now();
+        println!("\n=== Phase 3: Inline Files ===\n");
+        self.report_progress(ProgressEvent::PhaseChange {
+            phase: "Inline Files".to_string(),
+        });
+        dp.inline_phase()?;
+        trim_allocator_rss("inline files");
+        log_phase_metrics("Inline Files", inline_start);
+
+        // === Phase 4: DDS Transformations ===
+        let dds_start = Instant::now();
+        println!("\n=== Phase 4: DDS Transformations ===\n");
+        self.report_progress(ProgressEvent::PhaseChange {
+            phase: "DDS Transform".to_string(),
+        });
+        dp.texture_phase()?;
+        trim_allocator_rss("texture phase");
+        log_phase_metrics("DDS Transform", dds_start);
+
+        // === Phase 5: BSA Building ===
+        let bsa_start = Instant::now();
+        println!("\n=== Phase 5: BSA Building ===\n");
+        self.report_progress(ProgressEvent::PhaseChange {
+            phase: "BSA Build".to_string(),
+        });
+        dp.bsa_phase()?;
+        trim_allocator_rss("bsa build phase");
+        log_phase_metrics("BSA Build", bsa_start);
+
+        // === Phase 6: Cleanup ===
+        let cleanup_start = Instant::now();
+        println!("\n=== Phase 6: Cleanup ===\n");
+        self.report_progress(ProgressEvent::PhaseChange {
+            phase: "Cleanup".to_string(),
+        });
+        dp.cleanup_phase()?;
+        trim_allocator_rss("cleanup phase");
+        log_phase_metrics("Cleanup", cleanup_start);
+
+        let process_stats = dp.finish();
+        stats.directives_completed += process_stats.completed;
+        stats.directives_skipped += process_stats.skipped;
+        stats.directives_failed += process_stats.failed;
 
         if stats.directives_failed > 0 {
             println!(

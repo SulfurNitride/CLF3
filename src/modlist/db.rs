@@ -54,16 +54,6 @@ pub struct ModlistDb {
 impl ModlistDb {
     /// Open or create a modlist database
     pub fn open(db_path: &Path) -> Result<Self> {
-        // Clean up any stale WAL files that might cause issues on network filesystems
-        let wal_path = db_path.with_extension("db-wal");
-        let shm_path = db_path.with_extension("db-shm");
-        if wal_path.exists() {
-            let _ = std::fs::remove_file(&wal_path);
-        }
-        if shm_path.exists() {
-            let _ = std::fs::remove_file(&shm_path);
-        }
-
         let conn = Connection::open(db_path)
             .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
 
@@ -74,7 +64,8 @@ impl ModlistDb {
              PRAGMA synchronous = NORMAL;
              PRAGMA cache_size = 10000;
              PRAGMA temp_store = MEMORY;
-             PRAGMA mmap_size = 268435456;",
+             PRAGMA mmap_size = 268435456;
+             PRAGMA busy_timeout = 5000;",
         );
 
         if wal_result.is_err() {
@@ -101,6 +92,44 @@ impl ModlistDb {
         db.create_tables()?;
 
         Ok(db)
+    }
+
+    /// Open a second connection to an already-open database.
+    ///
+    /// Unlike `open()`, this does NOT delete WAL/SHM files — doing so would
+    /// corrupt any existing connection using WAL mode. Use this when you need
+    /// a separate connection for a different thread (e.g., download thread).
+    pub fn open_shared(db_path: &Path) -> Result<Self> {
+        let conn = Connection::open(db_path)
+            .with_context(|| format!("Failed to open shared database: {}", db_path.display()))?;
+
+        // Match the same pragmas as open(), but skip WAL file cleanup
+        let wal_result = conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA cache_size = 10000;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA busy_timeout = 5000;",
+        );
+
+        if wal_result.is_err() {
+            conn.execute_batch(
+                "PRAGMA locking_mode = EXCLUSIVE;
+                 PRAGMA journal_mode = DELETE;
+                 PRAGMA synchronous = NORMAL;
+                 PRAGMA cache_size = 10000;
+                 PRAGMA temp_store = MEMORY;
+                 PRAGMA busy_timeout = 5000;",
+            )
+            .with_context(|| {
+                format!(
+                    "Failed to configure SQLite pragmas for {}",
+                    db_path.display()
+                )
+            })?;
+        }
+
+        Ok(Self { conn })
     }
 
     /// Create an in-memory database (for testing)

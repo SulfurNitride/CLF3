@@ -234,7 +234,7 @@ pub struct FromArchiveDirective {
 }
 
 /// Extract file and apply binary patch
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct PatchedFromArchiveDirective {
     pub to: String,

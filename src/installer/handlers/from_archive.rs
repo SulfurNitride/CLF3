@@ -99,7 +99,7 @@ pub fn handle_from_archive(ctx: &ProcessContext, directive: &FromArchiveDirectiv
     // Extract the file data
     let data = if directive.archive_hash_path.len() == 1 {
         // Single file - just read it directly (e.g., GameFileSource files)
-        fs::read(archive_path)
+        fs::read(&archive_path)
             .with_context(|| format!("Failed to read file: {}", archive_path.display()))?
     } else if directive.archive_hash_path.len() == 2 {
         // Simple extraction from archive - try cache first
@@ -108,7 +108,7 @@ pub fn handle_from_archive(ctx: &ProcessContext, directive: &FromArchiveDirectiv
             cached
         } else {
             extract_from_archive_with_temp(
-                archive_path,
+                &archive_path,
                 path_in_archive,
                 &ctx.config.downloads_dir,
             )?
@@ -133,7 +133,7 @@ pub fn handle_from_archive(ctx: &ProcessContext, directive: &FromArchiveDirectiv
             })?
         } else {
             extract_nested_bsa(
-                archive_path,
+                &archive_path,
                 bsa_path_in_archive,
                 file_path_in_bsa,
                 &ctx.config.downloads_dir,

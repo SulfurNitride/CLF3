@@ -171,17 +171,13 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .with_filter(file_filter);
 
-    // Console layer (only if verbose or RUST_LOG is set)
-    if cli.verbose || std::env::var("RUST_LOG").is_ok() {
-        let console_layer = tracing_subscriber::fmt::layer().with_filter(console_filter);
+    // Console layer — always enabled (errors should always be visible)
+    let console_layer = tracing_subscriber::fmt::layer().with_filter(console_filter);
 
-        tracing_subscriber::registry()
-            .with(file_layer)
-            .with(console_layer)
-            .init();
-    } else {
-        tracing_subscriber::registry().with(file_layer).init();
-    }
+    tracing_subscriber::registry()
+        .with(file_layer)
+        .with(console_layer)
+        .init();
 
     tracing::info!(
         "CLF3 started, logging to {}",
@@ -245,7 +241,7 @@ async fn main() -> Result<()> {
             };
 
             let mut installer = Installer::new(config)?;
-            let stats = installer.run_streaming().await?;
+            let stats = installer.run_pipelined().await?;
 
             let total_processed =
                 stats.directives_completed + stats.directives_skipped + stats.directives_failed;

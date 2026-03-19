@@ -1295,6 +1295,8 @@ fn list_archive_innoextract(archive_path: &Path) -> Result<Vec<ArchiveEntry>> {
     let inno_path = get_innoextract_path()?;
     let output = Command::new(&inno_path)
         .arg("-l")
+        .arg("--collisions")
+        .arg("rename-all")
         .arg(archive_path)
         .output()
         .with_context(|| format!("Failed to run innoextract list on {}", archive_path.display()))?;
@@ -1315,6 +1317,8 @@ fn extract_all_innoextract(archive_path: &Path, output_dir: &Path) -> Result<usi
     let output = Command::new(&inno_path)
         .arg("-e")
         .arg("-s")
+        .arg("--collisions")
+        .arg("rename-all")
         .arg("-d")
         .arg(output_dir)
         .arg(archive_path)
@@ -1339,10 +1343,23 @@ fn extract_files_innoextract(archive_path: &Path, files: &[&str], output_dir: &P
     fs::create_dir_all(output_dir)?;
 
     let mut cmd = Command::new(&inno_path);
-    cmd.arg("-e").arg("-s").arg("-d").arg(output_dir);
+    cmd.arg("-e")
+        .arg("-s")
+        .arg("--collisions")
+        .arg("rename-all")
+        .arg("-d")
+        .arg(output_dir);
     for file in files {
-        // innoextract path filters are slash-separated
-        cmd.arg("-I").arg(file.replace('\\', "/"));
+        // innoextract path filters are slash-separated.
+        // Strip any InnoSetup component suffix (#plus, #basic, etc.) since innoextract's
+        // -I filter matches on base paths; --collisions rename-all handles the renaming.
+        let normalized = file.replace('\\', "/");
+        let base = if let Some(pos) = normalized.rfind('#') {
+            &normalized[..pos]
+        } else {
+            &normalized
+        };
+        cmd.arg("-I").arg(base);
     }
     cmd.arg(archive_path);
 

@@ -31,7 +31,7 @@ pub fn handle_patched_from_archive(
 
     let source_data = if directive.archive_hash_path.len() == 1 {
         // Whole file is the source
-        std::fs::read(archive_path)
+        std::fs::read(&archive_path)
             .with_context(|| format!("Failed to read source file: {}", archive_path.display()))?
     } else if directive.archive_hash_path.len() == 2 {
         // Simple extraction from archive
@@ -42,7 +42,7 @@ pub fn handle_patched_from_archive(
         } else {
             // Fall back to direct extraction
             extract_from_archive_with_temp(
-                archive_path,
+                &archive_path,
                 path_in_archive,
                 &ctx.config.downloads_dir,
             )?
@@ -63,7 +63,7 @@ pub fn handle_patched_from_archive(
         } else {
             // Fall back to direct extraction: extract BSA from archive, then file from BSA
             let bsa_data =
-                extract_from_archive_with_temp(archive_path, bsa_path, &ctx.config.downloads_dir)?;
+                extract_from_archive_with_temp(&archive_path, bsa_path, &ctx.config.downloads_dir)?;
 
             // Write BSA to temp file and extract from it
             let temp_bsa = tempfile::Builder::new()

@@ -5933,7 +5933,7 @@ async fn run_wabbajack_install(
     .ok();
 
     // Use streaming pipeline for better performance
-    let stats = match installer.run_streaming().await {
+    let stats = match installer.run_pipelined().await {
         Ok(s) => s,
         Err(e) => {
             tx.send(ProgressUpdate::Error(format!("Installation failed: {}", e)))

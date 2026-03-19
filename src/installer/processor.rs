@@ -283,6 +283,49 @@ fn list_rar_files(archive_path: &Path) -> Result<Vec<ArchiveFileEntry>> {
 }
 
 /// Index all archives that need indexing
+/// Index a single archive's file listing into the database.
+/// Returns the number of files indexed, or 0 for non-archive files.
+pub(crate) fn index_single_archive(
+    db: &ModlistDb,
+    archive_hash: &str,
+    archive_path: &Path,
+    archive_name: &str,
+) -> Result<usize> {
+    // Already indexed? Skip.
+    if db.is_archive_indexed(archive_hash).unwrap_or(false) {
+        return Ok(0);
+    }
+
+    // Detect archive type using magic bytes
+    let archive_type = match detect_archive_type(archive_path) {
+        Ok(t) => t,
+        Err(_) => ArchiveType::Unknown,
+    };
+
+    // Skip non-archive files (game files like ESM, ESL, INI, BIK, etc.)
+    let is_indexable = matches!(
+        archive_type,
+        ArchiveType::Zip
+            | ArchiveType::SevenZ
+            | ArchiveType::Rar
+            | ArchiveType::Tes3Bsa
+            | ArchiveType::Bsa
+            | ArchiveType::Ba2
+    );
+    if !is_indexable {
+        // Mark as indexed with empty file list (it's a single file, not a container)
+        let _ = db.index_archive_files(archive_hash, &[]);
+        return Ok(0);
+    }
+
+    // Use pure Rust listing for all archive types
+    let files = list_archive_files_rust(archive_path)?;
+    let count = files.len();
+    db.index_archive_files(archive_hash, &files)?;
+    debug!("Indexed {} ({} files)", archive_name, count);
+    Ok(count)
+}
+
 fn index_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
     // Get all archives
     let archives = db.get_all_archives()?;
@@ -680,14 +723,16 @@ pub struct ProcessContext<'a> {
     pub config: &'a InstallConfig,
     /// Open wabbajack archive for inline files
     pub wabbajack: Mutex<ZipArchive<BufReader<File>>>,
-    /// Archive cache - maps archive hash to file path
+    /// Archive cache - maps archive hash to file path (built at startup)
     pub archive_paths: HashMap<String, PathBuf>,
+    /// Dynamically registered archive paths (added as downloads complete in pipelined mode)
+    pub dynamic_archive_paths: RwLock<HashMap<String, PathBuf>>,
     /// SQLite cache for expensive extractions (7z/RAR)
     pub extraction_cache: BsaCache,
     /// Cache of existing output files: normalized_path -> size (built once at start)
     pub existing_files: HashMap<String, u64>,
     /// Patch basis keys that are actually needed for this run.
-    needed_patch_basis_keys: RwLock<HashSet<String>>,
+    pub(crate) needed_patch_basis_keys: RwLock<HashSet<String>>,
     /// Basis key -> local output path + quick verification metadata.
     patch_basis_db: RwLock<HashMap<String, PatchBasisRecord>>,
     /// Cache of expensive full file hashes by `path|size|mtime`.
@@ -778,6 +823,7 @@ impl<'a> ProcessContext<'a> {
             config,
             wabbajack: Mutex::new(wabbajack),
             archive_paths,
+            dynamic_archive_paths: RwLock::new(HashMap::new()),
             extraction_cache,
             existing_files,
             needed_patch_basis_keys: RwLock::new(HashSet::new()),
@@ -788,8 +834,23 @@ impl<'a> ProcessContext<'a> {
         })
     }
 
-    pub fn get_archive_path(&self, hash: &str) -> Option<&PathBuf> {
-        self.archive_paths.get(hash)
+    pub fn get_archive_path(&self, hash: &str) -> Option<PathBuf> {
+        if let Some(p) = self.archive_paths.get(hash) {
+            return Some(p.clone());
+        }
+        self.dynamic_archive_paths
+            .read()
+            .expect("dynamic_archive_paths lock")
+            .get(hash)
+            .cloned()
+    }
+
+    /// Register a newly downloaded archive's path for extraction.
+    pub fn register_archive_path(&self, hash: String, path: PathBuf) {
+        self.dynamic_archive_paths
+            .write()
+            .expect("dynamic_archive_paths lock")
+            .insert(hash, path);
     }
 
     pub fn resolve_output_path(&self, to_path: &str) -> PathBuf {
@@ -1437,6 +1498,64 @@ impl<'a> DirectiveProcessor<'a> {
             .fetch_add(streaming_stats.failed, Ordering::Relaxed);
         self.sync_reporter();
         self.record_phase_failures("FromArchive+Patch", streaming_stats.failed);
+
+        // InlineFile
+        let failed_before = self.failed.load(Ordering::Relaxed);
+        pb.set_message("Processing InlineFile...");
+        self.reporter.phase_started("InlineFile", inline_count);
+        process_simple_directives(
+            self.db,
+            &self.ctx,
+            "InlineFile",
+            &pb,
+            &self.completed,
+            &self.skipped,
+            &self.failed,
+            &self.reporter,
+        )?;
+        self.sync_reporter();
+        self.record_phase_failures(
+            "InlineFile",
+            self.failed.load(Ordering::Relaxed) - failed_before,
+        );
+
+        // RemappedInlineFile
+        let failed_before = self.failed.load(Ordering::Relaxed);
+        pb.set_message("Processing RemappedInlineFile...");
+        self.reporter
+            .phase_started("RemappedInlineFile", remapped_count);
+        process_simple_directives(
+            self.db,
+            &self.ctx,
+            "RemappedInlineFile",
+            &pb,
+            &self.completed,
+            &self.skipped,
+            &self.failed,
+            &self.reporter,
+        )?;
+        self.sync_reporter();
+        self.record_phase_failures(
+            "RemappedInlineFile",
+            self.failed.load(Ordering::Relaxed) - failed_before,
+        );
+
+        pb.finish_and_clear();
+        Ok(())
+    }
+
+    /// Inline files phase only: InlineFile + RemappedInlineFile.
+    /// Used by pipelined mode where FromArchive/Patched are handled separately.
+    pub fn inline_phase(&self) -> Result<()> {
+        let inline_count = self.get_type_count("InlineFile")?;
+        let remapped_count = self.get_type_count("RemappedInlineFile")?;
+
+        if inline_count + remapped_count == 0 {
+            println!("No inline directives to process");
+            return Ok(());
+        }
+
+        let pb = self.make_progress_bar((inline_count + remapped_count) as u64);
 
         // InlineFile
         let failed_before = self.failed.load(Ordering::Relaxed);

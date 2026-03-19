@@ -544,6 +544,341 @@ Copied files with different names will not be reused. Examples: {}",
     Ok(stats)
 }
 
+/// Event emitted per-archive during streaming downloads.
+#[derive(Debug)]
+pub enum ArchiveEvent {
+    /// Archive is ready (downloaded + hash verified, or already existed).
+    Ready {
+        hash: String,
+        name: String,
+        path: PathBuf,
+    },
+    /// Archive download failed.
+    Failed {
+        hash: String,
+        name: String,
+        error: String,
+    },
+    /// Archive requires manual download — not a hard failure but blocks this archive.
+    Manual {
+        hash: String,
+        name: String,
+    },
+}
+
+/// Download archives with per-archive completion events.
+///
+/// Like `download_archives`, but sends an `ArchiveEvent` through the provided
+/// `std::sync::mpsc::SyncSender` as each archive finishes. Already-downloaded
+/// archives emit `Ready` events before the download stream starts.
+pub async fn download_archives_streaming(
+    db: &ModlistDb,
+    config: &InstallConfig,
+    tx: &std::sync::mpsc::SyncSender<ArchiveEvent>,
+    priority: Option<&HashMap<String, u32>>,
+) -> Result<DownloadStats> {
+    // Smart check: scan output directory to find what's missing
+    println!("Scanning output directory for existing files...");
+    let existing_outputs = scan_existing_outputs(&config.output_dir)?;
+    println!("Found {} existing output files", existing_outputs.len());
+
+    // Get all directives that need archives and check which outputs are missing
+    let directive_outputs = db.get_directive_outputs_with_archives()?;
+    let mut needed_archives: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut missing_count = 0;
+
+    for (to_path, size, archive_hash) in &directive_outputs {
+        let normalized = crate::paths::normalize_for_lookup(to_path);
+        let output_exists = existing_outputs
+            .get(&normalized)
+            .map(|&existing_size| existing_size == *size as u64)
+            .unwrap_or(false);
+
+        if !output_exists {
+            needed_archives.insert(archive_hash.clone());
+            missing_count += 1;
+        }
+    }
+
+    if needed_archives.is_empty() {
+        println!("All output files exist - no downloads needed!");
+        return Ok(DownloadStats::default());
+    }
+
+    println!(
+        "Found {} missing outputs requiring {} archives",
+        missing_count,
+        needed_archives.len()
+    );
+
+    // Get archive info for needed archives
+    let needed_hashes: Vec<String> = needed_archives.into_iter().collect();
+    let archives_to_check = db.get_archives_by_hashes(&needed_hashes)?;
+
+    // Check which archives are already downloaded
+    let mut already_downloaded = 0usize;
+    let mut already_downloaded_size: u64 = 0;
+    let mut need_download: Vec<ArchiveInfo> = Vec::new();
+    let mut archives_to_verify: Vec<(ArchiveInfo, PathBuf)> = Vec::new();
+    let mut ready_archives: Vec<(ArchiveInfo, PathBuf)> = Vec::new();
+
+    for archive in archives_to_check {
+        let output_path = config.downloads_dir.join(&archive.name);
+        if output_path.exists() {
+            if let Ok(meta) = fs::metadata(&output_path) {
+                if archive.download_status == "completed" {
+                    if let Some(ref lp) = archive.local_path {
+                        if output_path.to_string_lossy() == lp.as_str()
+                            || meta.len() == archive.size as u64
+                        {
+                            already_downloaded += 1;
+                            already_downloaded_size += archive.size as u64;
+                            ready_archives.push((archive, output_path));
+                            continue;
+                        }
+                    }
+                }
+
+                // Queue for hash verification
+                archives_to_verify.push((archive, output_path));
+                continue;
+            }
+        }
+        need_download.push(archive);
+    }
+
+    // Sort ready archives by priority (highest first) and emit events
+    if let Some(prio) = priority {
+        ready_archives.sort_by(|a, b| {
+            let pa = prio.get(&a.0.hash).copied().unwrap_or(0);
+            let pb = prio.get(&b.0.hash).copied().unwrap_or(0);
+            pb.cmp(&pa)
+        });
+    }
+    for (archive, output_path) in ready_archives {
+        let _ = tx.send(ArchiveEvent::Ready {
+            hash: archive.hash.clone(),
+            name: archive.name.clone(),
+            path: output_path,
+        });
+    }
+
+    // Verify hashes of existing archives
+    if !archives_to_verify.is_empty() {
+        println!(
+            "Verifying {} existing archives...",
+            archives_to_verify.len()
+        );
+        let verify_total = archives_to_verify.len();
+        let verify_progress = AtomicUsize::new(0);
+
+        let verify_results: Vec<Result<(bool, String)>> = archives_to_verify
+            .par_iter()
+            .map(|(archive, output_path)| {
+                let done = verify_progress.fetch_add(1, Ordering::Relaxed) + 1;
+                eprint!(
+                    "\r  Verifying {}/{}: {}",
+                    done, verify_total, archive.name
+                );
+                verify_file_hash_detailed(output_path, &archive.hash)
+            })
+            .collect();
+        eprintln!();
+
+        for ((archive, output_path), result) in
+            archives_to_verify.into_iter().zip(verify_results)
+        {
+            match result {
+                Ok((true, _)) => {
+                    db.mark_archive_downloaded(
+                        &archive.hash,
+                        output_path.to_string_lossy().as_ref(),
+                    )?;
+                    already_downloaded += 1;
+                    already_downloaded_size += archive.size as u64;
+                    let _ = tx.send(ArchiveEvent::Ready {
+                        hash: archive.hash.clone(),
+                        name: archive.name.clone(),
+                        path: output_path,
+                    });
+                }
+                Ok((false, _)) | Err(_) => {
+                    let _ = fs::remove_file(&output_path);
+                    need_download.push(archive);
+                }
+            }
+        }
+    }
+
+    if already_downloaded > 0 {
+        println!(
+            "Found {} archives already downloaded ({} bytes)",
+            already_downloaded, already_downloaded_size
+        );
+        if let Some(ref callback) = config.progress_callback {
+            callback(super::ProgressEvent::DownloadSkipped {
+                count: already_downloaded,
+                total_size: already_downloaded_size,
+            });
+        }
+    }
+
+    if need_download.is_empty() {
+        println!("All needed archives already downloaded!");
+        return Ok(DownloadStats {
+            downloaded: 0,
+            skipped: already_downloaded,
+            ..Default::default()
+        });
+    }
+
+    // Sort downloads by priority (highest first) — BSA-feeding archives first
+    if let Some(prio) = priority {
+        need_download.sort_by(|a, b| {
+            let pa = prio.get(&a.hash).copied().unwrap_or(0);
+            let pb = prio.get(&b.hash).copied().unwrap_or(0);
+            pb.cmp(&pa)
+        });
+    }
+
+    println!("Need to download {} archives", need_download.len());
+
+    // Route to NXM mode if enabled — falls back to non-streaming (events after batch)
+    if config.nxm_mode {
+        let mut stats = download_archives_nxm(db, config, need_download).await?;
+        stats.skipped += already_downloaded;
+        // NXM mode doesn't stream events per-archive; emit all at end
+        let all_archives = db.get_all_archives()?;
+        for a in &all_archives {
+            if a.download_status == "completed" {
+                let path = match &a.local_path {
+                    Some(p) => PathBuf::from(p),
+                    None => config.downloads_dir.join(&a.name),
+                };
+                if path.exists() {
+                    let _ = tx.send(ArchiveEvent::Ready {
+                        hash: a.hash.clone(),
+                        name: a.name.clone(),
+                        path,
+                    });
+                }
+            }
+        }
+        return Ok(stats);
+    }
+
+    let pending = need_download;
+
+    // Setup progress display
+    let multi_progress = MultiProgress::new();
+    let overall_pb = multi_progress.add(ProgressBar::new(pending.len() as u64));
+    overall_pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {msg}")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+    overall_pb.enable_steady_tick(Duration::from_millis(100));
+    overall_pb.set_message("Starting downloads...");
+
+    let total_archives = pending.len();
+    let ctx = Arc::new(DownloadContext {
+        nexus: NexusDownloader::new(&config.nexus_api_key)?,
+        http: HttpClient::new()?,
+        cdn: WabbajackCdnDownloader::new()?,
+        gdrive: GoogleDriveDownloader::new()?,
+        mediafire: MediaFireDownloader::new()?,
+        config: config.clone(),
+        multi_progress,
+        overall_pb: overall_pb.clone(),
+        downloaded: AtomicUsize::new(0),
+        skipped: AtomicUsize::new(0),
+        failed: AtomicUsize::new(0),
+        manual_downloads: Mutex::new(Vec::new()),
+        failed_downloads: Mutex::new(Vec::new()),
+        completed_archives: AtomicUsize::new(0),
+        total_archives,
+    });
+
+    let concurrency = config.max_concurrent_downloads;
+
+    // Stream downloads, emitting events as each completes
+    stream::iter(pending)
+        .map(|archive| {
+            let ctx = Arc::clone(&ctx);
+            async move {
+                let output_path = ctx.config.downloads_dir.join(&archive.name);
+                let (result, url_to_cache) = process_archive(&ctx, &archive, &output_path).await;
+                (archive, output_path, result, url_to_cache)
+            }
+        })
+        .buffer_unordered(concurrency)
+        .for_each(|(archive, output_path, result, url_to_cache)| {
+            // Cache URL if we got one
+            if let Some((url, expires)) = url_to_cache {
+                let _ = db.cache_download_url(&archive.hash, &url, expires);
+            }
+
+            match result {
+                DownloadResult::Success | DownloadResult::Skipped => {
+                    let _ = db.mark_archive_downloaded(
+                        &archive.hash,
+                        output_path.to_string_lossy().as_ref(),
+                    );
+                    let _ = tx.send(ArchiveEvent::Ready {
+                        hash: archive.hash.clone(),
+                        name: archive.name.clone(),
+                        path: output_path,
+                    });
+                }
+                DownloadResult::Manual => {
+                    let _ = tx.send(ArchiveEvent::Manual {
+                        hash: archive.hash.clone(),
+                        name: archive.name.clone(),
+                    });
+                }
+                DownloadResult::Failed => {
+                    let _ = tx.send(ArchiveEvent::Failed {
+                        hash: archive.hash.clone(),
+                        name: archive.name.clone(),
+                        error: "Download failed".to_string(),
+                    });
+                }
+            }
+            futures::future::ready(())
+        })
+        .await;
+
+    overall_pb.finish_and_clear();
+
+    let manual_downloads_list = ctx.manual_downloads.lock().await.clone();
+    let failed_downloads_list = ctx.failed_downloads.lock().await.clone();
+
+    let stats = DownloadStats {
+        downloaded: ctx.downloaded.load(Ordering::Relaxed),
+        skipped: ctx.skipped.load(Ordering::Relaxed) + already_downloaded,
+        failed: ctx.failed.load(Ordering::Relaxed),
+        manual: manual_downloads_list.len(),
+        failed_downloads: failed_downloads_list,
+        manual_downloads: manual_downloads_list,
+    };
+
+    // Print summary
+    println!("\n=== Download Summary ===");
+    println!("Downloaded: {}", stats.downloaded);
+    println!("Skipped:    {}", stats.skipped);
+    println!("Manual:     {}", stats.manual);
+    println!("Failed:     {}", stats.failed);
+
+    let limits = ctx.nexus.rate_limits();
+    println!(
+        "\nNexus API: {}/{} hourly, {}/{} daily",
+        limits.hourly_remaining, limits.hourly_limit, limits.daily_remaining, limits.daily_limit
+    );
+
+    Ok(stats)
+}
+
 /// Result of processing a single archive
 #[derive(Debug, Clone, Copy)]
 enum DownloadResult {
