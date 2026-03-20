@@ -1,3 +1,4 @@
+#![allow(dead_code)] // Used by lib crate
 //! Installation orchestrator
 //!
 //! Coordinates the phases of modlist installation:

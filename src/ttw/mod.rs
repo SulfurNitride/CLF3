@@ -420,32 +420,30 @@ where
     // Read stdout line by line
     if let Some(stdout) = stdout {
         let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    info!("[TTW] {}", trimmed);
-                    // Parse progress from TTW installer output
-                    // Format: "[HH:MM:SS] Assets: X/Y - BSA N/M: ..."
-                    if trimmed.contains("Assets:")
-                        || trimmed.contains("Writing BSA")
-                        || trimmed.contains("Installation complete")
-                        || trimmed.contains("Processing")
-                        || trimmed.contains("Extracting")
-                        || trimmed.contains("checks passed")
-                    {
-                        // Extract just the message part (after timestamp)
-                        let msg = if trimmed.starts_with('[') {
-                            trimmed
-                                .find(']')
-                                .map(|i| &trimmed[i + 1..])
-                                .unwrap_or(trimmed)
-                                .trim()
-                        } else {
-                            trimmed
-                        };
-                        progress_callback(msg);
-                    }
+        for line in reader.lines().map_while(Result::ok) {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                info!("[TTW] {}", trimmed);
+                // Parse progress from TTW installer output
+                // Format: "[HH:MM:SS] Assets: X/Y - BSA N/M: ..."
+                if trimmed.contains("Assets:")
+                    || trimmed.contains("Writing BSA")
+                    || trimmed.contains("Installation complete")
+                    || trimmed.contains("Processing")
+                    || trimmed.contains("Extracting")
+                    || trimmed.contains("checks passed")
+                {
+                    // Extract just the message part (after timestamp)
+                    let msg = if trimmed.starts_with('[') {
+                        trimmed
+                            .find(']')
+                            .map(|i| &trimmed[i + 1..])
+                            .unwrap_or(trimmed)
+                            .trim()
+                    } else {
+                        trimmed
+                    };
+                    progress_callback(msg);
                 }
             }
         }
@@ -454,7 +452,7 @@ where
     // Read any remaining stderr
     if let Some(stderr) = stderr {
         let reader = BufReader::new(stderr);
-        for line in reader.lines().flatten() {
+        for line in reader.lines().map_while(Result::ok) {
             let trimmed = line.trim();
             if !trimmed.is_empty() {
                 warn!("[TTW] {}", trimmed);

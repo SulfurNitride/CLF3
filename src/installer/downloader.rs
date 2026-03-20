@@ -1,3 +1,4 @@
+#![allow(dead_code)] // Used by lib crate
 //! Download phase coordinator
 //!
 //! Coordinates downloading all archives from various sources with parallel downloads.

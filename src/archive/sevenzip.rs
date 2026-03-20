@@ -35,8 +35,110 @@ use std::io::{BufRead, BufReader, BufWriter, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use std::sync::Mutex;
+
 /// Windows file attribute flag for reparse points (symlinks, junctions).
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
+// ============================================================================
+// Archive listing cache — pre-lists archives into SQLite so extraction
+// workers can resolve paths without spawning 7zz/reading archive headers.
+// ============================================================================
+
+/// SQLite-backed cache for archive file listings.
+/// Stores normalized_path → actual_path mappings per archive.
+pub struct ArchiveListingCache {
+    conn: Mutex<rusqlite::Connection>,
+}
+
+impl ArchiveListingCache {
+    /// Create a new in-memory listing cache.
+    pub fn new() -> Result<Self> {
+        let conn = rusqlite::Connection::open_in_memory()
+            .context("Failed to create archive listing cache")?;
+        conn.execute_batch(
+            "CREATE TABLE archive_paths (
+                archive TEXT NOT NULL,
+                normalized TEXT NOT NULL,
+                actual TEXT NOT NULL
+            );
+            CREATE INDEX idx_archive_paths ON archive_paths(archive, normalized);",
+        )
+        .context("Failed to create cache tables")?;
+        // Use WAL mode and relaxed sync for speed — this is a transient cache
+        conn.pragma_update(None, "journal_mode", "WAL").ok();
+        conn.pragma_update(None, "synchronous", "OFF").ok();
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Pre-list an archive and store its path mappings in the cache.
+    pub fn populate(&self, archive_path: &Path) -> Result<()> {
+        let entries = list_archive(archive_path)?;
+        let lookup = build_path_lookup(&entries);
+        let archive_key = archive_path.to_string_lossy().to_string();
+
+        let conn = self.conn.lock().expect("listing cache lock");
+        let mut stmt = conn
+            .prepare_cached(
+                "INSERT INTO archive_paths (archive, normalized, actual) VALUES (?1, ?2, ?3)",
+            )
+            .context("Failed to prepare cache insert")?;
+
+        for (normalized, actual) in &lookup {
+            stmt.execute(rusqlite::params![archive_key, normalized, actual])?;
+        }
+        Ok(())
+    }
+
+    /// Resolve multiple files at once, returning the actual paths.
+    pub fn resolve_files(
+        &self,
+        archive_path: &Path,
+        files: &[String],
+    ) -> Result<Vec<String>> {
+        let archive_key = archive_path.to_string_lossy().to_string();
+        let conn = self.conn.lock().expect("listing cache lock");
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT actual FROM archive_paths WHERE archive = ?1 AND normalized = ?2",
+            )
+            .context("Failed to prepare cache query")?;
+
+        let mut resolved = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for file in files {
+            let normalized = normalize_path(file);
+            let actual: String = stmt
+                .query_row(rusqlite::params![archive_key, normalized], |row| row.get(0))
+                .with_context(|| {
+                    format!(
+                        "File '{}' not found in archive listing cache for '{}'",
+                        file, archive_key
+                    )
+                })?;
+
+            if seen.insert(actual.clone()) {
+                resolved.push(actual);
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// Check if an archive has been listed.
+    pub fn has_archive(&self, archive_path: &Path) -> bool {
+        let archive_key = archive_path.to_string_lossy().to_string();
+        let conn = self.conn.lock().expect("listing cache lock");
+        conn.query_row(
+            "SELECT 1 FROM archive_paths WHERE archive = ?1 LIMIT 1",
+            rusqlite::params![archive_key],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+}
 
 /// Archive type detected by magic bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,6 +327,30 @@ pub fn extract_files_case_insensitive(
     Ok(resolved_refs.len())
 }
 
+/// Extract multiple files using case-insensitive matching with a pre-populated listing cache.
+///
+/// Skips the `list_archive` call entirely — path resolution comes from the cache.
+/// Falls back to `extract_files_case_insensitive` if the archive isn't cached.
+pub fn extract_files_cached(
+    archive_path: &Path,
+    files: &[String],
+    output_dir: &Path,
+    cache: &ArchiveListingCache,
+) -> Result<usize> {
+    if files.is_empty() {
+        return Ok(0);
+    }
+
+    if !cache.has_archive(archive_path) {
+        return extract_files_case_insensitive(archive_path, files, output_dir);
+    }
+
+    let resolved = cache.resolve_files(archive_path, files)?;
+    let resolved_refs: Vec<&str> = resolved.iter().map(|s| s.as_str()).collect();
+    extract_files(archive_path, &resolved_refs, output_dir)?;
+    Ok(resolved_refs.len())
+}
+
 /// Extract all files from an archive to a directory.
 pub fn extract_all(archive_path: &Path, output_dir: &Path) -> Result<usize> {
     extract_all_with_threads(archive_path, output_dir, None)
@@ -260,18 +386,6 @@ pub fn extract_all_with_threads(
             }),
         _ => extract_all_7z_binary(archive_path, output_dir, threads),
     }
-}
-
-/// Check if an archive is a solid 7z archive.
-pub fn is_solid_archive(archive_path: &Path) -> Result<bool> {
-    let archive_type = detect_archive_type(archive_path).unwrap_or(ArchiveType::Unknown);
-
-    if archive_type != ArchiveType::SevenZ {
-        return Ok(false);
-    }
-
-    is_solid_7z_native(archive_path)
-        .or_else(|_| is_solid_7z_binary(archive_path))
 }
 
 /// Get the path to the 7z binary (used as fallback for RAR).
@@ -446,7 +560,7 @@ fn extract_zip_files(archive_path: &Path, files: &[&str], output_dir: &Path) -> 
             if let Some(parent) = output_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let mut outfile = BufWriter::new(File::create(&output_path)?);
+            let mut outfile = BufWriter::with_capacity(65536, File::create(&output_path)?);
             std::io::copy(&mut entry, &mut outfile)?;
         }
     }
@@ -478,7 +592,7 @@ fn extract_zip_all(archive_path: &Path, output_dir: &Path) -> Result<usize> {
             if let Some(parent) = output_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let mut outfile = BufWriter::new(File::create(&output_path)?);
+            let mut outfile = BufWriter::with_capacity(65536, File::create(&output_path)?);
             std::io::copy(&mut entry, &mut outfile)?;
             count += 1;
         }
@@ -515,208 +629,6 @@ fn list_7z_native(archive_path: &Path) -> Result<Vec<ArchiveEntry>> {
         });
     }
     Ok(entries)
-}
-
-/// Extract a single file from a 7z archive to memory.
-fn extract_7z_file_native(archive_path: &Path, file_path: &str) -> Result<Vec<u8>> {
-    let target = normalize_path(file_path);
-    let mut reader = sevenz_rust2::ArchiveReader::open(archive_path, sevenz_rust2::Password::empty())
-        .with_context(|| format!("Failed to open 7z: {}", archive_path.display()))?;
-
-    // Try exact name first
-    if let Ok(data) = reader.read_file(file_path) {
-        return Ok(data);
-    }
-
-    // Re-open and try case-insensitive via for_each_entries
-    let mut reader = sevenz_rust2::ArchiveReader::open(archive_path, sevenz_rust2::Password::empty())?;
-    let mut result: Option<Vec<u8>> = None;
-
-    // First pass: check for empty files (no stream) in the archive metadata
-    let archive = sevenz_rust2::Archive::open(archive_path)?;
-    for file_entry in &archive.files {
-        if !file_entry.is_directory
-            && !file_entry.has_stream
-            && normalize_path(&file_entry.name) == target
-        {
-            // Empty file - return empty vec
-            return Ok(Vec::new());
-        }
-    }
-
-    reader.for_each_entries(|entry, r| {
-        if result.is_some() {
-            // Already found; drain reader to maintain stream position
-            std::io::copy(r, &mut std::io::sink())?;
-            return Ok(true);
-        }
-        if entry.is_directory {
-            return Ok(true);
-        }
-        if normalize_path(&entry.name) == target {
-            let mut data = Vec::with_capacity(entry.size as usize);
-            r.read_to_end(&mut data)?;
-            result = Some(data);
-        } else {
-            // Drain to maintain stream position (needed for solid archives)
-            std::io::copy(r, &mut std::io::sink())?;
-        }
-        Ok(true)
-    }).with_context(|| format!("Failed extracting from 7z: {}", archive_path.display()))?;
-
-    result.ok_or_else(|| {
-        anyhow::anyhow!(
-            "File '{}' not found in 7z '{}'",
-            file_path,
-            archive_path.display()
-        )
-    })
-}
-
-/// Extract specific files from a 7z archive to a directory.
-fn extract_7z_files_native(
-    archive_path: &Path,
-    files: &[&str],
-    output_dir: &Path,
-) -> Result<()> {
-    let target_set: std::collections::HashSet<String> =
-        files.iter().map(|f| normalize_path(f)).collect();
-
-    fs::create_dir_all(output_dir)?;
-
-    // First pass: create empty files (no stream) from archive metadata
-    let archive = sevenz_rust2::Archive::open(archive_path)
-        .with_context(|| format!("Failed to open 7z: {}", archive_path.display()))?;
-    for file_entry in &archive.files {
-        if file_entry.is_directory || file_entry.has_stream || file_entry.is_anti_item {
-            continue;
-        }
-        let normalized = normalize_path(&file_entry.name);
-        if target_set.contains(&normalized) {
-            let dest = output_dir.join(&file_entry.name);
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            File::create(&dest)?; // Create empty file
-        }
-    }
-
-    // Second pass: extract files with stream data
-    let mut reader = sevenz_rust2::ArchiveReader::open(archive_path, sevenz_rust2::Password::empty())
-        .with_context(|| format!("Failed to open 7z: {}", archive_path.display()))?;
-
-    reader.for_each_entries(|entry, r| {
-        if entry.is_directory || entry.is_anti_item {
-            return Ok(true);
-        }
-        // Skip reparse points
-        if entry.has_windows_attributes
-            && (entry.windows_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
-        {
-            std::io::copy(r, &mut std::io::sink())?;
-            return Ok(true);
-        }
-
-        let normalized = normalize_path(&entry.name);
-        if target_set.contains(&normalized) {
-            let dest = output_dir.join(&entry.name);
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut outfile = BufWriter::new(File::create(&dest)?);
-            std::io::copy(r, &mut outfile)?;
-        } else {
-            // Must drain in solid archives
-            std::io::copy(r, &mut std::io::sink())?;
-        }
-        Ok(true)
-    }).with_context(|| format!("Failed extracting from 7z: {}", archive_path.display()))?;
-
-    Ok(())
-}
-
-/// Extract all files from a 7z archive to a directory.
-fn extract_7z_all_native(
-    archive_path: &Path,
-    output_dir: &Path,
-    threads: Option<usize>,
-) -> Result<usize> {
-    fs::create_dir_all(output_dir)?;
-
-    // First pass: create empty files (no stream) from archive metadata
-    let archive = sevenz_rust2::Archive::open(archive_path)
-        .with_context(|| format!("Failed to open 7z: {}", archive_path.display()))?;
-    let mut count = 0usize;
-    for file_entry in &archive.files {
-        if file_entry.is_directory || file_entry.has_stream || file_entry.is_anti_item {
-            continue;
-        }
-        // Skip reparse points
-        if file_entry.has_windows_attributes
-            && (file_entry.windows_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
-        {
-            continue;
-        }
-        let dest = output_dir.join(&file_entry.name);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        File::create(&dest)?; // Create empty file
-        count += 1;
-    }
-
-    // Second pass: extract files with stream data
-    let mut reader = sevenz_rust2::ArchiveReader::open(archive_path, sevenz_rust2::Password::empty())
-        .with_context(|| format!("Failed to open 7z: {}", archive_path.display()))?;
-
-    // Set thread count
-    let thread_count = match threads {
-        Some(0) | None => num_cpus(),
-        Some(n) => n,
-    };
-    reader.set_thread_count(thread_count as u32);
-
-    reader.for_each_entries(|entry, r| {
-        if entry.is_directory {
-            let dir_path = output_dir.join(&entry.name);
-            fs::create_dir_all(&dir_path)?;
-            return Ok(true);
-        }
-        if entry.is_anti_item {
-            return Ok(true);
-        }
-        // Skip reparse points
-        if entry.has_windows_attributes
-            && (entry.windows_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
-        {
-            std::io::copy(r, &mut std::io::sink())?;
-            return Ok(true);
-        }
-
-        let dest = output_dir.join(&entry.name);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut outfile = BufWriter::new(File::create(&dest)?);
-        std::io::copy(r, &mut outfile)?;
-        count += 1;
-        Ok(true)
-    }).with_context(|| format!("Failed extracting 7z: {}", archive_path.display()))?;
-
-    Ok(count)
-}
-
-/// Check if a 7z archive is solid using native crate.
-fn is_solid_7z_native(archive_path: &Path) -> Result<bool> {
-    let archive = sevenz_rust2::Archive::open(archive_path)
-        .with_context(|| format!("Failed to open 7z: {}", archive_path.display()))?;
-    Ok(archive.is_solid)
-}
-
-fn num_cpus() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
 }
 
 // ============================================================================
@@ -899,8 +811,7 @@ fn extract_file_7z_binary(archive_path: &Path, file_path: &str) -> Result<Vec<u8
         .arg("-y")
         .arg("-spd")
         .arg("-scsUTF-8")
-        // Use one 7z worker thread per process.
-        .arg("-mmt=1")
+        .arg("-mmt=2")
         .arg(archive_path)
         .arg(&normalized_path)
         .output()
@@ -956,8 +867,7 @@ fn extract_files_7z_binary(archive_path: &Path, files: &[&str], output_dir: &Pat
         .arg("-y")
         .arg("-aoa")
         .arg("-scsUTF-8")
-        // Use one 7z worker thread per process.
-        .arg("-mmt=1")
+        .arg("-mmt=2")
         .arg(format!("-o{}", output_dir.display()))
         .arg(archive_path)
         .arg("--");
@@ -978,7 +888,7 @@ fn extract_files_7z_binary(archive_path: &Path, files: &[&str], output_dir: &Pat
         if !reparse_paths.is_empty() {
             let mut retry = Command::new(&sz_path);
             retry.arg("x").arg("-y").arg("-aoa").arg("-scsUTF-8")
-                .arg("-mmt=1")
+                .arg("-mmt=2")
                 .arg(format!("-o{}", output_dir.display()));
 
             for path in &reparse_paths {
@@ -1034,12 +944,8 @@ fn extract_all_7z_binary(
     cmd.arg("x").arg("-y").arg("-aoa").arg("-scsUTF-8");
 
     match threads {
-        Some(1) => {
-            // Wabbajack parity: explicitly disable 7z internal MT for one-thread mode.
-            cmd.arg("-mmt=off");
-        }
-        Some(n) if n > 1 => {
-            cmd.arg(format!("-mmt={}", n));
+        Some(n) if n >= 1 => {
+            cmd.arg(format!("-mmt={}", n.max(2)));
         }
         _ => {
             cmd.arg("-mmt=on");
@@ -1063,11 +969,8 @@ fn extract_all_7z_binary(
             retry.arg("x").arg("-y").arg("-aoa").arg("-scsUTF-8");
 
             match threads {
-                Some(1) => {
-                    retry.arg("-mmt=off");
-                }
-                Some(n) if n > 1 => {
-                    retry.arg(format!("-mmt={}", n));
+                Some(n) if n >= 1 => {
+                    retry.arg(format!("-mmt={}", n.max(2)));
                 }
                 _ => {
                     retry.arg("-mmt=on");
@@ -1121,31 +1024,6 @@ fn extract_all_7z_binary(
         .count();
 
     Ok(count)
-}
-
-/// Check if 7z archive is solid using 7z binary.
-fn is_solid_7z_binary(archive_path: &Path) -> Result<bool> {
-    let sz_path = get_7z_path()?;
-
-    let output = Command::new(&sz_path)
-        .arg("l")
-        .arg("-slt")
-        .arg(archive_path)
-        .output()
-        .with_context(|| format!("Failed to check if {} is solid", archive_path.display()))?;
-
-    if !output.status.success() {
-        return Ok(false);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        if line.trim().starts_with("Solid = +") {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
 }
 
 // ============================================================================

@@ -230,7 +230,7 @@ impl BsaBuilder {
         // Write archive
         let file = fs::File::create(output_path)
             .with_context(|| format!("Failed to create BSA: {}", output_path.display()))?;
-        let mut writer = BufWriter::new(file);
+        let mut writer = BufWriter::with_capacity(65536, file);
 
         archive
             .write(&mut writer, &options)

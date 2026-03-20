@@ -259,7 +259,7 @@ impl Ba2Builder {
         // Write archive
         let file = fs::File::create(output_path)
             .with_context(|| format!("Failed to create BA2: {}", output_path.display()))?;
-        let mut writer = BufWriter::new(file);
+        let mut writer = BufWriter::with_capacity(65536, file);
 
         archive
             .write(&mut writer, &options)
@@ -325,7 +325,7 @@ impl Ba2Builder {
 
         let file = fs::File::create(output_path)
             .with_context(|| format!("Failed to create BA2: {}", output_path.display()))?;
-        let mut writer = BufWriter::new(file);
+        let mut writer = BufWriter::with_capacity(65536, file);
 
         archive
             .write(&mut writer, &options)

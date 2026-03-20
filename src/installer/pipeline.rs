@@ -552,6 +552,7 @@ fn prepare_archive(
 
 /// Extract and finalize a prepared archive. No DB access needed — safe for rayon.
 /// DDS textures are processed inline (no channel/spill).
+#[allow(clippy::too_many_arguments)]
 fn extract_prepared_archive(
     prepared: PreparedArchive,
     ctx: &ProcessContext,
@@ -669,6 +670,7 @@ fn extract_prepared_archive(
             ctx,
             Some(1),
             &prepared.extra_paths,
+            None, // pipeline path doesn't use listing cache yet
         );
 
         match result {

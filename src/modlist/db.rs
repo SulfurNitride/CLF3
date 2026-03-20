@@ -35,7 +35,7 @@ impl DirectiveStatus {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s {
             "pending" => DirectiveStatus::Pending,
             "processing" => DirectiveStatus::Processing,
@@ -506,6 +506,7 @@ impl ModlistDb {
 
     /// Get all completed directives of a given type with their expected sizes.
     /// Returns (id, to_path, size, archive_hash) for verification purposes.
+    #[allow(clippy::type_complexity)]
     pub fn get_completed_directives_of_type(
         &self,
         directive_type: &str,

@@ -22,7 +22,7 @@ where
     let mut unsupported: HashMap<String, Vec<String>> = HashMap::new();
 
     for (_, directive) in directives {
-        if OutputFormat::from_str(&directive.image_state.format).is_none() {
+        if OutputFormat::parse(&directive.image_state.format).is_none() {
             unsupported
                 .entry(directive.image_state.format.clone())
                 .or_default()
@@ -99,7 +99,7 @@ pub fn handle_transformed_texture(
     source_data: &[u8],
 ) -> Result<()> {
     // Parse output format from ImageState
-    let output_format = match OutputFormat::from_str(&directive.image_state.format) {
+    let output_format = match OutputFormat::parse(&directive.image_state.format) {
         Some(fmt) => fmt,
         None => {
             if is_fallback_mode() {

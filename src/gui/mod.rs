@@ -3148,6 +3148,7 @@ pub enum ProgressUpdate {
 }
 
 /// Static channel for communication between background thread and GUI
+#[allow(clippy::type_complexity)]
 static PROGRESS_CHANNEL: Lazy<(
     Mutex<Sender<ProgressUpdate>>,
     Mutex<Receiver<ProgressUpdate>>,
@@ -4015,7 +4016,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
 
             // Shared image store - maps machine_name to raw RGBA data (width, height, pixels)
             // This persists images across filter changes (can't store slint::Image across threads)
-            let loaded_images: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (u32, u32, Vec<u8>)>>> =
+            type ImageStore = std::collections::HashMap<String, (u32, u32, Vec<u8>)>;
+            let loaded_images: std::sync::Arc<std::sync::Mutex<ImageStore>> =
                 std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
             // Helper to filter and create model with cached images
@@ -5136,6 +5138,7 @@ impl InstallProgressViewHandle {
     }
 
     /// Set the installation statistics
+    #[allow(clippy::too_many_arguments)]
     pub fn set_stats(
         &self,
         downloaded_bytes: &str,

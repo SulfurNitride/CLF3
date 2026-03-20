@@ -1,3 +1,4 @@
+#![allow(dead_code)] // Used by lib crate
 //! Directive processor - TTW-style batch processing
 //!
 //! Architecture:
@@ -372,26 +373,21 @@ fn index_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
                 // Check if this is a GameFileSource archive (from game installation)
                 if archive.state_json.contains("GameFileSourceDownloader") {
                     // Parse the state to get the game file path
-                    if let Ok(state) =
+                    if let Ok(crate::modlist::DownloadState::GameFileSource(gf)) =
                         serde_json::from_str::<crate::modlist::DownloadState>(&archive.state_json)
                     {
-                        if let crate::modlist::DownloadState::GameFileSource(gf) = state {
-                            // Look in game directory with case-insensitive path resolution
-                            let game_file = &gf.game_file;
-                            if let Some(resolved) = crate::paths::resolve_case_insensitive(
-                                &ctx.config.game_dir,
-                                game_file,
-                            ) {
-                                resolved
-                            } else if let Some(resolved) = crate::paths::resolve_case_insensitive(
-                                &ctx.config.game_dir,
-                                &format!("Data/{}", game_file),
-                            ) {
-                                resolved
-                            } else {
-                                // Fallback to downloads dir (will fail, but with proper error)
-                                ctx.config.downloads_dir.join(&archive.name)
-                            }
+                        // Look in game directory with case-insensitive path resolution
+                        let game_file = &gf.game_file;
+                        if let Some(resolved) = crate::paths::resolve_case_insensitive(
+                            &ctx.config.game_dir,
+                            game_file,
+                        ) {
+                            resolved
+                        } else if let Some(resolved) = crate::paths::resolve_case_insensitive(
+                            &ctx.config.game_dir,
+                            &format!("Data/{}", game_file),
+                        ) {
+                            resolved
                         } else {
                             ctx.config.downloads_dir.join(&archive.name)
                         }
@@ -1884,7 +1880,7 @@ pub(crate) fn apply_patch_to_temp(
     paths::ensure_parent_dirs(temp_output_path)?;
     let output_file = File::create(temp_output_path)
         .with_context(|| format!("Failed to create temp output: {}", temp_output_path.display()))?;
-    let mut writer = BufWriter::new(output_file);
+    let mut writer = BufWriter::with_capacity(65536, output_file);
 
     let written = std::io::copy(&mut reader, &mut writer)
         .with_context(|| format!("Failed to write patched file: {}", temp_output_path.display()))?;
@@ -2317,7 +2313,7 @@ fn process_transformed_texture(
 
     // Process each format group
     for (fmt_str, jobs) in &by_format {
-        let fmt = OutputFormat::from_str(fmt_str)
+        let fmt = OutputFormat::parse(fmt_str)
             .unwrap_or(if handlers::texture::is_fallback_mode() { OutputFormat::BC1 } else { OutputFormat::BC7 });
 
         if fmt == OutputFormat::BC7 {
@@ -2500,6 +2496,7 @@ fn process_create_bsa(
 }
 
 /// Process simple directive types
+#[allow(clippy::too_many_arguments)]
 fn process_simple_directives(
     db: &ModlistDb,
     ctx: &ProcessContext,

@@ -1,20 +1,20 @@
+#![allow(dead_code)] // Used by lib crate
 //! Fused install + patch pipeline for FromArchive and PatchedFromArchive directives.
 //!
 //! # Architecture
 //!
 //! ```text
 //! Phase A: Extract + Patch (all N threads, per archive)
-//!   Extract archive → temp dir
-//!   FromArchive files: ready in temp
-//!   PatchedFromArchive files: apply delta patch → write to temp
-//!   Build manifest of staged files
+//!   Extract archive → staging dir (subdir of output, same filesystem)
+//!   FromArchive files: staged, ready for rename
+//!   PatchedFromArchive files: apply delta patch → write directly to final path
+//!   Texture sources: read from staging before finalize
 //!
-//! Phase B: Finalize (all N threads, per archive, immediately after Phase A)
-//!   Reflink/copy staged files → final destinations
-//!   Verify file sizes
-//!   All verified → delete temp dir
-//!   Failures → log, keep temp for diagnostics
-//!   Next archive
+//! Phase B: Finalize (per archive, immediately after Phase A)
+//!   Rename staged files → final destinations (instant, zero I/O on same FS)
+//!   Shared sources: copy all-but-last, rename last consumer
+//!   Falls back to reflink/copy only on cross-device (EXDEV)
+//!   Verify file sizes, cleanup staging dir
 //! ```
 //!
 //! Archives are processed in parallel via rayon's work-stealing pool.
@@ -548,39 +548,20 @@ pub fn process_fused_streaming(
         .into_iter()
         .partition(|(_, _, _, kind)| matches!(kind, ArchiveKind::BsaDirect));
 
-    // Split extract archives into 7z and non-7z so 7z process concurrency can be capped.
-    let (sevenzip_archives, other_extract_archives): (Vec<_>, Vec<_>) = extract_archives
-        .into_iter()
-        .partition(|(_, _, path, _)| {
-            detect_archive_type(path)
-                .map(|t| matches!(t, NestedArchiveType::SevenZ))
-                .unwrap_or(false)
-        });
-
     let extract_workers = config.max_extract_workers.unwrap_or_else(|| {
         std::thread::available_parallelism()
             .map(|n| n.get().max(2))
             .unwrap_or(4)
     });
-    let sevenzip_archive_workers = config
-        .max_parallel_7z_archives
-        .unwrap_or(extract_workers)
-        .max(1);
     let bsa_archive_workers = config.max_parallel_bsa_archives.unwrap_or(1).max(1);
 
-    // Non-7z extraction pool.
+    // Unified extraction pool for all archive types (7z, ZIP, RAR).
+    // All archives share one pool so all worker slots stay busy.
     let extract_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(extract_workers)
         .thread_name(|i| format!("extract-{}", i))
         .build()
         .expect("Failed to build extraction thread pool");
-
-    // 7z extraction pool (external 7z processes). Keep concurrency low to control memory.
-    let sevenzip_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(sevenzip_archive_workers)
-        .thread_name(|i| format!("extract-7z-{}", i))
-        .build()
-        .expect("Failed to build 7z extraction thread pool");
 
     let bsa_archive_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(bsa_archive_workers)
@@ -588,18 +569,11 @@ pub fn process_fused_streaming(
         .build()
         .expect("Failed to build BSA archive pool");
 
-    if !other_extract_archives.is_empty() {
+    if !extract_archives.is_empty() {
         eprintln!(
-            "  Extract queue (non-7z): {} archives ({} concurrent workers)",
-            other_extract_archives.len(),
+            "  Extract queue: {} archives ({} concurrent workers)",
+            extract_archives.len(),
             extract_workers
-        );
-    }
-    if !sevenzip_archives.is_empty() {
-        eprintln!(
-            "  Extract queue (7z): {} archives ({} concurrent workers)",
-            sevenzip_archives.len(),
-            sevenzip_archive_workers
         );
     }
     if !bsa_archives.is_empty() {
@@ -616,6 +590,31 @@ pub fn process_fused_streaming(
     let _ = fs::create_dir_all(&dds_spill_dir);
     let collected_dds_jobs: Arc<std::sync::Mutex<Vec<SpilledDdsJob>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // Pre-list all extract archives in parallel so extraction workers
+    // can resolve paths from cache instead of spawning 7zz/reading headers.
+    let listing_cache = sevenzip::ArchiveListingCache::new()
+        .expect("Failed to create archive listing cache");
+    {
+        let archive_paths: Vec<&Path> = extract_archives
+            .iter()
+            .map(|(_, _, path, _)| path.as_path())
+            .collect();
+        let total = archive_paths.len();
+        if total > 0 {
+            eprintln!("  Pre-listing {} archives...", total);
+            let listed = AtomicUsize::new(0);
+            archive_paths.par_iter().for_each(|path| {
+                if let Err(e) = listing_cache.populate(path) {
+                    debug!("Pre-list failed for {}: {} (will list on demand)", path.display(), e);
+                }
+                let done = listed.fetch_add(1, Ordering::Relaxed) + 1;
+                if done.is_multiple_of(100) || done == total {
+                    eprintln!("  Pre-listed {}/{} archives", done, total);
+                }
+            });
+        }
+    }
 
     // Process BSA-direct archives in main rayon pool (unlimited, they're fast)
     // and extract archives in bounded pool — concurrently via std::thread::scope.
@@ -820,7 +819,8 @@ pub fn process_fused_streaming(
                                dds_tx: &std::sync::mpsc::SyncSender<DdsJob>,
                                tex_d2: &HashMap<String, TextureLookupInner>,
                                tex_d3: &HashMap<String, NestedTextureLookupInner>,
-                               failed_archive_hashes: &std::sync::Mutex<HashSet<String>>| {
+                               failed_archive_hashes: &std::sync::Mutex<HashSet<String>>,
+                               listing_cache: &sevenzip::ArchiveListingCache| {
             let archive_name = archive_path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -855,6 +855,7 @@ pub fn process_fused_streaming(
                 ctx,
                 Some(1),
                 &extra_paths,
+                Some(listing_cache),
             );
 
             match result {
@@ -937,56 +938,7 @@ pub fn process_fused_streaming(
             ));
         };
 
-        // 7z archives: dedicated capped pool.
-        let sevenzip_handle = {
-            let extracted = extracted.clone();
-            let written = written.clone();
-            let skipped = skipped.clone();
-            let failed = failed.clone();
-            let logged_failures = logged_failures.clone();
-            let completed_archives = completed_archives.clone();
-            let overall_pb = overall_pb.clone();
-            let mp = mp.clone();
-            let archive_bar_style = archive_bar_style.clone();
-            let adjusted_callback = adjusted_callback.clone();
-            let failed_hashes = failed_archive_hashes.clone();
-            let dds_tx = extract_dds_tx.clone();
-            let tex_d2 = ext_tex_d2.clone();
-            let tex_d3 = ext_tex_d3.clone();
-            thread_scope.spawn(move || {
-                sevenzip_pool.scope(|s| {
-                    for (archive_hash, directives, archive_path, _kind) in &sevenzip_archives {
-                        let extracted = &extracted;
-                        let written = &written;
-                        let skipped = &skipped;
-                        let failed = &failed;
-                        let logged_failures = &logged_failures;
-                        let completed_archives = &completed_archives;
-                        let overall_pb = &overall_pb;
-                        let archive_bar_style = &archive_bar_style;
-                        let mp = &mp;
-                        let adjusted_callback = &adjusted_callback;
-                        let dds_tx = &dds_tx;
-                        let tex_d2 = &tex_d2;
-                        let tex_d3 = &tex_d3;
-                        let failed_hashes = &failed_hashes;
-
-                        s.spawn(move |_| {
-                            process_archive(
-                                archive_hash, directives, archive_path,
-                                extracted, written, skipped, failed,
-                                logged_failures, completed_archives,
-                                overall_pb, archive_bar_style, mp,
-                                adjusted_callback, dds_tx, tex_d2, tex_d3,
-                                failed_hashes,
-                            );
-                        });
-                    }
-                });
-            })
-        };
-
-        // Non-7z extract archives.
+        // All extract archives (7z, ZIP, RAR) in one unified pool.
         let extract_handle = {
             let extracted = extracted.clone();
             let written = written.clone();
@@ -1004,7 +956,7 @@ pub fn process_fused_streaming(
                 let tex_d2 = ext_tex_d2;
                 let tex_d3 = ext_tex_d3;
                 extract_pool.scope(|s| {
-                    for (archive_hash, directives, archive_path, _kind) in &other_extract_archives {
+                    for (archive_hash, directives, archive_path, _kind) in &extract_archives {
                         let extracted = &extracted;
                         let written = &written;
                         let skipped = &skipped;
@@ -1019,6 +971,7 @@ pub fn process_fused_streaming(
                         let tex_d2 = &tex_d2;
                         let tex_d3 = &tex_d3;
                         let failed_hashes = &failed_hashes;
+                        let listing_cache = &listing_cache;
 
                         s.spawn(move |_| {
                             process_archive(
@@ -1027,7 +980,7 @@ pub fn process_fused_streaming(
                                 logged_failures, completed_archives,
                                 overall_pb, archive_bar_style, mp,
                                 adjusted_callback, dds_tx, tex_d2, tex_d3,
-                                failed_hashes,
+                                failed_hashes, listing_cache,
                             );
                         });
                     }
@@ -1036,7 +989,6 @@ pub fn process_fused_streaming(
         };
 
         bsa_handle.join().expect("BSA processing thread panicked");
-        sevenzip_handle.join().expect("7z extract processing thread panicked");
         extract_handle.join().expect("Extract processing thread panicked");
         // All dds_tx senders (bsa + extract) are now dropped,
         // so the channel is closed and the collector will finish draining.
@@ -1151,6 +1103,7 @@ pub(crate) fn process_single_archive_fused(
     ctx: &ProcessContext,
     threads_per_archive: Option<usize>,
     extra_needed_paths: &[String],
+    listing_cache: Option<&sevenzip::ArchiveListingCache>,
 ) -> Result<ArchiveResult> {
     const MAX_LOGGED_FAILURES: usize = 100;
 
@@ -1330,6 +1283,7 @@ pub(crate) fn process_single_archive_fused(
                 &needed_paths,
                 &extract_dir,
                 threads_per_archive,
+                listing_cache,
             ) {
                 error!("FAIL: Cannot extract {}: {}", archive_path.display(), e);
             }
@@ -1571,7 +1525,7 @@ pub(crate) fn process_single_archive_fused(
     }
 
     // === Process PatchedFromArchive directives ===
-    // Use parallel processing for patch application
+    // Write patches directly to final output paths (no staging/copy needed).
     let patch_results: Vec<_> = patched_to_process
         .par_iter()
         .map(|(id, directive, resolved_path)| {
@@ -1594,40 +1548,31 @@ pub(crate) fn process_single_archive_fused(
                 }
             };
 
-            // Apply patch to temp file
-            let temp_output = temp_dir
-                .path()
-                .join(format!("patched_{}.tmp", id));
+            // Apply patch directly to final output path (skip temp staging)
+            let final_output_path = paths::join_windows_path(output_dir, &directive.to);
             if let Err(e) = apply_patch_to_temp(
                 ctx,
                 &source_path,
                 &patch_name,
                 preloaded_delta,
-                &temp_output,
+                &final_output_path,
                 directive.size,
             ) {
                 return Err((*id, format!("Patch apply failed: {:#}", e)));
             }
 
-            // Store in patch cache (from temp — cache verifies hash on restore)
-            if let Err(e) = store_patched_output_in_cache(ctx, directive, &temp_output) {
+            // Store in patch cache (reads from final output path)
+            if let Err(e) = store_patched_output_in_cache(ctx, directive, &final_output_path) {
                 warn!("Failed to cache patch output '{}': {}", directive.to, e);
             }
 
-            let final_output_path = paths::join_windows_path(output_dir, &directive.to);
-            Ok(StagedFile {
-                temp_path: temp_output,
-                output_path: final_output_path,
-                expected_size: directive.size,
-                directive_id: *id,
-            })
+            Ok((*id, final_output_path, directive.size))
         })
         .collect();
 
     for result in patch_results {
         match result {
-            Ok(sf) => {
-                staged_files.push(sf);
+            Ok((_id, _path, _size)) => {
                 patched_count += 1;
             }
             Err((id, msg)) => {
@@ -1738,11 +1683,13 @@ fn extract_bsa_files_to_temp(archive_path: &Path, needed_paths: &[String], temp_
 }
 
 /// Extract archive (7z/ZIP/RAR) to temp directory with fallback chain.
+/// Uses the listing cache when available to skip the `list_archive` call.
 fn extract_archive_to_temp(
     archive_path: &Path,
     needed_paths: &[String],
     temp_dir: &Path,
     threads: Option<usize>,
+    listing_cache: Option<&sevenzip::ArchiveListingCache>,
 ) -> Result<()> {
     if needed_paths.is_empty() {
         debug!(
@@ -1758,7 +1705,13 @@ fn extract_archive_to_temp(
         needed_paths.len()
     );
 
-    sevenzip::extract_files_case_insensitive(archive_path, needed_paths, temp_dir)
+    let selective_result = if let Some(cache) = listing_cache {
+        sevenzip::extract_files_cached(archive_path, needed_paths, temp_dir, cache)
+    } else {
+        sevenzip::extract_files_case_insensitive(archive_path, needed_paths, temp_dir)
+    };
+
+    selective_result
         .map(|_| ())
         .or_else(|selective_err| {
             warn!(
@@ -1778,7 +1731,11 @@ fn extract_archive_to_temp(
         })
 }
 
-/// Finalize staged files: reflink/copy to output, verify size, cleanup temp.
+/// Finalize staged files: rename to output (same FS), verify size, cleanup temp.
+///
+/// Uses `fs::rename` when possible (instant, zero I/O on same filesystem).
+/// Falls back to `reflink_or_copy` only when a source file is shared by multiple
+/// directives or when rename fails (e.g. cross-device).
 pub(crate) fn finalize_archive(
     result: ArchiveResult,
     _output_dir: &Path,
@@ -1790,6 +1747,16 @@ pub(crate) fn finalize_archive(
     let written = AtomicUsize::new(0);
     let skipped_atomic = AtomicUsize::new(0);
     let failed_atomic = AtomicUsize::new(0);
+
+    // Count how many destinations share each source path.
+    // Sources with count > 1 must be copied; the last consumer can rename.
+    let mut source_ref_counts: HashMap<PathBuf, AtomicUsize> = HashMap::new();
+    for sf in &result.staged_files {
+        source_ref_counts
+            .entry(sf.temp_path.clone())
+            .or_insert_with(|| AtomicUsize::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
 
     result.staged_files.par_iter().for_each(|sf| {
         // Create output directory
@@ -1807,13 +1774,12 @@ pub(crate) fn finalize_archive(
             return;
         }
 
-        // Check if output already exists with correct size (race condition)
+        // Check if output already exists with correct size
         if let Ok(meta) = fs::metadata(&sf.output_path) {
             if meta.len() == sf.expected_size {
                 skipped_atomic.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            // Wrong size - remove and re-copy
             let _ = fs::remove_file(&sf.output_path);
         }
 
@@ -1847,10 +1813,34 @@ pub(crate) fn finalize_archive(
             return;
         }
 
-        // Always copy (not rename) to preserve temp source for other directives
-        // sharing the same extracted file. Temp dir cleanup handles the originals.
         let _ = fs::remove_file(&sf.output_path);
-        if let Err(e) = reflink_copy::reflink_or_copy(&sf.temp_path, &sf.output_path) {
+
+        // Determine if we're the last consumer of this source file.
+        // If so, rename (instant, zero I/O). Otherwise, copy to preserve the source.
+        let remaining = source_ref_counts
+            .get(&sf.temp_path)
+            .map(|c| c.fetch_sub(1, Ordering::Relaxed))
+            .unwrap_or(0);
+        let can_rename = remaining <= 1;
+
+        let move_result = if can_rename {
+            // Try rename first (free on same filesystem)
+            fs::rename(&sf.temp_path, &sf.output_path)
+                .or_else(|e| {
+                    // Fall back to copy on cross-device or other rename errors
+                    if e.raw_os_error() == Some(libc::EXDEV) {
+                        reflink_copy::reflink_or_copy(&sf.temp_path, &sf.output_path)
+                            .map(|_| ())
+                    } else {
+                        Err(e)
+                    }
+                })
+        } else {
+            reflink_copy::reflink_or_copy(&sf.temp_path, &sf.output_path)
+                .map(|_| ())
+        };
+
+        if let Err(e) = move_result {
             // Check if another thread already created it (race condition)
             if let Ok(meta) = fs::metadata(&sf.output_path) {
                 if meta.len() == sf.expected_size {
@@ -1861,7 +1851,7 @@ pub(crate) fn finalize_archive(
             let count = logged_failures.fetch_add(1, Ordering::Relaxed);
             if count < MAX_LOGGED_FAILURES {
                 error!(
-                    "FAIL [{}]: copy failed: {}",
+                    "FAIL [{}]: move/copy failed: {}",
                     sf.directive_id, e
                 );
             }
@@ -1875,8 +1865,8 @@ pub(crate) fn finalize_archive(
         }
     });
 
-    // Explicitly drop temp dirs after all staged files have been copied out.
-    // This cleans up the extraction artifacts.
+    // Explicitly drop temp dirs after all staged files have been moved/copied out.
+    // This cleans up any remaining extraction artifacts.
     drop(result.temp_dir);
     drop(result.nested_temp_dirs);
 
@@ -2279,7 +2269,6 @@ pub(crate) fn extract_textures_from_bsa(
         return;
     }
 
-    let tex_lookup = tex_lookup;
     let _ = bsa::extract_archive_batch(archive_path, &wanted, |path, data| {
         let lookup = path.replace('\\', "/").to_lowercase();
         if let Some(directives) = tex_lookup.get(&lookup) {
@@ -2361,7 +2350,6 @@ pub(crate) fn extract_textures_from_nested_bsas(
         }
 
         // Extract texture files from the nested BSA
-        let tex_lookup = tex_lookup;
         let _ = bsa::extract_archive_batch(bsa_disk_path, &wanted, |path, data| {
             let lookup = path.replace('\\', "/").to_lowercase();
             if let Some(directives) = tex_lookup.get(&lookup) {
@@ -2506,7 +2494,7 @@ pub(crate) fn process_dds_jobs_inline(jobs: Vec<DdsJob>, ctx: &ProcessContext) -
     }
 
     for (fmt_str, jobs) in by_format {
-        let fmt = OutputFormat::from_str(&fmt_str).unwrap_or(if is_fallback_mode() {
+        let fmt = OutputFormat::parse(&fmt_str).unwrap_or(if is_fallback_mode() {
             OutputFormat::BC1
         } else {
             OutputFormat::BC7
@@ -2587,7 +2575,7 @@ pub(crate) fn process_dds_jobs_inline(jobs: Vec<DdsJob>, ctx: &ProcessContext) -
 /// Opens the archive ONCE and decompresses all files in parallel via callback.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn process_bsa_archive(
-    archive_path: &PathBuf,
+    archive_path: &Path,
     directives: &[(i64, FromArchiveDirective, Option<String>, Option<String>)],
     ctx: &ProcessContext,
     extracted: &Arc<AtomicUsize>,
@@ -2620,8 +2608,8 @@ pub(crate) fn process_bsa_archive(
     let output_dir = &ctx.config.output_dir;
 
     // Build lookup: normalized BSA path -> list of directives needing that file
-    let mut path_to_directives: HashMap<String, Vec<&(i64, FromArchiveDirective, Option<String>, Option<String>)>> =
-        HashMap::new();
+    type BsaDirectiveItem = (i64, FromArchiveDirective, Option<String>, Option<String>);
+    let mut path_to_directives: HashMap<String, Vec<&BsaDirectiveItem>> = HashMap::new();
     let mut wanted_paths: HashSet<String> = HashSet::new();
 
     for item in &to_process {
@@ -2712,8 +2700,9 @@ pub(crate) fn process_bsa_archive(
 /// Process PatchedFromArchive directives where the basis file is inside a BSA/BA2.
 /// Reads basis directly from BSA, writes to temp, applies patch, writes final output.
 /// Much faster than extracting the entire BSA via 7z.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn process_bsa_patched_directives(
-    archive_path: &PathBuf,
+    archive_path: &Path,
     _archive_hash: &str,
     directives: &[(i64, &PatchedFromArchiveDirective)],
     ctx: &ProcessContext,
@@ -2958,7 +2947,7 @@ pub(crate) fn process_spilled_dds_jobs(dds_jobs: Vec<SpilledDdsJob>, ctx: &Proce
 
     // Process each format group. BC7 uses GPU batch pipeline, everything else uses CPU par_iter.
     for (fmt_str, jobs) in by_format {
-        let fmt = OutputFormat::from_str(&fmt_str).unwrap_or(if is_fallback_mode() {
+        let fmt = OutputFormat::parse(&fmt_str).unwrap_or(if is_fallback_mode() {
             OutputFormat::BC1
         } else {
             OutputFormat::BC7

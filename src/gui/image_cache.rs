@@ -227,6 +227,7 @@ impl ImageCache {
 
     /// Prepare sync - cleanup stale images and return list of images to download
     /// Call this while holding the lock, then release lock before downloading
+    #[allow(clippy::type_complexity)]
     pub fn prepare_sync(
         &mut self,
         modlists: &[(String, String)],

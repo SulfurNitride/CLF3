@@ -70,8 +70,8 @@ impl OutputFormat {
         }
     }
 
-    /// Parse from string
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// Parse from format name string
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
             "BC7" | "BC7_UNORM" | "BC7_UNORM_SRGB" | "BC7_SRGB" => Some(OutputFormat::BC7),
             "BC6H" | "BC6H_UF16" | "BC6H_SF16" | "BC6H_TYPELESS" => Some(OutputFormat::BC6H),
@@ -1125,12 +1125,12 @@ mod tests {
 
     #[test]
     fn test_output_format_from_str() {
-        assert_eq!(OutputFormat::from_str("BC7"), Some(OutputFormat::BC7));
-        assert_eq!(OutputFormat::from_str("bc7_unorm"), Some(OutputFormat::BC7));
-        assert_eq!(OutputFormat::from_str("DXT5"), Some(OutputFormat::BC3));
-        assert_eq!(OutputFormat::from_str("DXT1"), Some(OutputFormat::BC1));
-        assert_eq!(OutputFormat::from_str("RGBA"), Some(OutputFormat::Rgba));
-        assert_eq!(OutputFormat::from_str("unknown"), None);
+        assert_eq!(OutputFormat::parse("BC7"), Some(OutputFormat::BC7));
+        assert_eq!(OutputFormat::parse("bc7_unorm"), Some(OutputFormat::BC7));
+        assert_eq!(OutputFormat::parse("DXT5"), Some(OutputFormat::BC3));
+        assert_eq!(OutputFormat::parse("DXT1"), Some(OutputFormat::BC1));
+        assert_eq!(OutputFormat::parse("RGBA"), Some(OutputFormat::Rgba));
+        assert_eq!(OutputFormat::parse("unknown"), None);
     }
 
     #[test]
