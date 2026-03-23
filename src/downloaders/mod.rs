@@ -9,7 +9,9 @@
 
 mod google_drive;
 mod http;
+pub mod loverslab;
 mod mediafire;
+pub mod mega_native;
 mod nexus;
 pub mod wabbajack_cdn;
 
@@ -18,6 +20,7 @@ pub use http::{
     download_file, download_file_with_callback, download_file_with_progress, HttpClient,
     ProgressCallback,
 };
+pub use loverslab::LoversLabDownloader;
 pub use mediafire::MediaFireDownloader;
 pub use nexus::{NexusDownloader, NexusRateLimits};
 pub use wabbajack_cdn::WabbajackCdnDownloader;

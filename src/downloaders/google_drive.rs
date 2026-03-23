@@ -32,13 +32,14 @@ impl GoogleDriveDownloader {
     /// Google Drive serves a confirmation page for large files.
     /// This method handles that flow and returns the actual download URL.
     pub async fn get_download_url(&self, file_id: &str, expected_size: u64) -> Result<String> {
-        // Try the drive.usercontent.google.com endpoint first (newer)
+        // Step 1: Hit the old-style URL to get the confirmation/quota page
+        // This returns a form with a unique UUID that we need
         let initial_url = format!(
-            "https://drive.usercontent.google.com/download?id={}&export=download&confirm=t",
+            "https://drive.google.com/uc?id={}&export=download",
             file_id
         );
 
-        debug!("Fetching Google Drive page: {}", initial_url);
+        debug!("Fetching Google Drive confirmation page: {}", initial_url);
 
         let response = self
             .client
@@ -47,22 +48,16 @@ impl GoogleDriveDownloader {
             .await
             .context("Failed to connect to Google Drive")?;
 
-        // Check if we got redirected to a download
         let final_url = response.url().to_string();
 
-        // Check content-length
+        // Check if we got the file directly (small files skip confirmation)
         if let Some(len) = response.content_length() {
             if len == expected_size {
                 debug!("Got direct download (size matches)");
                 return Ok(final_url);
             }
-            debug!(
-                "Content-Length {} doesn't match expected {}",
-                len, expected_size
-            );
         }
 
-        // Check content-type - if it's not HTML, we probably have the file
         if let Some(ct) = response.headers().get("content-type") {
             let ct_str = ct.to_str().unwrap_or("");
             if !ct_str.contains("text/html") {
@@ -71,10 +66,9 @@ impl GoogleDriveDownloader {
             }
         }
 
-        // We got HTML - parse for the actual download link
+        // We got HTML — parse for UUID / download link
         let html = response.text().await.context("Failed to read response")?;
 
-        // Debug: log first 500 chars of response
         debug!(
             "Got HTML response (first 500 chars): {}",
             &html[..html.len().min(500)]
@@ -107,6 +101,18 @@ impl GoogleDriveDownloader {
             .error_for_status()
             .context("Google Drive download failed")?;
 
+        // Check if we got HTML instead of the file (quota page, error, etc.)
+        if let Some(ct) = response.headers().get("content-type") {
+            let ct_str = ct.to_str().unwrap_or("");
+            if ct_str.contains("text/html") {
+                let body = response.text().await.unwrap_or_default();
+                if body.contains("Quota exceeded") || body.contains("Too many users") {
+                    bail!("Google Drive error: Too many users have viewed or downloaded this file recently");
+                }
+                bail!("Google Drive returned HTML instead of file data (possible quota or auth issue)");
+            }
+        }
+
         // Create parent directories
         if let Some(parent) = output_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -130,6 +136,20 @@ impl GoogleDriveDownloader {
         // Verify size
         let meta = tokio::fs::metadata(output_path).await?;
         if meta.len() != expected_size {
+            // If we got a tiny file, it's likely an error page
+            if meta.len() < 10000 {
+                let content = tokio::fs::read_to_string(output_path).await.unwrap_or_default();
+                let _ = tokio::fs::remove_file(output_path).await;
+                if content.contains("Quota") || content.contains("Too many") {
+                    bail!("Google Drive error: Too many users have viewed or downloaded this file recently");
+                }
+                bail!(
+                    "Google Drive returned {} bytes instead of expected {} (likely an error page)",
+                    meta.len(),
+                    expected_size
+                );
+            }
+            let _ = tokio::fs::remove_file(output_path).await;
             anyhow::bail!(
                 "Size mismatch: expected {} bytes, got {}",
                 expected_size,
@@ -160,7 +180,9 @@ fn parse_confirmation_page(html: &str, file_id: &str) -> Result<String> {
     static ERROR_RE: OnceLock<Regex> = OnceLock::new();
 
     // Method 1: Look for uuid parameter in the page (new Google Drive format)
-    let uuid_re = UUID_RE.get_or_init(|| Regex::new(r#"uuid[&=]([a-f0-9-]+)"#).unwrap());
+    // Matches both URL-encoded `uuid=xxx` and HTML form `name="uuid" value="xxx"`
+    let uuid_re = UUID_RE
+        .get_or_init(|| Regex::new(r#"(?:uuid[&=]|name="uuid"\s+value=")([a-f0-9-]+)"#).unwrap());
     if let Some(caps) = uuid_re.captures(html) {
         let uuid = caps.get(1).unwrap().as_str();
         let url = format!(
@@ -305,5 +327,37 @@ mod tests {
             r#"<form action="https://drive.usercontent.google.com/download?uuid=abc-123-def">"#;
         let url = parse_confirmation_page(html, "FILE123").unwrap();
         assert!(url.contains("uuid=abc-123-def") || url.contains("FILE123"));
+    }
+
+    #[test]
+    fn test_parse_uuid_from_hidden_input() {
+        let html = r#"<form id="download-form" action="https://drive.usercontent.google.com/download" method="get"><input type="hidden" name="id" value="FILEID"><input type="hidden" name="export" value="download"><input type="hidden" name="confirm" value="t"><input type="hidden" name="uuid" value="0abd7213-27dc-4e74-a661-8a1c756c0da6"></form>"#;
+        let url = parse_confirmation_page(html, "FILEID").unwrap();
+        assert!(
+            url.contains("uuid=0abd7213-27dc-4e74-a661-8a1c756c0da6"),
+            "URL should contain uuid: {}",
+            url
+        );
+        assert!(url.contains("confirm=t"), "URL should contain confirm=t: {}", url);
+    }
+
+    /// Live test: resolve GDrive download URL for High Poly Head
+    /// Run with: cargo test --lib downloaders::google_drive::tests::test_live_gdrive_url -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_gdrive_url() {
+        let gdrive = GoogleDriveDownloader::new().unwrap();
+        let url = gdrive
+            .get_download_url("15_0njBUjHKidNnJPmLXEygzGVWsA3Zbq", 188231174)
+            .await
+            .expect("Failed to get download URL");
+
+        println!("Resolved GDrive URL: {}", url);
+        assert!(url.contains("uuid="), "URL should contain uuid: {}", url);
+        assert!(
+            url.contains("drive.usercontent.google.com"),
+            "URL should point to usercontent: {}",
+            url
+        );
     }
 }

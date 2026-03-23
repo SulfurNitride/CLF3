@@ -563,15 +563,12 @@ fn extract_prepared_archive(
     failed: &AtomicUsize,
     logged_failures: &Arc<AtomicUsize>,
     progress_callback: &Option<ProgressCallback>,
-    // CLI progress
-    archives_completed: &AtomicUsize,
-    total_archives: usize,
+    // CLI progress bar
+    extract_pb: &indicatif::ProgressBar,
 ) {
     const MAX_LOGGED_FAILURES: usize = 100;
 
     let archive_name_for_progress = prepared.archive_name.clone();
-    let directive_count_for_progress =
-        prepared.resolved.len() + prepared.tex_d2.len() + prepared.tex_d3.len();
 
     let archive_type =
         detect_archive_type(&prepared.archive_path).unwrap_or(NestedArchiveType::Unknown);
@@ -719,14 +716,14 @@ fn extract_prepared_archive(
         }
     }
 
-    // CLI progress: print per-archive completion status
-    let done = archives_completed.fetch_add(1, Ordering::Relaxed) + 1;
-    let w = written.load(Ordering::Relaxed);
-    let f = failed.load(Ordering::Relaxed);
-    eprintln!(
-        "[{}/{}] Extracted: {} ({} directives, {} written, {} failed)",
-        done, total_archives, archive_name_for_progress, directive_count_for_progress, w, f
-    );
+    // Update extraction progress bar
+    let display = if archive_name_for_progress.len() > 40 {
+        format!("{}...", &archive_name_for_progress[..37])
+    } else {
+        archive_name_for_progress
+    };
+    extract_pb.set_message(display);
+    extract_pb.inc(1);
 }
 
 /// Run the pipelined processing coordinator.
@@ -758,7 +755,7 @@ pub(crate) fn run_processing_loop(
         if texture_count > 0 {
             use crate::textures::init_gpu;
             let _ = init_gpu();
-            eprintln!("DDS: {} texture directives will be processed inline per-archive", texture_count);
+            crate::installer::downloader::progress_println(&format!("DDS: {} texture directives will be processed inline per-archive", texture_count));
         }
     }
 
@@ -775,10 +772,10 @@ pub(crate) fn run_processing_loop(
 
     // Process whole-file directives first (simple copy, no archive extraction needed)
     if !grouped.whole_file.is_empty() {
-        eprintln!(
+        crate::installer::downloader::progress_println(&format!(
             "Copying {} whole-file directives...",
             grouped.whole_file.len()
-        );
+        ));
         let arc_extracted = Arc::new(AtomicUsize::new(0));
         let arc_skipped = Arc::new(AtomicUsize::new(0));
         let arc_failed = Arc::new(AtomicUsize::new(0));
@@ -806,9 +803,8 @@ pub(crate) fn run_processing_loop(
     let active_count = std::sync::Mutex::new(0usize);
     let active_cvar = std::sync::Condvar::new();
 
-    // CLI progress counter
-    let archives_completed = AtomicUsize::new(0);
-    let total_archives = grouped.total_archives;
+    // CLI extraction progress — hidden during pipelined mode (download bar handles display)
+    let extract_pb = indicatif::ProgressBar::hidden();
 
     // Completion channel: extraction threads signal when done (hash of completed archive)
     let (done_tx, done_rx) = std::sync::mpsc::channel::<String>();
@@ -826,7 +822,7 @@ pub(crate) fn run_processing_loop(
         let adjusted_callback = &adjusted_callback;
         let active_count = &active_count;
         let active_cvar = &active_cvar;
-        let archives_completed = &archives_completed;
+        let extract_pb = &extract_pb;
 
         // BSA readiness tracker — builds BSAs as soon as all their source archives are processed
         let mut bsa_tracker = BsaReadinessTracker::new(db, ctx, grouped)
@@ -840,10 +836,10 @@ pub(crate) fn run_processing_loop(
             });
 
         if bsa_tracker.has_tracked_bsas() {
-            eprintln!(
+            crate::installer::downloader::progress_println(&format!(
                 "BSA tracker: {} BSAs eligible for early building",
                 bsa_tracker.pending_sources.len()
-            );
+            ));
         }
 
         // Main processing loop: receive archive events, prepare (DB work) on this thread,
@@ -859,17 +855,17 @@ pub(crate) fn run_processing_loop(
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| directive.to.clone());
 
-                        eprintln!(
+                        crate::installer::downloader::progress_println(&format!(
                             "BSA ready — building: {} ({} files)",
                             bsa_name,
                             directive.file_states.len()
-                        );
+                        ));
 
                         // Build BSA on a separate thread
                         thread_scope.spawn(move || {
                             match handle_create_bsa(ctx, &directive) {
                                 Ok(()) => {
-                                    eprintln!("Created BSA: {}", bsa_name);
+                                    crate::installer::downloader::progress_println(&format!("Created BSA: {}", bsa_name));
                                 }
                                 Err(e) => {
                                     error!("Failed to build BSA {}: {:#}", bsa_name, e);
@@ -916,8 +912,7 @@ pub(crate) fn run_processing_loop(
                                 failed,
                                 logged_failures,
                                 adjusted_callback,
-                                archives_completed,
-                                total_archives,
+                                extract_pb,
                             );
 
                             // Signal completion for BSA readiness tracking
@@ -969,15 +964,15 @@ pub(crate) fn run_processing_loop(
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| directive.to.clone());
 
-                    eprintln!(
+                    crate::installer::downloader::progress_println(&format!(
                         "BSA ready — building: {} ({} files)",
                         bsa_name,
                         directive.file_states.len()
-                    );
+                    ));
 
                     match handle_create_bsa(ctx, &directive) {
                         Ok(()) => {
-                            eprintln!("Created BSA: {}", bsa_name);
+                            crate::installer::downloader::progress_println(&format!("Created BSA: {}", bsa_name));
                         }
                         Err(e) => {
                             error!("Failed to build BSA {}: {:#}", bsa_name, e);
@@ -990,15 +985,15 @@ pub(crate) fn run_processing_loop(
         }
 
         if bsa_tracker.built_count > 0 {
-            eprintln!(
+            crate::installer::downloader::progress_println(&format!(
                 "Pipeline complete: {} archives processed, {} failed, {} BSAs built early",
                 archives_processed, archives_failed, bsa_tracker.built_count
-            );
+            ));
         } else {
-            eprintln!(
+            crate::installer::downloader::progress_println(&format!(
                 "Pipeline complete: {} archives processed, {} failed",
                 archives_processed, archives_failed
-            );
+            ));
         }
     });
 

@@ -207,7 +207,7 @@ pub fn cleanup_temp_dirs(downloads_dir: &std::path::Path) -> usize {
         }
     }
     if cleaned > 0 {
-        eprintln!("Cleaned up {} leftover temp directories", cleaned);
+        crate::installer::downloader::progress_println(&format!("Cleaned up {} leftover temp directories", cleaned));
     }
     cleaned
 }
@@ -340,7 +340,7 @@ pub fn process_fused_streaming(
     }
 
     if pre_skipped > 0 {
-        eprintln!("Pre-filtered {} already-complete files", pre_skipped);
+        crate::installer::downloader::progress_println(&format!("Pre-filtered {} already-complete files", pre_skipped));
     }
     if parse_failures > 0 {
         warn!("WARN: {} directives failed to parse", parse_failures);
@@ -383,10 +383,10 @@ pub fn process_fused_streaming(
         }
     }
     if tex_only_count > 0 {
-        eprintln!(
+        crate::installer::downloader::progress_println(&format!(
             "Added {} texture-only archives to extraction pass",
             tex_only_count
-        );
+        ));
     }
 
     // Build per-archive texture lookups:
@@ -439,10 +439,10 @@ pub fn process_fused_streaming(
         let d2_archives: usize = texture_depth2.values().filter(|v| !v.is_empty()).count();
         let d3_archives: usize = texture_depth3.values().filter(|v| !v.is_empty()).count();
 
-        eprintln!(
+        crate::installer::downloader::progress_println(&format!(
             "DDS inline: {} textures ({} depth-2 in {} archives, {} depth-3 in {} archives)",
             texture_count, d2_count, d2_archives, d3_count, d3_archives
-        );
+        ));
     }
 
     // Global counter for GUI progress — shared across all archives
@@ -502,10 +502,10 @@ pub fn process_fused_streaming(
     let total_archives = all_archives.len();
     let total_files: usize = all_archives.iter().map(|(_, d, _, _)| d.len()).sum();
 
-    eprintln!(
+    crate::installer::downloader::progress_println(&format!(
         "Processing {} archives ({} files): {} extract + {} BSA-only",
         total_archives, total_files, extract_count, bsa_only_count
-    );
+    ));
 
     // Stats
     let extracted = Arc::new(AtomicUsize::new(0));
@@ -570,18 +570,18 @@ pub fn process_fused_streaming(
         .expect("Failed to build BSA archive pool");
 
     if !extract_archives.is_empty() {
-        eprintln!(
+        crate::installer::downloader::progress_println(&format!(
             "  Extract queue: {} archives ({} concurrent workers)",
             extract_archives.len(),
             extract_workers
-        );
+        ));
     }
     if !bsa_archives.is_empty() {
-        eprintln!(
+        crate::installer::downloader::progress_println(&format!(
             "  BSA queue: {} archives ({} concurrent archive workers)",
             bsa_archives.len(),
             bsa_archive_workers
-        );
+        ));
     }
 
     // Collect DDS jobs during extraction by spilling texture data to temp files.
@@ -602,7 +602,7 @@ pub fn process_fused_streaming(
             .collect();
         let total = archive_paths.len();
         if total > 0 {
-            eprintln!("  Pre-listing {} archives...", total);
+            crate::installer::downloader::progress_println(&format!("  Pre-listing {} archives...", total));
             let listed = AtomicUsize::new(0);
             archive_paths.par_iter().for_each(|path| {
                 if let Err(e) = listing_cache.populate(path) {
@@ -610,7 +610,7 @@ pub fn process_fused_streaming(
                 }
                 let done = listed.fetch_add(1, Ordering::Relaxed) + 1;
                 if done.is_multiple_of(100) || done == total {
-                    eprintln!("  Pre-listed {}/{} archives", done, total);
+                    crate::installer::downloader::progress_println(&format!("  Pre-listed {}/{} archives", done, total));
                 }
             });
         }
@@ -998,7 +998,7 @@ pub fn process_fused_streaming(
             0
         };
         if collected_count > 0 {
-            eprintln!("Collected {} texture jobs during extraction, processing in parallel...", collected_count);
+            crate::installer::downloader::progress_println(&format!("Collected {} texture jobs during extraction, processing in parallel...", collected_count));
         }
     });
 
@@ -1021,10 +1021,10 @@ pub fn process_fused_streaming(
         .clone();
 
     if !bad_hashes.is_empty() {
-        eprintln!(
+        crate::installer::downloader::progress_println(&format!(
             "\n{} archive(s) had failures — re-verifying hashes...",
             bad_hashes.len()
-        );
+        ));
         let mut corrupted = Vec::new();
         for hash in &bad_hashes {
             if let Some(archive_path) = ctx.get_archive_path(hash) {
@@ -1035,10 +1035,10 @@ pub fn process_fused_streaming(
                                 .file_name()
                                 .map(|n| n.to_string_lossy().to_string())
                                 .unwrap_or_else(|| hash.clone());
-                            eprintln!(
+                            crate::installer::downloader::progress_println(&format!(
                                 "  CORRUPTED: {} (expected {}, got {})",
                                 name, hash, actual_hash
-                            );
+                            ));
                             corrupted.push(hash.clone());
                             // Reset download status so next run re-downloads
                             if let Some(archive_name) = archive_path.file_name() {
@@ -1046,10 +1046,10 @@ pub fn process_fused_streaming(
                                 if let Err(e) = db.reset_archive_download_status(&name_str) {
                                     warn!("Failed to reset download status for {}: {}", name_str, e);
                                 } else {
-                                    eprintln!(
+                                    crate::installer::downloader::progress_println(&format!(
                                         "  → Marked {} for re-download on next run",
                                         name_str
-                                    );
+                                    ));
                                 }
                             }
                         } else {
@@ -1058,20 +1058,20 @@ pub fn process_fused_streaming(
                                 .file_name()
                                 .map(|n| n.to_string_lossy().to_string())
                                 .unwrap_or_else(|| hash.clone());
-                            eprintln!("  OK (hash valid): {} — content mismatch in modlist?", name);
+                            crate::installer::downloader::progress_println(&format!("  OK (hash valid): {} — content mismatch in modlist?", name));
                         }
                     }
                     Err(e) => {
-                        eprintln!("  ERROR: could not re-hash {}: {}", hash, e);
+                        crate::installer::downloader::progress_println(&format!("  ERROR: could not re-hash {}: {}", hash, e));
                     }
                 }
             }
         }
         if !corrupted.is_empty() {
-            eprintln!(
+            crate::installer::downloader::progress_println(&format!(
                 "\n{} corrupted archive(s) marked for re-download. Re-run to fix.",
                 corrupted.len()
-            );
+            ));
         }
         // Only keep the hashes that had failures (corrupted or content mismatch)
         // in the returned stats for the caller to act on.
@@ -1085,10 +1085,10 @@ pub fn process_fused_streaming(
         failed_archive_hashes: bad_hashes.into_iter().collect(),
     };
 
-    eprintln!(
+    crate::installer::downloader::progress_println(&format!(
         "Complete: {} extracted, {} written, {} skipped ({} pre-filtered), {} failed",
         stats.extracted, stats.written, stats.skipped, pre_skipped, stats.failed
-    );
+    ));
 
     Ok(stats)
 }
@@ -2934,10 +2934,10 @@ pub(crate) fn process_spilled_dds_jobs(dds_jobs: Vec<SpilledDdsJob>, ctx: &Proce
         .map(|(f, n)| format!("{}: {}", f, n))
         .collect::<Vec<_>>()
         .join(", ");
-    eprintln!(
+    crate::installer::downloader::progress_println(&format!(
         "Processing {} textures in parallel [{}]",
         total_tex, summary_str
-    );
+    ));
 
     // Initialize GPU for BC7
     let _ = init_gpu();
@@ -2955,7 +2955,7 @@ pub(crate) fn process_spilled_dds_jobs(dds_jobs: Vec<SpilledDdsJob>, ctx: &Proce
 
         if fmt == OutputFormat::BC7 {
             // BC7: parallel CPU prep → GPU batch encode
-            eprintln!("  BC7: {} textures (GPU+CPU pipeline)...", jobs.len());
+            crate::installer::downloader::progress_println(&format!("  BC7: {} textures (GPU+CPU pipeline)...", jobs.len()));
 
             let tex_jobs: Vec<TextureJob> = jobs
                 .iter()
@@ -2997,7 +2997,7 @@ pub(crate) fn process_spilled_dds_jobs(dds_jobs: Vec<SpilledDdsJob>, ctx: &Proce
             }
         } else {
             // Non-BC7: full CPU parallelism (like Radium)
-            eprintln!("  {}: {} textures (CPU parallel)...", fmt.name(), jobs.len());
+            crate::installer::downloader::progress_println(&format!("  {}: {} textures (CPU parallel)...", fmt.name(), jobs.len()));
 
             jobs.par_iter().for_each(|job| {
                 let result: anyhow::Result<()> = (|| {
@@ -3032,7 +3032,7 @@ pub(crate) fn process_spilled_dds_jobs(dds_jobs: Vec<SpilledDdsJob>, ctx: &Proce
 
     let ok = dds_ok.load(Ordering::Relaxed);
     let fail = dds_fail.load(Ordering::Relaxed);
-    eprintln!("DDS processing complete: {} OK, {} failed", ok, fail);
+    crate::installer::downloader::progress_println(&format!("DDS processing complete: {} OK, {} failed", ok, fail));
 }
 
 #[cfg(test)]

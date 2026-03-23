@@ -48,6 +48,14 @@ pub struct Settings {
     /// Optional directory for persistent patched-file cache
     #[serde(default)]
     pub patch_cache_dir: String,
+
+    /// LoversLab email for automated downloads
+    #[serde(default)]
+    pub loverslab_email: String,
+
+    /// LoversLab password for automated downloads
+    #[serde(default)]
+    pub loverslab_password: String,
 }
 
 impl Settings {
@@ -169,6 +177,8 @@ mod tests {
             fallout3_path: String::new(),
             ttw_output_path: String::new(),
             patch_cache_dir: "/home/user/.cache/clf3/patches".into(),
+            loverslab_email: String::new(),
+            loverslab_password: String::new(),
         };
 
         let json = serde_json::to_string(&settings).unwrap();

@@ -60,8 +60,16 @@ block_compression = { version = "0.8", features = ["wgpu", "bc7", "bc6h"] }
 pollster = "0.4"
 
 # HTTP client
-reqwest = { version = "0.13.1", features = ["stream", "cookies", "json", "blocking"] }
+reqwest = { version = "0.13.1", features = ["stream", "cookies", "json", "blocking", "form"] }
 futures = "0.3.31"
+
+# Mega downloads (native API, no proxy)
+# mega needs reqwest 0.12 for its HttpClient impl — we rename it to avoid conflict with our 0.13
+mega = "0.8"
+reqwest_012 = { package = "reqwest", version = "0.12", features = ["json", "stream"] }
+async-trait = "0.1"
+tokio-util = { version = "0.7", features = ["compat"] }
+sluice = "0.5"
 
 # Date/time
 chrono = { version = "0.4.43", features = ["serde"] }

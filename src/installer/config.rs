@@ -94,6 +94,12 @@ pub struct InstallConfig {
 
     /// Optional callback for progress reporting
     pub progress_callback: Option<ProgressCallback>,
+
+    /// LoversLab email for automated downloads (empty = manual)
+    pub loverslab_email: String,
+
+    /// LoversLab password for automated downloads (empty = manual)
+    pub loverslab_password: String,
 }
 
 impl std::fmt::Debug for InstallConfig {
@@ -115,6 +121,8 @@ impl std::fmt::Debug for InstallConfig {
                 "progress_callback",
                 &self.progress_callback.as_ref().map(|_| "<callback>"),
             )
+            .field("loverslab_email", &self.loverslab_email)
+            .field("loverslab_password", &"[REDACTED]")
             .finish()
     }
 }

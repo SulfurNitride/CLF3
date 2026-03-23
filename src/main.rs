@@ -82,6 +82,14 @@ enum Commands {
         /// Browser command to open Nexus pages (default: xdg-open)
         #[arg(long, default_value = "xdg-open")]
         browser: String,
+
+        /// LoversLab email for automated downloads
+        #[arg(long, env = "LOVERSLAB_EMAIL")]
+        ll_email: Option<String>,
+
+        /// LoversLab password for automated downloads
+        #[arg(long, env = "LOVERSLAB_PASSWORD")]
+        ll_password: Option<String>,
     },
 
     /// Show information about a Wabbajack modlist
@@ -171,8 +179,11 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .with_filter(file_filter);
 
-    // Console layer — always enabled (errors should always be visible)
-    let console_layer = tracing_subscriber::fmt::layer().with_filter(console_filter);
+    // Console layer — routes through indicatif MultiProgress when active
+    // to avoid stderr output fighting with progress bar rendering
+    let console_layer = tracing_subscriber::fmt::layer()
+        .with_writer(clf3::installer::downloader::IndicatifWriterFactory)
+        .with_filter(console_filter);
 
     tracing_subscriber::registry()
         .with(file_layer)
@@ -202,6 +213,8 @@ async fn main() -> Result<()> {
             sevenzip_workers,
             nxm_mode,
             browser,
+            ll_email,
+            ll_password,
         }) => {
             // Default to CPU thread count
             let thread_count = std::thread::available_parallelism()
@@ -238,6 +251,8 @@ async fn main() -> Result<()> {
                 browser,
                 patch_cache_dir: None,
                 progress_callback: None, // CLI doesn't need progress callback
+                loverslab_email: ll_email.unwrap_or_default(),
+                loverslab_password: ll_password.unwrap_or_default(),
             };
 
             let mut installer = Installer::new(config)?;

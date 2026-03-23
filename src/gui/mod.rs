@@ -959,7 +959,7 @@ slint::slint! {
     export component SettingsDialog inherits Window {
         title: "CLF3 Settings";
         min-width: 500px;
-        min-height: 420px;
+        min-height: 620px;
         background: #1e1e2e;
 
         // Settings values
@@ -967,6 +967,8 @@ slint::slint! {
         in-out property <string> default_downloads_dir: "";
         in-out property <string> patch_cache_dir: "";
         in-out property <string> nexus_api_key: "";
+        in-out property <string> loverslab_email: "";
+        in-out property <string> loverslab_password: "";
         in-out property <[GpuOption]> gpu_options: [];
         in-out property <int> selected_gpu_index: -1;
 
@@ -1197,6 +1199,91 @@ slint::slint! {
                     text: "Stored in ~/.config/clf3/settings.json";
                     font-size: 11px;
                     color: #6c7086;
+                }
+            }
+
+            // Separator
+            Rectangle {
+                height: 1px;
+                background: #313244;
+            }
+
+            // LoversLab Login
+            Text {
+                text: "LoversLab Login (Optional)";
+                font-size: 14px;
+                font-weight: 600;
+                color: #cdd6f4;
+            }
+
+            Text {
+                text: "Enables automatic download of LoversLab files instead of manual download.";
+                font-size: 11px;
+                color: #6c7086;
+            }
+
+            // LoversLab Email
+            VerticalLayout {
+                spacing: 6px;
+
+                Text {
+                    text: "Email";
+                    font-size: 13px;
+                    font-weight: 500;
+                    color: #bac2de;
+                }
+
+                Rectangle {
+                    height: 36px;
+                    background: #11111b;
+                    border-radius: 6px;
+                    clip: true;
+
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+
+                        TextInput {
+                            text <=> loverslab_email;
+                            font-size: 13px;
+                            color: #cdd6f4;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                }
+            }
+
+            // LoversLab Password
+            VerticalLayout {
+                spacing: 6px;
+
+                Text {
+                    text: "Password";
+                    font-size: 13px;
+                    font-weight: 500;
+                    color: #bac2de;
+                }
+
+                Rectangle {
+                    height: 36px;
+                    background: #11111b;
+                    border-radius: 6px;
+                    clip: true;
+
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+
+                        TextInput {
+                            text <=> loverslab_password;
+                            font-size: 13px;
+                            color: #cdd6f4;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            input-type: password;
+                        }
+                    }
                 }
             }
 
@@ -3442,6 +3529,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
             let downloads_dir = window.get_downloads_dir().to_string();
             let api_key = window.get_nexus_api_key().to_string();
             let patch_cache_dir = settings.borrow().patch_cache_dir.clone();
+            let ll_email = settings.borrow().loverslab_email.clone();
+            let ll_password = settings.borrow().loverslab_password.clone();
             let proton_index = window.get_selected_proton_index();
 
             // Get selected Proton name
@@ -3599,6 +3688,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
                         &api_key_clone,
                         non_premium,
                         patch_cache_dir_clone.clone(),
+                        ll_email.clone(),
+                        ll_password.clone(),
                     ).await;
 
                     match &result {
@@ -4573,6 +4664,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
             dialog.set_default_downloads_dir(current.default_downloads_dir.clone().into());
             dialog.set_patch_cache_dir(current.patch_cache_dir.clone().into());
             dialog.set_nexus_api_key(current.nexus_api_key.clone().into());
+            dialog.set_loverslab_email(current.loverslab_email.clone().into());
+            dialog.set_loverslab_password(current.loverslab_password.clone().into());
             dialog.set_selected_gpu_index(current.gpu_index.map(|i| i as i32).unwrap_or(-1));
             drop(current);
 
@@ -4655,6 +4748,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
                         s.default_downloads_dir = dialog.get_default_downloads_dir().to_string();
                         s.patch_cache_dir = dialog.get_patch_cache_dir().to_string();
                         s.nexus_api_key = dialog.get_nexus_api_key().to_string();
+                        s.loverslab_email = dialog.get_loverslab_email().to_string();
+                        s.loverslab_password = dialog.get_loverslab_password().to_string();
                         let gpu_idx = dialog.get_selected_gpu_index();
                         s.gpu_index = if gpu_idx < 0 {
                             None
@@ -5590,6 +5685,8 @@ async fn run_wabbajack_install(
     api_key: &str,
     non_premium: bool,
     patch_cache_dir: Option<String>,
+    loverslab_email: String,
+    loverslab_password: String,
 ) -> anyhow::Result<()> {
     use crate::installer::{InstallConfig, Installer, ProgressCallback, ProgressEvent};
     use std::path::PathBuf;
@@ -5893,6 +5990,8 @@ async fn run_wabbajack_install(
         browser: "xdg-open".to_string(),
         patch_cache_dir: patch_cache_dir.map(PathBuf::from),
         progress_callback: Some(progress_callback),
+        loverslab_email,
+        loverslab_password,
     };
 
     // Create installer

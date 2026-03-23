@@ -220,17 +220,22 @@ impl WabbajackCdnDownloader {
                         );
                     }
 
-                    // Write to the correct offset in the file
-                    let mut file = tokio::fs::OpenOptions::new()
-                        .write(true)
-                        .open(&output_path)
-                        .await
-                        .with_context(|| {
-                            format!("Failed to open {} for writing", output_path.display())
-                        })?;
-
-                    file.seek(std::io::SeekFrom::Start(part_offset)).await?;
-                    file.write_all(&bytes).await?;
+                    // Write at the correct offset using pwrite (atomic, no seek race)
+                    let output_path_clone = output_path.clone();
+                    let bytes_clone = bytes.clone();
+                    tokio::task::spawn_blocking(move || {
+                        use std::os::unix::fs::FileExt;
+                        let file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&output_path_clone)
+                            .with_context(|| {
+                                format!("Failed to open {} for writing", output_path_clone.display())
+                            })?;
+                        file.write_all_at(&bytes_clone, part_offset)?;
+                        Ok::<(), anyhow::Error>(())
+                    })
+                    .await
+                    .context("Write task panicked")??;
 
                     // Update progress
                     let new_total = downloaded_bytes

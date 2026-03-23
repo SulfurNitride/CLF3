@@ -5,8 +5,9 @@
 //! Supports both direct API mode (premium) and NXM browser mode (free/rate-limit bypass).
 
 use crate::downloaders::{
-    download_file_with_callback, GoogleDriveDownloader, HttpClient, MediaFireDownloader,
-    NexusDownloader, ProgressCallback as HttpProgressCallback, WabbajackCdnDownloader,
+    download_file_with_callback, GoogleDriveDownloader, HttpClient, LoversLabDownloader,
+    MediaFireDownloader, NexusDownloader, ProgressCallback as HttpProgressCallback,
+    WabbajackCdnDownloader,
 };
 use crate::hash::{verify_file_hash, verify_file_hash_detailed};
 use crate::modlist::{ArchiveInfo, DownloadState, ModlistDb, NexusState};
@@ -27,6 +28,91 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+
+/// Global MultiProgress reference so tracing output can route through it.
+/// When set, log messages are printed via multi_progress.println() to avoid
+/// fighting with progress bar rendering.
+static ACTIVE_MULTI_PROGRESS: std::sync::OnceLock<std::sync::Mutex<Option<MultiProgress>>> =
+    std::sync::OnceLock::new();
+
+fn set_active_multi_progress(mp: &MultiProgress) {
+    let holder = ACTIVE_MULTI_PROGRESS.get_or_init(|| std::sync::Mutex::new(None));
+    *holder.lock().expect("multi_progress lock") = Some(mp.clone());
+}
+
+fn clear_active_multi_progress() {
+    if let Some(holder) = ACTIVE_MULTI_PROGRESS.get() {
+        *holder.lock().expect("multi_progress lock") = None;
+    }
+}
+
+/// Write target that routes through the active MultiProgress if one exists.
+/// Used by the tracing console layer to avoid stderr fights with indicatif.
+pub struct IndicatifWriter {
+    buffer: Vec<u8>,
+}
+
+impl IndicatifWriter {
+    pub fn new() -> Self {
+        Self { buffer: Vec::new() }
+    }
+}
+
+/// Print a message that's safe to use during progress bar rendering.
+/// Routes through the active MultiProgress if one exists, otherwise uses eprintln.
+pub fn progress_println(msg: &str) {
+    if let Some(holder) = ACTIVE_MULTI_PROGRESS.get() {
+        if let Ok(guard) = holder.lock() {
+            if let Some(mp) = guard.as_ref() {
+                let _ = mp.println(msg);
+                return;
+            }
+        }
+    }
+    eprintln!("{}", msg);
+}
+
+impl std::io::Write for IndicatifWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let msg = String::from_utf8_lossy(&self.buffer).trim_end().to_string();
+        self.buffer.clear();
+        if msg.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(holder) = ACTIVE_MULTI_PROGRESS.get() {
+            if let Ok(guard) = holder.lock() {
+                if let Some(mp) = guard.as_ref() {
+                    let _ = mp.println(&msg);
+                    return Ok(());
+                }
+            }
+        }
+
+        // No active MultiProgress — write to stderr normally
+        eprintln!("{}", msg);
+        Ok(())
+    }
+}
+
+/// MakeWriter for tracing that produces IndicatifWriter instances
+pub struct IndicatifWriterFactory;
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for IndicatifWriterFactory {
+    type Writer = IndicatifWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        IndicatifWriter { buffer: Vec::new() }
+    }
+}
 
 /// Max retries for network operations
 const MAX_RETRIES: u32 = 3;
@@ -112,9 +198,17 @@ struct DownloadContext {
     cdn: WabbajackCdnDownloader,
     gdrive: GoogleDriveDownloader,
     mediafire: MediaFireDownloader,
+    /// LoversLab downloader (only present when credentials are configured)
+    loverslab: Option<LoversLabDownloader>,
+    /// Semaphore to enforce sequential LoversLab downloads (LL rate-limits concurrent requests)
+    ll_semaphore: tokio::sync::Semaphore,
     config: InstallConfig,
     multi_progress: MultiProgress,
     overall_pb: ProgressBar,
+    /// Fixed pool of reusable per-download progress bars (avoids insert/remove ghost lines)
+    bar_pool: Vec<ProgressBar>,
+    /// Tracks which pool bars are available (index -> available)
+    bar_available: Vec<tokio::sync::Mutex<bool>>,
     // Counters
     downloaded: AtomicUsize,
     skipped: AtomicUsize,
@@ -124,6 +218,38 @@ struct DownloadContext {
     // Progress tracking for callbacks
     completed_archives: AtomicUsize,
     total_archives: usize,
+}
+
+impl DownloadContext {
+    /// Claim a progress bar from the pool. Returns the index and a reference.
+    async fn claim_bar(&self) -> Option<usize> {
+        for (i, available) in self.bar_available.iter().enumerate() {
+            let mut guard = available.lock().await;
+            if *guard {
+                *guard = false;
+                // Reset the bar for reuse
+                self.bar_pool[i].reset();
+                self.bar_pool[i].set_style(
+                    ProgressStyle::default_bar()
+                        .template("  {spinner:.blue} {wide_msg} [{bar:30.white/dim}] {bytes}/{total_bytes} {bytes_per_sec}")
+                        .unwrap()
+                        .progress_chars("=>-"),
+                );
+                self.bar_pool[i].enable_steady_tick(Duration::from_millis(500));
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Release a progress bar back to the pool.
+    async fn release_bar(&self, index: usize) {
+        self.bar_pool[index].set_message("");
+        self.bar_pool[index].set_position(0);
+        self.bar_pool[index].set_length(0);
+        self.bar_pool[index].disable_steady_tick();
+        *self.bar_available[index].lock().await = true;
+    }
 }
 
 /// Download all pending archives (smart mode: only downloads archives needed for missing outputs)
@@ -363,8 +489,31 @@ Copied files with different names will not be reused. Examples: {}",
 
     let pending = need_download;
 
-    // Setup progress display
+    // Setup progress display with fixed bar pool (no dynamic insert/remove)
+    let concurrency = config.max_concurrent_downloads;
     let multi_progress = MultiProgress::new();
+
+    // Route tracing output through MultiProgress to avoid stderr fights
+    set_active_multi_progress(&multi_progress);
+
+    // Pre-create a fixed pool of download bars — only as many as needed
+    let pool_size = concurrency.min(pending.len());
+    let mut bar_pool = Vec::with_capacity(pool_size);
+    let mut bar_available = Vec::with_capacity(pool_size);
+    for _ in 0..pool_size {
+        let bar = multi_progress.add(ProgressBar::new(0));
+        bar.set_style(
+            ProgressStyle::default_bar()
+                .template("  {spinner:.blue} {wide_msg} [{bar:30.white/dim}] {bytes}/{total_bytes} {bytes_per_sec}")
+                .unwrap()
+                .progress_chars("=>-"),
+        );
+        bar.set_message("");
+        bar_pool.push(bar);
+        bar_available.push(tokio::sync::Mutex::new(true));
+    }
+
+    // Overall progress bar at the bottom
     let overall_pb = multi_progress.add(ProgressBar::new(pending.len() as u64));
     overall_pb.set_style(
         ProgressStyle::default_bar()
@@ -377,15 +526,20 @@ Copied files with different names will not be reused. Examples: {}",
 
     // Create shared context
     let total_archives = pending.len();
+    let loverslab = init_loverslab(config).await;
     let ctx = Arc::new(DownloadContext {
         nexus: NexusDownloader::new(&config.nexus_api_key)?,
         http: HttpClient::new()?,
         cdn: WabbajackCdnDownloader::new()?,
         gdrive: GoogleDriveDownloader::new()?,
         mediafire: MediaFireDownloader::new()?,
+        loverslab,
+        ll_semaphore: tokio::sync::Semaphore::new(1),
         config: config.clone(),
         multi_progress,
         overall_pb,
+        bar_pool,
+        bar_available,
         downloaded: AtomicUsize::new(0),
         skipped: AtomicUsize::new(0),
         failed: AtomicUsize::new(0),
@@ -394,9 +548,6 @@ Copied files with different names will not be reused. Examples: {}",
         completed_archives: AtomicUsize::new(0),
         total_archives,
     });
-
-    // Process downloads in parallel
-    let concurrency = config.max_concurrent_downloads;
 
     // Collect hashes and paths for DB updates (can't borrow db across await)
     let results: Vec<DownloadResultTuple> = stream::iter(pending)
@@ -433,6 +584,7 @@ Copied files with different names will not be reused. Examples: {}",
     }
 
     ctx.overall_pb.finish_and_clear();
+    clear_active_multi_progress();
 
     // Get the detailed lists for stats and printing
     let manual_downloads_list = ctx.manual_downloads.lock().await.clone();
@@ -770,8 +922,27 @@ pub async fn download_archives_streaming(
 
     let pending = need_download;
 
-    // Setup progress display
+    // Setup progress display with fixed bar pool
+    let concurrency = config.max_concurrent_downloads;
     let multi_progress = MultiProgress::new();
+    set_active_multi_progress(&multi_progress);
+
+    let pool_size = concurrency.min(pending.len());
+    let mut bar_pool = Vec::with_capacity(pool_size);
+    let mut bar_available = Vec::with_capacity(pool_size);
+    for _ in 0..pool_size {
+        let bar = multi_progress.add(ProgressBar::new(0));
+        bar.set_style(
+            ProgressStyle::default_bar()
+                .template("  {spinner:.blue} {wide_msg} [{bar:30.white/dim}] {bytes}/{total_bytes} {bytes_per_sec}")
+                .unwrap()
+                .progress_chars("=>-"),
+        );
+        bar.set_message("");
+        bar_pool.push(bar);
+        bar_available.push(tokio::sync::Mutex::new(true));
+    }
+
     let overall_pb = multi_progress.add(ProgressBar::new(pending.len() as u64));
     overall_pb.set_style(
         ProgressStyle::default_bar()
@@ -783,15 +954,20 @@ pub async fn download_archives_streaming(
     overall_pb.set_message("Starting downloads...");
 
     let total_archives = pending.len();
+    let loverslab = init_loverslab(config).await;
     let ctx = Arc::new(DownloadContext {
         nexus: NexusDownloader::new(&config.nexus_api_key)?,
         http: HttpClient::new()?,
         cdn: WabbajackCdnDownloader::new()?,
         gdrive: GoogleDriveDownloader::new()?,
         mediafire: MediaFireDownloader::new()?,
+        loverslab,
+        ll_semaphore: tokio::sync::Semaphore::new(1),
         config: config.clone(),
         multi_progress,
         overall_pb: overall_pb.clone(),
+        bar_pool,
+        bar_available,
         downloaded: AtomicUsize::new(0),
         skipped: AtomicUsize::new(0),
         failed: AtomicUsize::new(0),
@@ -851,6 +1027,7 @@ pub async fn download_archives_streaming(
         .await;
 
     overall_pb.finish_and_clear();
+    clear_active_multi_progress();
 
     let manual_downloads_list = ctx.manual_downloads.lock().await.clone();
     let failed_downloads_list = ctx.failed_downloads.lock().await.clone();
@@ -863,6 +1040,24 @@ pub async fn download_archives_streaming(
         failed_downloads: failed_downloads_list,
         manual_downloads: manual_downloads_list,
     };
+
+    // Print failed downloads with URLs for manual download
+    if !stats.failed_downloads.is_empty() {
+        println!(
+            "\n=== Failed Downloads ({}) ===",
+            stats.failed_downloads.len()
+        );
+        println!(
+            "Download these manually to: {}\n",
+            config.downloads_dir.display()
+        );
+        for (i, fd) in stats.failed_downloads.iter().enumerate() {
+            println!("{}. {}", i + 1, fd.name);
+            println!("   URL: {}", fd.url);
+            println!("   Error: {}", fd.error);
+            println!();
+        }
+    }
 
     // Print summary
     println!("\n=== Download Summary ===");
@@ -922,7 +1117,7 @@ async fn process_archive(
     };
 
     // Check for manual downloads first
-    if let Some(manual_info) = check_manual(&state, archive) {
+    if let Some(manual_info) = check_manual(&state, archive, ctx.loverslab.is_some()) {
         ctx.manual_downloads.lock().await.push(manual_info);
         ctx.overall_pb.inc(1);
         update_overall_message(ctx);
@@ -930,29 +1125,33 @@ async fn process_archive(
         return (DownloadResult::Manual, None);
     }
 
-    // Create progress bar for this download
-    let pb = ctx
-        .multi_progress
-        .insert_before(&ctx.overall_pb, ProgressBar::new(archive.size as u64));
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("  {spinner:.blue} {wide_msg} [{bar:30.white/dim}] {bytes}/{total_bytes} {bytes_per_sec}")
-            .unwrap()
-            .progress_chars("=>-"),
-    );
-    pb.enable_steady_tick(Duration::from_millis(100));
-
-    // Truncate filename for display
-    let display_name = truncate_name(&archive.name, 40);
-    pb.set_message(display_name.clone());
+    // Claim a progress bar from the fixed pool
+    let bar_idx = ctx.claim_bar().await;
+    let pb = match bar_idx {
+        Some(idx) => {
+            let pb = &ctx.bar_pool[idx];
+            pb.set_length(archive.size as u64);
+            pb.set_position(0);
+            pb.set_message(truncate_name(&archive.name, 40));
+            pb.clone()
+        }
+        None => {
+            // More concurrent tasks than pool size — use hidden bar
+            ProgressBar::hidden()
+        }
+    };
 
     // Download based on source type
     let source = source_type_name(&state);
     let result = download_archive(&state, archive, output_path, ctx, &pb).await;
 
+    // Release bar back to pool
+    if let Some(idx) = bar_idx {
+        ctx.release_bar(idx).await;
+    }
+
     match result {
         Ok(url_to_cache) => {
-            pb.finish_and_clear();
             ctx.downloaded.fetch_add(1, Ordering::Relaxed);
             ctx.overall_pb.inc(1);
             update_overall_message(ctx);
@@ -960,17 +1159,20 @@ async fn process_archive(
             (DownloadResult::Success, url_to_cache)
         }
         Err(e) => {
-            pb.finish_and_clear();
             ctx.failed.fetch_add(1, Ordering::Relaxed);
             ctx.overall_pb.inc(1);
             let error_msg = root_cause(&e);
+            let full_error = format!("{:#}", e);
+            warn!(
+                "Download failed for {}: {}",
+                archive.name, full_error
+            );
             ctx.overall_pb.println(format!(
                 "FAIL [{}] {} - {}",
                 source,
                 truncate_name(&archive.name, 30),
                 error_msg
             ));
-            // Record failed download with URL for manual download
             ctx.failed_downloads.lock().await.push(FailedDownloadInfo {
                 name: archive.name.clone(),
                 url: get_manual_url(&state),
@@ -1013,24 +1215,53 @@ fn report_archive_complete(ctx: &DownloadContext, name: &str) {
 }
 
 /// Check if this is a manual download type (only truly manual sources)
-fn check_manual(state: &DownloadState, archive: &ArchiveInfo) -> Option<ManualDownloadInfo> {
+fn check_manual(
+    state: &DownloadState,
+    archive: &ArchiveInfo,
+    has_loverslab: bool,
+) -> Option<ManualDownloadInfo> {
     match state {
         DownloadState::Manual(manual_state) => {
             // ModDB "manual" links can often be resolved automatically.
             if is_moddb_url(&manual_state.url) {
-                None
-            } else {
-                Some(ManualDownloadInfo {
-                    name: archive.name.clone(),
-                    url: manual_state.url.clone(),
-                    prompt: Some(manual_state.prompt.clone()),
-                    expected_size: archive.size as u64,
-                })
+                return None;
             }
+            // LoversLab links are automated when credentials are configured.
+            if has_loverslab && is_loverslab_url(&manual_state.url) {
+                return None;
+            }
+            Some(ManualDownloadInfo {
+                name: archive.name.clone(),
+                url: manual_state.url.clone(),
+                prompt: Some(manual_state.prompt.clone()),
+                expected_size: archive.size as u64,
+            })
         }
         // Mega is now handled via Wabbajack proxy, not manual
         _ => None,
     }
+}
+
+/// Try to log into LoversLab if credentials are configured.
+/// Returns None (with a warning) if login fails — downloads fall back to manual.
+async fn init_loverslab(config: &InstallConfig) -> Option<LoversLabDownloader> {
+    if config.loverslab_email.is_empty() || config.loverslab_password.is_empty() {
+        return None;
+    }
+    match LoversLabDownloader::login(&config.loverslab_email, &config.loverslab_password).await {
+        Ok(ll) => {
+            info!("LoversLab login successful — automated downloads enabled");
+            Some(ll)
+        }
+        Err(e) => {
+            warn!("LoversLab login failed (downloads will be manual): {}", e);
+            None
+        }
+    }
+}
+
+fn is_loverslab_url(url: &str) -> bool {
+    crate::downloaders::loverslab::is_loverslab_url(url)
 }
 
 fn is_moddb_url(url: &str) -> bool {
@@ -1359,9 +1590,21 @@ async fn download_archive(
                     "{} (verifying...)",
                     truncate_name(&archive.name, 30)
                 ));
+
+                // ccbgssse037-curios has Steam vs Bethesda variants with different
+                // hashes but identical content — accept if size matches
+                let is_curios = archive.name.to_lowercase().contains("ccbgssse037-curios");
+
                 match verify_file_hash(output_path, &archive.hash) {
                     Ok(true) => {
                         // Hash matches - success!
+                    }
+                    Ok(false) if is_curios => {
+                        // Curios Steam/Bethesda variant — accept it
+                        warn!(
+                            "{} has different hash (Steam/Bethesda variant) — accepting",
+                            archive.name
+                        );
                     }
                     Ok(false) => {
                         // Hash mismatch - corrupted download, delete and retry
@@ -1639,18 +1882,33 @@ async fn download_archive_inner(
         }
 
         DownloadState::GoogleDrive(gd_state) => {
-            // Use gdrive's own client to maintain cookies through the confirmation flow
-            ctx.gdrive
+            // Try direct GDrive download first, fall back to proxy/mirror on quota errors
+            match ctx
+                .gdrive
                 .download_to_file(&gd_state.id, output_path, archive.size as u64, Some(pb))
-                .await?;
-            // Report final progress for GUI
-            if let Some(ref cb) = ctx.config.progress_callback {
-                cb(ProgressEvent::DownloadProgress {
-                    name: archive.name.clone(),
-                    downloaded: archive.size as u64,
-                    total: archive.size as u64,
-                    speed: 0.0, // GDrive doesn't provide speed info through this path
-                });
+                .await
+            {
+                Ok(()) => {
+                    if let Some(ref cb) = ctx.config.progress_callback {
+                        cb(ProgressEvent::DownloadProgress {
+                            name: archive.name.clone(),
+                            downloaded: archive.size as u64,
+                            total: archive.size as u64,
+                            speed: 0.0,
+                        });
+                    }
+                }
+                Err(_) => {
+                    // GDrive failed (likely quota exceeded) — report for manual download
+                    let url = format!(
+                        "https://drive.google.com/file/d/{}/view",
+                        gd_state.id
+                    );
+                    bail!(
+                        "GDrive download failed (likely quota exceeded, download manually): {}",
+                        url
+                    );
+                }
             }
             Ok(((), None))
         }
@@ -1685,23 +1943,45 @@ async fn download_archive_inner(
         }
 
         DownloadState::Mega(mega_state) => {
-            // Mega has no native client - download via Wabbajack proxy directly
-            info!("Mega download for {} - using Wabbajack proxy", archive.name);
-            download_via_proxy(
-                &ctx.http,
+            // Try native Mega download first, fall back to Wabbajack proxy
+            info!("Mega download for {} - trying native API", archive.name);
+            pb.set_message(format!("Mega: {}", truncate_name(&archive.name, 30)));
+
+            match crate::downloaders::mega_native::download_mega_file(
                 &mega_state.url,
                 output_path,
-                archive.size as u64,
-                pb,
-                callback_ref,
             )
             .await
-            .with_context(|| {
-                format!(
-                    "Mega proxy download failed for {} ({})",
-                    archive.name, mega_state.url
-                )
-            })?;
+            {
+                Ok(()) => {
+                    info!("Mega native download succeeded for {}", archive.name);
+                    if let Ok(meta) = std::fs::metadata(output_path) {
+                        pb.set_length(meta.len());
+                        pb.set_position(meta.len());
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Mega native download failed for {}: {} — trying proxy",
+                        archive.name, e
+                    );
+                    download_via_proxy(
+                        &ctx.http,
+                        &mega_state.url,
+                        output_path,
+                        archive.size as u64,
+                        pb,
+                        callback_ref,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Mega download failed for {} ({}) — native and proxy both failed",
+                            archive.name, mega_state.url
+                        )
+                    })?;
+                }
+            }
             Ok(((), None))
         }
 
@@ -1729,6 +2009,69 @@ async fn download_archive_inner(
                 )
                 .await?;
                 Ok(((), None))
+            } else if is_loverslab_url(&manual_state.url) {
+                if let Some(ll) = &ctx.loverslab {
+                    // Show waiting status while queued for LL semaphore
+                    pb.set_style(
+                        ProgressStyle::default_spinner()
+                            .template("  {spinner:.magenta} {wide_msg}")
+                            .unwrap(),
+                    );
+                    pb.set_message(format!("LL (queued): {}", truncate_name(&archive.name, 30)));
+
+                    // Acquire semaphore to enforce sequential LL downloads
+                    let _permit = ctx.ll_semaphore.acquire().await
+                        .map_err(|_| anyhow::anyhow!("LoversLab semaphore closed"))?;
+
+                    pb.set_message(format!("LL: {}", truncate_name(&archive.name, 35)));
+
+                    let result = ll.download(&manual_state.url, &archive.name, output_path)
+                        .await;
+
+                    match result {
+                        Ok(()) => Ok(((), None)),
+                        Err(e) => {
+                            let err_msg = format!("{:#}", e);
+                            // If LL redirected to Mega (lost URL fragment), try proxy/mirror
+                            let err_lower = err_msg.to_lowercase();
+                            if err_lower.contains("invalid")
+                                || err_lower.contains("public url")
+                                || err_lower.contains("mega")
+                            {
+                                warn!(
+                                    "LL download for {} redirected to Mega (key lost) — trying mirror",
+                                    archive.name
+                                );
+                                download_from_mirror(
+                                    &ctx.cdn,
+                                    &archive.hash,
+                                    output_path,
+                                    archive.size as u64,
+                                )
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "LL/Mega download failed for {} — mirror also failed",
+                                        archive.name
+                                    )
+                                })?;
+                                Ok(((), None))
+                            } else {
+                                Err(e).with_context(|| {
+                                    format!(
+                                        "LoversLab download failed for {} ({})",
+                                        archive.name, manual_state.url
+                                    )
+                                })
+                            }
+                        }
+                    }
+                } else {
+                    bail!(
+                        "LoversLab download required but credentials not configured: {}",
+                        manual_state.url
+                    )
+                }
             } else {
                 bail!(
                     "Manual download required and no automation handler available: {}",
@@ -2021,12 +2364,13 @@ async fn download_archives_nxm(
                         .unwrap()
                         .progress_chars("=>-"),
                 );
-                pb.enable_steady_tick(Duration::from_millis(100));
+                pb.enable_steady_tick(Duration::from_millis(500));
                 pb.set_message(truncate_name(&archive_name, 40));
 
                 let active = Arc::clone(&active_downloads);
                 active.fetch_add(1, Ordering::Relaxed);
                 let tx = result_tx.clone();
+                let mp = multi_progress.clone();
 
                 tokio::spawn(async move {
                     let result = async {
@@ -2056,6 +2400,7 @@ async fn download_archives_nxm(
                     }.await;
 
                     pb.finish_and_clear();
+                    mp.remove(&pb);
                     active.fetch_sub(1, Ordering::Relaxed);
                     let _ = tx.send((archive_hash, archive_name, output_path, result));
                 });
@@ -2169,7 +2514,26 @@ async fn download_non_nexus_files(
     config: &InstallConfig,
     pending: Vec<ArchiveInfo>,
 ) -> Result<DownloadStats> {
+    let concurrency = config.max_concurrent_downloads;
     let multi_progress = MultiProgress::new();
+    set_active_multi_progress(&multi_progress);
+
+    let pool_size = concurrency.min(pending.len());
+    let mut bar_pool = Vec::with_capacity(pool_size);
+    let mut bar_available = Vec::with_capacity(pool_size);
+    for _ in 0..pool_size {
+        let bar = multi_progress.add(ProgressBar::new(0));
+        bar.set_style(
+            ProgressStyle::default_bar()
+                .template("  {spinner:.blue} {wide_msg} [{bar:30.white/dim}] {bytes}/{total_bytes} {bytes_per_sec}")
+                .unwrap()
+                .progress_chars("=>-"),
+        );
+        bar.set_message("");
+        bar_pool.push(bar);
+        bar_available.push(tokio::sync::Mutex::new(true));
+    }
+
     let overall_pb = multi_progress.add(ProgressBar::new(pending.len() as u64));
     overall_pb.set_style(
         ProgressStyle::default_bar()
@@ -2181,15 +2545,20 @@ async fn download_non_nexus_files(
     overall_pb.set_message("Starting downloads...");
 
     let total_archives = pending.len();
+    let loverslab = init_loverslab(config).await;
     let ctx = Arc::new(DownloadContext {
         nexus: NexusDownloader::new(&config.nexus_api_key)?,
         http: HttpClient::new()?,
         cdn: WabbajackCdnDownloader::new()?,
         gdrive: GoogleDriveDownloader::new()?,
         mediafire: MediaFireDownloader::new()?,
+        loverslab,
+        ll_semaphore: tokio::sync::Semaphore::new(1),
         config: config.clone(),
         multi_progress,
         overall_pb,
+        bar_pool,
+        bar_available,
         downloaded: AtomicUsize::new(0),
         skipped: AtomicUsize::new(0),
         failed: AtomicUsize::new(0),
@@ -2198,8 +2567,6 @@ async fn download_non_nexus_files(
         completed_archives: AtomicUsize::new(0),
         total_archives,
     });
-
-    let concurrency = config.max_concurrent_downloads;
 
     let results: Vec<DownloadResultTuple> = stream::iter(pending)
         .map(|archive| {
@@ -2229,6 +2596,7 @@ async fn download_non_nexus_files(
     }
 
     ctx.overall_pb.finish_and_clear();
+    clear_active_multi_progress();
 
     let manual_downloads_list = ctx.manual_downloads.lock().await.clone();
     let failed_downloads_list = ctx.failed_downloads.lock().await.clone();
