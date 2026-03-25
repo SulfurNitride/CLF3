@@ -59,10 +59,12 @@ impl GoogleDriveDownloader {
         }
 
         if let Some(ct) = response.headers().get("content-type") {
-            let ct_str = ct.to_str().unwrap_or("");
-            if !ct_str.contains("text/html") {
-                debug!("Non-HTML content-type: {}, assuming download", ct_str);
-                return Ok(final_url);
+            // Treat unparseable content-type as potentially HTML (err on the safe side)
+            if let Ok(ct_str) = ct.to_str() {
+                if !ct_str.contains("text/html") {
+                    debug!("Non-HTML content-type: {}, assuming download", ct_str);
+                    return Ok(final_url);
+                }
             }
         }
 
@@ -103,7 +105,7 @@ impl GoogleDriveDownloader {
 
         // Check if we got HTML instead of the file (quota page, error, etc.)
         if let Some(ct) = response.headers().get("content-type") {
-            let ct_str = ct.to_str().unwrap_or("");
+            let ct_str = ct.to_str().unwrap_or("application/octet-stream");
             if ct_str.contains("text/html") {
                 let body = response.text().await.unwrap_or_default();
                 if body.contains("Quota exceeded") || body.contains("Too many users") {
@@ -161,11 +163,6 @@ impl GoogleDriveDownloader {
     }
 }
 
-impl Default for GoogleDriveDownloader {
-    fn default() -> Self {
-        Self::new().expect("Failed to create Google Drive downloader")
-    }
-}
 
 /// Parse Google Drive confirmation page to extract download URL
 ///
@@ -287,8 +284,8 @@ fn parse_confirmation_page(html: &str, file_id: &str) -> Result<String> {
     }
 
     // Log the HTML for debugging
-    eprintln!(
-        "DEBUG: Could not parse GDrive page. First 2000 chars:\n{}",
+    tracing::warn!(
+        "Could not parse GDrive page. First 2000 chars:\n{}",
         &html[..html.len().min(2000)]
     );
 

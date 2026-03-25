@@ -10,9 +10,16 @@ use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
 
 /// Well-known socket path for NXM IPC
+///
+/// Uses XDG_RUNTIME_DIR (user-private, tmpfs) to avoid world-writable /tmp.
+/// Falls back to ~/.cache/clf3/ if XDG_RUNTIME_DIR is unset.
 fn socket_path() -> PathBuf {
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         PathBuf::from(runtime_dir).join("clf3-nxm.sock")
+    } else if let Ok(home) = std::env::var("HOME") {
+        let dir = PathBuf::from(home).join(".cache").join("clf3");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("clf3-nxm.sock")
     } else {
         PathBuf::from("/tmp/clf3-nxm.sock")
     }
@@ -101,6 +108,13 @@ pub async fn start_listener() -> Result<(mpsc::UnboundedReceiver<NxmLink>, PathB
 
     let listener = tokio::net::UnixListener::bind(&path)
         .with_context(|| format!("Failed to bind Unix socket: {}", path.display()))?;
+
+    // Restrict socket to current user only (prevents other users hijacking NXM links)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
 
     println!("NXM handler listening on {}", path.display());
 

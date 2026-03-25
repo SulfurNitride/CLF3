@@ -96,13 +96,27 @@ pub fn handle_from_archive(ctx: &ProcessContext, directive: &FromArchiveDirectiv
         .get_archive_path(archive_hash)
         .with_context(|| format!("Archive not found for hash: {}", archive_hash))?;
 
-    // Extract the file data
-    let data = if directive.archive_hash_path.len() == 1 {
-        // Single file - just read it directly (e.g., GameFileSource files)
-        fs::read(&archive_path)
-            .with_context(|| format!("Failed to read file: {}", archive_path.display()))?
-    } else if directive.archive_hash_path.len() == 2 {
-        // Simple extraction from archive - try cache first
+    let output_path = ctx.resolve_output_path(&directive.to);
+    paths::ensure_parent_dirs(&output_path)?;
+
+    if directive.archive_hash_path.len() == 1 {
+        // Single file (GameFileSource): copy directly, no memory allocation
+        let meta = fs::metadata(&archive_path)
+            .with_context(|| format!("Failed to stat file: {}", archive_path.display()))?;
+        if meta.len() != directive.size {
+            bail!(
+                "Size mismatch: expected {} bytes, got {}",
+                directive.size,
+                meta.len()
+            );
+        }
+        reflink_copy::reflink_or_copy(&archive_path, &output_path)
+            .with_context(|| format!("Failed to copy {} -> {}", archive_path.display(), output_path.display()))?;
+        return Ok(());
+    }
+
+    // Extract file data from archive (decompression inherently buffers)
+    let data = if directive.archive_hash_path.len() == 2 {
         let path_in_archive = &directive.archive_hash_path[1];
         if let Some(cached) = ctx.get_cached_file(archive_hash, path_in_archive) {
             cached
@@ -114,7 +128,7 @@ pub fn handle_from_archive(ctx: &ProcessContext, directive: &FromArchiveDirectiv
             )?
         }
     } else {
-        // Nested extraction: file is inside a BSA within the archive - try cache first
+        // Nested extraction: file is inside a BSA within the archive
         let bsa_path_in_archive = &directive.archive_hash_path[1];
         let file_path_in_bsa = &directive.archive_hash_path[2];
         if let Some(cached) =
@@ -124,7 +138,6 @@ pub fn handle_from_archive(ctx: &ProcessContext, directive: &FromArchiveDirectiv
         } else if let Some(bsa_disk_path) =
             ctx.get_cached_bsa_path(archive_hash, bsa_path_in_archive)
         {
-            // BSA is in working folder - extract directly from it
             bsa::extract_archive_file(&bsa_disk_path, file_path_in_bsa).with_context(|| {
                 format!(
                     "Failed to extract '{}' from BSA '{}'",
@@ -151,9 +164,6 @@ pub fn handle_from_archive(ctx: &ProcessContext, directive: &FromArchiveDirectiv
     }
 
     // Write to output
-    let output_path = ctx.resolve_output_path(&directive.to);
-    paths::ensure_parent_dirs(&output_path)?;
-
     let mut file = File::create(&output_path)
         .with_context(|| format!("Failed to create output file: {}", output_path.display()))?;
     file.write_all(&data)
@@ -253,29 +263,61 @@ fn extract_with_7z(archive_path: &Path, file_path: &str, temp_base_dir: &Path) -
     )
 }
 
-/// Extract a file that's inside a BSA within an archive
+/// Extract a file that's inside a BSA within an archive.
+///
+/// Extracts the BSA directly to a temp directory (no Vec<u8> intermediate),
+/// then extracts the inner file from the on-disk BSA.
 fn extract_nested_bsa(
     archive_path: &Path,
     bsa_path_in_archive: &str,
     file_path_in_bsa: &str,
     temp_dir: &Path,
 ) -> Result<Vec<u8>> {
-    // First extract the BSA from the outer archive
-    let bsa_data = extract_from_archive_with_temp(archive_path, bsa_path_in_archive, temp_dir)?;
+    // Extract the BSA to a temp directory on disk (avoids loading entire BSA into memory)
+    let extraction_dir =
+        tempfile::tempdir_in(temp_dir).context("Failed to create temp directory for BSA")?;
 
-    // Write BSA to a temp file in downloads folder (ba2 crate needs a file path)
-    // Use tempfile crate for unique, auto-cleaned temp files
-    let temp_file = tempfile::Builder::new()
-        .prefix(".clf3_bsa_")
-        .suffix(".bsa")
-        .tempfile_in(temp_dir)
-        .context("Failed to create temp file for BSA")?;
+    sevenzip::extract_files_case_insensitive(
+        archive_path,
+        &[bsa_path_in_archive.to_string()],
+        extraction_dir.path(),
+    )
+    .or_else(|_| {
+        // Fallback: full extraction if selective fails
+        sevenzip::extract_all(archive_path, extraction_dir.path()).map(|_| 1)
+    })
+    .with_context(|| {
+        format!(
+            "Failed to extract BSA '{}' from '{}'",
+            bsa_path_in_archive,
+            archive_path.display()
+        )
+    })?;
 
-    fs::write(temp_file.path(), &bsa_data)
-        .with_context(|| format!("Failed to write temp BSA: {}", temp_file.path().display()))?;
+    // Find the BSA file on disk (case-insensitive)
+    let target_normalized = paths::normalize_for_lookup(bsa_path_in_archive);
+    let bsa_on_disk = walkdir::WalkDir::new(extraction_dir.path())
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .find(|e| {
+            let rel = e
+                .path()
+                .strip_prefix(extraction_dir.path())
+                .unwrap_or(e.path());
+            paths::normalize_for_lookup(&rel.to_string_lossy()) == target_normalized
+        })
+        .map(|e| e.into_path())
+        .with_context(|| {
+            format!(
+                "BSA '{}' not found after extraction from '{}'",
+                bsa_path_in_archive,
+                archive_path.display()
+            )
+        })?;
 
-    // Extract from the BSA (temp_file auto-deleted when dropped)
-    bsa::extract_archive_file(temp_file.path(), file_path_in_bsa)
+    // Extract the inner file from the on-disk BSA (extraction_dir auto-cleaned on drop)
+    bsa::extract_archive_file(&bsa_on_disk, file_path_in_bsa)
 }
 
 #[cfg(test)]
