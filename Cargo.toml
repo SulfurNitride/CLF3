@@ -119,6 +119,12 @@ once_cell = "1.19"
 # Unicode normalization (for path matching with accented characters)
 unicode-normalization = "0.1"
 
+# Memory allocator — mimalloc returns freed pages to the OS much more
+# aggressively than glibc malloc, preventing RSS bloat during extraction
+# where hundreds of large temporary Vec<u8> buffers are allocated and freed.
+mimalloc = "0.1"
+console = "0.16.3"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

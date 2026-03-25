@@ -3,6 +3,12 @@
 //! Named after Chlorine Trifluoride - burns through modlists
 //! like CLF3 burns through concrete.
 
+// Use mimalloc — returns freed pages to OS aggressively, preventing RSS bloat
+// during extraction where hundreds of large buffers are allocated and freed.
+// glibc malloc holds onto freed arena pages; mimalloc uses OS-native page return.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod archive;
 mod bsa;
 mod downloaders;
@@ -16,8 +22,9 @@ mod textures;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use installer::{InstallConfig, Installer};
+use installer::{CliReporter, InstallConfig, Installer, ProgressReporter};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 #[derive(Parser)]
@@ -179,10 +186,14 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .with_filter(file_filter);
 
-    // Console layer — routes through indicatif MultiProgress when active
-    // to avoid stderr output fighting with progress bar rendering
+    // Create CLI reporter for progress bars — must exist before tracing init
+    // so its writer factory can route tracing output through MultiProgress.
+    // Pool size is generous; unused bars stay hidden.
+    let cli_reporter = CliReporter::new(16);
+
+    // Console layer — routes through CliReporter's MultiProgress
     let console_layer = tracing_subscriber::fmt::layer()
-        .with_writer(clf3::installer::downloader::IndicatifWriterFactory)
+        .with_writer(cli_reporter.make_writer_factory())
         .with_filter(console_filter);
 
     tracing_subscriber::registry()
@@ -250,7 +261,8 @@ async fn main() -> Result<()> {
                 nxm_mode,
                 browser,
                 patch_cache_dir: None,
-                progress_callback: None, // CLI doesn't need progress callback
+                progress_callback: None,
+                reporter: cli_reporter.clone() as Arc<dyn ProgressReporter>,
                 loverslab_email: ll_email.unwrap_or_default(),
                 loverslab_password: ll_password.unwrap_or_default(),
             };
@@ -258,30 +270,61 @@ async fn main() -> Result<()> {
             let mut installer = Installer::new(config)?;
             let stats = installer.run_pipelined().await?;
 
+            let reporter = &cli_reporter;
             let total_processed =
                 stats.directives_completed + stats.directives_skipped + stats.directives_failed;
-            println!("\n=== Installation Summary ===");
-            println!(
+
+            reporter.log("\n=== Installation Summary ===");
+            reporter.log(&format!(
                 "Downloads:  {} downloaded, {} skipped, {} manual, {} failed",
                 stats.archives_downloaded,
                 stats.archives_skipped,
                 stats.archives_manual,
                 stats.archives_failed
-            );
-            println!(
+            ));
+            reporter.log(&format!(
                 "Directives: {} new, {} existing, {} failed ({} total)",
                 stats.directives_completed,
                 stats.directives_skipped,
                 stats.directives_failed,
                 total_processed
-            );
+            ));
+
+            // Show manual download details
+            if !stats.manual_downloads.is_empty() {
+                reporter.log(&format!(
+                    "\n=== Manual Downloads Needed ({}) ===",
+                    stats.manual_downloads.len()
+                ));
+                for (i, md) in stats.manual_downloads.iter().enumerate() {
+                    reporter.log(&format!("{}. {}", i + 1, md.name));
+                    reporter.log(&format!("   URL: {}", md.url));
+                    reporter.log(&format!("   Size: {} bytes", md.expected_size));
+                    if let Some(ref prompt) = md.prompt {
+                        reporter.log(&format!("   Note: {}", prompt));
+                    }
+                }
+            }
+
+            // Show failed download details
+            if !stats.failed_downloads.is_empty() {
+                reporter.log(&format!(
+                    "\n=== Failed Downloads ({}) ===",
+                    stats.failed_downloads.len()
+                ));
+                for (i, fd) in stats.failed_downloads.iter().enumerate() {
+                    reporter.log(&format!("{}. {}", i + 1, fd.name));
+                    reporter.log(&format!("   URL: {}", fd.url));
+                    reporter.log(&format!("   Error: {}", fd.error));
+                }
+            }
 
             if stats.archives_manual > 0 || stats.archives_failed > 0 {
-                println!("\nSome archives need manual download. Fix issues and run again.");
+                reporter.log("\nSome archives need manual download. Fix issues and run again.");
             } else if stats.directives_failed > 0 {
-                println!("\nSome directives failed. Check logs and run again.");
+                reporter.log("\nSome directives failed. Check the log file for details.");
             } else {
-                println!("\nInstallation complete!");
+                reporter.log("\nInstallation complete!");
             }
         }
 

@@ -16,20 +16,27 @@ pub mod downloader;
 pub mod handlers;
 pub mod pipeline;
 pub mod processor;
+pub mod progress;
+pub mod progress_cli;
+pub mod sidecar;
 pub mod streaming;
 
+#[allow(unused_imports)] // ProgressCallback/ProgressEvent used by lib crate (GUI)
 pub use config::{InstallConfig, ProgressCallback, ProgressEvent};
+#[allow(unused_imports)] // NullReporter used by lib crate (GUI)
+pub use progress::{NullReporter, Phase, ProgressHandle, ProgressReporter};
+pub use progress_cli::CliReporter;
 #[allow(unused_imports)] // Used by lib crate (GUI)
 pub use config_cache::{ConfigCache, ModlistConfig};
 
 use crate::modlist::{import_wabbajack_to_db, ModlistDb};
 use anyhow::{bail, Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
 use std::fs;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Instant;
 use tracing::{info, warn};
 
-fn current_rss_kb() -> Option<u64> {
+pub(crate) fn current_rss_kb() -> Option<u64> {
     let status = fs::read_to_string("/proc/self/status").ok()?;
     for line in status.lines() {
         if line.starts_with("VmRSS:") {
@@ -106,29 +113,26 @@ impl Installer {
         })?;
 
         // Parse wabbajack and import to database
-        println!("Parsing: {}", config.wabbajack_path.display());
+        config.reporter.log(&format!("Parsing: {}", config.wabbajack_path.display()));
         let db = import_wabbajack_to_db(&config.wabbajack_path, &config.db_path())?;
 
         // Show modlist info
         if let (Some(name), Some(version)) = (db.get_metadata("name")?, db.get_metadata("version")?)
         {
-            println!("Modlist: {} v{}", name, version);
+            config.reporter.log(&format!("Modlist: {} v{}", name, version));
         }
 
         let stats = db.get_directive_stats()?;
-        println!(
+        config.reporter.log(&format!(
             "Directives: {} total ({} pending)\n",
             stats.total, stats.pending
-        );
+        ));
 
         Ok(Self { config, db })
     }
 
-    /// Report a progress event to the callback if one is set
-    fn report_progress(&self, event: ProgressEvent) {
-        if let Some(ref callback) = self.config.progress_callback {
-            callback(event);
-        }
+    fn reporter(&self) -> &Arc<dyn ProgressReporter> {
+        &self.config.reporter
     }
 
     /// Download all required archives
@@ -154,21 +158,13 @@ impl Installer {
             .collect();
 
         if archives_to_check.is_empty() {
-            println!("No downloaded archives to validate");
+            self.reporter().log("No downloaded archives to validate");
             return Ok(Vec::new());
         }
 
-        let pb = ProgressBar::new(archives_to_check.len() as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} | {msg}",
-                )
-                .unwrap()
-                .progress_chars("=>-"),
-        );
-        pb.enable_steady_tick(Duration::from_millis(100));
-        pb.set_message("Verifying archives (size + hash)...");
+        let reporter = self.reporter().clone();
+        reporter.overall_set_total(archives_to_check.len() as u64);
+        reporter.overall_set_message("Verifying archives (size + hash)...");
 
         let errors = Mutex::new(Vec::new());
         let downloads_dir = &self.config.downloads_dir;
@@ -190,7 +186,7 @@ impl Installer {
                                 (actual_size * 100) / expected_size.max(1)
                             ),
                         ));
-                        pb.inc(1);
+                        reporter.overall_inc();
                         return;
                     }
 
@@ -223,17 +219,17 @@ impl Installer {
                 }
             }
 
-            pb.inc(1);
+            reporter.overall_inc();
         });
 
-        pb.finish_and_clear();
+        reporter.overall_finish();
         let errors = errors.into_inner().expect("errors mutex");
-        println!(
+        self.reporter().log(&format!(
             "Verified {} archives ({} valid, {} corrupted)",
             archives_to_check.len(),
             archives_to_check.len() - errors.len(),
             errors.len()
-        );
+        ));
 
         Ok(errors)
     }
@@ -250,26 +246,20 @@ impl Installer {
 
         // === Phase 1: Game Check ===
         let game_check_start = Instant::now();
-        println!("=== Phase 1: Game Check ===\n");
-        self.report_progress(ProgressEvent::PhaseChange {
-            phase: "Game Check".to_string(),
-        });
-        println!("Game directory: {}", self.config.game_dir.display());
+        self.reporter().phase_start(Phase::GameCheck);
+        self.reporter().log(&format!("Game directory: {}", self.config.game_dir.display()));
         if !self.config.game_dir.exists() {
             bail!(
                 "Game directory does not exist: {}",
                 self.config.game_dir.display()
             );
         }
-        println!("Game directory validated\n");
+        self.reporter().log("Game directory validated");
         log_phase_metrics("Game Check", game_check_start);
 
         // === Phase 2: Download Archives ===
         let download_start = Instant::now();
-        println!("=== Phase 2: Download Archives ===\n");
-        self.report_progress(ProgressEvent::PhaseChange {
-            phase: "Downloading".to_string(),
-        });
+        self.reporter().phase_start(Phase::Downloading);
         let download_stats = self.download_phase().await?;
         stats.archives_downloaded = download_stats.downloaded;
         stats.archives_skipped = download_stats.skipped;
@@ -286,10 +276,7 @@ impl Installer {
 
         // === Phase 3: Validate + Index Archives ===
         let validate_start = Instant::now();
-        println!("\n=== Phase 3: Validate + Index Archives ===\n");
-        self.report_progress(ProgressEvent::PhaseChange {
-            phase: "Validating".to_string(),
-        });
+        self.reporter().phase_start(Phase::Validating);
         let mut validation_attempts = 0;
         const MAX_VALIDATION_ATTEMPTS: usize = 3;
 
@@ -298,31 +285,31 @@ impl Installer {
             let validation_errors = self.validate_archives()?;
 
             if validation_errors.is_empty() {
-                println!("All archives validated successfully!\n");
+                self.reporter().log("All archives validated successfully!");
                 break;
             }
 
             if validation_attempts >= MAX_VALIDATION_ATTEMPTS {
-                println!(
-                    "\nValidation failed after {} attempts! {} archives still have issues:",
+                self.reporter().log(&format!(
+                    "Validation failed after {} attempts! {} archives still have issues:",
                     MAX_VALIDATION_ATTEMPTS,
                     validation_errors.len()
-                );
+                ));
                 for (name, error) in &validation_errors {
-                    println!("  - {}: {}", name, error);
+                    self.reporter().log(&format!("  - {}: {}", name, error));
                 }
                 bail!("Archive validation failed");
             }
 
-            println!(
-                "\nFound {} corrupted archives, auto-fixing...",
+            self.reporter().log(&format!(
+                "Found {} corrupted archives, auto-fixing...",
                 validation_errors.len()
-            );
+            ));
             for (name, error) in &validation_errors {
-                println!("  - {}: {}", name, error);
+                self.reporter().log(&format!("  - {}: {}", name, error));
                 let file_path = self.config.downloads_dir.join(name);
-                if file_path.exists() {
-                    if let Err(e) = fs::remove_file(&file_path) {
+                if let Err(e) = fs::remove_file(&file_path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
                         warn!(
                             "Failed to remove corrupted file {}: {}",
                             file_path.display(),
@@ -335,11 +322,11 @@ impl Installer {
                 }
             }
 
-            println!("\nRe-downloading {} files...\n", validation_errors.len());
+            self.reporter().log(&format!("Re-downloading {} files...", validation_errors.len()));
             let redownload_stats = self.download_phase().await?;
 
             if redownload_stats.failed > 0 {
-                println!("Re-download had {} failures", redownload_stats.failed);
+                self.reporter().log(&format!("Re-download had {} failures", redownload_stats.failed));
             }
         }
 
@@ -354,13 +341,8 @@ impl Installer {
 
         // === Phase 4: Install + Patch Files ===
         let install_start = Instant::now();
-        println!("\n=== Phase 4: Install + Patch Files ===\n");
-        self.report_progress(ProgressEvent::PhaseChange {
-            phase: "Installing".to_string(),
-        });
-        self.report_progress(ProgressEvent::Status {
-            message: "Installing + patching files...".to_string(),
-        });
+        self.reporter().phase_start(Phase::Installing);
+        self.reporter().status("Installing + patching files...");
         dp.install_phase()?;
         trim_allocator_rss("install phase");
         log_phase_metrics("Install+Patch", install_start);
@@ -376,30 +358,21 @@ impl Installer {
 
         // === Phase 5: DDS Transformations ===
         let dds_start = Instant::now();
-        println!("\n=== Phase 5: DDS Transformations ===\n");
-        self.report_progress(ProgressEvent::PhaseChange {
-            phase: "DDS Transform".to_string(),
-        });
+        self.reporter().phase_start(Phase::DdsTransform);
         dp.texture_phase()?;
         trim_allocator_rss("texture phase");
         log_phase_metrics("DDS Transform", dds_start);
 
         // === Phase 6: BSA Building ===
         let bsa_start = Instant::now();
-        println!("\n=== Phase 6: BSA Building ===\n");
-        self.report_progress(ProgressEvent::PhaseChange {
-            phase: "BSA Build".to_string(),
-        });
+        self.reporter().phase_start(Phase::BsaBuild);
         dp.bsa_phase()?;
         trim_allocator_rss("bsa build phase");
         log_phase_metrics("BSA Build", bsa_start);
 
         // === Phase 7: Cleanup ===
         let cleanup_start = Instant::now();
-        println!("\n=== Phase 7: Cleanup ===\n");
-        self.report_progress(ProgressEvent::PhaseChange {
-            phase: "Cleanup".to_string(),
-        });
+        self.reporter().phase_start(Phase::Cleanup);
         dp.cleanup_phase()?;
         trim_allocator_rss("cleanup phase");
         log_phase_metrics("Cleanup", cleanup_start);
@@ -410,12 +383,12 @@ impl Installer {
         stats.directives_failed = process_stats.failed;
 
         if stats.directives_failed > 0 {
-            println!(
-                "\nDirective processing incomplete. {} failures.",
+            self.reporter().log(&format!(
+                "Directive processing incomplete. {} failures.",
                 stats.directives_failed
-            );
+            ));
         } else {
-            println!("\nInstallation complete!");
+            self.reporter().log("Installation complete!");
         }
 
         Ok(stats)
@@ -431,26 +404,20 @@ impl Installer {
 
         // === Phase 1: Game Check ===
         let game_check_start = Instant::now();
-        println!("=== Phase 1: Game Check ===\n");
-        self.report_progress(ProgressEvent::PhaseChange {
-            phase: "Game Check".to_string(),
-        });
-        println!("Game directory: {}", self.config.game_dir.display());
+        self.reporter().phase_start(Phase::GameCheck);
+        self.reporter().log(&format!("Game directory: {}", self.config.game_dir.display()));
         if !self.config.game_dir.exists() {
             bail!(
                 "Game directory does not exist: {}",
                 self.config.game_dir.display()
             );
         }
-        println!("Game directory validated\n");
+        self.reporter().log("Game directory validated");
         log_phase_metrics("Game Check", game_check_start);
 
         // === Phase 2: Pipelined Download + Extract ===
         let pipeline_start = Instant::now();
-        println!("=== Phase 2: Pipelined Download + Extract ===\n");
-        self.report_progress(ProgressEvent::PhaseChange {
-            phase: "Downloading + Installing".to_string(),
-        });
+        self.reporter().phase_start(Phase::Downloading);
 
         // Create the directive processor early (needs DB + config)
         let dp = processor::DirectiveProcessor::new(&self.db, &self.config)?;
@@ -461,10 +428,10 @@ impl Installer {
         let total_patched = grouped.patched.values().map(|v| v.len()).sum::<usize>();
         let total_textures = grouped.textures.values().map(|v| v.len()).sum::<usize>();
         let total_whole = grouped.whole_file.len();
-        println!(
+        self.reporter().log(&format!(
             "Grouped directives: {} FromArchive, {} Patched, {} Textures, {} whole-file ({} pre-skipped)",
             total_from, total_patched, total_textures, total_whole, grouped.pre_skipped
-        );
+        ));
 
         // Create channel for archive events
         let (tx, rx) = std::sync::mpsc::sync_channel::<downloader::ArchiveEvent>(32);
@@ -474,20 +441,6 @@ impl Installer {
             max_parallel_7z_archives: Some(self.config.max_parallel_7z_archives),
             max_parallel_bsa_archives: Some(self.config.max_parallel_bsa_archives),
         };
-
-        // Progress callback
-        let progress_callback: Option<streaming::ProgressCallback> =
-            if let Some(ref callback) = self.config.progress_callback {
-                let cb = callback.clone();
-                Some(std::sync::Arc::new(move |count: usize| {
-                    cb(ProgressEvent::DirectiveComplete {
-                        index: count,
-                        total: 0, // Will be set properly later
-                    });
-                }))
-            } else {
-                None
-            };
 
         // Run download + extraction concurrently:
         // - Main thread: runs the processing loop (has &self.db, which is !Send)
@@ -522,7 +475,7 @@ impl Installer {
             &rx,
             &grouped,
             streaming_config,
-            progress_callback,
+            &self.config.reporter,
         )?;
 
         // Wait for download thread to finish
@@ -546,52 +499,37 @@ impl Installer {
             return Ok(stats);
         }
 
-        // Check for extraction failures — abort early
+        // Check for extraction failures — return early with stats so summary is shown
         if streaming_stats.failed > 0 {
             log_phase_metrics("Pipelined Download+Extract", pipeline_start);
-            bail!(
-                "Pipelined install had {} failures. Please fix the issues above and re-run.",
-                streaming_stats.failed
-            );
+            return Ok(stats);
         }
         log_phase_metrics("Pipelined Download+Extract", pipeline_start);
 
         // === Phase 3: InlineFile + RemappedInlineFile ===
         let inline_start = Instant::now();
-        println!("\n=== Phase 3: Inline Files ===\n");
-        self.report_progress(ProgressEvent::PhaseChange {
-            phase: "Inline Files".to_string(),
-        });
+        self.reporter().phase_start(Phase::Installing);
         dp.inline_phase()?;
         trim_allocator_rss("inline files");
         log_phase_metrics("Inline Files", inline_start);
 
         // === Phase 4: DDS Transformations ===
         let dds_start = Instant::now();
-        println!("\n=== Phase 4: DDS Transformations ===\n");
-        self.report_progress(ProgressEvent::PhaseChange {
-            phase: "DDS Transform".to_string(),
-        });
+        self.reporter().phase_start(Phase::DdsTransform);
         dp.texture_phase()?;
         trim_allocator_rss("texture phase");
         log_phase_metrics("DDS Transform", dds_start);
 
         // === Phase 5: BSA Building ===
         let bsa_start = Instant::now();
-        println!("\n=== Phase 5: BSA Building ===\n");
-        self.report_progress(ProgressEvent::PhaseChange {
-            phase: "BSA Build".to_string(),
-        });
+        self.reporter().phase_start(Phase::BsaBuild);
         dp.bsa_phase()?;
         trim_allocator_rss("bsa build phase");
         log_phase_metrics("BSA Build", bsa_start);
 
         // === Phase 6: Cleanup ===
         let cleanup_start = Instant::now();
-        println!("\n=== Phase 6: Cleanup ===\n");
-        self.report_progress(ProgressEvent::PhaseChange {
-            phase: "Cleanup".to_string(),
-        });
+        self.reporter().phase_start(Phase::Cleanup);
         dp.cleanup_phase()?;
         trim_allocator_rss("cleanup phase");
         log_phase_metrics("Cleanup", cleanup_start);
@@ -602,12 +540,12 @@ impl Installer {
         stats.directives_failed += process_stats.failed;
 
         if stats.directives_failed > 0 {
-            println!(
-                "\nDirective processing incomplete. {} failures.",
+            self.reporter().log(&format!(
+                "Directive processing incomplete. {} failures.",
                 stats.directives_failed
-            );
+            ));
         } else {
-            println!("\nInstallation complete!");
+            self.reporter().log("Installation complete!");
         }
 
         Ok(stats)

@@ -2,6 +2,7 @@
 //!
 //! Defines the configuration structure for modlist installation.
 
+use super::progress::ProgressReporter;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -92,8 +93,11 @@ pub struct InstallConfig {
     /// Optional directory to persist patched outputs by hash for reuse
     pub patch_cache_dir: Option<PathBuf>,
 
-    /// Optional callback for progress reporting
+    /// Optional callback for progress reporting (legacy — being replaced by reporter)
     pub progress_callback: Option<ProgressCallback>,
+
+    /// Unified progress reporter (CLI or GUI implementation)
+    pub reporter: Arc<dyn ProgressReporter>,
 
     /// LoversLab email for automated downloads (empty = manual)
     pub loverslab_email: String,
@@ -121,6 +125,7 @@ impl std::fmt::Debug for InstallConfig {
                 "progress_callback",
                 &self.progress_callback.as_ref().map(|_| "<callback>"),
             )
+            .field("reporter", &"<reporter>")
             .field("loverslab_email", &self.loverslab_email)
             .field("loverslab_password", &"[REDACTED]")
             .finish()

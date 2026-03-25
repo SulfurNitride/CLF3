@@ -188,6 +188,11 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
         }
     }
 
+    // Write sidecar hash cache so re-runs can skip this BSA
+    if let Err(e) = crate::installer::sidecar::write_sidecar(&output_path, &directive.hash) {
+        tracing::warn!("Failed to write BSA sidecar for {}: {}", output_path.display(), e);
+    }
+
     // Clean up staging directory
     if let Err(e) = fs::remove_dir_all(&staging_dir) {
         tracing::warn!(
@@ -200,24 +205,11 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
     Ok(())
 }
 
-/// Check if a CreateBSA output already exists and is valid
+/// Check if a CreateBSA output already exists and is valid.
+///
+/// Uses sidecar hash cache: checks that the `.clf3hash` sidecar matches the
+/// directive's expected hash and the file size hasn't changed (corruption check).
 pub fn output_bsa_valid(ctx: &ProcessContext, directive: &CreateBSADirective) -> bool {
     let output_path = ctx.resolve_output_path(&directive.to);
-
-    if !output_path.exists() {
-        return false;
-    }
-
-    // Check magic bytes - BSA or BA2
-    if let Ok(file) = fs::File::open(&output_path) {
-        use std::io::BufReader;
-        let mut reader = BufReader::new(file);
-        let mut magic = [0u8; 4];
-        if std::io::Read::read_exact(&mut reader, &mut magic).is_ok() {
-            // BSA magic is "BSA\0", BA2 magic is "BTDX"
-            return &magic == b"BSA\0" || &magic == b"BTDX";
-        }
-    }
-
-    false
+    crate::installer::sidecar::sidecar_valid(&output_path, &directive.hash)
 }

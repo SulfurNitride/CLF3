@@ -5990,6 +5990,7 @@ async fn run_wabbajack_install(
         browser: "xdg-open".to_string(),
         patch_cache_dir: patch_cache_dir.map(PathBuf::from),
         progress_callback: Some(progress_callback),
+        reporter: crate::installer::CliReporter::new(thread_count),
         loverslab_email,
         loverslab_password,
     };

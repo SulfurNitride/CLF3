@@ -42,8 +42,9 @@ use super::processor::{
     should_preload_patch_blobs, store_patched_output_in_cache, ProcessContext,
 };
 
+use super::progress::ProgressReporter;
+
 use anyhow::Result;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -193,7 +194,7 @@ pub fn get_large_archive_threshold() -> u64 {
 }
 
 /// Clean up leftover temp directories from previous interrupted runs.
-pub fn cleanup_temp_dirs(downloads_dir: &std::path::Path) -> usize {
+pub fn cleanup_temp_dirs(downloads_dir: &std::path::Path, reporter: &Arc<dyn ProgressReporter>) -> usize {
     let mut cleaned = 0;
     if let Ok(entries) = fs::read_dir(downloads_dir) {
         for entry in entries.filter_map(|e| e.ok()) {
@@ -207,15 +208,10 @@ pub fn cleanup_temp_dirs(downloads_dir: &std::path::Path) -> usize {
         }
     }
     if cleaned > 0 {
-        crate::installer::downloader::progress_println(&format!("Cleaned up {} leftover temp directories", cleaned));
+        reporter.log(&format!("Cleaned up {} leftover temp directories", cleaned));
     }
     cleaned
 }
-
-/// Progress callback type for streaming extraction.
-/// Called with the current count of written files.
-pub type ProgressCallback = Arc<dyn Fn(usize) + Send + Sync>;
-
 
 /// Main entry point for fused install + patch pipeline.
 ///
@@ -226,27 +222,35 @@ pub fn process_fused_streaming(
     db: &ModlistDb,
     ctx: &ProcessContext,
     config: StreamingConfig,
-    pb: &ProgressBar,
-    progress_callback: Option<ProgressCallback>,
+    reporter: &Arc<dyn ProgressReporter>,
 ) -> Result<StreamingStats> {
     const MAX_LOGGED_FAILURES: usize = 100;
 
     // Clean up any leftover temp dirs from previous interrupted runs
-    cleanup_temp_dirs(&ctx.config.downloads_dir);
+    cleanup_temp_dirs(&ctx.config.downloads_dir, reporter);
+
+    let rss0 = crate::installer::current_rss_kb().unwrap_or(0);
+    reporter.log(&format!("[RSS-SETUP] start: {}MB", rss0 / 1024));
 
     // === Load FromArchive directives ===
-    pb.set_message("Loading FromArchive directives...");
+    reporter.status("Loading FromArchive directives...");
     let from_archive_raw = db.get_all_pending_directives_of_type("FromArchive")?;
 
+    let rss1 = crate::installer::current_rss_kb().unwrap_or(0);
+    reporter.log(&format!("[RSS-SETUP] after load FromArchive ({} rows): {}MB", from_archive_raw.len(), rss1 / 1024));
+
     // === Load PatchedFromArchive directives ===
-    pb.set_message("Loading PatchedFromArchive directives...");
+    reporter.status("Loading PatchedFromArchive directives...");
     let patched_raw = db.get_all_pending_directives_of_type("PatchedFromArchive")?;
+
+    let rss2 = crate::installer::current_rss_kb().unwrap_or(0);
+    reporter.log(&format!("[RSS-SETUP] after load Patched ({} rows): {}MB", patched_raw.len(), rss2 / 1024));
 
     if from_archive_raw.is_empty() && patched_raw.is_empty() {
         return Ok(StreamingStats::default());
     }
 
-    pb.set_message("Pre-filtering completed files...");
+    reporter.status("Pre-filtering completed files...");
 
     // Parse FromArchive directives, pre-filter, group by archive
     let mut by_archive: HashMap<String, Vec<ArchiveDirective>> = HashMap::new();
@@ -339,8 +343,14 @@ pub fn process_fused_streaming(
         }
     }
 
+    let rss3 = crate::installer::current_rss_kb().unwrap_or(0);
+    reporter.log(&format!(
+        "[RSS-SETUP] after grouping ({} archives, {} skipped): {}MB",
+        by_archive.len(), pre_skipped, rss3 / 1024
+    ));
+
     if pre_skipped > 0 {
-        crate::installer::downloader::progress_println(&format!("Pre-filtered {} already-complete files", pre_skipped));
+        reporter.log(&format!("Pre-filtered {} already-complete files", pre_skipped));
     }
     if parse_failures > 0 {
         warn!("WARN: {} directives failed to parse", parse_failures);
@@ -383,7 +393,7 @@ pub fn process_fused_streaming(
         }
     }
     if tex_only_count > 0 {
-        crate::installer::downloader::progress_println(&format!(
+        reporter.log(&format!(
             "Added {} texture-only archives to extraction pass",
             tex_only_count
         ));
@@ -439,24 +449,11 @@ pub fn process_fused_streaming(
         let d2_archives: usize = texture_depth2.values().filter(|v| !v.is_empty()).count();
         let d3_archives: usize = texture_depth3.values().filter(|v| !v.is_empty()).count();
 
-        crate::installer::downloader::progress_println(&format!(
+        reporter.log(&format!(
             "DDS inline: {} textures ({} depth-2 in {} archives, {} depth-3 in {} archives)",
             texture_count, d2_count, d2_archives, d3_count, d3_archives
         ));
     }
-
-    // Global counter for GUI progress — shared across all archives
-    let global_written = Arc::new(AtomicUsize::new(0));
-
-    // Create a wrapper callback that uses global counter + pre_skipped offset
-    let adjusted_callback: Option<ProgressCallback> = progress_callback.map(|cb| {
-        let offset = pre_skipped;
-        let counter = global_written.clone();
-        Arc::new(move |_per_archive_count: usize| {
-            let total = counter.fetch_add(1, Ordering::Relaxed) + 1;
-            cb(offset + total);
-        }) as ProgressCallback
-    });
 
     // Classify archives by type
     let mut archives: Vec<_> = by_archive.into_iter().collect();
@@ -502,7 +499,7 @@ pub fn process_fused_streaming(
     let total_archives = all_archives.len();
     let total_files: usize = all_archives.iter().map(|(_, d, _, _)| d.len()).sum();
 
-    crate::installer::downloader::progress_println(&format!(
+    reporter.log(&format!(
         "Processing {} archives ({} files): {} extract + {} BSA-only",
         total_archives, total_files, extract_count, bsa_only_count
     ));
@@ -517,26 +514,19 @@ pub fn process_fused_streaming(
     let failed_archive_hashes: Arc<std::sync::Mutex<HashSet<String>>> =
         Arc::new(std::sync::Mutex::new(HashSet::new()));
 
-    // Multi-progress display: overall bar + per-archive spinner bars
-    let mp = MultiProgress::new();
-    pb.finish_and_clear();
-    let overall_pb = mp.add(ProgressBar::new(total_archives as u64));
-    overall_pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} archives | {msg}")
-            .unwrap()
-            .progress_chars("=>-"),
-    );
-    overall_pb.enable_steady_tick(std::time::Duration::from_millis(100));
-    overall_pb.set_message("Starting...");
+    // Set up overall progress
+    reporter.overall_set_total(total_archives as u64);
+    reporter.overall_set_message("Starting...");
 
-    let archive_bar_style = ProgressStyle::default_spinner()
-        .template("  {spinner:.blue} {wide_msg}")
-        .unwrap();
+    let rss4 = crate::installer::current_rss_kb().unwrap_or(0);
+    reporter.log(&format!(
+        "[RSS-SETUP] before extraction ({} total archives): {}MB",
+        total_archives, rss4 / 1024
+    ));
 
     // Process whole-file directives first (simple copy)
     if !whole_file_directives.is_empty() {
-        overall_pb.set_message(format!(
+        reporter.overall_set_message(&format!(
             "Copying {} whole-file directives...",
             whole_file_directives.len()
         ));
@@ -570,14 +560,14 @@ pub fn process_fused_streaming(
         .expect("Failed to build BSA archive pool");
 
     if !extract_archives.is_empty() {
-        crate::installer::downloader::progress_println(&format!(
+        reporter.log(&format!(
             "  Extract queue: {} archives ({} concurrent workers)",
             extract_archives.len(),
             extract_workers
         ));
     }
     if !bsa_archives.is_empty() {
-        crate::installer::downloader::progress_println(&format!(
+        reporter.log(&format!(
             "  BSA queue: {} archives ({} concurrent archive workers)",
             bsa_archives.len(),
             bsa_archive_workers
@@ -587,6 +577,10 @@ pub fn process_fused_streaming(
     // Collect DDS jobs during extraction by spilling texture data to temp files.
     // Only metadata is kept in RAM (~100 bytes each). Data is read back when processing.
     let dds_spill_dir = ctx.config.output_dir.join(".clf3_dds_spill");
+    // Clean up stale spill dir from a previous failed run before creating fresh
+    if dds_spill_dir.exists() {
+        let _ = fs::remove_dir_all(&dds_spill_dir);
+    }
     let _ = fs::create_dir_all(&dds_spill_dir);
     let collected_dds_jobs: Arc<std::sync::Mutex<Vec<SpilledDdsJob>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -602,15 +596,16 @@ pub fn process_fused_streaming(
             .collect();
         let total = archive_paths.len();
         if total > 0 {
-            crate::installer::downloader::progress_println(&format!("  Pre-listing {} archives...", total));
+            reporter.log(&format!("  Pre-listing {} archives...", total));
             let listed = AtomicUsize::new(0);
+            let prelist_reporter = reporter.clone();
             archive_paths.par_iter().for_each(|path| {
                 if let Err(e) = listing_cache.populate(path) {
                     debug!("Pre-list failed for {}: {} (will list on demand)", path.display(), e);
                 }
                 let done = listed.fetch_add(1, Ordering::Relaxed) + 1;
                 if done.is_multiple_of(100) || done == total {
-                    crate::installer::downloader::progress_println(&format!("  Pre-listed {}/{} archives", done, total));
+                    prelist_reporter.log(&format!("  Pre-listed {}/{} archives", done, total));
                 }
             });
         }
@@ -642,7 +637,7 @@ pub fn process_fused_streaming(
                     idx += 1;
                 }
                 let count = jobs.len();
-                collected_jobs.lock().expect("dds jobs lock").extend(jobs);
+                collected_jobs.lock().unwrap_or_else(|e| e.into_inner()).extend(jobs);
                 count
             }))
         } else {
@@ -669,10 +664,7 @@ pub fn process_fused_streaming(
             let failed = failed.clone();
             let logged_failures = logged_failures.clone();
             let completed_archives = completed_archives.clone();
-            let overall_pb = overall_pb.clone();
-            let mp = mp.clone();
-            let archive_bar_style = archive_bar_style.clone();
-            let adjusted_callback = adjusted_callback.clone();
+            let reporter = reporter.clone();
             thread_scope.spawn(move || {
                 let dds_tx = bsa_dds_tx;
                 let tex_d2 = bsa_tex_d2;
@@ -685,10 +677,7 @@ pub fn process_fused_streaming(
                         let failed = &failed;
                         let logged_failures = &logged_failures;
                         let completed_archives = &completed_archives;
-                        let overall_pb = &overall_pb;
-                        let archive_bar_style = &archive_bar_style;
-                        let mp = &mp;
-                        let adjusted_callback = &adjusted_callback;
+                        let reporter = &reporter;
                         let dds_tx = &dds_tx;
                         let tex_d2 = &tex_d2;
                         let _tex_d3 = &tex_d3; // BSA-direct: no nested BSAs
@@ -700,14 +689,12 @@ pub fn process_fused_streaming(
                             .unwrap_or_else(|| archive_hash.clone());
                         let display_name = truncate_name(&archive_name, 50);
 
-                        let archive_pb = mp.insert_before(overall_pb, ProgressBar::new_spinner());
-                        archive_pb.set_style(archive_bar_style.clone());
-                        archive_pb.enable_steady_tick(std::time::Duration::from_millis(100));
-                        archive_pb.set_message(format!(
-                            "{} ({} files) reading...",
-                            display_name,
-                            directives.len(),
-                        ));
+                        let handle = reporter.begin_item(
+                            &format!("{} ({} files) reading...", display_name, directives.len()),
+                            None,
+                        );
+
+                        let bsa_rss_before = crate::installer::current_rss_kb().unwrap_or(0);
 
                         // BSA/BA2 direct-read path — handles both FromArchive and Patched
                         let bsa_from: Vec<(
@@ -757,7 +744,7 @@ pub fn process_fused_streaming(
                                 skipped,
                                 failed,
                                 logged_failures,
-                                adjusted_callback.clone(),
+                                reporter,
                             );
                         }
 
@@ -772,7 +759,7 @@ pub fn process_fused_streaming(
                                 skipped,
                                 failed,
                                 logged_failures,
-                                adjusted_callback.clone(),
+                                reporter,
                             );
                         }
 
@@ -785,11 +772,25 @@ pub fn process_fused_streaming(
                             }
                         }
 
-                        archive_pb.finish_and_clear();
+                        let bsa_rss_after = crate::installer::current_rss_kb().unwrap_or(0);
+                        reporter.log(&format!(
+                            "[RSS-BSA] {} : before={}MB after={}MB (delta={}MB, {} from + {} patched)",
+                            display_name,
+                            bsa_rss_before / 1024,
+                            bsa_rss_after / 1024,
+                            bsa_rss_after.saturating_sub(bsa_rss_before) / 1024,
+                            bsa_from.len(),
+                            bsa_patched.len(),
+                        ));
+
+                        handle.finish();
+
+                        #[cfg(target_os = "linux")]
+                        unsafe { libc::malloc_trim(0); }
+
                         completed_archives.fetch_add(1, Ordering::Relaxed);
-                        let done = completed_archives.load(Ordering::Relaxed);
-                        overall_pb.set_position(done as u64);
-                        overall_pb.set_message(format!(
+                        reporter.overall_inc();
+                        reporter.overall_set_message(&format!(
                             "OK:{} Skip:{} Fail:{}",
                             written.load(Ordering::Relaxed),
                             skipped.load(Ordering::Relaxed),
@@ -812,10 +813,7 @@ pub fn process_fused_streaming(
                                failed: &AtomicUsize,
                                logged_failures: &Arc<AtomicUsize>,
                                completed_archives: &AtomicUsize,
-                               overall_pb: &ProgressBar,
-                               archive_bar_style: &ProgressStyle,
-                               mp: &MultiProgress,
-                               adjusted_callback: &Option<ProgressCallback>,
+                               reporter: &Arc<dyn ProgressReporter>,
                                dds_tx: &std::sync::mpsc::SyncSender<DdsJob>,
                                tex_d2: &HashMap<String, TextureLookupInner>,
                                tex_d3: &HashMap<String, NestedTextureLookupInner>,
@@ -827,14 +825,10 @@ pub fn process_fused_streaming(
                 .unwrap_or_else(|| archive_hash.clone());
             let display_name = truncate_name(&archive_name, 50);
 
-            let archive_pb = mp.insert_before(overall_pb, ProgressBar::new_spinner());
-            archive_pb.set_style(archive_bar_style.clone());
-            archive_pb.enable_steady_tick(std::time::Duration::from_millis(100));
-            archive_pb.set_message(format!(
-                "{} ({} files) extracting...",
-                display_name,
-                directives.len(),
-            ));
+            let item_handle = reporter.begin_item(
+                &format!("{} ({} files) extracting...", display_name, directives.len()),
+                None,
+            );
 
             let mut extra_paths: Vec<String> = Vec::new();
             if let Some(d2) = tex_d2.get(archive_hash) {
@@ -848,6 +842,8 @@ pub fn process_fused_streaming(
                 }
             }
 
+            let rss_before = crate::installer::current_rss_kb().unwrap_or(0);
+
             let result = process_single_archive_fused(
                 archive_path,
                 archive_hash,
@@ -857,6 +853,8 @@ pub fn process_fused_streaming(
                 &extra_paths,
                 Some(listing_cache),
             );
+
+            let rss_after_extract = crate::installer::current_rss_kb().unwrap_or(0);
 
             match result {
                 Ok(archive_result) => {
@@ -869,7 +867,7 @@ pub fn process_fused_streaming(
 
                     if archive_result.failed_count > 0 {
                         failed_archive_hashes
-                            .lock().expect("failed hashes lock")
+                            .lock().unwrap_or_else(|e| e.into_inner())
                             .insert(archive_hash.clone());
                     }
 
@@ -892,7 +890,9 @@ pub fn process_fused_streaming(
                         }
                     }
 
-                    archive_pb.set_message(format!(
+                    let rss_after_tex = crate::installer::current_rss_kb().unwrap_or(0);
+
+                    item_handle.set_message(&format!(
                         "{} ({} files) finalizing...",
                         display_name,
                         archive_result.staged_files.len()
@@ -902,15 +902,28 @@ pub fn process_fused_streaming(
                         archive_result,
                         &ctx.config.output_dir,
                         logged_failures,
-                        adjusted_callback,
+                        reporter,
                     );
+
+                    let rss_after_finalize = crate::installer::current_rss_kb().unwrap_or(0);
+                    let rss_mb = |kb: u64| kb / 1024;
+                    reporter.log(&format!(
+                        "[RSS] {} : before={}MB extract={}MB tex={}MB final={}MB (delta={}MB, {} files)",
+                        display_name,
+                        rss_mb(rss_before),
+                        rss_mb(rss_after_extract),
+                        rss_mb(rss_after_tex),
+                        rss_mb(rss_after_finalize),
+                        rss_mb(rss_after_finalize.saturating_sub(rss_before)),
+                        fin_stats.written + fin_stats.skipped + fin_stats.failed,
+                    ));
                     written.fetch_add(fin_stats.written, Ordering::Relaxed);
                     skipped.fetch_add(fin_stats.skipped, Ordering::Relaxed);
                     failed.fetch_add(fin_stats.failed, Ordering::Relaxed);
 
                     if fin_stats.failed > 0 {
                         failed_archive_hashes
-                            .lock().expect("failed hashes lock")
+                            .lock().unwrap_or_else(|e| e.into_inner())
                             .insert(archive_hash.clone());
                     }
                 }
@@ -921,16 +934,22 @@ pub fn process_fused_streaming(
                     }
                     failed.fetch_add(directives.len(), Ordering::Relaxed);
                     failed_archive_hashes
-                        .lock().expect("failed hashes lock")
+                        .lock().unwrap_or_else(|e| e.into_inner())
                         .insert(archive_hash.clone());
                 }
             }
 
-            archive_pb.finish_and_clear();
+            item_handle.finish();
+
+            // Return freed memory to the OS after each archive.
+            // glibc malloc holds onto freed pages — without this, RSS grows
+            // monotonically across hundreds of archive extractions.
+            #[cfg(target_os = "linux")]
+            unsafe { libc::malloc_trim(0); }
+
             completed_archives.fetch_add(1, Ordering::Relaxed);
-            let done = completed_archives.load(Ordering::Relaxed);
-            overall_pb.set_position(done as u64);
-            overall_pb.set_message(format!(
+            reporter.overall_inc();
+            reporter.overall_set_message(&format!(
                 "OK:{} Skip:{} Fail:{}",
                 written.load(Ordering::Relaxed),
                 skipped.load(Ordering::Relaxed),
@@ -946,10 +965,7 @@ pub fn process_fused_streaming(
             let failed = failed.clone();
             let logged_failures = logged_failures.clone();
             let completed_archives = completed_archives.clone();
-            let overall_pb = overall_pb.clone();
-            let mp = mp.clone();
-            let archive_bar_style = archive_bar_style.clone();
-            let adjusted_callback = adjusted_callback.clone();
+            let reporter = reporter.clone();
             let failed_hashes = failed_archive_hashes.clone();
             thread_scope.spawn(move || {
                 let dds_tx = extract_dds_tx;
@@ -963,10 +979,7 @@ pub fn process_fused_streaming(
                         let failed = &failed;
                         let logged_failures = &logged_failures;
                         let completed_archives = &completed_archives;
-                        let overall_pb = &overall_pb;
-                        let archive_bar_style = &archive_bar_style;
-                        let mp = &mp;
-                        let adjusted_callback = &adjusted_callback;
+                        let reporter = &reporter;
                         let dds_tx = &dds_tx;
                         let tex_d2 = &tex_d2;
                         let tex_d3 = &tex_d3;
@@ -978,8 +991,7 @@ pub fn process_fused_streaming(
                                 archive_hash, directives, archive_path,
                                 extracted, written, skipped, failed,
                                 logged_failures, completed_archives,
-                                overall_pb, archive_bar_style, mp,
-                                adjusted_callback, dds_tx, tex_d2, tex_d3,
+                                reporter, dds_tx, tex_d2, tex_d3,
                                 failed_hashes, listing_cache,
                             );
                         });
@@ -988,40 +1000,52 @@ pub fn process_fused_streaming(
             })
         };
 
-        bsa_handle.join().expect("BSA processing thread panicked");
-        extract_handle.join().expect("Extract processing thread panicked");
+        if let Err(e) = bsa_handle.join() {
+            error!("BSA processing thread panicked: {:?}", e);
+        }
+        if let Err(e) = extract_handle.join() {
+            error!("Extract processing thread panicked: {:?}", e);
+        }
         // All dds_tx senders (bsa + extract) are now dropped,
         // so the channel is closed and the collector will finish draining.
         let collected_count = if let Some(handle) = collector_handle {
-            handle.join().expect("DDS collector thread panicked")
+            match handle.join() {
+                Ok(count) => count,
+                Err(e) => {
+                    error!("DDS collector thread panicked: {:?}", e);
+                    0
+                }
+            }
         } else {
             0
         };
         if collected_count > 0 {
-            crate::installer::downloader::progress_println(&format!("Collected {} texture jobs during extraction, processing in parallel...", collected_count));
+            reporter.log(&format!("Collected {} texture jobs during extraction, processing in parallel...", collected_count));
         }
     });
 
-    overall_pb.finish_and_clear();
+    reporter.overall_finish();
 
     // Process collected DDS textures in parallel using rayon (all CPU cores).
     // Data was spilled to temp files during extraction — read back on demand.
-    let dds_jobs = std::mem::take(&mut *collected_dds_jobs.lock().expect("dds jobs lock"));
+    let dds_jobs = std::mem::take(&mut *collected_dds_jobs.lock().unwrap_or_else(|e| e.into_inner()));
     process_spilled_dds_jobs(dds_jobs, ctx);
 
     // Clean up DDS spill directory
-    if let Err(e) = fs::remove_dir_all(&dds_spill_dir) {
-        debug!("DDS spill cleanup: {}", e);
+    if dds_spill_dir.exists() {
+        if let Err(e) = fs::remove_dir_all(&dds_spill_dir) {
+            warn!("Failed to clean up DDS spill directory {}: {}", dds_spill_dir.display(), e);
+        }
     }
 
     // Re-verify archives that had extraction failures — detect corrupted downloads.
     let bad_hashes = failed_archive_hashes
         .lock()
-        .expect("failed hashes lock")
+        .unwrap_or_else(|e| e.into_inner())
         .clone();
 
     if !bad_hashes.is_empty() {
-        crate::installer::downloader::progress_println(&format!(
+        reporter.log(&format!(
             "\n{} archive(s) had failures — re-verifying hashes...",
             bad_hashes.len()
         ));
@@ -1035,7 +1059,7 @@ pub fn process_fused_streaming(
                                 .file_name()
                                 .map(|n| n.to_string_lossy().to_string())
                                 .unwrap_or_else(|| hash.clone());
-                            crate::installer::downloader::progress_println(&format!(
+                            reporter.log(&format!(
                                 "  CORRUPTED: {} (expected {}, got {})",
                                 name, hash, actual_hash
                             ));
@@ -1046,8 +1070,8 @@ pub fn process_fused_streaming(
                                 if let Err(e) = db.reset_archive_download_status(&name_str) {
                                     warn!("Failed to reset download status for {}: {}", name_str, e);
                                 } else {
-                                    crate::installer::downloader::progress_println(&format!(
-                                        "  → Marked {} for re-download on next run",
+                                    reporter.log(&format!(
+                                        "  -> Marked {} for re-download on next run",
                                         name_str
                                     ));
                                 }
@@ -1058,17 +1082,17 @@ pub fn process_fused_streaming(
                                 .file_name()
                                 .map(|n| n.to_string_lossy().to_string())
                                 .unwrap_or_else(|| hash.clone());
-                            crate::installer::downloader::progress_println(&format!("  OK (hash valid): {} — content mismatch in modlist?", name));
+                            reporter.log(&format!("  OK (hash valid): {} -- content mismatch in modlist?", name));
                         }
                     }
                     Err(e) => {
-                        crate::installer::downloader::progress_println(&format!("  ERROR: could not re-hash {}: {}", hash, e));
+                        reporter.log(&format!("  ERROR: could not re-hash {}: {}", hash, e));
                     }
                 }
             }
         }
         if !corrupted.is_empty() {
-            crate::installer::downloader::progress_println(&format!(
+            reporter.log(&format!(
                 "\n{} corrupted archive(s) marked for re-download. Re-run to fix.",
                 corrupted.len()
             ));
@@ -1085,7 +1109,7 @@ pub fn process_fused_streaming(
         failed_archive_hashes: bad_hashes.into_iter().collect(),
     };
 
-    crate::installer::downloader::progress_println(&format!(
+    reporter.log(&format!(
         "Complete: {} extracted, {} written, {} skipped ({} pre-filtered), {} failed",
         stats.extracted, stats.written, stats.skipped, pre_skipped, stats.failed
     ));
@@ -1379,7 +1403,7 @@ pub(crate) fn process_single_archive_fused(
                     if let Some(combined_key) = path_to_combined.get(&normalized) {
                         extracted_entries
                             .lock()
-                            .expect("extracted_entries mutex")
+                            .unwrap_or_else(|e| e.into_inner())
                             .push((combined_key.clone(), temp_file));
                     }
                     Ok(())
@@ -1409,7 +1433,7 @@ pub(crate) fn process_single_archive_fused(
                             if let Some(temp_file) = found {
                                 extracted_entries
                                     .lock()
-                                    .expect("extracted_entries mutex")
+                                    .unwrap_or_else(|e| e.into_inner())
                                     .push((combined_normalized.clone(), temp_file));
                             }
                         }
@@ -1425,7 +1449,7 @@ pub(crate) fn process_single_archive_fused(
             }
 
             // Merge extracted entries into the main map
-            for (key, path) in extracted_entries.into_inner().expect("extracted_entries mutex") {
+            for (key, path) in extracted_entries.into_inner().unwrap_or_else(|e| e.into_inner()) {
                 extracted_map.insert(key, path);
             }
 
@@ -1740,7 +1764,7 @@ pub(crate) fn finalize_archive(
     result: ArchiveResult,
     _output_dir: &Path,
     logged_failures: &Arc<AtomicUsize>,
-    progress_callback: &Option<ProgressCallback>,
+    _reporter: &Arc<dyn ProgressReporter>,
 ) -> FinalizeStats {
     const MAX_LOGGED_FAILURES: usize = 100;
 
@@ -1817,9 +1841,14 @@ pub(crate) fn finalize_archive(
 
         // Determine if we're the last consumer of this source file.
         // If so, rename (instant, zero I/O). Otherwise, copy to preserve the source.
+        // fetch_sub returns the PREVIOUS value, so remaining==1 means we just decremented to 0.
         let remaining = source_ref_counts
             .get(&sf.temp_path)
-            .map(|c| c.fetch_sub(1, Ordering::Relaxed))
+            .map(|c| {
+                let prev = c.fetch_sub(1, Ordering::SeqCst);
+                debug_assert!(prev >= 1, "ref count underflow for {:?}", sf.temp_path);
+                prev
+            })
             .unwrap_or(0);
         let can_rename = remaining <= 1;
 
@@ -1859,10 +1888,7 @@ pub(crate) fn finalize_archive(
             return;
         }
 
-        let new_count = written.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Some(ref callback) = progress_callback {
-            callback(new_count);
-        }
+        written.fetch_add(1, Ordering::Relaxed);
     });
 
     // Explicitly drop temp dirs after all staged files have been moved/copied out.
@@ -1913,7 +1939,7 @@ fn process_nested_bsa_directives_staged(
             Some(p) => p.clone(),
             None => {
                 for (id, _, _) in &directives {
-                    results.lock().expect("results mutex").push(Err(format!(
+                    results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!(
                         "FAIL [{}]: Nested archive not found: {}",
                         id, archive_path_in_outer
                     )));
@@ -1926,7 +1952,7 @@ fn process_nested_bsa_directives_staged(
             Ok(t) => t,
             Err(e) => {
                 for (id, _, _) in &directives {
-                    results.lock().expect("results mutex").push(Err(format!(
+                    results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!(
                         "FAIL [{}]: Cannot detect archive type for {}: {}",
                         id, archive_path_in_outer, e
                     )));
@@ -1971,7 +1997,7 @@ fn process_nested_bsa_directives_staged(
                                 let extracted_path = match nested_map.get(&normalized_file) {
                                     Some(p) => p,
                                     None => {
-                                        results.lock().expect("results mutex").push(Err(format!(
+                                        results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!(
                                             "FAIL [{}]: Nested file not found: {}",
                                             id, file_in_archive
                                         )));
@@ -1982,7 +2008,7 @@ fn process_nested_bsa_directives_staged(
                                 let src_size = match fs::metadata(extracted_path) {
                                     Ok(meta) => meta.len(),
                                     Err(e) => {
-                                        results.lock().expect("results mutex").push(Err(format!(
+                                        results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!(
                                             "FAIL [{}]: Nested metadata error: {}",
                                             id, e
                                         )));
@@ -1991,7 +2017,7 @@ fn process_nested_bsa_directives_staged(
                                 };
 
                                 if src_size != directive.size {
-                                    results.lock().expect("results mutex").push(Err(format!(
+                                    results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!(
                                         "FAIL [{}]: Size mismatch: expected {} got {}",
                                         id, directive.size, src_size
                                     )));
@@ -2017,7 +2043,7 @@ fn process_nested_bsa_directives_staged(
                                     );
                                 }
 
-                                results.lock().expect("results mutex").push(Ok(StagedFile {
+                                results.lock().unwrap_or_else(|e| e.into_inner()).push(Ok(StagedFile {
                                     temp_path: extracted_path.clone(),
                                     output_path: final_path,
                                     expected_size: directive.size,
@@ -2030,7 +2056,7 @@ fn process_nested_bsa_directives_staged(
                         }
                         Err(e) => {
                             for (id, _, _) in &directives {
-                                results.lock().expect("results mutex").push(Err(format!(
+                                results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!(
                                     "FAIL [{}]: Nested batch extract error from {:?} archive {}: {}",
                                     id, archive_type, archive_disk_path.display(), e
                                 )));
@@ -2040,7 +2066,7 @@ fn process_nested_bsa_directives_staged(
                 }
                 Err(e) => {
                     for (id, _, _) in &directives {
-                        results.lock().expect("results mutex").push(Err(format!(
+                        results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!(
                             "FAIL [{}]: Cannot create temp dir for nested extraction: {}",
                             id, e
                         )));
@@ -2075,7 +2101,7 @@ fn process_nested_bsa_directives_staged(
 
                 for &(id, directive, file_in_archive) in directive_list {
                     if data.len() as u64 != directive.size {
-                        results.lock().expect("results mutex").push(Err(format!(
+                        results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!(
                             "FAIL [{}]: Size mismatch: expected {} got {}",
                             id, directive.size, data.len()
                         )));
@@ -2084,7 +2110,7 @@ fn process_nested_bsa_directives_staged(
 
                     let out_path = paths::join_windows_path(output_dir, &directive.to);
                     if let Err(_e) = paths::ensure_parent_dirs(&out_path) {
-                        results.lock().expect("results mutex").push(Err(format!(
+                        results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!(
                             "FAIL [{}]: Cannot create parent dirs",
                             id
                         )));
@@ -2092,7 +2118,7 @@ fn process_nested_bsa_directives_staged(
                     }
 
                     if let Err(e) = fs::write(&out_path, &data) {
-                        results.lock().expect("results mutex").push(Err(format!("FAIL [{}]: write error: {}", id, e)));
+                        results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!("FAIL [{}]: write error: {}", id, e)));
                         continue;
                     }
 
@@ -2110,7 +2136,7 @@ fn process_nested_bsa_directives_staged(
                         );
                     }
 
-                    results.lock().expect("results mutex").push(Ok(StagedFile {
+                    results.lock().unwrap_or_else(|e| e.into_inner()).push(Ok(StagedFile {
                         temp_path: out_path.clone(),
                         output_path: out_path,
                         expected_size: directive.size,
@@ -2122,7 +2148,7 @@ fn process_nested_bsa_directives_staged(
         ) {
             // Batch extraction failed entirely — report for all directives
             for (id, _, _) in &directives {
-                results.lock().expect("results mutex").push(Err(format!(
+                results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!(
                     "FAIL [{}]: Nested BSA batch extract error from {:?}: {}",
                     id, archive_type, e
                 )));
@@ -2130,7 +2156,7 @@ fn process_nested_bsa_directives_staged(
         }
     }
 
-    (results.into_inner().expect("results mutex"), kept_temp_dirs)
+    (results.into_inner().unwrap_or_else(|e| e.into_inner()), kept_temp_dirs)
 }
 
 fn normalize_archive_lookup_path(path: &str) -> String {
@@ -2207,6 +2233,10 @@ pub(crate) fn process_whole_file_directives(
         let archive_path = match ctx.get_archive_path(archive_hash) {
             Some(p) => p,
             None => {
+                error!(
+                    "FAIL [{}]: whole-file archive not found (hash={}): {}",
+                    id, archive_hash, directive.to
+                );
                 failed.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -2214,7 +2244,11 @@ pub(crate) fn process_whole_file_directives(
 
         let archive_size = match fs::metadata(&archive_path) {
             Ok(m) => m.len(),
-            Err(_) => {
+            Err(e) => {
+                error!(
+                    "FAIL [{}]: whole-file archive unreadable: {}: {}",
+                    id, archive_path.display(), e
+                );
                 failed.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -2366,6 +2400,272 @@ pub(crate) fn extract_textures_from_nested_bsas(
     }
 }
 
+/// Spill texture data to disk during extraction, then process in batched GPU/CPU pipeline.
+/// BC7 textures are batched (up to BATCH_SIZE) for GPU encoding; others use CPU parallel.
+/// Only one batch's worth of texture data is in memory at a time.
+const DDS_BATCH_SIZE: usize = 16;
+
+/// Process textures from a BSA — spill to disk, then batch-process.
+pub(crate) fn process_textures_from_bsa_streaming(
+    archive_path: &Path,
+    tex_lookup: &TextureLookupInner,
+    ctx: &ProcessContext,
+) -> (usize, usize) {
+    let wanted: HashSet<String> = tex_lookup.keys().cloned().collect();
+    if wanted.is_empty() {
+        return (0, 0);
+    }
+
+    // Spill extracted texture data to temp files
+    let spill_dir = match tempfile::tempdir_in(&ctx.config.output_dir) {
+        Ok(d) => d,
+        Err(_) => return (0, 0),
+    };
+    let spilled: std::sync::Mutex<Vec<SpilledDdsJob>> = std::sync::Mutex::new(Vec::new());
+    let idx = AtomicUsize::new(0);
+
+    let _ = bsa::extract_archive_batch(archive_path, &wanted, |path, data| {
+        let lookup = path.replace('\\', "/").to_lowercase();
+        let Some(directives) = tex_lookup.get(&lookup) else {
+            return Ok(());
+        };
+        for (id, directive) in directives {
+            let i = idx.fetch_add(1, Ordering::Relaxed);
+            let data_path = spill_dir.path().join(format!("tex_{}.tmp", i));
+            fs::write(&data_path, &data)?;
+            spilled.lock().unwrap_or_else(|e| e.into_inner()).push(SpilledDdsJob {
+                id: *id,
+                directive: directive.clone(),
+                data_path,
+            });
+        }
+        Ok(())
+    });
+
+    process_spilled_dds_batched(spilled.into_inner().unwrap_or_default(), ctx)
+}
+
+/// Process textures from extracted temp dir — read one at a time, spill, batch-process.
+pub(crate) fn process_textures_from_temp_streaming(
+    temp_dir: &Path,
+    tex_lookup: &TextureLookupInner,
+    ctx: &ProcessContext,
+) -> (usize, usize) {
+    let file_map = build_extracted_file_map(temp_dir);
+    let spill_dir = match tempfile::tempdir_in(&ctx.config.output_dir) {
+        Ok(d) => d,
+        Err(_) => return (0, 0),
+    };
+    let mut spilled: Vec<SpilledDdsJob> = Vec::new();
+    let mut idx = 0u64;
+
+    for (normalized_path, directives) in tex_lookup {
+        let found = file_map.get(normalized_path)
+            .or_else(|| file_map.get(&normalized_path.replace('/', "\\")));
+        let Some(file_path) = found else { continue };
+
+        for (id, directive) in directives {
+            // Symlink or copy the source to spill dir (avoids reading into memory now)
+            let data_path = spill_dir.path().join(format!("tex_{}.tmp", idx));
+            if std::os::unix::fs::symlink(file_path, &data_path).is_err() {
+                if fs::copy(file_path, &data_path).is_err() { continue; }
+            }
+            spilled.push(SpilledDdsJob {
+                id: *id,
+                directive: directive.clone(),
+                data_path,
+            });
+            idx += 1;
+        }
+    }
+
+    process_spilled_dds_batched(spilled, ctx)
+}
+
+/// Process textures from nested BSAs — spill to disk, then batch-process.
+pub(crate) fn process_textures_from_nested_bsas_streaming(
+    temp_dir: &Path,
+    nested_lookup: &NestedTextureLookupInner,
+    ctx: &ProcessContext,
+) -> (usize, usize) {
+    let file_map = build_extracted_file_map(temp_dir);
+    let spill_dir = match tempfile::tempdir_in(&ctx.config.output_dir) {
+        Ok(d) => d,
+        Err(_) => return (0, 0),
+    };
+    let mut spilled: Vec<SpilledDdsJob> = Vec::new();
+    let idx = AtomicUsize::new(0);
+
+    for (bsa_name, tex_lookup) in nested_lookup {
+        let bsa_path = file_map.get(bsa_name)
+            .or_else(|| file_map.get(&bsa_name.replace('/', "\\")));
+        let Some(bsa_disk_path) = bsa_path else {
+            debug!("Nested BSA not found in temp dir: {}", bsa_name);
+            continue;
+        };
+
+        let wanted: HashSet<String> = tex_lookup.keys().cloned().collect();
+        if wanted.is_empty() { continue; }
+
+        let spill_path = spill_dir.path().to_path_buf();
+        let spilled_ref = std::sync::Mutex::new(Vec::new());
+
+        let _ = bsa::extract_archive_batch(bsa_disk_path, &wanted, |path, data| {
+            let lookup = path.replace('\\', "/").to_lowercase();
+            let Some(directives) = tex_lookup.get(&lookup) else {
+                return Ok(());
+            };
+            for (id, directive) in directives {
+                let i = idx.fetch_add(1, Ordering::Relaxed);
+                let data_path = spill_path.join(format!("tex_{}.tmp", i));
+                fs::write(&data_path, &data)?;
+                spilled_ref.lock().unwrap_or_else(|e| e.into_inner()).push(SpilledDdsJob {
+                    id: *id,
+                    directive: directive.clone(),
+                    data_path,
+                });
+            }
+            Ok(())
+        });
+
+        spilled.extend(spilled_ref.into_inner().unwrap_or_default());
+    }
+
+    process_spilled_dds_batched(spilled, ctx)
+}
+
+/// Process spilled DDS jobs in batches: BC7 through GPU batch pipeline, others CPU parallel.
+/// Reads texture data from disk in batches of DDS_BATCH_SIZE to bound memory.
+fn process_spilled_dds_batched(jobs: Vec<SpilledDdsJob>, ctx: &ProcessContext) -> (usize, usize) {
+    if jobs.is_empty() {
+        return (0, 0);
+    }
+
+    use crate::installer::handlers::texture::is_fallback_mode;
+    use crate::installer::sidecar;
+    use crate::textures::{process_texture_batch, process_texture_with_fallback, OutputFormat, TextureJob};
+
+    // Pre-filter: skip jobs whose output already has a valid sidecar
+    let mut skipped = 0usize;
+    let jobs: Vec<SpilledDdsJob> = jobs.into_iter().filter(|job| {
+        let out = paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
+        if sidecar::sidecar_valid(&out, &job.directive.hash) {
+            ctx.textures_processed_during_install
+                .lock().unwrap_or_else(|e| e.into_inner())
+                .insert(job.id);
+            skipped += 1;
+            false
+        } else {
+            true
+        }
+    }).collect();
+
+    let mut ok_count = skipped;
+    let mut fail_count = 0usize;
+
+    // Group by format
+    let mut by_format: HashMap<String, Vec<&SpilledDdsJob>> = HashMap::new();
+    for job in &jobs {
+        let fmt_str = job.directive.image_state.format.to_uppercase();
+        by_format.entry(fmt_str).or_default().push(job);
+    }
+
+    for (fmt_str, format_jobs) in by_format {
+        let fmt = OutputFormat::parse(&fmt_str).unwrap_or(if is_fallback_mode() {
+            OutputFormat::BC1
+        } else {
+            OutputFormat::BC7
+        });
+
+        if fmt == OutputFormat::BC7 {
+            // BC7: batch through GPU in chunks of DDS_BATCH_SIZE
+            for chunk in format_jobs.chunks(DDS_BATCH_SIZE) {
+                let tex_jobs: Vec<TextureJob> = chunk
+                    .iter()
+                    .filter_map(|j| {
+                        match j.read_data() {
+                            Ok(data) => Some(TextureJob {
+                                data,
+                                width: j.directive.image_state.width,
+                                height: j.directive.image_state.height,
+                                format: OutputFormat::BC7,
+                                id: Some(format!("{}", j.id)),
+                            }),
+                            Err(e) => {
+                                warn!("DDS spill read failed for {}: {:#}", j.id, e);
+                                None
+                            }
+                        }
+                    })
+                    .collect();
+
+                let results = process_texture_batch(tex_jobs);
+
+                for (job, (_job_id, result)) in chunk.iter().zip(results.into_iter()) {
+                    match result {
+                        Ok(processed) => {
+                            let out = paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
+                            if paths::ensure_parent_dirs(&out).is_ok()
+                                && fs::write(&out, &processed.data).is_ok()
+                            {
+                                // Only write sidecar for final output paths (not BSA staging dirs)
+                                if !job.directive.to.contains("TEMP_BSA_FILES") {
+                                    let _ = sidecar::write_sidecar(&out, &job.directive.hash);
+                                }
+                                ok_count += 1;
+                                ctx.textures_processed_during_install
+                                    .lock().unwrap_or_else(|e| e.into_inner())
+                                    .insert(job.id);
+                            } else {
+                                fail_count += 1;
+                            }
+                        }
+                        Err(e) => {
+                            fail_count += 1;
+                            warn!("DDS BC7 fail [{}]: {:#}", job.id, e);
+                        }
+                    }
+                }
+                // Batch data freed here before next chunk
+            }
+        } else {
+            // Non-BC7: process one at a time with CPU
+            for job in format_jobs {
+                let result: anyhow::Result<()> = (|| {
+                    let data = job.read_data()?;
+                    let (tex, _) = process_texture_with_fallback(
+                        &data,
+                        job.directive.image_state.width,
+                        job.directive.image_state.height,
+                        fmt,
+                    )?;
+                    let out = paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
+                    paths::ensure_parent_dirs(&out)?;
+                    fs::write(&out, &tex.data)?;
+                    if !job.directive.to.contains("TEMP_BSA_FILES") {
+                        let _ = sidecar::write_sidecar(&out, &job.directive.hash);
+                    }
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => {
+                        ok_count += 1;
+                        ctx.textures_processed_during_install
+                            .lock().unwrap_or_else(|e| e.into_inner())
+                            .insert(job.id);
+                    }
+                    Err(e) => {
+                        fail_count += 1;
+                        warn!("DDS {} fail [{}]: {}", fmt.name(), job.id, e);
+                    }
+                }
+            }
+        }
+    }
+
+    (ok_count, fail_count)
+}
+
 /// Collect texture source files from a BSA/BA2 archive into a Vec (no channel).
 pub(crate) fn collect_textures_from_bsa(
     archive_path: &Path,
@@ -2381,7 +2681,7 @@ pub(crate) fn collect_textures_from_bsa(
         let lookup = path.replace('\\', "/").to_lowercase();
         if let Some(directives) = tex_lookup.get(&lookup) {
             for (id, directive) in directives {
-                jobs.lock().expect("dds jobs lock").push(DdsJob {
+                jobs.lock().unwrap_or_else(|e| e.into_inner()).push(DdsJob {
                     id: *id,
                     directive: directive.clone(),
                     data: data.clone(),
@@ -2391,7 +2691,7 @@ pub(crate) fn collect_textures_from_bsa(
         Ok(())
     });
 
-    jobs.into_inner().expect("dds jobs lock")
+    jobs.into_inner().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Collect texture source files from a temp directory into a Vec (no channel).
@@ -2457,7 +2757,7 @@ pub(crate) fn collect_textures_from_nested_bsas(
             let lookup = path.replace('\\', "/").to_lowercase();
             if let Some(directives) = tex_lookup.get(&lookup) {
                 for (id, directive) in directives {
-                    nested_jobs.lock().expect("dds jobs lock").push(DdsJob {
+                    nested_jobs.lock().unwrap_or_else(|e| e.into_inner()).push(DdsJob {
                         id: *id,
                         directive: directive.clone(),
                         data: data.clone(),
@@ -2467,7 +2767,7 @@ pub(crate) fn collect_textures_from_nested_bsas(
             Ok(())
         });
 
-        jobs.extend(nested_jobs.into_inner().expect("dds jobs lock"));
+        jobs.extend(nested_jobs.into_inner().unwrap_or_else(|e| e.into_inner()));
     }
 
     jobs
@@ -2525,7 +2825,7 @@ pub(crate) fn process_dds_jobs_inline(jobs: Vec<DdsJob>, ctx: &ProcessContext) -
                             ok_count.fetch_add(1, Ordering::Relaxed);
                             ctx.textures_processed_during_install
                                 .lock()
-                                .expect("tex lock")
+                                .unwrap_or_else(|e| e.into_inner())
                                 .insert(job.id);
                         } else {
                             fail_count.fetch_add(1, Ordering::Relaxed);
@@ -2556,7 +2856,7 @@ pub(crate) fn process_dds_jobs_inline(jobs: Vec<DdsJob>, ctx: &ProcessContext) -
                         ok_count.fetch_add(1, Ordering::Relaxed);
                         ctx.textures_processed_during_install
                             .lock()
-                            .expect("tex lock")
+                            .unwrap_or_else(|e| e.into_inner())
                             .insert(job.id);
                     }
                     Err(e) => {
@@ -2583,7 +2883,7 @@ pub(crate) fn process_bsa_archive(
     skipped: &Arc<AtomicUsize>,
     failed: &Arc<AtomicUsize>,
     logged_failures: &Arc<AtomicUsize>,
-    progress_callback: Option<ProgressCallback>,
+    _reporter: &Arc<dyn ProgressReporter>,
 ) {
     const MAX_LOGGED_FAILURES: usize = 100;
 
@@ -2678,10 +2978,7 @@ pub(crate) fn process_bsa_archive(
             }
 
             extracted.fetch_add(1, Ordering::Relaxed);
-            let new_count = written.fetch_add(1, Ordering::Relaxed) + 1;
-            if let Some(ref callback) = progress_callback {
-                callback(new_count);
-            }
+            written.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
     }) {
@@ -2711,7 +3008,7 @@ pub(crate) fn process_bsa_patched_directives(
     skipped: &Arc<AtomicUsize>,
     failed: &Arc<AtomicUsize>,
     logged_failures: &Arc<AtomicUsize>,
-    progress_callback: Option<ProgressCallback>,
+    _reporter: &Arc<dyn ProgressReporter>,
 ) {
     const MAX_LOGGED_FAILURES: usize = 100;
     let output_dir = &ctx.config.output_dir;
@@ -2816,10 +3113,7 @@ pub(crate) fn process_bsa_patched_directives(
                     }
 
                     extracted.fetch_add(1, Ordering::Relaxed);
-                    let new_count = written.fetch_add(1, Ordering::Relaxed) + 1;
-                    if let Some(ref callback) = progress_callback {
-                        callback(new_count);
-                    }
+                    written.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
                     let count = logged_failures.fetch_add(1, Ordering::Relaxed);
@@ -2934,7 +3228,7 @@ pub(crate) fn process_spilled_dds_jobs(dds_jobs: Vec<SpilledDdsJob>, ctx: &Proce
         .map(|(f, n)| format!("{}: {}", f, n))
         .collect::<Vec<_>>()
         .join(", ");
-    crate::installer::downloader::progress_println(&format!(
+    ctx.config.reporter.log(&format!(
         "Processing {} textures in parallel [{}]",
         total_tex, summary_str
     ));
@@ -2955,18 +3249,25 @@ pub(crate) fn process_spilled_dds_jobs(dds_jobs: Vec<SpilledDdsJob>, ctx: &Proce
 
         if fmt == OutputFormat::BC7 {
             // BC7: parallel CPU prep → GPU batch encode
-            crate::installer::downloader::progress_println(&format!("  BC7: {} textures (GPU+CPU pipeline)...", jobs.len()));
+            ctx.config.reporter.log(&format!("  BC7: {} textures (GPU+CPU pipeline)...", jobs.len()));
 
             let tex_jobs: Vec<TextureJob> = jobs
                 .iter()
                 .filter_map(|j| {
-                    j.read_data().ok().map(|data| TextureJob {
-                        data,
-                        width: j.directive.image_state.width,
-                        height: j.directive.image_state.height,
-                        format: OutputFormat::BC7,
-                        id: Some(format!("{}", j.id)),
-                    })
+                    match j.read_data() {
+                        Ok(data) => Some(TextureJob {
+                            data,
+                            width: j.directive.image_state.width,
+                            height: j.directive.image_state.height,
+                            format: OutputFormat::BC7,
+                            id: Some(format!("{}", j.id)),
+                        }),
+                        Err(e) => {
+                            warn!("DDS spill read failed for texture {}: {:#}", j.id, e);
+                            dds_fail.fetch_add(1, Ordering::Relaxed);
+                            None
+                        }
+                    }
                 })
                 .collect();
 
@@ -2983,7 +3284,7 @@ pub(crate) fn process_spilled_dds_jobs(dds_jobs: Vec<SpilledDdsJob>, ctx: &Proce
                             dds_ok.fetch_add(1, Ordering::Relaxed);
                             ctx.textures_processed_during_install
                                 .lock()
-                                .expect("tex lock")
+                                .unwrap_or_else(|e| e.into_inner())
                                 .insert(job.id);
                         } else {
                             dds_fail.fetch_add(1, Ordering::Relaxed);
@@ -2997,7 +3298,7 @@ pub(crate) fn process_spilled_dds_jobs(dds_jobs: Vec<SpilledDdsJob>, ctx: &Proce
             }
         } else {
             // Non-BC7: full CPU parallelism (like Radium)
-            crate::installer::downloader::progress_println(&format!("  {}: {} textures (CPU parallel)...", fmt.name(), jobs.len()));
+            ctx.config.reporter.log(&format!("  {}: {} textures (CPU parallel)...", fmt.name(), jobs.len()));
 
             jobs.par_iter().for_each(|job| {
                 let result: anyhow::Result<()> = (|| {
@@ -3018,7 +3319,7 @@ pub(crate) fn process_spilled_dds_jobs(dds_jobs: Vec<SpilledDdsJob>, ctx: &Proce
                         dds_ok.fetch_add(1, Ordering::Relaxed);
                         ctx.textures_processed_during_install
                             .lock()
-                            .expect("tex lock")
+                            .unwrap_or_else(|e| e.into_inner())
                             .insert(job.id);
                     }
                     Err(e) => {
@@ -3032,7 +3333,7 @@ pub(crate) fn process_spilled_dds_jobs(dds_jobs: Vec<SpilledDdsJob>, ctx: &Proce
 
     let ok = dds_ok.load(Ordering::Relaxed);
     let fail = dds_fail.load(Ordering::Relaxed);
-    crate::installer::downloader::progress_println(&format!("DDS processing complete: {} OK, {} failed", ok, fail));
+    ctx.config.reporter.log(&format!("DDS processing complete: {} OK, {} failed", ok, fail));
 }
 
 #[cfg(test)]

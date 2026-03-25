@@ -18,7 +18,6 @@ use super::handlers;
 use super::handlers::from_archive::{detect_archive_type, ArchiveType};
 
 use anyhow::{bail, Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use rusqlite::params;
 use std::collections::{HashMap, HashSet};
@@ -28,8 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 use zip::ZipArchive;
 
 #[derive(Debug, Clone)]
@@ -168,13 +166,13 @@ pub(crate) fn store_patched_output_in_cache(
         fs::create_dir_all(parent)?;
     }
 
-    if cache_path.exists() {
-        if let Ok(meta) = fs::metadata(&cache_path) {
-            if meta.len() == directive.size
-                && verify_file_hash(&cache_path, &directive.hash).unwrap_or(false) {
-                    return Ok(());
-                }
+    if let Ok(meta) = fs::metadata(&cache_path) {
+        if meta.len() == directive.size
+            && verify_file_hash(&cache_path, &directive.hash).unwrap_or(false)
+        {
+            return Ok(());
         }
+        // Exists but wrong size/hash — remove stale copy
         let _ = fs::remove_file(&cache_path);
     }
 
@@ -352,18 +350,9 @@ fn index_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
         return Ok(());
     }
 
-    println!("Indexing {} archives...", to_index.len());
-
-    let pb = ProgressBar::new(to_index.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} | {msg}",
-            )
-            .unwrap()
-            .progress_chars("=>-"),
-    );
-    pb.enable_steady_tick(Duration::from_millis(100));
+    let reporter = &ctx.config.reporter;
+    reporter.log(&format!("Indexing {} archives...", to_index.len()));
+    reporter.overall_set_total(to_index.len() as u64);
 
     for archive in to_index {
         // Determine archive location based on type
@@ -400,7 +389,7 @@ fn index_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
             }
         };
 
-        pb.set_message(format!("Indexing {}...", archive.name));
+        reporter.overall_set_message(&format!("Indexing {}...", archive.name));
 
         // Detect archive type using magic bytes
         let archive_type = match detect_archive_type(&archive_path) {
@@ -421,7 +410,7 @@ fn index_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
         if !is_indexable {
             // Mark as indexed with empty file list (it's a single file, not a container)
             let _ = db.index_archive_files(&archive.hash, &[]);
-            pb.inc(1);
+            reporter.overall_inc();
             continue;
         }
 
@@ -432,21 +421,21 @@ fn index_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
             Ok(files) => {
                 let count = files.len();
                 if let Err(e) = db.index_archive_files(&archive.hash, &files) {
-                    pb.println(format!("WARN: Failed to index {}: {}", archive.name, e));
+                    reporter.log(&format!("WARN: Failed to index {}: {}", archive.name, e));
                 } else {
-                    pb.println(format!("OK: {} ({} files)", archive.name, count));
+                    reporter.log(&format!("OK: {} ({} files)", archive.name, count));
                 }
             }
             Err(e) => {
-                pb.println(format!("WARN: Failed to list {}: {}", archive.name, e));
+                reporter.log(&format!("WARN: Failed to list {}: {}", archive.name, e));
             }
         }
 
-        pb.inc(1);
+        reporter.overall_inc();
     }
 
-    pb.finish_and_clear();
-    println!("Archive indexing complete");
+    reporter.overall_finish();
+    reporter.log("Archive indexing complete");
 
     Ok(())
 }
@@ -472,7 +461,7 @@ impl FailureTracker {
         entry.0 += 1;
     }
 
-    fn print_summary(&self, pb: &ProgressBar) {
+    fn print_summary(&self, reporter: &Arc<dyn super::progress::ProgressReporter>) {
         let map = self.failures.read().unwrap();
         if map.is_empty() {
             return;
@@ -482,14 +471,14 @@ impl FailureTracker {
         let mut failures: Vec<_> = map.iter().collect();
         failures.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
 
-        pb.println("\n--- Archives with failures (may need re-download) ---");
+        reporter.log("\n--- Archives with failures (may need re-download) ---");
         for (name, (count, sample_error)) in failures.iter().take(20) {
-            pb.println(format!("  {} failures: {}", count, name));
-            pb.println(format!("    Sample error: {}", sample_error));
+            reporter.log(&format!("  {} failures: {}", count, name));
+            reporter.log(&format!("    Sample error: {}", sample_error));
         }
 
         if failures.len() > 20 {
-            pb.println(format!("  ... and {} more archives", failures.len() - 20));
+            reporter.log(&format!("  ... and {} more archives", failures.len() - 20));
         }
     }
 }
@@ -502,78 +491,6 @@ pub struct ProcessStats {
     pub failed: usize,
 }
 
-/// Helper for reporting progress to callback
-pub struct ProgressReporter {
-    callback: Option<super::ProgressCallback>,
-    processed_count: AtomicUsize,
-    /// Current phase's total (for accurate per-phase progress reporting)
-    phase_total: AtomicUsize,
-    /// Current phase's processed count (reset per phase)
-    phase_count: AtomicUsize,
-}
-
-impl ProgressReporter {
-    pub fn new(callback: Option<super::ProgressCallback>, total_directives: usize) -> Self {
-        Self {
-            callback,
-            processed_count: AtomicUsize::new(0),
-            phase_total: AtomicUsize::new(total_directives),
-            phase_count: AtomicUsize::new(0),
-        }
-    }
-
-    /// Report that a directive phase is starting
-    pub fn phase_started(&self, directive_type: &str, count: usize) {
-        // Set phase-specific totals and reset phase counter
-        self.phase_total.store(count, Ordering::Relaxed);
-        self.phase_count.store(0, Ordering::Relaxed);
-        if let Some(ref callback) = self.callback {
-            callback(super::ProgressEvent::DirectivePhaseStarted {
-                directive_type: directive_type.to_string(),
-                total: count,
-            });
-        }
-    }
-
-    /// Report that a directive completed (increments internal counter)
-    pub fn directive_completed(&self) {
-        self.processed_count.fetch_add(1, Ordering::Relaxed);
-        let phase_current = self.phase_count.fetch_add(1, Ordering::Relaxed) + 1;
-        let phase_total = self.phase_total.load(Ordering::Relaxed);
-        if let Some(ref callback) = self.callback {
-            callback(super::ProgressEvent::DirectiveComplete {
-                index: phase_current,
-                total: phase_total,
-            });
-        }
-    }
-
-    /// Report progress with a specific count (for batch updates within current phase)
-    pub fn report_count(&self, index: usize) {
-        let phase_total = self.phase_total.load(Ordering::Relaxed);
-        if let Some(ref callback) = self.callback {
-            callback(super::ProgressEvent::DirectiveComplete {
-                index,
-                total: phase_total,
-            });
-        }
-    }
-
-    /// Set the processed count (for syncing with atomic counters)
-    pub fn set_count(&self, count: usize) {
-        self.processed_count.store(count, Ordering::Relaxed);
-    }
-
-    /// Get a clone of the callback (for passing to other threads)
-    pub fn get_callback(&self) -> Option<super::ProgressCallback> {
-        self.callback.clone()
-    }
-
-    /// Get the current phase's total count
-    pub fn get_phase_total(&self) -> usize {
-        self.phase_total.load(Ordering::Relaxed)
-    }
-}
 
 /// Persistent SQLite-backed store for patch basis entries.
 ///
@@ -595,7 +512,7 @@ impl PatchBasisStore {
              PRAGMA synchronous = NORMAL;
              PRAGMA cache_size = 500;",
         )?;
-        conn.busy_timeout(Duration::from_secs(10))
+        conn.busy_timeout(std::time::Duration::from_secs(10))
             .context("Failed to set patch basis DB busy timeout")?;
 
         conn.execute(
@@ -752,7 +669,29 @@ impl<'a> ProcessContext<'a> {
         let archives = db.get_all_archives()?;
         for archive in archives {
             if let Some(local_path) = &archive.local_path {
-                archive_paths.insert(archive.hash.clone(), PathBuf::from(local_path));
+                let p = PathBuf::from(local_path);
+                if p.exists() {
+                    archive_paths.insert(archive.hash.clone(), p);
+                    continue;
+                }
+                // local_path points to a non-existent file — fall through
+            }
+            if archive.state_json.contains("GameFileSourceDownloader") {
+                // GameFileSource: resolve from game directory, not downloads
+                if let Ok(crate::modlist::DownloadState::GameFileSource(gf)) =
+                    serde_json::from_str::<crate::modlist::DownloadState>(&archive.state_json)
+                {
+                    let game_file = &gf.game_file;
+                    if let Some(resolved) = crate::paths::resolve_case_insensitive(
+                        &config.game_dir, game_file,
+                    ) {
+                        archive_paths.insert(archive.hash.clone(), resolved);
+                    } else if let Some(resolved) = crate::paths::resolve_case_insensitive(
+                        &config.game_dir, &format!("Data/{}", game_file),
+                    ) {
+                        archive_paths.insert(archive.hash.clone(), resolved);
+                    }
+                }
             } else {
                 let path = config.downloads_dir.join(&archive.name);
                 if path.exists() {
@@ -1123,21 +1062,9 @@ pub(crate) fn output_exists(ctx: &ProcessContext, to_path: &str, expected_size: 
 
 /// Check if output DDS file exists and has valid header
 /// For textures where compression size isn't deterministic
-fn output_dds_valid(ctx: &ProcessContext, to_path: &str) -> bool {
+fn output_dds_valid(ctx: &ProcessContext, to_path: &str, directive_hash: &str) -> bool {
     let output_path = ctx.resolve_output_path(to_path);
-    if !output_path.exists() {
-        return false;
-    }
-
-    // Check DDS magic number "DDS " (0x20534444)
-    if let Ok(file) = File::open(&output_path) {
-        let mut reader = BufReader::new(file);
-        let mut magic = [0u8; 4];
-        if std::io::Read::read_exact(&mut reader, &mut magic).is_ok() {
-            return &magic == b"DDS ";
-        }
-    }
-    false
+    crate::installer::sidecar::sidecar_valid(&output_path, directive_hash)
 }
 
 /// Pre-flight check: verify all archives needed for pending directives are present
@@ -1238,20 +1165,20 @@ pub fn cleanup_bsa_temp_dirs(config: &InstallConfig) -> Result<()> {
     // 1. Clean up TEMP_BSA_FILES staging directory
     let staging_root = config.output_dir.join("TEMP_BSA_FILES");
     if staging_root.exists() {
-        eprintln!("Cleaning up orphaned BSA staging directories...");
+        config.reporter.log("Cleaning up orphaned BSA staging directories...");
         match std::fs::remove_dir_all(&staging_root) {
-            Ok(()) => eprintln!("  Removed: {}", staging_root.display()),
-            Err(e) => eprintln!("  WARN: Failed to remove {}: {}", staging_root.display(), e),
+            Ok(()) => config.reporter.log(&format!("  Removed: {}", staging_root.display())),
+            Err(e) => config.reporter.log(&format!("  WARN: Failed to remove {}: {}", staging_root.display(), e)),
         }
     }
 
     // 2. Clean up Working_BSA cache
     let working_dir = get_bsa_working_dir(&config.downloads_dir);
     if working_dir.exists() {
-        eprintln!("Cleaning up BSA working cache...");
+        config.reporter.log("Cleaning up BSA working cache...");
         match std::fs::remove_dir_all(&working_dir) {
-            Ok(()) => eprintln!("  Removed: {}", working_dir.display()),
-            Err(e) => eprintln!("  WARN: Failed to remove {}: {}", working_dir.display(), e),
+            Ok(()) => config.reporter.log(&format!("  Removed: {}", working_dir.display())),
+            Err(e) => config.reporter.log(&format!("  WARN: Failed to remove {}: {}", working_dir.display(), e)),
         }
     }
 
@@ -1262,7 +1189,7 @@ pub fn cleanup_bsa_temp_dirs(config: &InstallConfig) -> Result<()> {
 pub struct DirectiveProcessor<'a> {
     pub ctx: ProcessContext<'a>,
     pub db: &'a ModlistDb,
-    pub reporter: Arc<ProgressReporter>,
+    pub reporter: Arc<dyn super::progress::ProgressReporter>,
     completed: AtomicUsize,
     skipped: AtomicUsize,
     failed: AtomicUsize,
@@ -1282,11 +1209,7 @@ impl<'a> DirectiveProcessor<'a> {
         }
         println!();
 
-        let stats = db.get_directive_stats()?;
-        let reporter = Arc::new(ProgressReporter::new(
-            config.progress_callback.clone(),
-            stats.pending,
-        ));
+        let reporter = config.reporter.clone();
 
         Ok(Self {
             ctx,
@@ -1309,25 +1232,10 @@ impl<'a> DirectiveProcessor<'a> {
             .unwrap_or(0))
     }
 
-    /// Create a progress bar
-    fn make_progress_bar(&self, total: u64) -> ProgressBar {
-        let pb = ProgressBar::new(total);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {msg}",
-                )
-                .unwrap()
-                .progress_chars("=>-"),
-        );
-        pb.enable_steady_tick(Duration::from_millis(100));
-        pb
-    }
-
     /// Record failures from a phase
     fn record_phase_failures(&self, phase: &str, count: usize) {
         if count > 0 {
-            eprintln!("WARNING: {} phase had {} failures", phase, count);
+            self.reporter.log(&format!("WARNING: {} phase had {} failures", phase, count));
             self.phase_failures
                 .lock()
                 .expect("phase_failures lock poisoned")
@@ -1425,8 +1333,6 @@ impl<'a> DirectiveProcessor<'a> {
 
     /// Install + Patch phase: FromArchive + PatchedFromArchive + InlineFile + RemappedInlineFile
     pub fn install_phase(&self) -> Result<()> {
-        use super::ProgressEvent;
-
         let stats = self.db.get_directive_stats()?;
         let total_pending = stats.pending;
 
@@ -1436,11 +1342,7 @@ impl<'a> DirectiveProcessor<'a> {
         }
 
         // Signal phase change to Installing
-        if let Some(ref callback) = self.ctx.config.progress_callback {
-            callback(ProgressEvent::PhaseChange {
-                phase: "Installing".to_string(),
-            });
-        }
+        self.reporter.phase_start(super::progress::Phase::Installing);
 
         let from_archive_count = self.get_type_count("FromArchive")?;
         let patched_count = self.get_type_count("PatchedFromArchive")?;
@@ -1448,7 +1350,7 @@ impl<'a> DirectiveProcessor<'a> {
         let remapped_count = self.get_type_count("RemappedInlineFile")?;
 
         let install_total = from_archive_count + patched_count + inline_count + remapped_count;
-        let pb = self.make_progress_bar(install_total as u64);
+        self.reporter.overall_set_total(install_total as u64);
 
         // FromArchive + PatchedFromArchive (fused streaming pipeline)
         let streaming_config = super::streaming::StreamingConfig {
@@ -1456,22 +1358,7 @@ impl<'a> DirectiveProcessor<'a> {
             max_parallel_7z_archives: Some(self.ctx.config.max_parallel_7z_archives),
             max_parallel_bsa_archives: Some(self.ctx.config.max_parallel_bsa_archives),
         };
-        pb.set_message("Processing FromArchive + PatchedFromArchive (fused)...");
-        self.reporter
-            .phase_started("FromArchive+Patch", from_archive_count + patched_count);
-
-        let progress_callback: Option<super::streaming::ProgressCallback> =
-            if let Some(callback) = self.reporter.get_callback() {
-                let total = self.reporter.get_phase_total();
-                Some(std::sync::Arc::new(move |written_count| {
-                    callback(super::ProgressEvent::DirectiveComplete {
-                        index: written_count,
-                        total,
-                    });
-                }))
-            } else {
-                None
-            };
+        self.reporter.overall_set_message("FromArchive+Patch");
 
         println!(
             "Patch basis DB: {} candidate local files for {} patch directives",
@@ -1483,8 +1370,7 @@ impl<'a> DirectiveProcessor<'a> {
             self.db,
             &self.ctx,
             streaming_config,
-            &pb,
-            progress_callback,
+            &self.ctx.config.reporter,
         )?;
         self.completed
             .fetch_add(streaming_stats.extracted, Ordering::Relaxed);
@@ -1492,24 +1378,20 @@ impl<'a> DirectiveProcessor<'a> {
             .fetch_add(streaming_stats.skipped, Ordering::Relaxed);
         self.failed
             .fetch_add(streaming_stats.failed, Ordering::Relaxed);
-        self.sync_reporter();
         self.record_phase_failures("FromArchive+Patch", streaming_stats.failed);
 
         // InlineFile
         let failed_before = self.failed.load(Ordering::Relaxed);
-        pb.set_message("Processing InlineFile...");
-        self.reporter.phase_started("InlineFile", inline_count);
+        self.reporter.overall_set_message("InlineFile");
         process_simple_directives(
             self.db,
             &self.ctx,
             "InlineFile",
-            &pb,
             &self.completed,
             &self.skipped,
             &self.failed,
             &self.reporter,
         )?;
-        self.sync_reporter();
         self.record_phase_failures(
             "InlineFile",
             self.failed.load(Ordering::Relaxed) - failed_before,
@@ -1517,26 +1399,22 @@ impl<'a> DirectiveProcessor<'a> {
 
         // RemappedInlineFile
         let failed_before = self.failed.load(Ordering::Relaxed);
-        pb.set_message("Processing RemappedInlineFile...");
-        self.reporter
-            .phase_started("RemappedInlineFile", remapped_count);
+        self.reporter.overall_set_message("RemappedInlineFile");
         process_simple_directives(
             self.db,
             &self.ctx,
             "RemappedInlineFile",
-            &pb,
             &self.completed,
             &self.skipped,
             &self.failed,
             &self.reporter,
         )?;
-        self.sync_reporter();
         self.record_phase_failures(
             "RemappedInlineFile",
             self.failed.load(Ordering::Relaxed) - failed_before,
         );
 
-        pb.finish_and_clear();
+        self.reporter.overall_finish();
         Ok(())
     }
 
@@ -1551,23 +1429,20 @@ impl<'a> DirectiveProcessor<'a> {
             return Ok(());
         }
 
-        let pb = self.make_progress_bar((inline_count + remapped_count) as u64);
+        self.reporter.overall_set_total((inline_count + remapped_count) as u64);
 
         // InlineFile
         let failed_before = self.failed.load(Ordering::Relaxed);
-        pb.set_message("Processing InlineFile...");
-        self.reporter.phase_started("InlineFile", inline_count);
+        self.reporter.overall_set_message("InlineFile");
         process_simple_directives(
             self.db,
             &self.ctx,
             "InlineFile",
-            &pb,
             &self.completed,
             &self.skipped,
             &self.failed,
             &self.reporter,
         )?;
-        self.sync_reporter();
         self.record_phase_failures(
             "InlineFile",
             self.failed.load(Ordering::Relaxed) - failed_before,
@@ -1575,98 +1450,84 @@ impl<'a> DirectiveProcessor<'a> {
 
         // RemappedInlineFile
         let failed_before = self.failed.load(Ordering::Relaxed);
-        pb.set_message("Processing RemappedInlineFile...");
-        self.reporter
-            .phase_started("RemappedInlineFile", remapped_count);
+        self.reporter.overall_set_message("RemappedInlineFile");
         process_simple_directives(
             self.db,
             &self.ctx,
             "RemappedInlineFile",
-            &pb,
             &self.completed,
             &self.skipped,
             &self.failed,
             &self.reporter,
         )?;
-        self.sync_reporter();
         self.record_phase_failures(
             "RemappedInlineFile",
             self.failed.load(Ordering::Relaxed) - failed_before,
         );
 
-        pb.finish_and_clear();
+        self.reporter.overall_finish();
         Ok(())
     }
 
     /// DDS Transform phase: TransformedTexture
     pub fn texture_phase(&self) -> Result<()> {
         let texture_count = self.get_type_count("TransformedTexture")?;
-        let pb = self.make_progress_bar(texture_count as u64);
+
+        self.reporter.phase_start(super::progress::Phase::DdsTransform);
+        self.reporter.overall_set_total(texture_count as u64);
 
         let failed_before = self.failed.load(Ordering::Relaxed);
-        pb.set_message("Processing TransformedTexture...");
-        self.reporter
-            .phase_started("TransformedTexture", texture_count);
+        self.reporter.overall_set_message("TransformedTexture");
         process_transformed_texture(
             self.db,
             &self.ctx,
-            &pb,
             &self.completed,
             &self.skipped,
             &self.failed,
             &self.reporter,
         )?;
-        self.sync_reporter();
         self.record_phase_failures(
             "TransformedTexture",
             self.failed.load(Ordering::Relaxed) - failed_before,
         );
 
-        pb.finish_and_clear();
+        self.reporter.overall_finish();
         Ok(())
     }
 
     /// BSA Build phase: CreateBSA
     pub fn bsa_phase(&self) -> Result<()> {
         let bsa_count = self.get_type_count("CreateBSA")?;
-        let pb = self.make_progress_bar(bsa_count as u64);
+
+        self.reporter.phase_start(super::progress::Phase::BsaBuild);
+        self.reporter.overall_set_total(bsa_count as u64);
 
         let failed_before = self.failed.load(Ordering::Relaxed);
-        pb.set_message("Processing CreateBSA...");
-        self.reporter.phase_started("CreateBSA", bsa_count);
+        self.reporter.overall_set_message("CreateBSA");
         process_create_bsa(
             self.db,
             &self.ctx,
-            &pb,
             &self.completed,
             &self.skipped,
             &self.failed,
             &self.reporter,
         )?;
-        self.sync_reporter();
         self.record_phase_failures(
             "CreateBSA",
             self.failed.load(Ordering::Relaxed) - failed_before,
         );
 
-        pb.finish_and_clear();
+        self.reporter.overall_finish();
         Ok(())
     }
 
     /// Cleanup phase: extra files + BSA temp dirs
     pub fn cleanup_phase(&self) -> Result<()> {
+        self.reporter.phase_start(super::progress::Phase::Cleanup);
         cleanup_extra_files(self.db, &self.ctx)?;
         cleanup_bsa_temp_dirs(self.ctx.config)?;
+        self.reporter.overall_finish();
         Ok(())
-    }
-
-    /// Sync the reporter with current counters
-    fn sync_reporter(&self) {
-        let current = self.completed.load(Ordering::Relaxed)
-            + self.skipped.load(Ordering::Relaxed)
-            + self.failed.load(Ordering::Relaxed);
-        self.reporter.set_count(current);
-        self.reporter.report_count(current);
     }
 
     /// Get current failure count (for early abort checks)
@@ -1695,11 +1556,11 @@ impl<'a> DirectiveProcessor<'a> {
             .lock()
             .expect("phase_failures lock poisoned");
         if !phase_failures.is_empty() {
-            eprintln!("\n=== FAILURE SUMMARY ===");
+            self.reporter.log("\n=== FAILURE SUMMARY ===");
             for (phase, count) in phase_failures.iter() {
-                eprintln!("  {}: {} failures", phase, count);
+                self.reporter.log(&format!("  {}: {} failures", phase, count));
             }
-            eprintln!("=======================\n");
+            self.reporter.log("=======================\n");
         }
 
         stats
@@ -1754,6 +1615,11 @@ fn cleanup_extra_files(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
         }
 
         if entry.file_type().is_file() {
+            // Never delete sidecar hash cache files
+            if entry.path().extension().map(|e| e == "clf3hash").unwrap_or(false) {
+                continue;
+            }
+
             // Get relative path from output dir
             if let Ok(rel_path) = entry.path().strip_prefix(output_dir) {
                 let normalized = paths::normalize_for_lookup(&rel_path.to_string_lossy());
@@ -1771,7 +1637,7 @@ fn cleanup_extra_files(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
             deleted_bytes += meta.len();
         }
         if let Err(e) = fs::remove_file(path) {
-            eprintln!("WARN: Failed to delete {}: {}", path.display(), e);
+            ctx.config.reporter.log(&format!("WARN: Failed to delete {}: {}", path.display(), e));
         } else {
             deleted_files += 1;
         }
@@ -2016,25 +1882,24 @@ fn read_single_file_from_archive(
 fn process_transformed_texture(
     db: &ModlistDb,
     ctx: &ProcessContext,
-    pb: &ProgressBar,
     completed: &AtomicUsize,
     skipped: &AtomicUsize,
     failed: &AtomicUsize,
-    reporter: &Arc<ProgressReporter>,
+    reporter: &Arc<dyn super::progress::ProgressReporter>,
 ) -> Result<()> {
     use crate::modlist::TransformedTextureDirective;
 
     let failure_tracker = Arc::new(FailureTracker::new());
 
-    pb.set_message("Loading TransformedTexture directives...");
+    reporter.overall_set_message("Loading TransformedTexture directives...");
     let all_raw = db.get_all_pending_directives_of_type("TransformedTexture")?;
 
     if all_raw.is_empty() {
-        pb.println("No TransformedTexture directives to process");
+        reporter.log("No TransformedTexture directives to process");
         return Ok(());
     }
 
-    pb.set_message(format!(
+    reporter.overall_set_message(&format!(
         "Parsing {} TransformedTexture directives...",
         all_raw.len()
     ));
@@ -2052,7 +1917,7 @@ fn process_transformed_texture(
     for (id, json) in all_raw {
         if already_done.contains(&id) {
             completed.fetch_add(1, Ordering::Relaxed);
-            pb.inc(1);
+            reporter.overall_inc();
             continue;
         }
         match serde_json::from_str::<Directive>(&json) {
@@ -2064,39 +1929,34 @@ fn process_transformed_texture(
             _ => {
                 parse_failures += 1;
                 failed.fetch_add(1, Ordering::Relaxed);
-                pb.inc(1);
+                reporter.overall_inc();
             }
         }
     }
 
     if pre_done > 0 {
-        eprintln!("{} textures already processed during install phase", pre_done);
+        reporter.log(&format!("{} textures already processed during install phase", pre_done));
     }
 
     if parse_failures > 0 {
-        pb.println(format!(
+        reporter.log(&format!(
             "WARN: {} TransformedTexture directives failed to parse",
             parse_failures
         ));
     }
 
     // Pre-scan for unsupported texture formats
-    pb.set_message("Checking texture formats...");
+    reporter.overall_set_message("Checking texture formats...");
     let unsupported = handlers::texture::find_unsupported_formats(by_archive.values().flatten());
 
     if !unsupported.is_empty() {
-        // Suspend progress bar to show prompt
-        pb.suspend(|| {
-            if handlers::texture::prompt_unsupported_formats(&unsupported) {
-                handlers::texture::enable_fallback_mode();
-                println!("Continuing with BC1 fallback for unsupported formats...\n");
-            } else {
-                println!(
-                    "\nAborting installation. Please report unsupported formats to developers."
-                );
-                std::process::exit(1);
-            }
-        });
+        if handlers::texture::prompt_unsupported_formats(&unsupported) {
+            handlers::texture::enable_fallback_mode();
+            reporter.log("Continuing with BC1 fallback for unsupported formats...");
+        } else {
+            reporter.log("Aborting installation. Please report unsupported formats to developers.");
+            std::process::exit(1);
+        }
     }
 
     use crate::textures::{OutputFormat, TextureJob, process_texture_batch, process_texture_with_fallback};
@@ -2110,17 +1970,13 @@ fn process_transformed_texture(
     let staging_dir = tempfile::tempdir_in(&ctx.config.output_dir)
         .context("Failed to create texture staging dir")?;
 
-    pb.set_message("Staging texture source files...");
-    pb.finish_and_clear();
-    pb.reset();
-    pb.set_length(total_archives as u64);
-    pb.set_position(0);
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    reporter.overall_set_message("Staging texture source files...");
+    reporter.overall_set_total(total_archives as u64);
 
-    eprintln!(
+    reporter.log(&format!(
         "Staging {} textures from {} archives...",
         total_directives, total_archives
-    );
+    ));
 
     // Build flat list: (directive_id, directive, archive_hash, staged_path)
     // Each texture gets a unique file in staging_dir named by directive ID.
@@ -2142,13 +1998,19 @@ fn process_transformed_texture(
             Some(p) => p.clone(),
             None => {
                 for (_, directive) in directives {
-                    if output_dds_valid(ctx, &directive.to) {
+                    if output_dds_valid(ctx, &directive.to, &directive.hash)
+                        || directive.to.contains("TEMP_BSA_FILES")
+                    {
                         stage_skipped.fetch_add(1, Ordering::Relaxed);
                     } else {
+                        error!(
+                            "FAIL: texture archive not found (hash={}): {}",
+                            archive_hash, directive.to
+                        );
                         stage_failed.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                pb.inc(1);
+                reporter.overall_inc();
                 return;
             }
         };
@@ -2156,14 +2018,14 @@ fn process_transformed_texture(
         // Filter to directives that actually need processing
         let to_process: Vec<_> = directives
             .iter()
-            .filter(|(_, d)| !output_dds_valid(ctx, &d.to))
+            .filter(|(_, d)| !output_dds_valid(ctx, &d.to, &d.hash))
             .collect();
 
         let skip_count = directives.len() - to_process.len();
         stage_skipped.fetch_add(skip_count, Ordering::Relaxed);
 
         if to_process.is_empty() {
-            pb.inc(1);
+            reporter.overall_inc();
             return;
         }
 
@@ -2185,7 +2047,7 @@ fn process_transformed_texture(
             match tempfile::tempdir_in(&ctx.config.output_dir) {
                 Ok(td) => {
                     if let Err(e) = extract_to_temp_disk(&archive_path, &needed_paths, td.path()) {
-                        pb.println(format!("WARN: Failed to extract {}: {}", archive_name, e));
+                        reporter.log(&format!("WARN: Failed to extract {}: {}", archive_name, e));
                     }
                     Some(td)
                 }
@@ -2254,14 +2116,19 @@ fn process_transformed_texture(
                         staged_path,
                     });
                 } else {
+                    error!("FAIL [{}]: failed to write staged texture: {}", id, directive.to);
                     stage_failed.fetch_add(1, Ordering::Relaxed);
                 }
             } else {
+                error!(
+                    "FAIL [{}]: failed to read texture source from archive (path depth {}): {}",
+                    id, directive.archive_hash_path.len(), directive.to
+                );
                 stage_failed.fetch_add(1, Ordering::Relaxed);
             }
         }
 
-        pb.inc(1);
+        reporter.overall_inc();
         // temp_extract dropped here — archive temp dir cleaned up
     });
 
@@ -2272,22 +2139,18 @@ fn process_transformed_texture(
     skipped.fetch_add(total_skipped, Ordering::Relaxed);
     failed.fetch_add(total_failed_stage, Ordering::Relaxed);
 
-    eprintln!(
+    reporter.log(&format!(
         "Staged {} textures ({} skipped, {} failed to read)",
         total_staged, total_skipped, total_failed_stage
-    );
+    ));
 
     // ── Pass 2: Process all staged textures through GPU/CPU pipeline ──
     // Group by format like Radium — process each format section fully parallel.
-    pb.finish_and_clear();
-    pb.reset();
-    pb.set_length(total_directives as u64);
-    pb.set_position((total_skipped + total_failed_stage) as u64);
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
-    pb.set_message("Processing textures...");
+    reporter.overall_set_total(total_directives as u64);
+    reporter.overall_set_message("Processing textures...");
 
-    for _ in 0..total_skipped { reporter.directive_completed(); }
-    for _ in 0..total_failed_stage { reporter.directive_completed(); }
+    for _ in 0..total_skipped { reporter.overall_inc(); }
+    for _ in 0..total_failed_stage { reporter.overall_inc(); }
 
     let failure_tracker = failure_tracker.clone();
     let reporter = reporter.clone();
@@ -2306,7 +2169,7 @@ fn process_transformed_texture(
         .map(|(f, n)| format!("{}: {}", f, n))
         .collect::<Vec<_>>()
         .join(", ");
-    eprintln!("Processing textures by format [{}]", summary_str);
+    reporter.log(&format!("Processing textures by format [{}]", summary_str));
 
     // Initialize GPU for BC7
     let _ = crate::textures::init_gpu();
@@ -2318,7 +2181,7 @@ fn process_transformed_texture(
 
         if fmt == OutputFormat::BC7 {
             // BC7: parallel CPU prep → GPU batch encode
-            pb.set_message(format!("BC7: {} textures (GPU+CPU)...", jobs.len()));
+            reporter.overall_set_message(&format!("BC7: {} textures (GPU+CPU)...", jobs.len()));
 
             let tex_jobs: Vec<TextureJob> = jobs.iter().filter_map(|st| {
                 fs::read(&st.staged_path).ok().map(|data| TextureJob {
@@ -2349,16 +2212,15 @@ fn process_transformed_texture(
                         failed.fetch_add(1, Ordering::Relaxed);
                         failure_tracker.record_failure("texture", &format!("{:#}", e));
                         if failed.load(Ordering::Relaxed) <= 10 {
-                            pb.println(format!("FAIL [{}] BC7 texture: {:#}", st.id, e));
+                            reporter.log(&format!("FAIL [{}] BC7 texture: {:#}", st.id, e));
                         }
                     }
                 }
-                pb.inc(1);
-                reporter.directive_completed();
+                reporter.overall_inc();
             }
         } else {
             // Non-BC7: full CPU parallelism (all cores, like Radium)
-            pb.set_message(format!("{}: {} textures (CPU parallel)...", fmt.name(), jobs.len()));
+            reporter.overall_set_message(&format!("{}: {} textures (CPU parallel)...", fmt.name(), jobs.len()));
 
             jobs.par_iter().for_each(|st| {
                 let result: Result<()> = (|| {
@@ -2379,15 +2241,14 @@ fn process_transformed_texture(
                         failure_tracker.record_failure("texture", &e.to_string());
                     }
                 }
-                pb.inc(1);
-                reporter.directive_completed();
+                reporter.overall_inc();
             });
         }
     }
     // staging_dir dropped here — all staged files cleaned up
 
     // Print failure summary
-    failure_tracker.print_summary(pb);
+    failure_tracker.print_summary(&reporter);
 
     Ok(())
 }
@@ -2396,29 +2257,22 @@ fn process_transformed_texture(
 fn process_create_bsa(
     db: &ModlistDb,
     ctx: &ProcessContext,
-    pb: &ProgressBar,
     completed: &AtomicUsize,
     skipped: &AtomicUsize,
     failed: &AtomicUsize,
-    reporter: &Arc<ProgressReporter>,
+    reporter: &Arc<dyn super::progress::ProgressReporter>,
 ) -> Result<()> {
     use crate::modlist::CreateBSADirective;
 
-    pb.set_message("Loading CreateBSA directives...");
+    reporter.overall_set_message("Loading CreateBSA directives...");
     let all_raw = db.get_all_pending_directives_of_type("CreateBSA")?;
 
     if all_raw.is_empty() {
         return Ok(());
     }
 
-    eprintln!("Building {} BSA archives...", all_raw.len());
-
-    // Reset progress bar for BSA build phase
-    pb.finish_and_clear();
-    pb.reset();
-    pb.set_length(all_raw.len() as u64);
-    pb.set_position(0);
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    reporter.log(&format!("Building {} BSA archives...", all_raw.len()));
+    reporter.overall_set_total(all_raw.len() as u64);
 
     // Parse all directives
     let mut directives: Vec<(i64, CreateBSADirective)> = all_raw
@@ -2428,7 +2282,7 @@ fn process_create_bsa(
                 Ok(Directive::CreateBSA(d)) => Some((id, d)),
                 _ => {
                     failed.fetch_add(1, Ordering::Relaxed);
-                    pb.inc(1);
+                    reporter.overall_inc();
                     None
                 }
             },
@@ -2439,17 +2293,16 @@ fn process_create_bsa(
     directives.sort_by_key(|(_, d)| d.file_states.len());
 
     let workers = ctx.config.max_parallel_bsa_archives.max(1);
-    eprintln!(
+    reporter.log(&format!(
         "Processing {} BSA/BA2 archives one-at-a-time (configured workers: {}, inner compression stays fully threaded)",
         directives.len(),
         workers
-    );
+    ));
 
     let process_one = |id: i64, directive: CreateBSADirective| {
         if handlers::output_bsa_valid(ctx, &directive) {
             skipped.fetch_add(1, Ordering::Relaxed);
-            pb.inc(1);
-            reporter.directive_completed();
+            reporter.overall_inc();
             return;
         }
 
@@ -2466,7 +2319,7 @@ fn process_create_bsa(
         match handlers::handle_create_bsa(ctx, &directive) {
             Ok(()) => {
                 completed.fetch_add(1, Ordering::Relaxed);
-                pb.println(format!(
+                reporter.log(&format!(
                     "Created {}: {} ({} files)",
                     archive_type,
                     bsa_name,
@@ -2475,15 +2328,14 @@ fn process_create_bsa(
             }
             Err(e) => {
                 failed.fetch_add(1, Ordering::Relaxed);
-                pb.println(format!(
+                reporter.log(&format!(
                     "FAIL [{}] create {} {}: {:#}",
                     id, archive_type, bsa_name, e
                 ));
             }
         }
 
-        pb.inc(1);
-        reporter.directive_completed();
+        reporter.overall_inc();
     };
 
     // Always process one archive at a time. This avoids nested rayon pool throttling
@@ -2501,11 +2353,10 @@ fn process_simple_directives(
     db: &ModlistDb,
     ctx: &ProcessContext,
     dtype: &str,
-    pb: &ProgressBar,
     completed: &AtomicUsize,
     skipped: &AtomicUsize,
     failed: &AtomicUsize,
-    reporter: &Arc<ProgressReporter>,
+    reporter: &Arc<dyn super::progress::ProgressReporter>,
 ) -> Result<()> {
     let directives = db.get_all_pending_directives_of_type(dtype)?;
     if directives.is_empty() {
@@ -2546,12 +2397,11 @@ fn process_simple_directives(
             Err(e) => {
                 failed.fetch_add(1, Ordering::Relaxed);
                 if failed.load(Ordering::Relaxed) <= 10 {
-                    pb.println(format!("FAIL [{}]: {}", id, e));
+                    reporter.log(&format!("FAIL [{}]: {}", id, e));
                 }
             }
         }
-        pb.inc(1);
-        reporter.directive_completed();
+        reporter.overall_inc();
     }
 
     Ok(())

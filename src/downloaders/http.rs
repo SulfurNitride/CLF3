@@ -2,7 +2,6 @@
 
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
-use indicatif::ProgressBar;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -117,28 +116,27 @@ impl DownloadProgress {
 /// Progress callback type for GUI updates
 pub type ProgressCallback = Box<dyn Fn(u64, u64, f64) + Send + Sync>;
 
-/// Download a file with stall detection and optional progress bar
+/// Download a file with stall detection
 pub async fn download_file(
     client: &HttpClient,
     url: &str,
     output_path: &Path,
     expected_size: Option<u64>,
 ) -> Result<u64> {
-    download_file_with_progress(client, url, output_path, expected_size, None).await
+    download_file_with_callback(client, url, output_path, expected_size, None).await
 }
 
-/// Download a file with stall detection and progress bar updates
+/// Download a file with stall detection and progress callback
 pub async fn download_file_with_progress(
     client: &HttpClient,
     url: &str,
     output_path: &Path,
     expected_size: Option<u64>,
-    progress_bar: Option<&ProgressBar>,
 ) -> Result<u64> {
-    download_file_with_callback(client, url, output_path, expected_size, progress_bar, None).await
+    download_file_with_callback(client, url, output_path, expected_size, None).await
 }
 
-/// Download a file with stall detection, progress bar updates, and progress callback
+/// Download a file with stall detection and progress callback
 ///
 /// The callback receives (downloaded_bytes, total_bytes, bytes_per_second).
 pub async fn download_file_with_callback(
@@ -146,7 +144,6 @@ pub async fn download_file_with_callback(
     url: &str,
     output_path: &Path,
     expected_size: Option<u64>,
-    progress_bar: Option<&ProgressBar>,
     progress_callback: Option<&ProgressCallback>,
 ) -> Result<u64> {
     if let Some(parent) = output_path.parent() {
@@ -170,10 +167,6 @@ pub async fn download_file_with_callback(
             let _ = tokio::fs::remove_file(output_path).await;
             offset = 0;
         } else if offset == expected {
-            if let Some(pb) = progress_bar {
-                pb.set_position(expected);
-                pb.tick();
-            }
             if let Some(callback) = progress_callback {
                 callback(expected, expected, 0.0);
             }
@@ -217,10 +210,6 @@ pub async fn download_file_with_callback(
         if offset > 0 && status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
             if let Some(expected) = expected_size {
                 if offset == expected {
-                    if let Some(pb) = progress_bar {
-                        pb.set_position(expected);
-                        pb.tick();
-                    }
                     if let Some(callback) = progress_callback {
                         callback(expected, expected, 0.0);
                     }
@@ -306,11 +295,6 @@ pub async fn download_file_with_callback(
             }
         });
 
-        if let Some(pb) = progress_bar {
-            pb.set_position(offset);
-            pb.tick();
-        }
-
         let mut last_callback_time = Instant::now();
         let mut stream = response.bytes_stream();
         let download_result: Result<u64> = async {
@@ -321,11 +305,6 @@ pub async fn download_file_with_callback(
                     .context("Failed to write chunk")?;
                 let len = chunk.len() as u64;
                 progress.add_bytes(len);
-
-                if let Some(pb) = progress_bar {
-                    pb.inc(len);
-                    pb.tick();
-                }
 
                 if let Some(callback) = progress_callback {
                     let now = Instant::now();

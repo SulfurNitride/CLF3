@@ -14,11 +14,11 @@ use crate::modlist::{ArchiveInfo, DownloadState, ModlistDb, NexusState};
 use crate::nxm_handler;
 
 use super::config::{InstallConfig, ProgressEvent};
+use super::progress::{ProgressHandle, ProgressReporter};
 
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use futures::stream::{self, StreamExt};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
@@ -29,89 +29,40 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-/// Global MultiProgress reference so tracing output can route through it.
-/// When set, log messages are printed via multi_progress.println() to avoid
-/// fighting with progress bar rendering.
-static ACTIVE_MULTI_PROGRESS: std::sync::OnceLock<std::sync::Mutex<Option<MultiProgress>>> =
-    std::sync::OnceLock::new();
-
-fn set_active_multi_progress(mp: &MultiProgress) {
-    let holder = ACTIVE_MULTI_PROGRESS.get_or_init(|| std::sync::Mutex::new(None));
-    *holder.lock().expect("multi_progress lock") = Some(mp.clone());
-}
-
-fn clear_active_multi_progress() {
-    if let Some(holder) = ACTIVE_MULTI_PROGRESS.get() {
-        *holder.lock().expect("multi_progress lock") = None;
-    }
-}
-
-/// Write target that routes through the active MultiProgress if one exists.
-/// Used by the tracing console layer to avoid stderr fights with indicatif.
-pub struct IndicatifWriter {
-    buffer: Vec<u8>,
-}
-
-impl IndicatifWriter {
-    pub fn new() -> Self {
-        Self { buffer: Vec::new() }
-    }
-}
-
-/// Print a message that's safe to use during progress bar rendering.
-/// Routes through the active MultiProgress if one exists, otherwise uses eprintln.
-pub fn progress_println(msg: &str) {
-    if let Some(holder) = ACTIVE_MULTI_PROGRESS.get() {
-        if let Ok(guard) = holder.lock() {
-            if let Some(mp) = guard.as_ref() {
-                let _ = mp.println(msg);
-                return;
+/// Build set of BSA temp_ids whose output already has a valid sidecar.
+/// Used to skip downloading archives only needed for BSAs that are already built.
+fn build_valid_bsa_set(db: &ModlistDb, config: &InstallConfig) -> std::collections::HashSet<String> {
+    let mut valid = std::collections::HashSet::new();
+    let bsa_directives = db.get_all_pending_directives_of_type("CreateBSA").unwrap_or_default();
+    for (_id, json) in bsa_directives {
+        if let Ok(crate::modlist::Directive::CreateBSA(d)) = serde_json::from_str(&json) {
+            let output_path = crate::paths::join_windows_path(&config.output_dir, &d.to);
+            if crate::installer::sidecar::sidecar_valid(&output_path, &d.hash) {
+                valid.insert(d.temp_id.to_string());
             }
         }
     }
-    eprintln!("{}", msg);
+    if !valid.is_empty() {
+        config.reporter.log(&format!(
+            "Found {} BSAs with valid sidecar cache (skipping their source downloads)",
+            valid.len()
+        ));
+    }
+    valid
 }
 
-impl std::io::Write for IndicatifWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.buffer.extend_from_slice(buf);
-        Ok(buf.len())
+/// Check if a directive's to_path is a BSA staging path for a valid BSA.
+fn is_bsa_staging_path(to_path: &str, valid_temp_ids: &std::collections::HashSet<String>) -> bool {
+    if !to_path.contains("TEMP_BSA_FILES") {
+        return false;
     }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        if self.buffer.is_empty() {
-            return Ok(());
+    let parts: Vec<&str> = to_path.split(|c: char| c == '/' || c == '\\').collect();
+    if let Some(idx) = parts.iter().position(|&p| p == "TEMP_BSA_FILES") {
+        if let Some(temp_id) = parts.get(idx + 1) {
+            return valid_temp_ids.contains(*temp_id);
         }
-        let msg = String::from_utf8_lossy(&self.buffer).trim_end().to_string();
-        self.buffer.clear();
-        if msg.is_empty() {
-            return Ok(());
-        }
-
-        if let Some(holder) = ACTIVE_MULTI_PROGRESS.get() {
-            if let Ok(guard) = holder.lock() {
-                if let Some(mp) = guard.as_ref() {
-                    let _ = mp.println(&msg);
-                    return Ok(());
-                }
-            }
-        }
-
-        // No active MultiProgress — write to stderr normally
-        eprintln!("{}", msg);
-        Ok(())
     }
-}
-
-/// MakeWriter for tracing that produces IndicatifWriter instances
-pub struct IndicatifWriterFactory;
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for IndicatifWriterFactory {
-    type Writer = IndicatifWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        IndicatifWriter { buffer: Vec::new() }
-    }
+    false
 }
 
 /// Max retries for network operations
@@ -203,12 +154,7 @@ struct DownloadContext {
     /// Semaphore to enforce sequential LoversLab downloads (LL rate-limits concurrent requests)
     ll_semaphore: tokio::sync::Semaphore,
     config: InstallConfig,
-    multi_progress: MultiProgress,
-    overall_pb: ProgressBar,
-    /// Fixed pool of reusable per-download progress bars (avoids insert/remove ghost lines)
-    bar_pool: Vec<ProgressBar>,
-    /// Tracks which pool bars are available (index -> available)
-    bar_available: Vec<tokio::sync::Mutex<bool>>,
+    reporter: Arc<dyn ProgressReporter>,
     // Counters
     downloaded: AtomicUsize,
     skipped: AtomicUsize,
@@ -221,43 +167,47 @@ struct DownloadContext {
 }
 
 impl DownloadContext {
-    /// Claim a progress bar from the pool. Returns the index and a reference.
-    async fn claim_bar(&self) -> Option<usize> {
-        for (i, available) in self.bar_available.iter().enumerate() {
-            let mut guard = available.lock().await;
-            if *guard {
-                *guard = false;
-                // Reset the bar for reuse
-                self.bar_pool[i].reset();
-                self.bar_pool[i].set_style(
-                    ProgressStyle::default_bar()
-                        .template("  {spinner:.blue} {wide_msg} [{bar:30.white/dim}] {bytes}/{total_bytes} {bytes_per_sec}")
-                        .unwrap()
-                        .progress_chars("=>-"),
-                );
-                self.bar_pool[i].enable_steady_tick(Duration::from_millis(500));
-                return Some(i);
-            }
-        }
-        None
+    /// Create a progress handle for a download item.
+    fn begin_download(&self, name: &str, total_bytes: u64) -> Arc<dyn ProgressHandle> {
+        self.reporter.begin_item(name, Some(total_bytes))
     }
+}
 
-    /// Release a progress bar back to the pool.
-    async fn release_bar(&self, index: usize) {
-        self.bar_pool[index].set_message("");
-        self.bar_pool[index].set_position(0);
-        self.bar_pool[index].set_length(0);
-        self.bar_pool[index].disable_steady_tick();
-        *self.bar_available[index].lock().await = true;
-    }
+/// Helper: build a DownloadContext from config and pending count.
+async fn build_context(config: &InstallConfig, total_archives: usize) -> Result<DownloadContext> {
+    let loverslab = init_loverslab(config).await;
+    Ok(DownloadContext {
+        nexus: NexusDownloader::new(&config.nexus_api_key)?,
+        http: HttpClient::new()?,
+        cdn: WabbajackCdnDownloader::new()?,
+        gdrive: GoogleDriveDownloader::new()?,
+        mediafire: MediaFireDownloader::new()?,
+        loverslab,
+        ll_semaphore: tokio::sync::Semaphore::new(1),
+        config: config.clone(),
+        reporter: config.reporter.clone(),
+        downloaded: AtomicUsize::new(0),
+        skipped: AtomicUsize::new(0),
+        failed: AtomicUsize::new(0),
+        manual_downloads: Mutex::new(Vec::new()),
+        failed_downloads: Mutex::new(Vec::new()),
+        completed_archives: AtomicUsize::new(0),
+        total_archives,
+    })
 }
 
 /// Download all pending archives (smart mode: only downloads archives needed for missing outputs)
 pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result<DownloadStats> {
+    let reporter = &config.reporter;
+
     // Smart check: scan output directory to find what's missing
-    println!("Scanning output directory for existing files...");
+    reporter.log("Scanning output directory for existing files...");
     let existing_outputs = scan_existing_outputs(&config.output_dir)?;
-    println!("Found {} existing output files", existing_outputs.len());
+    reporter.log(&format!("Found {} existing output files", existing_outputs.len()));
+
+    // Build set of BSA temp_ids whose output is already valid (sidecar matches).
+    // Directives writing into TEMP_BSA_FILES/{temp_id} can be skipped.
+    let valid_bsa_temp_ids = build_valid_bsa_set(db, config);
 
     // Get all directives that need archives and check which outputs are missing
     let directive_outputs = db.get_directive_outputs_with_archives()?;
@@ -265,6 +215,11 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
     let mut missing_count = 0;
 
     for (to_path, size, archive_hash) in &directive_outputs {
+        // Skip directives that feed into a BSA that's already valid
+        if is_bsa_staging_path(to_path, &valid_bsa_temp_ids) {
+            continue;
+        }
+
         let normalized = crate::paths::normalize_for_lookup(to_path);
         let output_exists = existing_outputs
             .get(&normalized)
@@ -278,15 +233,15 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
     }
 
     if needed_archives.is_empty() {
-        println!("All output files exist - no downloads needed!");
+        reporter.log("All output files exist - no downloads needed!");
         return Ok(DownloadStats::default());
     }
 
-    println!(
+    reporter.log(&format!(
         "Found {} missing outputs requiring {} archives",
         missing_count,
         needed_archives.len()
-    );
+    ));
 
     // Get archive info for needed archives
     let needed_hashes: Vec<String> = needed_archives.into_iter().collect();
@@ -306,35 +261,17 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
         let output_path = config.downloads_dir.join(&archive.name);
         if output_path.exists() {
             if let Ok(meta) = fs::metadata(&output_path) {
-                // Already hash-verified in a previous run? Skip re-hashing.
-                if archive.download_status == "completed" {
-                    if let Some(ref lp) = archive.local_path {
-                        if output_path.to_string_lossy() == lp.as_str()
-                            || meta.len() == archive.size as u64
-                        {
-                            already_downloaded += 1;
-                            already_downloaded_size += archive.size as u64;
-                            continue;
-                        }
-                    }
-                }
-
-                if meta.len() == archive.size as u64 {
-                    // Size matches - queue for hash verification
-                    archives_to_verify.push((archive, output_path));
-                    continue;
-                } else {
-                    // Size mismatch — don't delete yet, verify hash first
-                    // (modlist metadata size can be stale while hash remains correct)
+                if meta.len() != archive.size as u64 {
                     warn!(
                         "Size mismatch for '{}' (expected={}, actual={}) — will verify hash",
                         output_path.display(),
                         archive.size,
                         meta.len()
                     );
-                    archives_to_verify.push((archive, output_path));
-                    continue;
                 }
+                // Always hash-verify — never trust previous status
+                archives_to_verify.push((archive, output_path));
+                continue;
             }
         } else {
             // Important UX signal: copied archives must match the exact expected name/path.
@@ -359,10 +296,10 @@ Copied files with different names will not be reused. Examples: {}",
     // Second pass: verify hashes of existing archives
     let mut corrupted_count = 0usize;
     if !archives_to_verify.is_empty() {
-        println!(
+        reporter.log(&format!(
             "Verifying {} existing archives...",
             archives_to_verify.len()
-        );
+        ));
 
         // Verify hashes in parallel using rayon — pipelining reads helps even on slow storage
         let verify_total = archives_to_verify.len();
@@ -373,15 +310,12 @@ Copied files with different names will not be reused. Examples: {}",
             .par_iter()
             .map(|(archive, output_path)| {
                 let done = verify_progress.fetch_add(1, Ordering::Relaxed) + 1;
-                // Progress line (may interleave, that's fine)
-                eprint!(
-                    "\r  Verifying {}/{}...            ",
-                    done, verify_total
-                );
+                if done % 10 == 0 || done == verify_total {
+                    reporter.log(&format!("  Verifying {}/{}...", done, verify_total));
+                }
                 verify_file_hash_detailed(output_path, &archive.hash)
             })
             .collect();
-        eprintln!();
 
         // Process results sequentially (DB writes, file deletes, bookkeeping)
         for ((archive, output_path), result) in
@@ -399,10 +333,10 @@ Copied files with different names will not be reused. Examples: {}",
                 }
                 Ok((false, actual_hash)) => {
                     // Hash mismatch - corrupted, delete and re-download
-                    println!(
+                    reporter.log(&format!(
                         "  Corrupted (hash mismatch): {}",
                         archive.name
-                    );
+                    ));
                     warn!(
                         "Rejecting local archive '{}' due to hash mismatch (expected={}, actual={})",
                         output_path.display(),
@@ -421,10 +355,10 @@ Copied files with different names will not be reused. Examples: {}",
                 }
                 Err(e) => {
                     // Error reading file - treat as corrupted
-                    println!(
+                    reporter.log(&format!(
                         "  Verify error for {}: {}",
                         archive.name, e
-                    );
+                    ));
                     if let Err(e) = fs::remove_file(output_path) {
                         warn!(
                             "Failed to remove unreadable file {}: {}",
@@ -437,26 +371,26 @@ Copied files with different names will not be reused. Examples: {}",
                 }
             }
         }
-        println!(
+        reporter.log(&format!(
             "  Verified {} archives ({} valid, {} corrupted)",
             verify_total,
             already_downloaded,
             corrupted_count
-        );
+        ));
     }
 
     if corrupted_count > 0 {
-        println!(
+        reporter.log(&format!(
             "Found {} corrupted archives - will re-download",
             corrupted_count
-        );
+        ));
     }
 
     if already_downloaded > 0 {
-        println!(
+        reporter.log(&format!(
             "Found {} archives already downloaded ({} bytes)",
             already_downloaded, already_downloaded_size
-        );
+        ));
         // Report skipped archives to progress callback
         if let Some(ref callback) = config.progress_callback {
             callback(ProgressEvent::DownloadSkipped {
@@ -467,7 +401,7 @@ Copied files with different names will not be reused. Examples: {}",
     }
 
     if need_download.is_empty() {
-        println!("All needed archives already downloaded!");
+        reporter.log("All needed archives already downloaded!");
         return Ok(DownloadStats {
             downloaded: 0,
             skipped: already_downloaded,
@@ -478,7 +412,7 @@ Copied files with different names will not be reused. Examples: {}",
         });
     }
 
-    println!("Need to download {} archives", need_download.len());
+    reporter.log(&format!("Need to download {} archives", need_download.len()));
 
     // Route to NXM mode if enabled
     if config.nxm_mode {
@@ -488,66 +422,15 @@ Copied files with different names will not be reused. Examples: {}",
     }
 
     let pending = need_download;
-
-    // Setup progress display with fixed bar pool (no dynamic insert/remove)
     let concurrency = config.max_concurrent_downloads;
-    let multi_progress = MultiProgress::new();
 
-    // Route tracing output through MultiProgress to avoid stderr fights
-    set_active_multi_progress(&multi_progress);
-
-    // Pre-create a fixed pool of download bars — only as many as needed
-    let pool_size = concurrency.min(pending.len());
-    let mut bar_pool = Vec::with_capacity(pool_size);
-    let mut bar_available = Vec::with_capacity(pool_size);
-    for _ in 0..pool_size {
-        let bar = multi_progress.add(ProgressBar::new(0));
-        bar.set_style(
-            ProgressStyle::default_bar()
-                .template("  {spinner:.blue} {wide_msg} [{bar:30.white/dim}] {bytes}/{total_bytes} {bytes_per_sec}")
-                .unwrap()
-                .progress_chars("=>-"),
-        );
-        bar.set_message("");
-        bar_pool.push(bar);
-        bar_available.push(tokio::sync::Mutex::new(true));
-    }
-
-    // Overall progress bar at the bottom
-    let overall_pb = multi_progress.add(ProgressBar::new(pending.len() as u64));
-    overall_pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {msg}")
-            .unwrap()
-            .progress_chars("=>-"),
-    );
-    overall_pb.enable_steady_tick(Duration::from_millis(100));
-    overall_pb.set_message("Starting downloads...");
+    // Setup progress
+    reporter.overall_set_total(pending.len() as u64);
+    reporter.overall_set_message("Starting downloads...");
 
     // Create shared context
     let total_archives = pending.len();
-    let loverslab = init_loverslab(config).await;
-    let ctx = Arc::new(DownloadContext {
-        nexus: NexusDownloader::new(&config.nexus_api_key)?,
-        http: HttpClient::new()?,
-        cdn: WabbajackCdnDownloader::new()?,
-        gdrive: GoogleDriveDownloader::new()?,
-        mediafire: MediaFireDownloader::new()?,
-        loverslab,
-        ll_semaphore: tokio::sync::Semaphore::new(1),
-        config: config.clone(),
-        multi_progress,
-        overall_pb,
-        bar_pool,
-        bar_available,
-        downloaded: AtomicUsize::new(0),
-        skipped: AtomicUsize::new(0),
-        failed: AtomicUsize::new(0),
-        manual_downloads: Mutex::new(Vec::new()),
-        failed_downloads: Mutex::new(Vec::new()),
-        completed_archives: AtomicUsize::new(0),
-        total_archives,
-    });
+    let ctx = Arc::new(build_context(config, total_archives).await?);
 
     // Collect hashes and paths for DB updates (can't borrow db across await)
     let results: Vec<DownloadResultTuple> = stream::iter(pending)
@@ -583,8 +466,7 @@ Copied files with different names will not be reused. Examples: {}",
         }
     }
 
-    ctx.overall_pb.finish_and_clear();
-    clear_active_multi_progress();
+    reporter.overall_finish();
 
     // Get the detailed lists for stats and printing
     let manual_downloads_list = ctx.manual_downloads.lock().await.clone();
@@ -602,14 +484,14 @@ Copied files with different names will not be reused. Examples: {}",
 
     // Print manual download instructions
     if !manual_downloads_list.is_empty() {
-        println!(
+        reporter.log(&format!(
             "\n=== Manual Downloads Required ({}) ===",
             manual_downloads_list.len()
-        );
-        println!(
+        ));
+        reporter.log(&format!(
             "Please download the following files to: {}\n",
             config.downloads_dir.display()
-        );
+        ));
 
         // Log to file for later reference
         warn!(
@@ -619,13 +501,13 @@ Copied files with different names will not be reused. Examples: {}",
         warn!("Download destination: {}", config.downloads_dir.display());
 
         for (i, md) in manual_downloads_list.iter().enumerate() {
-            println!("{}. {}", i + 1, md.name);
-            println!("   URL: {}", md.url);
-            println!("   Expected size: {} bytes", md.expected_size);
+            reporter.log(&format!("{}. {}", i + 1, md.name));
+            reporter.log(&format!("   URL: {}", md.url));
+            reporter.log(&format!("   Expected size: {} bytes", md.expected_size));
             if let Some(prompt) = &md.prompt {
-                println!("   Note: {}", prompt);
+                reporter.log(&format!("   Note: {}", prompt));
             }
-            println!();
+            reporter.log("");
 
             // Log each manual download to file
             if let Some(prompt) = &md.prompt {
@@ -641,34 +523,34 @@ Copied files with different names will not be reused. Examples: {}",
             }
         }
 
-        println!("After downloading, run the command again to continue.\n");
+        reporter.log("After downloading, run the command again to continue.\n");
     }
 
     // Print failed download instructions
     if !failed_downloads_list.is_empty() {
-        println!(
+        reporter.log(&format!(
             "\n=== Failed Downloads ({}) ===",
             failed_downloads_list.len()
-        );
-        println!(
+        ));
+        reporter.log(&format!(
             "These downloads failed. Try manually downloading to: {}\n",
             config.downloads_dir.display()
-        );
+        ));
 
         // Log to file for later reference
         warn!("=== Failed Downloads ({}) ===", failed_downloads_list.len());
         warn!("Download destination: {}", config.downloads_dir.display());
 
         for (i, fd) in failed_downloads_list.iter().enumerate() {
-            println!("{}. {}", i + 1, fd.name);
-            println!("   URL: {}", fd.url);
-            println!("   Error: {}", fd.error);
-            println!(
+            reporter.log(&format!("{}. {}", i + 1, fd.name));
+            reporter.log(&format!("   URL: {}", fd.url));
+            reporter.log(&format!("   Error: {}", fd.error));
+            reporter.log(&format!(
                 "   Expected size: {} bytes ({:.2} MB)",
                 fd.expected_size,
                 fd.expected_size as f64 / 1024.0 / 1024.0
-            );
-            println!();
+            ));
+            reporter.log("");
 
             // Log each failed download to file
             warn!(
@@ -677,22 +559,22 @@ Copied files with different names will not be reused. Examples: {}",
             );
         }
 
-        println!("After downloading, run the command again to continue.\n");
+        reporter.log("After downloading, run the command again to continue.\n");
     }
 
     // Print summary
-    println!("\n=== Download Summary ===");
-    println!("Downloaded: {}", stats.downloaded);
-    println!("Skipped:    {}", stats.skipped);
-    println!("Manual:     {}", stats.manual);
-    println!("Failed:     {}", stats.failed);
+    reporter.log("\n=== Download Summary ===");
+    reporter.log(&format!("Downloaded: {}", stats.downloaded));
+    reporter.log(&format!("Skipped:    {}", stats.skipped));
+    reporter.log(&format!("Manual:     {}", stats.manual));
+    reporter.log(&format!("Failed:     {}", stats.failed));
 
     // Print Nexus rate limits
     let limits = ctx.nexus.rate_limits();
-    println!(
+    reporter.log(&format!(
         "\nNexus API: {}/{} hourly, {}/{} daily",
         limits.hourly_remaining, limits.hourly_limit, limits.daily_remaining, limits.daily_limit
-    );
+    ));
 
     Ok(stats)
 }
@@ -730,10 +612,15 @@ pub async fn download_archives_streaming(
     tx: &std::sync::mpsc::SyncSender<ArchiveEvent>,
     priority: Option<&HashMap<String, u32>>,
 ) -> Result<DownloadStats> {
+    let reporter = &config.reporter;
+
     // Smart check: scan output directory to find what's missing
-    println!("Scanning output directory for existing files...");
+    reporter.log("Scanning output directory for existing files...");
     let existing_outputs = scan_existing_outputs(&config.output_dir)?;
-    println!("Found {} existing output files", existing_outputs.len());
+    reporter.log(&format!("Found {} existing output files", existing_outputs.len()));
+
+    // Build set of BSA temp_ids whose output is already valid (sidecar matches)
+    let valid_bsa_temp_ids = build_valid_bsa_set(db, config);
 
     // Get all directives that need archives and check which outputs are missing
     let directive_outputs = db.get_directive_outputs_with_archives()?;
@@ -741,6 +628,10 @@ pub async fn download_archives_streaming(
     let mut missing_count = 0;
 
     for (to_path, size, archive_hash) in &directive_outputs {
+        if is_bsa_staging_path(to_path, &valid_bsa_temp_ids) {
+            continue;
+        }
+
         let normalized = crate::paths::normalize_for_lookup(to_path);
         let output_exists = existing_outputs
             .get(&normalized)
@@ -754,15 +645,15 @@ pub async fn download_archives_streaming(
     }
 
     if needed_archives.is_empty() {
-        println!("All output files exist - no downloads needed!");
+        reporter.log("All output files exist - no downloads needed!");
         return Ok(DownloadStats::default());
     }
 
-    println!(
+    reporter.log(&format!(
         "Found {} missing outputs requiring {} archives",
         missing_count,
         needed_archives.len()
-    );
+    ));
 
     // Get archive info for needed archives
     let needed_hashes: Vec<String> = needed_archives.into_iter().collect();
@@ -773,26 +664,12 @@ pub async fn download_archives_streaming(
     let mut already_downloaded_size: u64 = 0;
     let mut need_download: Vec<ArchiveInfo> = Vec::new();
     let mut archives_to_verify: Vec<(ArchiveInfo, PathBuf)> = Vec::new();
-    let mut ready_archives: Vec<(ArchiveInfo, PathBuf)> = Vec::new();
 
     for archive in archives_to_check {
         let output_path = config.downloads_dir.join(&archive.name);
         if output_path.exists() {
-            if let Ok(meta) = fs::metadata(&output_path) {
-                if archive.download_status == "completed" {
-                    if let Some(ref lp) = archive.local_path {
-                        if output_path.to_string_lossy() == lp.as_str()
-                            || meta.len() == archive.size as u64
-                        {
-                            already_downloaded += 1;
-                            already_downloaded_size += archive.size as u64;
-                            ready_archives.push((archive, output_path));
-                            continue;
-                        }
-                    }
-                }
-
-                // Queue for hash verification
+            if fs::metadata(&output_path).is_ok() {
+                // Always hash-verify — never trust previous status
                 archives_to_verify.push((archive, output_path));
                 continue;
             }
@@ -800,28 +677,12 @@ pub async fn download_archives_streaming(
         need_download.push(archive);
     }
 
-    // Sort ready archives by priority (highest first) and emit events
-    if let Some(prio) = priority {
-        ready_archives.sort_by(|a, b| {
-            let pa = prio.get(&a.0.hash).copied().unwrap_or(0);
-            let pb = prio.get(&b.0.hash).copied().unwrap_or(0);
-            pb.cmp(&pa)
-        });
-    }
-    for (archive, output_path) in ready_archives {
-        let _ = tx.send(ArchiveEvent::Ready {
-            hash: archive.hash.clone(),
-            name: archive.name.clone(),
-            path: output_path,
-        });
-    }
-
-    // Verify hashes of existing archives
+    // Verify hashes of existing archives (threaded)
     if !archives_to_verify.is_empty() {
-        println!(
+        reporter.log(&format!(
             "Verifying {} existing archives...",
             archives_to_verify.len()
-        );
+        ));
         let verify_total = archives_to_verify.len();
         let verify_progress = AtomicUsize::new(0);
 
@@ -829,15 +690,14 @@ pub async fn download_archives_streaming(
             .par_iter()
             .map(|(archive, output_path)| {
                 let done = verify_progress.fetch_add(1, Ordering::Relaxed) + 1;
-                eprint!(
-                    "\r  Verifying {}/{}: {}",
-                    done, verify_total, archive.name
-                );
+                if done % 10 == 0 || done == verify_total {
+                    reporter.log(&format!("  Verifying {}/{}...", done, verify_total));
+                }
                 verify_file_hash_detailed(output_path, &archive.hash)
             })
             .collect();
-        eprintln!();
 
+        let mut verified_archives: Vec<(ArchiveInfo, PathBuf)> = Vec::new();
         for ((archive, output_path), result) in
             archives_to_verify.into_iter().zip(verify_results)
         {
@@ -849,11 +709,7 @@ pub async fn download_archives_streaming(
                     )?;
                     already_downloaded += 1;
                     already_downloaded_size += archive.size as u64;
-                    let _ = tx.send(ArchiveEvent::Ready {
-                        hash: archive.hash.clone(),
-                        name: archive.name.clone(),
-                        path: output_path,
-                    });
+                    verified_archives.push((archive, output_path));
                 }
                 Ok((false, _)) | Err(_) => {
                     let _ = fs::remove_file(&output_path);
@@ -861,13 +717,29 @@ pub async fn download_archives_streaming(
                 }
             }
         }
+
+        // Emit verified archives in priority order
+        if let Some(prio) = priority {
+            verified_archives.sort_by(|a, b| {
+                let pa = prio.get(&a.0.hash).copied().unwrap_or(0);
+                let pb = prio.get(&b.0.hash).copied().unwrap_or(0);
+                pb.cmp(&pa)
+            });
+        }
+        for (archive, output_path) in verified_archives {
+            let _ = tx.send(ArchiveEvent::Ready {
+                hash: archive.hash.clone(),
+                name: archive.name.clone(),
+                path: output_path,
+            });
+        }
     }
 
     if already_downloaded > 0 {
-        println!(
+        reporter.log(&format!(
             "Found {} archives already downloaded ({} bytes)",
             already_downloaded, already_downloaded_size
-        );
+        ));
         if let Some(ref callback) = config.progress_callback {
             callback(super::ProgressEvent::DownloadSkipped {
                 count: already_downloaded,
@@ -877,7 +749,7 @@ pub async fn download_archives_streaming(
     }
 
     if need_download.is_empty() {
-        println!("All needed archives already downloaded!");
+        reporter.log("All needed archives already downloaded!");
         return Ok(DownloadStats {
             downloaded: 0,
             skipped: already_downloaded,
@@ -894,7 +766,7 @@ pub async fn download_archives_streaming(
         });
     }
 
-    println!("Need to download {} archives", need_download.len());
+    reporter.log(&format!("Need to download {} archives", need_download.len()));
 
     // Route to NXM mode if enabled — falls back to non-streaming (events after batch)
     if config.nxm_mode {
@@ -921,63 +793,14 @@ pub async fn download_archives_streaming(
     }
 
     let pending = need_download;
-
-    // Setup progress display with fixed bar pool
     let concurrency = config.max_concurrent_downloads;
-    let multi_progress = MultiProgress::new();
-    set_active_multi_progress(&multi_progress);
 
-    let pool_size = concurrency.min(pending.len());
-    let mut bar_pool = Vec::with_capacity(pool_size);
-    let mut bar_available = Vec::with_capacity(pool_size);
-    for _ in 0..pool_size {
-        let bar = multi_progress.add(ProgressBar::new(0));
-        bar.set_style(
-            ProgressStyle::default_bar()
-                .template("  {spinner:.blue} {wide_msg} [{bar:30.white/dim}] {bytes}/{total_bytes} {bytes_per_sec}")
-                .unwrap()
-                .progress_chars("=>-"),
-        );
-        bar.set_message("");
-        bar_pool.push(bar);
-        bar_available.push(tokio::sync::Mutex::new(true));
-    }
-
-    let overall_pb = multi_progress.add(ProgressBar::new(pending.len() as u64));
-    overall_pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {msg}")
-            .unwrap()
-            .progress_chars("=>-"),
-    );
-    overall_pb.enable_steady_tick(Duration::from_millis(100));
-    overall_pb.set_message("Starting downloads...");
+    // Setup progress
+    reporter.overall_set_total(pending.len() as u64);
+    reporter.overall_set_message("Starting downloads...");
 
     let total_archives = pending.len();
-    let loverslab = init_loverslab(config).await;
-    let ctx = Arc::new(DownloadContext {
-        nexus: NexusDownloader::new(&config.nexus_api_key)?,
-        http: HttpClient::new()?,
-        cdn: WabbajackCdnDownloader::new()?,
-        gdrive: GoogleDriveDownloader::new()?,
-        mediafire: MediaFireDownloader::new()?,
-        loverslab,
-        ll_semaphore: tokio::sync::Semaphore::new(1),
-        config: config.clone(),
-        multi_progress,
-        overall_pb: overall_pb.clone(),
-        bar_pool,
-        bar_available,
-        downloaded: AtomicUsize::new(0),
-        skipped: AtomicUsize::new(0),
-        failed: AtomicUsize::new(0),
-        manual_downloads: Mutex::new(Vec::new()),
-        failed_downloads: Mutex::new(Vec::new()),
-        completed_archives: AtomicUsize::new(0),
-        total_archives,
-    });
-
-    let concurrency = config.max_concurrent_downloads;
+    let ctx = Arc::new(build_context(config, total_archives).await?);
 
     // Stream downloads, emitting events as each completes
     stream::iter(pending)
@@ -1026,8 +849,7 @@ pub async fn download_archives_streaming(
         })
         .await;
 
-    overall_pb.finish_and_clear();
-    clear_active_multi_progress();
+    reporter.overall_finish();
 
     let manual_downloads_list = ctx.manual_downloads.lock().await.clone();
     let failed_downloads_list = ctx.failed_downloads.lock().await.clone();
@@ -1043,34 +865,34 @@ pub async fn download_archives_streaming(
 
     // Print failed downloads with URLs for manual download
     if !stats.failed_downloads.is_empty() {
-        println!(
+        reporter.log(&format!(
             "\n=== Failed Downloads ({}) ===",
             stats.failed_downloads.len()
-        );
-        println!(
+        ));
+        reporter.log(&format!(
             "Download these manually to: {}\n",
             config.downloads_dir.display()
-        );
+        ));
         for (i, fd) in stats.failed_downloads.iter().enumerate() {
-            println!("{}. {}", i + 1, fd.name);
-            println!("   URL: {}", fd.url);
-            println!("   Error: {}", fd.error);
-            println!();
+            reporter.log(&format!("{}. {}", i + 1, fd.name));
+            reporter.log(&format!("   URL: {}", fd.url));
+            reporter.log(&format!("   Error: {}", fd.error));
+            reporter.log("");
         }
     }
 
     // Print summary
-    println!("\n=== Download Summary ===");
-    println!("Downloaded: {}", stats.downloaded);
-    println!("Skipped:    {}", stats.skipped);
-    println!("Manual:     {}", stats.manual);
-    println!("Failed:     {}", stats.failed);
+    reporter.log("\n=== Download Summary ===");
+    reporter.log(&format!("Downloaded: {}", stats.downloaded));
+    reporter.log(&format!("Skipped:    {}", stats.skipped));
+    reporter.log(&format!("Manual:     {}", stats.manual));
+    reporter.log(&format!("Failed:     {}", stats.failed));
 
     let limits = ctx.nexus.rate_limits();
-    println!(
+    reporter.log(&format!(
         "\nNexus API: {}/{} hourly, {}/{} daily",
         limits.hourly_remaining, limits.hourly_limit, limits.daily_remaining, limits.daily_limit
-    );
+    ));
 
     Ok(stats)
 }
@@ -1096,7 +918,7 @@ async fn process_archive(
         if let Ok(meta) = fs::metadata(output_path) {
             if meta.len() == archive.size as u64 {
                 ctx.skipped.fetch_add(1, Ordering::Relaxed);
-                ctx.overall_pb.inc(1);
+                ctx.reporter.overall_inc();
                 update_overall_message(ctx);
                 report_archive_complete(ctx, &archive.name);
                 return (DownloadResult::Skipped, None);
@@ -1109,9 +931,8 @@ async fn process_archive(
         Ok(s) => s,
         Err(e) => {
             ctx.failed.fetch_add(1, Ordering::Relaxed);
-            ctx.overall_pb.inc(1);
-            ctx.overall_pb
-                .println(format!("FAIL {} - parse error: {}", archive.name, e));
+            ctx.reporter.overall_inc();
+            ctx.reporter.log(&format!("FAIL {} - parse error: {}", archive.name, e));
             return (DownloadResult::Failed, None);
         }
     };
@@ -1119,55 +940,44 @@ async fn process_archive(
     // Check for manual downloads first
     if let Some(manual_info) = check_manual(&state, archive, ctx.loverslab.is_some()) {
         ctx.manual_downloads.lock().await.push(manual_info);
-        ctx.overall_pb.inc(1);
+        ctx.reporter.overall_inc();
         update_overall_message(ctx);
         report_archive_complete(ctx, &archive.name);
         return (DownloadResult::Manual, None);
     }
 
-    // Claim a progress bar from the fixed pool
-    let bar_idx = ctx.claim_bar().await;
-    let pb = match bar_idx {
-        Some(idx) => {
-            let pb = &ctx.bar_pool[idx];
-            pb.set_length(archive.size as u64);
-            pb.set_position(0);
-            pb.set_message(truncate_name(&archive.name, 40));
-            pb.clone()
-        }
-        None => {
-            // More concurrent tasks than pool size — use hidden bar
-            ProgressBar::hidden()
-        }
-    };
+    // Create a progress handle for this download
+    let handle = ctx.begin_download(&archive.name, archive.size as u64);
 
     // Download based on source type
     let source = source_type_name(&state);
-    let result = download_archive(&state, archive, output_path, ctx, &pb).await;
-
-    // Release bar back to pool
-    if let Some(idx) = bar_idx {
-        ctx.release_bar(idx).await;
-    }
+    let result = download_archive(&state, archive, output_path, ctx, &handle).await;
 
     match result {
         Ok(url_to_cache) => {
+            handle.finish();
             ctx.downloaded.fetch_add(1, Ordering::Relaxed);
-            ctx.overall_pb.inc(1);
+            ctx.reporter.overall_inc();
             update_overall_message(ctx);
             report_archive_complete(ctx, &archive.name);
             (DownloadResult::Success, url_to_cache)
         }
         Err(e) => {
             ctx.failed.fetch_add(1, Ordering::Relaxed);
-            ctx.overall_pb.inc(1);
+            ctx.reporter.overall_inc();
             let error_msg = root_cause(&e);
             let full_error = format!("{:#}", e);
             warn!(
                 "Download failed for {}: {}",
                 archive.name, full_error
             );
-            ctx.overall_pb.println(format!(
+            handle.finish_with_error(&format!(
+                "FAIL [{}] {} - {}",
+                source,
+                truncate_name(&archive.name, 30),
+                error_msg
+            ));
+            ctx.reporter.log(&format!(
                 "FAIL [{}] {} - {}",
                 source,
                 truncate_name(&archive.name, 30),
@@ -1190,7 +1000,7 @@ fn update_overall_message(ctx: &DownloadContext) {
     let downloaded = ctx.downloaded.load(Ordering::Relaxed);
     let skipped = ctx.skipped.load(Ordering::Relaxed);
     let failed = ctx.failed.load(Ordering::Relaxed);
-    ctx.overall_pb.set_message(format!(
+    ctx.reporter.overall_set_message(&format!(
         "OK:{} Skip:{} Fail:{}",
         downloaded, skipped, failed
     ));
@@ -1230,6 +1040,10 @@ fn check_manual(
             if has_loverslab && is_loverslab_url(&manual_state.url) {
                 return None;
             }
+            // MediaFire links can be resolved automatically.
+            if is_mediafire_url(&manual_state.url) {
+                return None;
+            }
             Some(ManualDownloadInfo {
                 name: archive.name.clone(),
                 url: manual_state.url.clone(),
@@ -1262,6 +1076,11 @@ async fn init_loverslab(config: &InstallConfig) -> Option<LoversLabDownloader> {
 
 fn is_loverslab_url(url: &str) -> bool {
     crate::downloaders::loverslab::is_loverslab_url(url)
+}
+
+fn is_mediafire_url(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    lower.contains("mediafire.com/")
 }
 
 fn is_moddb_url(url: &str) -> bool {
@@ -1474,7 +1293,7 @@ async fn download_via_proxy(
     source_url: &str,
     output_path: &Path,
     expected_size: u64,
-    pb: &ProgressBar,
+    _handle: &Arc<dyn ProgressHandle>,
     callback: Option<&HttpProgressCallback>,
 ) -> Result<()> {
     let proxy_url = build_proxy_url(source_url);
@@ -1484,7 +1303,7 @@ async fn download_via_proxy(
         &proxy_url,
         output_path,
         Some(expected_size),
-        Some(pb),
+
         callback,
     )
     .await?;
@@ -1522,7 +1341,7 @@ async fn download_archive(
     archive: &ArchiveInfo,
     output_path: &Path,
     ctx: &DownloadContext,
-    pb: &ProgressBar,
+    handle: &Arc<dyn ProgressHandle>,
 ) -> Result<Option<(String, i64)>> {
     let mut attempt = 0u32;
     let mut rate_limit_retries = 0u32;
@@ -1532,15 +1351,15 @@ async fn download_archive(
     loop {
         attempt += 1;
 
-        // Reset progress bar for retry
+        // Reset progress for retry
         if attempt > 1 {
-            pb.set_position(0);
-            pb.set_message(display_name.clone());
+            handle.set_bytes(0, expected_size, 0.0);
+            handle.set_message(&display_name);
             // Remove partial file if exists
             let _ = std::fs::remove_file(output_path);
         }
 
-        let result = download_archive_inner(state, archive, output_path, ctx, pb).await;
+        let result = download_archive_inner(state, archive, output_path, ctx, handle).await;
 
         match result {
             Ok(((), url_to_cache)) => {
@@ -1552,7 +1371,7 @@ async fn download_archive(
                             // Size mismatch - delete and retry
                             let _ = std::fs::remove_file(output_path);
                             if attempt < MAX_RETRIES {
-                                ctx.overall_pb.println(format!(
+                                ctx.reporter.log(&format!(
                                     "Size mismatch for {} (got {} expected {}), retrying...",
                                     truncate_name(&archive.name, 25),
                                     actual_size,
@@ -1572,7 +1391,7 @@ async fn download_archive(
                     }
                     Err(e) => {
                         if attempt < MAX_RETRIES {
-                            ctx.overall_pb.println(format!(
+                            ctx.reporter.log(&format!(
                                 "Cannot verify {} ({}), retrying...",
                                 truncate_name(&archive.name, 25),
                                 e
@@ -1586,7 +1405,7 @@ async fn download_archive(
                 }
 
                 // Verify hash after size check passes
-                pb.set_message(format!(
+                handle.set_message(&format!(
                     "{} (verifying...)",
                     truncate_name(&archive.name, 30)
                 ));
@@ -1610,7 +1429,7 @@ async fn download_archive(
                         // Hash mismatch - corrupted download, delete and retry
                         let _ = std::fs::remove_file(output_path);
                         if attempt < MAX_RETRIES {
-                            ctx.overall_pb.println(format!(
+                            ctx.reporter.log(&format!(
                                 "Hash mismatch for {}, re-downloading...",
                                 truncate_name(&archive.name, 35)
                             ));
@@ -1627,7 +1446,7 @@ async fn download_archive(
                     Err(e) => {
                         // Hash computation failed - treat as retry
                         if attempt < MAX_RETRIES {
-                            ctx.overall_pb.println(format!(
+                            ctx.reporter.log(&format!(
                                 "Hash verify error for {} ({}), retrying...",
                                 truncate_name(&archive.name, 25),
                                 e
@@ -1654,8 +1473,8 @@ async fn download_archive(
                         let delay_secs = (RATE_LIMIT_BASE_DELAY.as_secs()
                             << (rate_limit_retries - 1).min(3))
                         .min(300);
-                        pb.set_message(format!("Rate limited, waiting {}s...", delay_secs));
-                        ctx.overall_pb.println(format!(
+                        handle.set_message(&format!("Rate limited, waiting {}s...", delay_secs));
+                        ctx.reporter.log(&format!(
                             "Rate limit hit for {}, waiting {}s (retry {}/{})",
                             truncate_name(&archive.name, 25),
                             delay_secs,
@@ -1677,12 +1496,13 @@ async fn download_archive(
                     let progress_callback = make_progress_callback(
                         archive.name.clone(),
                         &ctx.config.progress_callback,
+                        handle,
                     );
                     let callback_ref = progress_callback.as_ref();
 
                     // Try Wabbajack proxy
-                    pb.set_position(0);
-                    pb.set_message(format!(
+                    handle.set_bytes(0, expected_size, 0.0);
+                    handle.set_message(&format!(
                         "{} (proxy)",
                         truncate_name(&archive.name, 30)
                     ));
@@ -1697,7 +1517,7 @@ async fn download_archive(
                         &source_url,
                         output_path,
                         expected_size,
-                        pb,
+                        handle,
                         callback_ref,
                     )
                     .await
@@ -1717,8 +1537,8 @@ async fn download_archive(
                     }
 
                     // Try Wabbajack mirror (CDN by hash)
-                    pb.set_position(0);
-                    pb.set_message(format!(
+                    handle.set_bytes(0, expected_size, 0.0);
+                    handle.set_message(&format!(
                         "{} (mirror)",
                         truncate_name(&archive.name, 30)
                     ));
@@ -1759,19 +1579,24 @@ async fn download_archive(
 fn make_progress_callback(
     archive_name: String,
     callback: &Option<crate::installer::config::ProgressCallback>,
+    handle: &Arc<dyn ProgressHandle>,
 ) -> Option<HttpProgressCallback> {
-    callback.as_ref().map(|cb| {
-        let cb = cb.clone();
-        let name = archive_name;
-        Box::new(move |downloaded: u64, total: u64, speed: f64| {
+    // Always create a callback that updates the ProgressHandle (CLI bars).
+    // Optionally also forward to the legacy GUI ProgressEvent callback.
+    let gui_cb = callback.clone();
+    let name = archive_name;
+    let h = Arc::clone(handle);
+    Some(Box::new(move |downloaded: u64, total: u64, speed: f64| {
+        h.set_bytes(downloaded, total, speed);
+        if let Some(ref cb) = gui_cb {
             cb(ProgressEvent::DownloadProgress {
                 name: name.clone(),
                 downloaded,
                 total,
                 speed,
             });
-        }) as HttpProgressCallback
-    })
+        }
+    }) as HttpProgressCallback)
 }
 
 /// Inner download function (single attempt)
@@ -1780,11 +1605,11 @@ async fn download_archive_inner(
     archive: &ArchiveInfo,
     output_path: &Path,
     ctx: &DownloadContext,
-    pb: &ProgressBar,
+    handle: &Arc<dyn ProgressHandle>,
 ) -> Result<((), Option<(String, i64)>)> {
     // Create progress callback for GUI updates
     let progress_callback =
-        make_progress_callback(archive.name.clone(), &ctx.config.progress_callback);
+        make_progress_callback(archive.name.clone(), &ctx.config.progress_callback, handle);
     let callback_ref = progress_callback.as_ref();
 
     // Returns (result, optional url to cache)
@@ -1843,7 +1668,6 @@ async fn download_archive_inner(
                 &url,
                 output_path,
                 Some(archive.size as u64),
-                Some(pb),
                 callback_ref,
             )
             .await?;
@@ -1856,7 +1680,6 @@ async fn download_archive_inner(
                 &http_state.url,
                 output_path,
                 Some(archive.size as u64),
-                Some(pb),
                 callback_ref,
             )
             .await?;
@@ -1868,7 +1691,7 @@ async fn download_archive_inner(
             ctx.cdn
                 .download(&cdn_state.url, output_path, archive.size as u64)
                 .await?;
-            pb.set_position(archive.size as u64);
+            handle.set_bytes(archive.size as u64, archive.size as u64, 0.0);
             // Report final progress for GUI
             if let Some(ref cb) = ctx.config.progress_callback {
                 cb(ProgressEvent::DownloadProgress {
@@ -1885,10 +1708,11 @@ async fn download_archive_inner(
             // Try direct GDrive download first, fall back to proxy/mirror on quota errors
             match ctx
                 .gdrive
-                .download_to_file(&gd_state.id, output_path, archive.size as u64, Some(pb))
+                .download_to_file(&gd_state.id, output_path, archive.size as u64, None)
                 .await
             {
                 Ok(()) => {
+                    handle.set_bytes(archive.size as u64, archive.size as u64, 0.0);
                     if let Some(ref cb) = ctx.config.progress_callback {
                         cb(ProgressEvent::DownloadProgress {
                             name: archive.name.clone(),
@@ -1920,7 +1744,6 @@ async fn download_archive_inner(
                 &url,
                 output_path,
                 Some(archive.size as u64),
-                Some(pb),
                 callback_ref,
             )
             .await?;
@@ -1929,7 +1752,7 @@ async fn download_archive_inner(
 
         DownloadState::GameFileSource(gf_state) => {
             copy_game_file(gf_state, archive, output_path, &ctx.config)?;
-            pb.set_position(archive.size as u64);
+            handle.set_bytes(archive.size as u64, archive.size as u64, 0.0);
             // Report final progress for GUI (game file copies are instant)
             if let Some(ref cb) = ctx.config.progress_callback {
                 cb(ProgressEvent::DownloadProgress {
@@ -1945,7 +1768,7 @@ async fn download_archive_inner(
         DownloadState::Mega(mega_state) => {
             // Try native Mega download first, fall back to Wabbajack proxy
             info!("Mega download for {} - trying native API", archive.name);
-            pb.set_message(format!("Mega: {}", truncate_name(&archive.name, 30)));
+            handle.set_message(&format!("Mega: {}", truncate_name(&archive.name, 30)));
 
             match crate::downloaders::mega_native::download_mega_file(
                 &mega_state.url,
@@ -1956,8 +1779,7 @@ async fn download_archive_inner(
                 Ok(()) => {
                     info!("Mega native download succeeded for {}", archive.name);
                     if let Ok(meta) = std::fs::metadata(output_path) {
-                        pb.set_length(meta.len());
-                        pb.set_position(meta.len());
+                        handle.set_bytes(meta.len(), meta.len(), 0.0);
                     }
                 }
                 Err(e) => {
@@ -1970,7 +1792,7 @@ async fn download_archive_inner(
                         &mega_state.url,
                         output_path,
                         archive.size as u64,
-                        pb,
+                        handle,
                         callback_ref,
                     )
                     .await
@@ -2004,7 +1826,6 @@ async fn download_archive_inner(
                     &resolved_url,
                     output_path,
                     Some(archive.size as u64),
-                    Some(pb),
                     callback_ref,
                 )
                 .await?;
@@ -2012,18 +1833,13 @@ async fn download_archive_inner(
             } else if is_loverslab_url(&manual_state.url) {
                 if let Some(ll) = &ctx.loverslab {
                     // Show waiting status while queued for LL semaphore
-                    pb.set_style(
-                        ProgressStyle::default_spinner()
-                            .template("  {spinner:.magenta} {wide_msg}")
-                            .unwrap(),
-                    );
-                    pb.set_message(format!("LL (queued): {}", truncate_name(&archive.name, 30)));
+                    handle.set_message(&format!("LL (queued): {}", truncate_name(&archive.name, 30)));
 
                     // Acquire semaphore to enforce sequential LL downloads
                     let _permit = ctx.ll_semaphore.acquire().await
                         .map_err(|_| anyhow::anyhow!("LoversLab semaphore closed"))?;
 
-                    pb.set_message(format!("LL: {}", truncate_name(&archive.name, 35)));
+                    handle.set_message(&format!("LL: {}", truncate_name(&archive.name, 35)));
 
                     let result = ll.download(&manual_state.url, &archive.name, output_path)
                         .await;
@@ -2072,6 +1888,21 @@ async fn download_archive_inner(
                         manual_state.url
                     )
                 }
+            } else if is_mediafire_url(&manual_state.url) {
+                // MediaFire: resolve direct download URL from page
+                let url = ctx.mediafire.get_download_url(&manual_state.url)
+                    .await
+                    .with_context(|| format!("Failed to resolve MediaFire URL: {}", manual_state.url))?;
+                info!("Resolved MediaFire URL for {}: {}", archive.name, url);
+                download_file_with_callback(
+                    &ctx.http,
+                    &url,
+                    output_path,
+                    Some(archive.size as u64),
+                    callback_ref,
+                )
+                .await?;
+                Ok(((), None))
             } else {
                 bail!(
                     "Manual download required and no automation handler available: {}",
@@ -2158,9 +1989,11 @@ async fn download_archives_nxm(
     config: &InstallConfig,
     pending: Vec<ArchiveInfo>,
 ) -> Result<DownloadStats> {
-    println!("\n=== NXM Browser Mode ===");
-    println!("This mode opens browser tabs for Nexus downloads.");
-    println!("Click 'Slow Download' or 'Download with Manager' for each file.\n");
+    let reporter = &config.reporter;
+
+    reporter.log("\n=== NXM Browser Mode ===");
+    reporter.log("This mode opens browser tabs for Nexus downloads.");
+    reporter.log("Click 'Slow Download' or 'Download with Manager' for each file.\n");
 
     // Separate Nexus downloads from others
     let mut nexus_pending: Vec<NexusPending> = Vec::new();
@@ -2197,14 +2030,14 @@ async fn download_archives_nxm(
         }
     }
 
-    println!("Nexus downloads (NXM mode): {}", nexus_pending.len());
-    println!("Other downloads (direct):   {}", other_pending.len());
+    reporter.log(&format!("Nexus downloads (NXM mode): {}", nexus_pending.len()));
+    reporter.log(&format!("Other downloads (direct):   {}", other_pending.len()));
 
     // First, handle non-Nexus downloads with direct API
     let mut stats = DownloadStats::default();
 
     if !other_pending.is_empty() {
-        println!("\n--- Downloading non-Nexus files ---");
+        reporter.log("\n--- Downloading non-Nexus files ---");
         // Create a temporary config with nxm_mode disabled for direct downloads
         let mut direct_config = config.clone();
         direct_config.nxm_mode = false;
@@ -2219,11 +2052,11 @@ async fn download_archives_nxm(
 
     // Now handle Nexus downloads via NXM
     if nexus_pending.is_empty() {
-        println!("\nNo Nexus downloads needed in NXM mode.");
+        reporter.log("\nNo Nexus downloads needed in NXM mode.");
         return Ok(stats);
     }
 
-    println!("\n--- Starting NXM server ---");
+    reporter.log("\n--- Starting NXM server ---");
 
     // Auto-register as nxm:// handler so browser clicks work
     let exe = std::env::current_exe()
@@ -2256,21 +2089,11 @@ async fn download_archives_nxm(
     }
 
     let total_nexus = lookup.len();
-    println!("Waiting for {} NXM links...\n", total_nexus);
+    reporter.log(&format!("Waiting for {} NXM links...\n", total_nexus));
 
-    // Progress display
-    let multi_progress = MultiProgress::new();
-    let overall_pb = multi_progress.add(ProgressBar::new(total_nexus as u64));
-    overall_pb.set_style(
-        ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} | {msg}",
-            )
-            .unwrap()
-            .progress_chars("=>-"),
-    );
-    overall_pb.enable_steady_tick(Duration::from_millis(100));
-    overall_pb.set_message("Waiting for browser clicks...");
+    // Setup progress via reporter
+    reporter.overall_set_total(total_nexus as u64);
+    reporter.overall_set_message("Waiting for browser clicks...");
 
     // Pipelined NXM download: open ONE tab at a time, wait for user to click
     // "Download with Manager", start the download in background, then open the
@@ -2309,7 +2132,7 @@ async fn download_archives_nxm(
         }
     }
 
-    println!("Click 'Download with Manager' on each Nexus page.\n");
+    reporter.log("Click 'Download with Manager' on each Nexus page.\n");
 
     // Main event loop: process NXM links and download completions
     loop {
@@ -2323,14 +2146,14 @@ async fn download_archives_nxm(
                 let link = match nxm_result {
                     Some(link) => link,
                     None => {
-                        println!("NXM server closed unexpectedly");
+                        reporter.log("NXM server closed unexpectedly");
                         break;
                     }
                 };
 
                 let key = link.lookup_key();
                 let Some(pending) = lookup.remove(&key) else {
-                    println!("Received NXM link for unknown file: {}", key);
+                    reporter.log(&format!("Received NXM link for unknown file: {}", key));
                     continue;
                 };
 
@@ -2353,24 +2176,17 @@ async fn download_archives_nxm(
                 let archive_size = pending.archive.size as u64;
                 let archive_name = pending.archive.name.clone();
                 let archive_hash = pending.archive.hash.clone();
+                // Create a per-download progress handle via the reporter
+                let dl_handle = reporter.begin_item(&archive_name, Some(archive_size));
                 let progress_callback = make_progress_callback(
                     archive_name.clone(),
                     &config.progress_callback,
+                    &dl_handle,
                 );
-                let pb = multi_progress.insert_before(&overall_pb, ProgressBar::new(archive_size));
-                pb.set_style(
-                    ProgressStyle::default_bar()
-                        .template("  {spinner:.blue} {wide_msg} [{bar:30.white/dim}] {bytes}/{total_bytes} {bytes_per_sec}")
-                        .unwrap()
-                        .progress_chars("=>-"),
-                );
-                pb.enable_steady_tick(Duration::from_millis(500));
-                pb.set_message(truncate_name(&archive_name, 40));
 
                 let active = Arc::clone(&active_downloads);
                 active.fetch_add(1, Ordering::Relaxed);
                 let tx = result_tx.clone();
-                let mp = multi_progress.clone();
 
                 tokio::spawn(async move {
                     let result = async {
@@ -2395,17 +2211,20 @@ async fn download_archives_nxm(
                             .and_then(|u| u.as_str())
                             .context("No download URL in response")?;
 
-                        download_file_with_callback(&http, url, &output_path, Some(archive_size), Some(&pb), progress_callback.as_ref()).await?;
+                        download_file_with_callback(&http, url, &output_path, Some(archive_size), progress_callback.as_ref()).await?;
                         Ok::<_, anyhow::Error>(())
                     }.await;
 
-                    pb.finish_and_clear();
-                    mp.remove(&pb);
+                    dl_handle.finish();
                     active.fetch_sub(1, Ordering::Relaxed);
-                    let _ = tx.send((archive_hash, archive_name, output_path, result));
+                    // Always send result — if this line is somehow skipped (panic),
+                    // the receiver will see the channel close when the sender drops.
+                    if tx.send((archive_hash.clone(), archive_name.clone(), output_path.clone(), result)).is_err() {
+                        tracing::warn!("NXM result channel closed for {}", archive_name);
+                    }
                 });
 
-                overall_pb.set_message(format!(
+                reporter.overall_set_message(&format!(
                     "OK:{} Fail:{} Active:{} Remaining:{}",
                     downloaded, failed,
                     active_downloads.load(Ordering::Relaxed),
@@ -2417,7 +2236,7 @@ async fn download_archives_nxm(
             Some((hash, name, output_path, result)) = result_rx.recv() => {
                 match result {
                     Ok(()) => {
-                        overall_pb.set_message(format!("Verifying {}...", truncate_name(&output_path.file_name().unwrap_or_default().to_string_lossy(), 30)));
+                        reporter.overall_set_message(&format!("Verifying {}...", truncate_name(&output_path.file_name().unwrap_or_default().to_string_lossy(), 30)));
                         match verify_file_hash(&output_path, &hash) {
                             Ok(true) => {
                                 downloaded += 1;
@@ -2427,22 +2246,22 @@ async fn download_archives_nxm(
                                 )?;
                             }
                             Ok(false) => {
-                                overall_pb.println(format!("FAIL {} - hash mismatch", output_path.display()));
+                                reporter.log(&format!("FAIL {} - hash mismatch", output_path.display()));
                                 let _ = fs::remove_file(&output_path);
                                 failed += 1;
                             }
                             Err(e) => {
-                                overall_pb.println(format!("FAIL {} - verify error: {}", output_path.display(), e));
+                                reporter.log(&format!("FAIL {} - verify error: {}", output_path.display(), e));
                                 let _ = fs::remove_file(&output_path);
                                 failed += 1;
                             }
                         }
-                        overall_pb.inc(1);
+                        reporter.overall_inc();
                     }
                     Err(e) => {
                         failed += 1;
-                        overall_pb.println(format!("FAIL {} - {}", output_path.display(), e));
-                        overall_pb.inc(1);
+                        reporter.log(&format!("FAIL {} - {}", output_path.display(), e));
+                        reporter.overall_inc();
                     }
                 }
 
@@ -2466,7 +2285,7 @@ async fn download_archives_nxm(
                     }
                 }
 
-                overall_pb.set_message(format!(
+                reporter.overall_set_message(&format!(
                     "OK:{} Fail:{} Active:{} Remaining:{}",
                     downloaded, failed,
                     active_downloads.load(Ordering::Relaxed),
@@ -2477,14 +2296,14 @@ async fn download_archives_nxm(
             // Timeout if nothing happens for 5 minutes
             _ = tokio::time::sleep(Duration::from_secs(300)) => {
                 if tab_open || !lookup.is_empty() {
-                    println!("Timeout waiting for NXM links. {} remaining.", lookup.len());
+                    reporter.log(&format!("Timeout waiting for NXM links. {} remaining.", lookup.len()));
                     break;
                 }
             }
         }
     }
 
-    overall_pb.finish_and_clear();
+    reporter.overall_finish();
 
     // Add remaining as failed
     failed += lookup.len();
@@ -2493,17 +2312,17 @@ async fn download_archives_nxm(
 
     // Print Nexus rate limits
     let limits = nexus.rate_limits();
-    println!(
+    reporter.log(&format!(
         "\nNexus API: {}/{} hourly, {}/{} daily",
         limits.hourly_remaining, limits.hourly_limit, limits.daily_remaining, limits.daily_limit
-    );
+    ));
 
     // Print summary
-    println!("\n=== Download Summary ===");
-    println!("Downloaded: {}", stats.downloaded);
-    println!("Skipped:    {}", stats.skipped);
-    println!("Manual:     {}", stats.manual);
-    println!("Failed:     {}", stats.failed);
+    reporter.log("\n=== Download Summary ===");
+    reporter.log(&format!("Downloaded: {}", stats.downloaded));
+    reporter.log(&format!("Skipped:    {}", stats.skipped));
+    reporter.log(&format!("Manual:     {}", stats.manual));
+    reporter.log(&format!("Failed:     {}", stats.failed));
 
     Ok(stats)
 }
@@ -2514,59 +2333,15 @@ async fn download_non_nexus_files(
     config: &InstallConfig,
     pending: Vec<ArchiveInfo>,
 ) -> Result<DownloadStats> {
+    let reporter = &config.reporter;
     let concurrency = config.max_concurrent_downloads;
-    let multi_progress = MultiProgress::new();
-    set_active_multi_progress(&multi_progress);
 
-    let pool_size = concurrency.min(pending.len());
-    let mut bar_pool = Vec::with_capacity(pool_size);
-    let mut bar_available = Vec::with_capacity(pool_size);
-    for _ in 0..pool_size {
-        let bar = multi_progress.add(ProgressBar::new(0));
-        bar.set_style(
-            ProgressStyle::default_bar()
-                .template("  {spinner:.blue} {wide_msg} [{bar:30.white/dim}] {bytes}/{total_bytes} {bytes_per_sec}")
-                .unwrap()
-                .progress_chars("=>-"),
-        );
-        bar.set_message("");
-        bar_pool.push(bar);
-        bar_available.push(tokio::sync::Mutex::new(true));
-    }
-
-    let overall_pb = multi_progress.add(ProgressBar::new(pending.len() as u64));
-    overall_pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {msg}")
-            .unwrap()
-            .progress_chars("=>-"),
-    );
-    overall_pb.enable_steady_tick(Duration::from_millis(100));
-    overall_pb.set_message("Starting downloads...");
+    // Setup progress
+    reporter.overall_set_total(pending.len() as u64);
+    reporter.overall_set_message("Starting downloads...");
 
     let total_archives = pending.len();
-    let loverslab = init_loverslab(config).await;
-    let ctx = Arc::new(DownloadContext {
-        nexus: NexusDownloader::new(&config.nexus_api_key)?,
-        http: HttpClient::new()?,
-        cdn: WabbajackCdnDownloader::new()?,
-        gdrive: GoogleDriveDownloader::new()?,
-        mediafire: MediaFireDownloader::new()?,
-        loverslab,
-        ll_semaphore: tokio::sync::Semaphore::new(1),
-        config: config.clone(),
-        multi_progress,
-        overall_pb,
-        bar_pool,
-        bar_available,
-        downloaded: AtomicUsize::new(0),
-        skipped: AtomicUsize::new(0),
-        failed: AtomicUsize::new(0),
-        manual_downloads: Mutex::new(Vec::new()),
-        failed_downloads: Mutex::new(Vec::new()),
-        completed_archives: AtomicUsize::new(0),
-        total_archives,
-    });
+    let ctx = Arc::new(build_context(config, total_archives).await?);
 
     let results: Vec<DownloadResultTuple> = stream::iter(pending)
         .map(|archive| {
@@ -2595,8 +2370,7 @@ async fn download_non_nexus_files(
         }
     }
 
-    ctx.overall_pb.finish_and_clear();
-    clear_active_multi_progress();
+    reporter.overall_finish();
 
     let manual_downloads_list = ctx.manual_downloads.lock().await.clone();
     let failed_downloads_list = ctx.failed_downloads.lock().await.clone();

@@ -28,18 +28,19 @@ use super::processor::{
     ProcessContext,
 };
 use super::streaming::{
-    cleanup_temp_dirs, collect_textures_from_bsa, collect_textures_from_nested_bsas,
-    collect_textures_from_temp_dir, finalize_archive, process_bsa_archive,
-    process_bsa_patched_directives, process_dds_jobs_inline, process_single_archive_fused,
-    process_whole_file_directives, ArchiveDirective, NestedTextureLookupInner,
-    ProgressCallback, StreamingConfig, StreamingStats, TextureLookupInner,
+    cleanup_temp_dirs, finalize_archive, process_bsa_archive,
+    process_bsa_patched_directives, process_single_archive_fused,
+    process_textures_from_bsa_streaming, process_textures_from_nested_bsas_streaming,
+    process_textures_from_temp_streaming, process_whole_file_directives, ArchiveDirective,
+    NestedTextureLookupInner, StreamingConfig, StreamingStats,
+    TextureLookupInner,
 };
 
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -562,13 +563,29 @@ fn extract_prepared_archive(
     skipped: &AtomicUsize,
     failed: &AtomicUsize,
     logged_failures: &Arc<AtomicUsize>,
-    progress_callback: &Option<ProgressCallback>,
-    // CLI progress bar
-    extract_pb: &indicatif::ProgressBar,
+    reporter: &Arc<dyn super::progress::ProgressReporter>,
+    // Status counters
+    extract_status: &Mutex<Option<Arc<dyn super::progress::ProgressHandle>>>,
+    extract_counter: &AtomicUsize,
+    total_archives: usize,
+    dds_status: &Mutex<Option<Arc<dyn super::progress::ProgressHandle>>>,
+    dds_counter: &AtomicUsize,
+    total_textures: usize,
 ) {
     const MAX_LOGGED_FAILURES: usize = 100;
 
     let archive_name_for_progress = prepared.archive_name.clone();
+    let rss_before = crate::installer::current_rss_kb().unwrap_or(0);
+
+    // Log to file to avoid stdout/stderr buffering issues
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true).append(true)
+        .open("/tmp/clf3_rss.log")
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "[RSS-START] {} : {}MB ({}directives)",
+            archive_name_for_progress, rss_before / 1024, prepared.resolved.len());
+    }
 
     let archive_type =
         detect_archive_type(&prepared.archive_path).unwrap_or(NestedArchiveType::Unknown);
@@ -625,7 +642,7 @@ fn extract_prepared_archive(
                 &arc_skipped,
                 &arc_failed,
                 &arc_logged,
-                progress_callback.clone(),
+                reporter,
             );
         }
 
@@ -640,17 +657,20 @@ fn extract_prepared_archive(
                 &arc_skipped,
                 &arc_failed,
                 &arc_logged,
-                progress_callback.clone(),
+                reporter,
             );
         }
 
-        // Collect and process textures from BSA inline
+        // Process textures from BSA — one at a time to avoid loading all into memory
         if !prepared.tex_d2.is_empty() {
-            let dds_jobs = collect_textures_from_bsa(&prepared.archive_path, &prepared.tex_d2);
-            if !dds_jobs.is_empty() {
-                let (ok, fail) = process_dds_jobs_inline(dds_jobs, ctx);
-                written.fetch_add(ok, Ordering::Relaxed);
-                failed.fetch_add(fail, Ordering::Relaxed);
+            let (ok, fail) = process_textures_from_bsa_streaming(
+                &prepared.archive_path, &prepared.tex_d2, ctx,
+            );
+            written.fetch_add(ok, Ordering::Relaxed);
+            failed.fetch_add(fail, Ordering::Relaxed);
+            let done = dds_counter.fetch_add(ok + fail, Ordering::Relaxed) + ok + fail;
+            if let Some(ref s) = *dds_status.lock().expect("dds lock") {
+                s.set_count(done, total_textures);
             }
         }
 
@@ -677,33 +697,49 @@ fn extract_prepared_archive(
                     Ordering::Relaxed,
                 );
                 skipped.fetch_add(archive_result.skipped_count, Ordering::Relaxed);
+                if archive_result.failed_count > 0 {
+                    error!(
+                        "Archive {} extraction had {} failures",
+                        prepared.archive_name, archive_result.failed_count
+                    );
+                }
                 failed.fetch_add(archive_result.failed_count, Ordering::Relaxed);
 
-                // Collect and process textures inline before finalization
+                // Process textures one at a time before finalization
                 // (temp dir still exists, so we can read source files)
-                let mut dds_jobs = Vec::new();
                 if !prepared.tex_d2.is_empty() {
-                    dds_jobs.extend(collect_textures_from_temp_dir(
-                        archive_result.temp_dir.path(),
-                        &prepared.tex_d2,
-                    ));
-                }
-                if !prepared.tex_d3.is_empty() {
-                    dds_jobs.extend(collect_textures_from_nested_bsas(
-                        archive_result.temp_dir.path(),
-                        &prepared.tex_d3,
-                    ));
-                }
-                if !dds_jobs.is_empty() {
-                    let (ok, fail) = process_dds_jobs_inline(dds_jobs, ctx);
+                    let (ok, fail) = process_textures_from_temp_streaming(
+                        archive_result.temp_dir.path(), &prepared.tex_d2, ctx,
+                    );
                     written.fetch_add(ok, Ordering::Relaxed);
                     failed.fetch_add(fail, Ordering::Relaxed);
+                    let done = dds_counter.fetch_add(ok + fail, Ordering::Relaxed) + ok + fail;
+                    if let Some(ref s) = *dds_status.lock().expect("dds lock") {
+                        s.set_count(done, total_textures);
+                    }
+                }
+                if !prepared.tex_d3.is_empty() {
+                    let (ok, fail) = process_textures_from_nested_bsas_streaming(
+                        archive_result.temp_dir.path(), &prepared.tex_d3, ctx,
+                    );
+                    written.fetch_add(ok, Ordering::Relaxed);
+                    failed.fetch_add(fail, Ordering::Relaxed);
+                    let done = dds_counter.fetch_add(ok + fail, Ordering::Relaxed) + ok + fail;
+                    if let Some(ref s) = *dds_status.lock().expect("dds lock") {
+                        s.set_count(done, total_textures);
+                    }
                 }
 
                 let fin_stats =
-                    finalize_archive(archive_result, &ctx.config.output_dir, logged_failures, progress_callback);
+                    finalize_archive(archive_result, &ctx.config.output_dir, logged_failures, reporter);
                 written.fetch_add(fin_stats.written, Ordering::Relaxed);
                 skipped.fetch_add(fin_stats.skipped, Ordering::Relaxed);
+                if fin_stats.failed > 0 {
+                    error!(
+                        "Archive {} finalization had {} failures",
+                        prepared.archive_name, fin_stats.failed
+                    );
+                }
                 failed.fetch_add(fin_stats.failed, Ordering::Relaxed);
             }
             Err(e) => {
@@ -716,14 +752,14 @@ fn extract_prepared_archive(
         }
     }
 
-    // Update extraction progress bar
-    let display = if archive_name_for_progress.len() > 40 {
-        format!("{}...", &archive_name_for_progress[..37])
-    } else {
-        archive_name_for_progress
-    };
-    extract_pb.set_message(display);
-    extract_pb.inc(1);
+    #[cfg(target_os = "linux")]
+    unsafe { libc::malloc_trim(0); }
+
+    // Update extraction status counter
+    let done = extract_counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Some(ref s) = *extract_status.lock().expect("extract_status lock") {
+        s.set_count(done, total_archives);
+    }
 }
 
 /// Run the pipelined processing coordinator.
@@ -737,10 +773,16 @@ pub(crate) fn run_processing_loop(
     rx: &std::sync::mpsc::Receiver<ArchiveEvent>,
     grouped: &GroupedDirectives,
     config: StreamingConfig,
-    progress_callback: Option<ProgressCallback>,
+    reporter: &Arc<dyn super::progress::ProgressReporter>,
 ) -> Result<StreamingStats> {
     // Clean up leftover temp dirs from previous interrupted runs
-    cleanup_temp_dirs(&ctx.config.downloads_dir);
+    cleanup_temp_dirs(&ctx.config.downloads_dir, reporter);
+
+    let rss_start = crate::installer::current_rss_kb().unwrap_or(0);
+    reporter.log(&format!(
+        "[RSS-PIPELINE] processing loop start: {}MB",
+        rss_start / 1024
+    ));
 
     // Stats
     let extracted = AtomicUsize::new(0);
@@ -749,30 +791,47 @@ pub(crate) fn run_processing_loop(
     let failed = AtomicUsize::new(0);
     let logged_failures = Arc::new(AtomicUsize::new(0));
 
+    // Pre-compute counts for status counters (created later, after download scan)
+    let total_archives: usize = grouped.from_archive.len()
+        + grouped.patched.len()
+        + grouped.textures.len();
+    let texture_count: usize = grouped.textures.values().map(|v| v.len()).sum();
+
     // Initialize GPU once for inline DDS processing (BC7 textures)
+    if texture_count > 0 {
+        use crate::textures::init_gpu;
+        let _ = init_gpu();
+    }
+
+    // Pre-register GameFileSource archive paths so whole-file directives
+    // that reference game files can find them before downloads start.
     {
-        let texture_count: usize = grouped.textures.values().map(|v| v.len()).sum();
-        if texture_count > 0 {
-            use crate::textures::init_gpu;
-            let _ = init_gpu();
-            crate::installer::downloader::progress_println(&format!("DDS: {} texture directives will be processed inline per-archive", texture_count));
+        let archives = db.get_all_archives().unwrap_or_default();
+        for archive in &archives {
+            if archive.state_json.contains("GameFileSourceDownloader") {
+                if let Ok(crate::modlist::DownloadState::GameFileSource(gf)) =
+                    serde_json::from_str::<crate::modlist::DownloadState>(&archive.state_json)
+                {
+                    let game_file = &gf.game_file;
+                    if let Some(resolved) = crate::paths::resolve_case_insensitive(
+                        &ctx.config.game_dir,
+                        game_file,
+                    ) {
+                        ctx.register_archive_path(archive.hash.clone(), resolved);
+                    } else if let Some(resolved) = crate::paths::resolve_case_insensitive(
+                        &ctx.config.game_dir,
+                        &format!("Data/{}", game_file),
+                    ) {
+                        ctx.register_archive_path(archive.hash.clone(), resolved);
+                    }
+                }
+            }
         }
     }
 
-    // Global counter for GUI progress
-    let global_written = Arc::new(AtomicUsize::new(0));
-    let adjusted_callback: Option<ProgressCallback> = progress_callback.map(|cb| {
-        let offset = grouped.pre_skipped;
-        let counter = global_written.clone();
-        Arc::new(move |_per_archive_count: usize| {
-            let total = counter.fetch_add(1, Ordering::Relaxed) + 1;
-            cb(offset + total);
-        }) as ProgressCallback
-    });
-
     // Process whole-file directives first (simple copy, no archive extraction needed)
     if !grouped.whole_file.is_empty() {
-        crate::installer::downloader::progress_println(&format!(
+        reporter.log(&format!(
             "Copying {} whole-file directives...",
             grouped.whole_file.len()
         ));
@@ -803,11 +862,18 @@ pub(crate) fn run_processing_loop(
     let active_count = std::sync::Mutex::new(0usize);
     let active_cvar = std::sync::Condvar::new();
 
-    // CLI extraction progress — hidden during pipelined mode (download bar handles display)
-    let extract_pb = indicatif::ProgressBar::hidden();
-
     // Completion channel: extraction threads signal when done (hash of completed archive)
     let (done_tx, done_rx) = std::sync::mpsc::channel::<String>();
+
+    // Status counters — created lazily on first extraction to avoid ghost bars
+    // during the download scanning phase.
+    let extract_status: Mutex<Option<Arc<dyn super::progress::ProgressHandle>>> = Mutex::new(None);
+    let extract_counter = AtomicUsize::new(0);
+    let dds_status: Mutex<Option<Arc<dyn super::progress::ProgressHandle>>> = Mutex::new(None);
+    let dds_counter = AtomicUsize::new(0);
+    let bsa_status: Mutex<Option<Arc<dyn super::progress::ProgressHandle>>> = Mutex::new(None);
+    let bsa_built = AtomicUsize::new(0);
+    let status_bars_created = AtomicBool::new(false);
 
     std::thread::scope(|thread_scope| {
         let mut archives_processed = 0usize;
@@ -819,15 +885,25 @@ pub(crate) fn run_processing_loop(
         let skipped = &skipped;
         let failed = &failed;
         let logged_failures = &logged_failures;
-        let adjusted_callback = &adjusted_callback;
+        let reporter = reporter;
         let active_count = &active_count;
         let active_cvar = &active_cvar;
-        let extract_pb = &extract_pb;
+        let extract_status = &extract_status;
+        let extract_counter = &extract_counter;
+        let dds_status = &dds_status;
+        let dds_counter = &dds_counter;
+        let bsa_status = &bsa_status;
+        let bsa_built = &bsa_built;
+        let status_bars_created = &status_bars_created;
 
         // BSA readiness tracker — builds BSAs as soon as all their source archives are processed
         let mut bsa_tracker = BsaReadinessTracker::new(db, ctx, grouped)
             .unwrap_or_else(|e| {
                 warn!("Failed to initialize BSA tracker: {}", e);
+                reporter.log(&format!(
+                    "WARNING: BSA tracker init failed: {} — BSAs will be built at end instead of incrementally",
+                    e
+                ));
                 BsaReadinessTracker {
                     bsa_directives: HashMap::new(),
                     pending_sources: HashMap::new(),
@@ -835,12 +911,34 @@ pub(crate) fn run_processing_loop(
                 }
             });
 
-        if bsa_tracker.has_tracked_bsas() {
-            crate::installer::downloader::progress_println(&format!(
-                "BSA tracker: {} BSAs eligible for early building",
-                bsa_tracker.pending_sources.len()
-            ));
-        }
+        let total_bsa_tracked = bsa_tracker.pending_sources.len();
+
+        // Helper: create status bars on first use
+        let ensure_status_bars = || {
+            if !status_bars_created.swap(true, Ordering::Relaxed) {
+                let mut es = extract_status.lock().expect("extract_status lock");
+                if es.is_none() {
+                    let s = reporter.begin_status("Extracted");
+                    s.set_count(0, total_archives);
+                    *es = Some(s);
+                }
+                if texture_count > 0 {
+                    let mut ds = dds_status.lock().expect("dds_status lock");
+                    if ds.is_none() {
+                        let s = reporter.begin_status("DDS");
+                        s.set_count(0, texture_count);
+                        *ds = Some(s);
+                    }
+                }
+                let mut bs = bsa_status.lock().expect("bsa_status lock");
+                if bs.is_none() {
+                    let s = reporter.begin_status("BSA");
+                    let total = total_bsa_tracked;
+                    if total > 0 { s.set_count(0, total); }
+                    *bs = Some(s);
+                }
+            }
+        };
 
         // Main processing loop: receive archive events, prepare (DB work) on this thread,
         // then spawn extraction threads in parallel.
@@ -855,17 +953,14 @@ pub(crate) fn run_processing_loop(
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| directive.to.clone());
 
-                        crate::installer::downloader::progress_println(&format!(
-                            "BSA ready — building: {} ({} files)",
-                            bsa_name,
-                            directive.file_states.len()
-                        ));
-
                         // Build BSA on a separate thread
                         thread_scope.spawn(move || {
                             match handle_create_bsa(ctx, &directive) {
                                 Ok(()) => {
-                                    crate::installer::downloader::progress_println(&format!("Created BSA: {}", bsa_name));
+                                    let done = bsa_built.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if let Some(ref s) = *bsa_status.lock().expect("bsa lock") {
+                                        s.set_count(done, total_bsa_tracked);
+                                    }
                                 }
                                 Err(e) => {
                                     error!("Failed to build BSA {}: {:#}", bsa_name, e);
@@ -880,6 +975,8 @@ pub(crate) fn run_processing_loop(
 
             match event {
                 ArchiveEvent::Ready { hash, name, path } => {
+                    // Create status bars on first archive (avoids ghost bars during scan)
+                    ensure_status_bars();
                     // Register the archive path for extraction
                     ctx.register_archive_path(hash.clone(), path.clone());
 
@@ -911,8 +1008,13 @@ pub(crate) fn run_processing_loop(
                                 skipped,
                                 failed,
                                 logged_failures,
-                                adjusted_callback,
-                                extract_pb,
+                                reporter,
+                                extract_status,
+                                extract_counter,
+                                total_archives,
+                                dds_status,
+                                dds_counter,
+                                texture_count,
                             );
 
                             // Signal completion for BSA readiness tracking
@@ -964,15 +1066,12 @@ pub(crate) fn run_processing_loop(
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| directive.to.clone());
 
-                    crate::installer::downloader::progress_println(&format!(
-                        "BSA ready — building: {} ({} files)",
-                        bsa_name,
-                        directive.file_states.len()
-                    ));
-
                     match handle_create_bsa(ctx, &directive) {
                         Ok(()) => {
-                            crate::installer::downloader::progress_println(&format!("Created BSA: {}", bsa_name));
+                            let done = bsa_built.fetch_add(1, Ordering::Relaxed) + 1;
+                            if let Some(ref s) = *bsa_status.lock().expect("bsa lock") {
+                                s.set_count(done, total_bsa_tracked);
+                            }
                         }
                         Err(e) => {
                             error!("Failed to build BSA {}: {:#}", bsa_name, e);
@@ -985,17 +1084,22 @@ pub(crate) fn run_processing_loop(
         }
 
         if bsa_tracker.built_count > 0 {
-            crate::installer::downloader::progress_println(&format!(
+            reporter.log(&format!(
                 "Pipeline complete: {} archives processed, {} failed, {} BSAs built early",
                 archives_processed, archives_failed, bsa_tracker.built_count
             ));
         } else {
-            crate::installer::downloader::progress_println(&format!(
+            reporter.log(&format!(
                 "Pipeline complete: {} archives processed, {} failed",
                 archives_processed, archives_failed
             ));
         }
     });
+
+    // Finish status counters
+    if let Some(ref s) = *extract_status.lock().expect("lock") { s.finish(); }
+    if let Some(ref s) = *bsa_status.lock().expect("lock") { s.finish(); }
+    if let Some(ref s) = *dds_status.lock().expect("lock") { s.finish(); }
 
     Ok(StreamingStats {
         extracted: extracted.load(Ordering::Relaxed),
