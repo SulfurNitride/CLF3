@@ -35,9 +35,51 @@ pub use config_cache::{ConfigCache, ModlistConfig};
 use crate::modlist::{import_wabbajack_to_db, ModlistDb};
 use anyhow::{bail, Context, Result};
 use std::fs;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
+
+/// Tracks peak RSS and logs whenever a new high-water mark is hit.
+/// Thread-safe — share via Arc or &reference.
+pub(crate) struct PeakRssTracker {
+    /// Highest RSS seen so far, in KB.
+    peak_kb: AtomicU64,
+    /// Timestamp of install start, for relative timing.
+    start: Instant,
+}
+
+impl PeakRssTracker {
+    pub fn new() -> Self {
+        Self {
+            peak_kb: AtomicU64::new(0),
+            start: Instant::now(),
+        }
+    }
+
+    /// Sample current RSS. If it exceeds the previous peak, log and update.
+    /// `label` describes what's happening (e.g. "extract Mod.7z", "build BSA").
+    pub fn check(&self, label: &str, reporter: &dyn progress::ProgressReporter) {
+        let rss_kb = current_rss_kb().unwrap_or(0);
+        let prev_peak = self.peak_kb.fetch_max(rss_kb, Ordering::Relaxed);
+        if rss_kb > prev_peak && rss_kb > prev_peak + 50_000 {
+            // New peak, at least 50MB higher than previous — worth logging
+            let elapsed = self.start.elapsed().as_secs_f64();
+            reporter.log(&format!(
+                "[RSS-PEAK] {}MB (+{}MB) at {:.1}s — {}",
+                rss_kb / 1024,
+                (rss_kb - prev_peak) / 1024,
+                elapsed,
+                label,
+            ));
+        }
+    }
+
+    /// Return the peak RSS seen so far, in KB.
+    pub fn peak_kb(&self) -> u64 {
+        self.peak_kb.load(Ordering::Relaxed)
+    }
+}
 
 pub(crate) fn current_rss_kb() -> Option<u64> {
     let status = fs::read_to_string("/proc/self/status").ok()?;
@@ -155,15 +197,18 @@ fn log_phase_metrics(phase: &str, started: Instant) {
 
 #[cfg(target_os = "linux")]
 fn trim_allocator_rss(reason: &str) {
-    // Return free arena memory to the OS when large temporary allocations are dropped.
-    let released = unsafe { libc::malloc_trim(0) };
-    if released != 0 {
-        info!("malloc_trim released memory after {}", reason);
-    }
+    // Return free pages to the OS from both allocators:
+    // - mi_collect: mimalloc (Rust allocations via #[global_allocator])
+    // - malloc_trim: glibc (C library allocations: SQLite, libcurl, etc.)
+    unsafe { libmimalloc_sys::mi_collect(true); }
+    unsafe { libc::malloc_trim(0); }
+    info!("allocator collect after {}", reason);
 }
 
 #[cfg(not(target_os = "linux"))]
-fn trim_allocator_rss(_reason: &str) {}
+fn trim_allocator_rss(_reason: &str) {
+    unsafe { libmimalloc_sys::mi_collect(true); }
+}
 
 /// Installation statistics
 #[derive(Debug, Default, Clone)]

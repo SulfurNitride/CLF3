@@ -226,6 +226,8 @@ pub fn process_fused_streaming(
 ) -> Result<StreamingStats> {
     const MAX_LOGGED_FAILURES: usize = 100;
 
+    let rss_tracker = crate::installer::PeakRssTracker::new();
+
     // Clean up any leftover temp dirs from previous interrupted runs
     cleanup_temp_dirs(&ctx.config.downloads_dir, reporter);
 
@@ -664,6 +666,8 @@ pub fn process_fused_streaming(
     // Process BSA-direct archives in main rayon pool (unlimited, they're fast)
     // and extract archives in bounded pool — concurrently via std::thread::scope.
     std::thread::scope(|thread_scope| {
+        let rss_tracker = &rss_tracker;
+
         // Spawn collector thread — receives DDS jobs and spills data to disk
         let collected_jobs = collected_dds_jobs.clone();
         let spill_dir = dds_spill_dir.clone();
@@ -734,6 +738,7 @@ pub fn process_fused_streaming(
                         let dds_tx = &dds_tx;
                         let tex_d2 = &tex_d2;
                         let _tex_d3 = &tex_d3; // BSA-direct: no nested BSAs
+                        let rss_tracker = rss_tracker;
 
                     s.spawn(move |_| {
                         let archive_name = archive_path
@@ -826,6 +831,7 @@ pub fn process_fused_streaming(
                         }
 
                         let bsa_rss_after = crate::installer::current_rss_kb().unwrap_or(0);
+                        rss_tracker.check(&format!("bsa-direct {}", display_name), reporter.as_ref());
                         reporter.log(&format!(
                             "[RSS-BSA] {} : before={}MB after={}MB (delta={}MB, {} from + {} patched)",
                             display_name,
@@ -838,6 +844,7 @@ pub fn process_fused_streaming(
 
                         handle.finish();
 
+                        unsafe { libmimalloc_sys::mi_collect(false); }
                         #[cfg(target_os = "linux")]
                         unsafe { libc::malloc_trim(0); }
 
@@ -871,7 +878,8 @@ pub fn process_fused_streaming(
                                tex_d2: &HashMap<String, TextureLookupInner>,
                                tex_d3: &HashMap<String, NestedTextureLookupInner>,
                                failed_archive_hashes: &std::sync::Mutex<HashSet<String>>,
-                               listing_cache: &sevenzip::ArchiveListingCache| {
+                               listing_cache: &sevenzip::ArchiveListingCache,
+                               rss_tracker: &crate::installer::PeakRssTracker| {
             let archive_name = archive_path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -908,6 +916,7 @@ pub fn process_fused_streaming(
             );
 
             let rss_after_extract = crate::installer::current_rss_kb().unwrap_or(0);
+            rss_tracker.check(&format!("extract {}", display_name), reporter.as_ref());
 
             match result {
                 Ok(archive_result) => {
@@ -944,6 +953,7 @@ pub fn process_fused_streaming(
                     }
 
                     let rss_after_tex = crate::installer::current_rss_kb().unwrap_or(0);
+                    rss_tracker.check(&format!("textures {}", display_name), reporter.as_ref());
 
                     item_handle.set_message(&format!(
                         "{} ({} files) finalizing...",
@@ -960,6 +970,7 @@ pub fn process_fused_streaming(
                     );
 
                     let rss_after_finalize = crate::installer::current_rss_kb().unwrap_or(0);
+                    rss_tracker.check(&format!("finalize {}", display_name), reporter.as_ref());
                     let rss_mb = |kb: u64| kb / 1024;
                     reporter.log(&format!(
                         "[RSS] {} : before={}MB extract={}MB tex={}MB final={}MB (delta={}MB, {} files)",
@@ -996,8 +1007,9 @@ pub fn process_fused_streaming(
             item_handle.finish();
 
             // Return freed memory to the OS after each archive.
-            // glibc malloc holds onto freed pages — without this, RSS grows
-            // monotonically across hundreds of archive extractions.
+            // mi_collect: mimalloc pages (Rust allocations)
+            // malloc_trim: glibc pages (C library allocations: SQLite, etc.)
+            unsafe { libmimalloc_sys::mi_collect(false); }
             #[cfg(target_os = "linux")]
             unsafe { libc::malloc_trim(0); }
 
@@ -1061,6 +1073,7 @@ pub fn process_fused_streaming(
                                             &reporter, &complex_dds_tx,
                                             &*complex_tex_d2, &*complex_tex_d3,
                                             &failed_hashes, &listing_cache,
+                                            &rss_tracker,
                                         );
                                     }
                                 });
@@ -1101,6 +1114,7 @@ pub fn process_fused_streaming(
                                                     &reporter, &complex_dds_tx,
                                                     &*simple_tex_d2, &*simple_tex_d3,
                                                     &failed_hashes, &listing_cache,
+                                                    &rss_tracker,
                                                 );
                                             }
                                         });
@@ -1126,6 +1140,7 @@ pub fn process_fused_streaming(
                                             &reporter, &simple_dds_tx,
                                             &*simple_tex_d2, &*simple_tex_d3,
                                             &failed_hashes, &listing_cache,
+                                            &rss_tracker,
                                         );
                                     }
                                 });
@@ -1166,6 +1181,7 @@ pub fn process_fused_streaming(
                                                     &reporter, &simple_dds_tx,
                                                     &*complex_tex_d2, &*complex_tex_d3,
                                                     &failed_hashes, &listing_cache,
+                                                    &rss_tracker,
                                                 );
                                             }
                                         });
@@ -1299,6 +1315,10 @@ pub fn process_fused_streaming(
     reporter.log(&format!(
         "Complete: {} extracted, {} written, {} skipped ({} pre-filtered), {} failed",
         stats.extracted, stats.written, stats.skipped, pre_skipped, stats.failed
+    ));
+    reporter.log(&format!(
+        "[RSS-PEAK] Extraction peak: {}MB",
+        rss_tracker.peak_kb() / 1024,
     ));
 
     Ok(stats)

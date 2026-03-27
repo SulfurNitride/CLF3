@@ -123,6 +123,7 @@ unicode-normalization = "0.1"
 # aggressively than glibc malloc, preventing RSS bloat during extraction
 # where hundreds of large temporary Vec<u8> buffers are allocated and freed.
 mimalloc = "0.1"
+libmimalloc-sys = { version = "0.1", features = ["extended"] }  # FFI for mi_collect()
 console = "0.16.3"
 
 [profile.release]

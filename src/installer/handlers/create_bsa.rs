@@ -169,7 +169,11 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
             }
         }
         ArchiveKind::Ba2 { version } => {
-            // BA2 builder still takes Vec<u8> — read files for it
+            // BA2 builder still takes Vec<u8> — read files for it.
+            // WARNING: This loads ALL staged files into RAM at once.
+            // For large BA2s (1GB+), this is a major memory spike.
+            let rss_before = crate::installer::current_rss_kb().unwrap_or(0);
+            let mut total_bytes = 0u64;
             let mut builder = Ba2Builder::from_name(&directive.to)
                 .with_version(version)
                 .with_compression(Ba2CompressionFormat::Zlib);
@@ -178,8 +182,20 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
                 let data = fs::read(disk_path).with_context(|| {
                     format!("Failed to read staged file: {}", disk_path.display())
                 })?;
+                total_bytes += data.len() as u64;
                 builder.add_file(path, data);
             }
+
+            let rss_after_load = crate::installer::current_rss_kb().unwrap_or(0);
+            tracing::info!(
+                "[RSS-BA2] {} : loaded {}MB into builder ({} files), RSS {}MB → {}MB (+{}MB)",
+                directive.to,
+                total_bytes / (1024 * 1024),
+                files.len(),
+                rss_before / 1024,
+                rss_after_load / 1024,
+                rss_after_load.saturating_sub(rss_before) / 1024,
+            );
 
             builder
                 .build(&output_path)

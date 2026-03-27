@@ -1027,6 +1027,7 @@ fn extract_prepared_archive(
         }
     }
 
+    unsafe { libmimalloc_sys::mi_collect(false); }
     #[cfg(target_os = "linux")]
     unsafe { libc::malloc_trim(0); }
 

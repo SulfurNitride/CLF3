@@ -33,12 +33,29 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use unicode_normalization::UnicodeNormalization;
+use std::process::{Command, Stdio};
 
 use std::sync::Mutex;
 
+/// Run a Command and capture output, using spawn() instead of output().
+///
+/// `Command::output()` uses `fork()` on Linux, which copies the entire
+/// process page table. When the parent is using 8+ GB, this causes the
+/// child's `maxrss` to spike to 8+ GB (COW pages) even though 7z itself
+/// only needs ~100 MB. Using `spawn()` allows the runtime to use
+/// `posix_spawn()` which avoids the page table copy entirely.
+fn spawn_output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?
+        .wait_with_output()
+}
+
 /// Windows file attribute flag for reparse points (symlinks, junctions).
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
 
 // ============================================================================
 // Archive listing cache — pre-lists archives into SQLite so extraction
@@ -108,22 +125,44 @@ impl ArchiveListingCache {
 
         let mut resolved = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        let mut not_found = Vec::new();
 
         for file in files {
             let normalized = normalize_path(file);
-            let actual: String = stmt
-                .query_row(rusqlite::params![archive_key, normalized], |row| row.get(0))
-                .with_context(|| {
-                    format!(
-                        "File '{}' not found in archive listing cache for '{}'",
-                        file, archive_key
-                    )
-                })?;
-
-            if seen.insert(actual.clone()) {
-                resolved.push(actual);
+            match stmt.query_row(rusqlite::params![archive_key, normalized], |row| {
+                row.get::<_, String>(0)
+            }) {
+                Ok(actual) => {
+                    if seen.insert(actual.clone()) {
+                        resolved.push(actual);
+                    }
+                }
+                Err(_) => {
+                    not_found.push(file.clone());
+                }
             }
         }
+
+        if !not_found.is_empty() {
+            let archive_name = archive_path.file_name()
+                .unwrap_or_default().to_string_lossy();
+            tracing::warn!(
+                "[selective-miss] {} of {} files not in cache for '{}'. Missing: {:?}",
+                not_found.len(),
+                files.len(),
+                archive_name,
+                if not_found.len() <= 5 { &not_found[..] } else { &not_found[..5] },
+            );
+        }
+
+        if resolved.is_empty() && !files.is_empty() {
+            bail!(
+                "None of {} requested files found in cache for '{}'",
+                files.len(),
+                archive_key
+            );
+        }
+
         Ok(resolved)
     }
 
@@ -322,20 +361,41 @@ pub fn extract_files_case_insensitive(
 
     let mut resolved = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let mut not_found = Vec::new();
 
     for file in files {
         let normalized = normalize_path(file);
-        let actual = lookup.get(&normalized).with_context(|| {
-            format!(
-                "File '{}' not found in archive '{}'",
-                file,
-                archive_path.display()
-            )
-        })?;
-
-        if seen.insert(actual.clone()) {
-            resolved.push(actual.clone());
+        match lookup.get(&normalized) {
+            Some(actual) => {
+                if seen.insert(actual.clone()) {
+                    resolved.push(actual.clone());
+                }
+            }
+            None => {
+                not_found.push(file.clone());
+            }
         }
+    }
+
+    if !not_found.is_empty() {
+        let archive_name = archive_path.file_name()
+            .unwrap_or_default().to_string_lossy();
+        tracing::warn!(
+            "[selective-miss] {} of {} files not found in '{}', extracting {} found. Missing: {:?}",
+            not_found.len(),
+            files.len(),
+            archive_name,
+            resolved.len(),
+            if not_found.len() <= 5 { &not_found[..] } else { &not_found[..5] },
+        );
+    }
+
+    if resolved.is_empty() {
+        bail!(
+            "None of {} requested files found in archive '{}'",
+            files.len(),
+            archive_path.display()
+        );
     }
 
     let resolved_refs: Vec<&str> = resolved.iter().map(|s| s.as_str()).collect();
@@ -621,7 +681,9 @@ pub fn get_innoextract_path() -> Result<PathBuf> {
 
 /// Normalize a path for case-insensitive comparison.
 fn normalize_path(path: &str) -> String {
-    path.to_lowercase()
+    path.nfc()
+        .collect::<String>()
+        .to_lowercase()
         .replace('\\', "/")
         .trim_matches('/')
         .to_string()
@@ -970,14 +1032,15 @@ fn extract_rar_all(archive_path: &Path, output_dir: &Path) -> Result<usize> {
 fn list_archive_7z_binary(archive_path: &Path) -> Result<Vec<ArchiveEntry>> {
     let sz_path = get_7z_path()?;
 
-    let output = Command::new(&sz_path)
-        .arg("l")
-        .arg("-slt")
-        .arg("-ba")
-        .arg("-scsUTF-8")
-        .arg(archive_path)
-        .output()
-        .with_context(|| format!("Failed to run 7z list on {}", archive_path.display()))?;
+    let output = spawn_output(
+        Command::new(&sz_path)
+            .arg("l")
+            .arg("-slt")
+            .arg("-ba")
+            .arg("-scsUTF-8")
+            .arg(archive_path),
+    )
+    .with_context(|| format!("Failed to run 7z list on {}", archive_path.display()))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1000,23 +1063,24 @@ fn extract_file_7z_binary(archive_path: &Path, file_path: &str) -> Result<Vec<u8
     let sz_path = get_7z_path()?;
     let normalized_path = file_path.replace('\\', "/");
 
-    let output = Command::new(&sz_path)
-        .arg("e")
-        .arg("-so")
-        .arg("-y")
-        .arg("-spd")
-        .arg("-scsUTF-8")
-        .arg("-mmt=2")
-        .arg(archive_path)
-        .arg(&normalized_path)
-        .output()
-        .with_context(|| {
-            format!(
-                "Failed to extract '{}' from {}",
-                file_path,
-                archive_path.display()
-            )
-        })?;
+    let output = spawn_output(
+        Command::new(&sz_path)
+            .arg("e")
+            .arg("-so")
+            .arg("-y")
+            .arg("-spd")
+            .arg("-scsUTF-8")
+            .arg("-mmt=2")
+            .arg(archive_path)
+            .arg(&normalized_path),
+    )
+    .with_context(|| {
+        format!(
+            "Failed to extract '{}' from {}",
+            file_path,
+            archive_path.display()
+        )
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1081,8 +1145,7 @@ fn extract_files_7z_binary_threaded(
         cmd.arg(file);
     }
 
-    let output = cmd
-        .output()
+    let output = spawn_output(&mut cmd)
         .with_context(|| format!("Failed to extract files from {}", archive_path.display()))?;
 
     if !output.status.success() {
@@ -1104,7 +1167,7 @@ fn extract_files_7z_binary_threaded(
                 retry.arg(file);
             }
 
-            let retry_output = retry.output()?;
+            let retry_output = spawn_output(&mut retry)?;
             if retry_output.status.success() {
                 return Ok(());
             }
@@ -1160,8 +1223,7 @@ fn extract_all_7z_binary(
     cmd.arg(format!("-o{}", output_dir.display()))
         .arg(archive_path);
 
-    let output = cmd
-        .output()
+    let output = spawn_output(&mut cmd)
         .with_context(|| format!("Failed to extract {}", archive_path.display()))?;
 
     if !output.status.success() {
@@ -1188,7 +1250,7 @@ fn extract_all_7z_binary(
             }
             retry.arg(archive_path);
 
-            let retry_output = retry.output()?;
+            let retry_output = spawn_output(&mut retry)?;
             if retry_output.status.success() {
                 let count = walkdir::WalkDir::new(output_dir)
                     .into_iter()
@@ -1376,13 +1438,14 @@ fn parse_inno_list(output: &str) -> Vec<ArchiveEntry> {
 
 fn list_archive_innoextract(archive_path: &Path) -> Result<Vec<ArchiveEntry>> {
     let inno_path = get_innoextract_path()?;
-    let output = Command::new(&inno_path)
-        .arg("-l")
-        .arg("--collisions")
-        .arg("rename-all")
-        .arg(archive_path)
-        .output()
-        .with_context(|| format!("Failed to run innoextract list on {}", archive_path.display()))?;
+    let output = spawn_output(
+        Command::new(&inno_path)
+            .arg("-l")
+            .arg("--collisions")
+            .arg("rename-all")
+            .arg(archive_path),
+    )
+    .with_context(|| format!("Failed to run innoextract list on {}", archive_path.display()))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1397,16 +1460,17 @@ fn extract_all_innoextract(archive_path: &Path, output_dir: &Path) -> Result<usi
     let inno_path = get_innoextract_path()?;
     fs::create_dir_all(output_dir)?;
 
-    let output = Command::new(&inno_path)
-        .arg("-e")
-        .arg("-s")
-        .arg("--collisions")
-        .arg("rename-all")
-        .arg("-d")
-        .arg(output_dir)
-        .arg(archive_path)
-        .output()
-        .with_context(|| format!("Failed to run innoextract on {}", archive_path.display()))?;
+    let output = spawn_output(
+        Command::new(&inno_path)
+            .arg("-e")
+            .arg("-s")
+            .arg("--collisions")
+            .arg("rename-all")
+            .arg("-d")
+            .arg(output_dir)
+            .arg(archive_path),
+    )
+    .with_context(|| format!("Failed to run innoextract on {}", archive_path.display()))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1446,8 +1510,7 @@ fn extract_files_innoextract(archive_path: &Path, files: &[&str], output_dir: &P
     }
     cmd.arg(archive_path);
 
-    let output = cmd
-        .output()
+    let output = spawn_output(&mut cmd)
         .with_context(|| format!("Failed to run innoextract on {}", archive_path.display()))?;
 
     if !output.status.success() {
