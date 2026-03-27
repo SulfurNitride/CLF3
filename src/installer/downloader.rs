@@ -296,24 +296,24 @@ Copied files with different names will not be reused. Examples: {}",
     // Second pass: verify hashes of existing archives
     let mut corrupted_count = 0usize;
     if !archives_to_verify.is_empty() {
-        reporter.log(&format!(
-            "Verifying {} existing archives...",
-            archives_to_verify.len()
-        ));
+        let verify_total = archives_to_verify.len();
+        reporter.log(&format!("Verifying {} existing archives...", verify_total));
+        reporter.overall_set_total(verify_total as u64);
+        reporter.overall_set_message("Verifying archives...");
 
         // Verify hashes in parallel using rayon — pipelining reads helps even on slow storage
-        let verify_total = archives_to_verify.len();
-        let verify_progress = AtomicUsize::new(0);
-
         // Each result: Ok(true) = valid, Ok(false) = hash mismatch, Err = read error
         let verify_results: Vec<Result<(bool, String)>> = archives_to_verify
             .par_iter()
             .map(|(archive, output_path)| {
-                let done = verify_progress.fetch_add(1, Ordering::Relaxed) + 1;
-                if done % 10 == 0 || done == verify_total {
-                    reporter.log(&format!("  Verifying {}/{}...", done, verify_total));
-                }
-                verify_file_hash_detailed(output_path, &archive.hash)
+                let name = output_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                reporter.overall_set_message(&format!("Verifying {}...", truncate_name(&name, 40)));
+                let result = verify_file_hash_detailed(output_path, &archive.hash);
+                reporter.overall_inc();
+                result
             })
             .collect();
 
@@ -679,21 +679,22 @@ pub async fn download_archives_streaming(
 
     // Verify hashes of existing archives (threaded)
     if !archives_to_verify.is_empty() {
-        reporter.log(&format!(
-            "Verifying {} existing archives...",
-            archives_to_verify.len()
-        ));
         let verify_total = archives_to_verify.len();
-        let verify_progress = AtomicUsize::new(0);
+        reporter.log(&format!("Verifying {} existing archives...", verify_total));
+        reporter.overall_set_total(verify_total as u64);
+        reporter.overall_set_message("Verifying archives...");
 
         let verify_results: Vec<Result<(bool, String)>> = archives_to_verify
             .par_iter()
             .map(|(archive, output_path)| {
-                let done = verify_progress.fetch_add(1, Ordering::Relaxed) + 1;
-                if done % 10 == 0 || done == verify_total {
-                    reporter.log(&format!("  Verifying {}/{}...", done, verify_total));
-                }
-                verify_file_hash_detailed(output_path, &archive.hash)
+                let name = output_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                reporter.overall_set_message(&format!("Verifying {}...", truncate_name(&name, 40)));
+                let result = verify_file_hash_detailed(output_path, &archive.hash);
+                reporter.overall_inc();
+                result
             })
             .collect();
 

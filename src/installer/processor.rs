@@ -142,7 +142,7 @@ pub(crate) fn restore_patched_output_from_cache(
     }
 
     let output_path = ctx.resolve_output_path(&directive.to);
-    paths::ensure_parent_dirs(&output_path)?;
+    ctx.dir_cache.ensure_parent_dirs(&output_path)?;
     let _ = fs::remove_file(&output_path);
     reflink_copy::reflink_or_copy(&cache_path, &output_path).with_context(|| {
         format!(
@@ -654,6 +654,14 @@ pub struct ProcessContext<'a> {
     patch_basis_store: Option<PatchBasisStore>,
     /// Set of texture directive IDs already processed during extraction (by DDS handler thread)
     pub textures_processed_during_install: Mutex<HashSet<i64>>,
+    /// Directive IDs validated as already-complete by pre-validation (skip in all phases)
+    pub skip_set: HashSet<i64>,
+    /// Per-type stats from pre-validation: type_name -> (total, needs_work)
+    pub prevalidation_stats: HashMap<String, (usize, usize)>,
+    /// Extra files detected during pre-validation (normalized paths for cleanup)
+    pub extra_files_for_cleanup: Vec<String>,
+    /// Directory creation cache — eliminates redundant stat/mkdir syscalls
+    pub dir_cache: crate::paths::DirCache,
 }
 
 impl<'a> ProcessContext<'a> {
@@ -754,6 +762,8 @@ impl<'a> ProcessContext<'a> {
                 }
             };
 
+        let dir_cache = crate::paths::DirCache::new();
+
         Ok(Self {
             config,
             wabbajack: Mutex::new(wabbajack),
@@ -766,6 +776,10 @@ impl<'a> ProcessContext<'a> {
             patch_basis_full_hash_cache: Mutex::new(HashMap::new()),
             patch_basis_store,
             textures_processed_during_install: Mutex::new(HashSet::new()),
+            skip_set: HashSet::new(),
+            prevalidation_stats: HashMap::new(),
+            extra_files_for_cleanup: Vec::new(),
+            dir_cache,
         })
     }
 
@@ -1471,7 +1485,10 @@ impl<'a> DirectiveProcessor<'a> {
 
     /// DDS Transform phase: TransformedTexture
     pub fn texture_phase(&self) -> Result<()> {
-        let texture_count = self.get_type_count("TransformedTexture")?;
+        let texture_count = self.ctx.prevalidation_stats
+            .get("TransformedTexture")
+            .map(|&(total, needs_work)| if needs_work > 0 { total } else { 0 })
+            .unwrap_or_else(|| self.get_type_count("TransformedTexture").unwrap_or(0));
 
         self.reporter.phase_start(super::progress::Phase::DdsTransform);
         self.reporter.overall_set_total(texture_count as u64);
@@ -1497,7 +1514,10 @@ impl<'a> DirectiveProcessor<'a> {
 
     /// BSA Build phase: CreateBSA
     pub fn bsa_phase(&self) -> Result<()> {
-        let bsa_count = self.get_type_count("CreateBSA")?;
+        let bsa_count = self.ctx.prevalidation_stats
+            .get("CreateBSA")
+            .map(|&(total, needs_work)| if needs_work > 0 { total } else { 0 })
+            .unwrap_or_else(|| self.get_type_count("CreateBSA").unwrap_or(0));
 
         self.reporter.phase_start(super::progress::Phase::BsaBuild);
         self.reporter.overall_set_total(bsa_count as u64);
@@ -1615,8 +1635,8 @@ fn cleanup_extra_files(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
         }
 
         if entry.file_type().is_file() {
-            // Never delete sidecar hash cache files
-            if entry.path().extension().map(|e| e == "clf3hash").unwrap_or(false) {
+            // Never delete sidecar hash cache or manifest files
+            if entry.path().extension().map(|e| e == "clf3hash" || e == "clf3manifest").unwrap_or(false) {
                 continue;
             }
 
@@ -1743,7 +1763,7 @@ pub(crate) fn apply_patch_to_temp(
     let mut reader = DeltaReader::new(basis, delta)?;
 
     // Stream to temp output file
-    paths::ensure_parent_dirs(temp_output_path)?;
+    ctx.dir_cache.ensure_parent_dirs(temp_output_path)?;
     let output_file = File::create(temp_output_path)
         .with_context(|| format!("Failed to create temp output: {}", temp_output_path.display()))?;
     let mut writer = BufWriter::with_capacity(65536, output_file);
@@ -1915,7 +1935,7 @@ fn process_transformed_texture(
     let mut parse_failures = 0;
 
     for (id, json) in all_raw {
-        if already_done.contains(&id) {
+        if already_done.contains(&id) || ctx.skip_set.contains(&id) {
             completed.fetch_add(1, Ordering::Relaxed);
             reporter.overall_inc();
             continue;
@@ -2199,7 +2219,7 @@ fn process_transformed_texture(
                 match result {
                     Ok(processed) => {
                         let output_path = ctx.resolve_output_path(&st.directive.to);
-                        if let Err(e) = paths::ensure_parent_dirs(&output_path)
+                        if let Err(e) = ctx.dir_cache.ensure_parent_dirs(&output_path)
                             .and_then(|_| fs::write(&output_path, &processed.data))
                         {
                             failed.fetch_add(1, Ordering::Relaxed);
@@ -2230,7 +2250,7 @@ fn process_transformed_texture(
                         &data, st.directive.image_state.width, st.directive.image_state.height, fmt,
                     )?;
                     let output_path = ctx.resolve_output_path(&st.directive.to);
-                    paths::ensure_parent_dirs(&output_path)?;
+                    ctx.dir_cache.ensure_parent_dirs(&output_path)?;
                     fs::write(&output_path, &processed.data)?;
                     Ok(())
                 })();
@@ -2300,7 +2320,7 @@ fn process_create_bsa(
     ));
 
     let process_one = |id: i64, directive: CreateBSADirective| {
-        if handlers::output_bsa_valid(ctx, &directive) {
+        if ctx.skip_set.contains(&id) || handlers::output_bsa_valid(ctx, &directive) {
             skipped.fetch_add(1, Ordering::Relaxed);
             reporter.overall_inc();
             return;
@@ -2359,6 +2379,24 @@ fn process_simple_directives(
     reporter: &Arc<dyn super::progress::ProgressReporter>,
 ) -> Result<()> {
     let directives = db.get_all_pending_directives_of_type(dtype)?;
+    if directives.is_empty() {
+        return Ok(());
+    }
+
+    // Filter out pre-validated directives before parsing JSON
+    let directives: Vec<(i64, String)> = directives
+        .into_iter()
+        .filter(|(id, _)| {
+            if ctx.skip_set.contains(id) {
+                skipped.fetch_add(1, Ordering::Relaxed);
+                reporter.overall_inc();
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+
     if directives.is_empty() {
         return Ok(());
     }

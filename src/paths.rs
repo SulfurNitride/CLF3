@@ -220,6 +220,106 @@ pub fn join_windows_path(base: &Path, relative: &str) -> PathBuf {
     base.join(to_linux_path(relative))
 }
 
+/// Thread-safe directory creation cache.
+///
+/// Tracks which directories have already been created so we can skip
+/// redundant `create_dir_all` syscalls. With 595k+ output files sharing
+/// a much smaller set of directories, this eliminates millions of stat/mkdir calls.
+pub struct DirCache {
+    known: std::sync::RwLock<std::collections::HashSet<PathBuf>>,
+}
+
+impl DirCache {
+    pub fn new() -> Self {
+        Self {
+            known: std::sync::RwLock::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Ensure parent directories exist for `path`, using the cache to skip
+    /// directories we've already created.
+    pub fn ensure_parent_dirs(&self, path: &Path) -> std::io::Result<()> {
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => return Ok(()),
+        };
+
+        // Fast path: check read lock (no contention between threads)
+        {
+            let known = self.known.read().unwrap_or_else(|e| e.into_inner());
+            if known.contains(parent) {
+                return Ok(());
+            }
+        }
+
+        // Slow path: actually create the directory
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                if let Some(blocker) = find_blocking_entry(parent) {
+                    let kind = match std::fs::symlink_metadata(&blocker) {
+                        Ok(m) if m.is_symlink() => "symlink",
+                        Ok(m) if m.is_file() => "file",
+                        Ok(_) => "other",
+                        Err(_) => "unknown",
+                    };
+                    tracing::warn!(
+                        "Removing {} blocking directory creation: {}",
+                        kind,
+                        blocker.display()
+                    );
+                    match std::fs::remove_file(&blocker) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e),
+                    }
+                    std::fs::create_dir_all(parent)?;
+                } else if !parent.is_dir() {
+                    return Err(e);
+                }
+            } else {
+                return Err(e);
+            }
+        }
+
+        // Cache this directory and all its ancestors
+        let mut dir = parent.to_path_buf();
+        let mut to_insert = Vec::new();
+        loop {
+            to_insert.push(dir.clone());
+            if !dir.pop() || dir.as_os_str().is_empty() {
+                break;
+            }
+        }
+        let mut known = self.known.write().unwrap_or_else(|e| e.into_inner());
+        for d in to_insert {
+            known.insert(d);
+        }
+
+        Ok(())
+    }
+
+    /// Pre-seed the cache with directories that already exist on disk.
+    /// Call once before extraction starts with the output directory.
+    pub fn seed_from_disk(&self, root: &Path) {
+        let mut dirs = Vec::new();
+        let walker = walkdir::WalkDir::new(root)
+            .min_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_dir());
+        for entry in walker {
+            dirs.push(entry.into_path());
+        }
+        // Also add root itself
+        dirs.push(root.to_path_buf());
+
+        let mut known = self.known.write().unwrap_or_else(|e| e.into_inner());
+        for d in dirs {
+            known.insert(d);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -270,6 +270,24 @@ pub fn extract_file_case_insensitive(archive_path: &Path, file_path: &str) -> Re
 
 /// Extract multiple files from an archive to a directory.
 pub fn extract_files(archive_path: &Path, files: &[&str], output_dir: &Path) -> Result<()> {
+    let archive_type = detect_archive_type(archive_path).unwrap_or(ArchiveType::Unknown);
+    let threads = if matches!(archive_type, ArchiveType::SevenZ) {
+        Some(crate::installer::thread_budget::threads_per_7z())
+    } else {
+        None
+    };
+    extract_files_with_threads(archive_path, files, output_dir, threads)
+}
+
+/// Extract multiple files from an archive with controlled thread count.
+///
+/// `threads`: thread budget for 7z processes. ZIP/RAR are I/O bound and ignore this.
+pub fn extract_files_with_threads(
+    archive_path: &Path,
+    files: &[&str],
+    output_dir: &Path,
+    threads: Option<usize>,
+) -> Result<()> {
     if files.is_empty() {
         return Ok(());
     }
@@ -278,13 +296,11 @@ pub fn extract_files(archive_path: &Path, files: &[&str], output_dir: &Path) -> 
 
     match archive_type {
         ArchiveType::Zip => extract_zip_files(archive_path, files, output_dir)
-            .or_else(|_| extract_files_7z_binary(archive_path, files, output_dir)),
-        // Match Wabbajack behavior: use external 7z process for 7z extraction.
-        ArchiveType::SevenZ => extract_files_7z_binary(archive_path, files, output_dir),
-
+            .or_else(|_| extract_files_7z_binary_threaded(archive_path, files, output_dir, threads)),
+        ArchiveType::SevenZ => extract_files_7z_binary_threaded(archive_path, files, output_dir, threads),
         ArchiveType::Rar => extract_rar_files(archive_path, files, output_dir)
-            .or_else(|_| extract_files_7z_binary(archive_path, files, output_dir)),
-        _ => extract_files_7z_binary(archive_path, files, output_dir),
+            .or_else(|_| extract_files_7z_binary_threaded(archive_path, files, output_dir, threads)),
+        _ => extract_files_7z_binary_threaded(archive_path, files, output_dir, threads),
     }
 }
 
@@ -360,9 +376,8 @@ pub fn extract_all(archive_path: &Path, output_dir: &Path) -> Result<usize> {
 ///
 /// # Arguments
 /// * `threads` - Number of threads:
-///   - `None` or `Some(0)` = auto (all available cores)
-///   - `Some(1)` = single-threaded
-///   - `Some(n)` = use n threads
+///   - `None` = use smart thread budget (recommended)
+///   - `Some(n)` = use exactly n threads
 pub fn extract_all_with_threads(
     archive_path: &Path,
     output_dir: &Path,
@@ -370,22 +385,170 @@ pub fn extract_all_with_threads(
 ) -> Result<usize> {
     let archive_type = detect_archive_type(archive_path).unwrap_or(ArchiveType::Unknown);
 
+    // Use thread budget for 7z when no explicit thread count given
+    let effective_threads = threads.or_else(|| {
+        if matches!(archive_type, ArchiveType::SevenZ) {
+            Some(crate::installer::thread_budget::threads_per_7z())
+        } else {
+            None
+        }
+    });
+
     match archive_type {
         ArchiveType::Zip => extract_zip_all(archive_path, output_dir)
             .or_else(|e| {
                 tracing::warn!("Native ZIP extraction failed, falling back to 7z binary: {}", e);
-                extract_all_7z_binary(archive_path, output_dir, threads)
+                extract_all_7z_binary(archive_path, output_dir, effective_threads)
             }),
-        // Match Wabbajack behavior: use external 7z process for 7z extraction.
-        ArchiveType::SevenZ => extract_all_7z_binary(archive_path, output_dir, threads),
+        // 7z: external binary with multi-threading is fastest
+        ArchiveType::SevenZ => extract_all_7z_binary(archive_path, output_dir, effective_threads),
 
         ArchiveType::Rar => extract_rar_all(archive_path, output_dir)
             .or_else(|e| {
                 tracing::warn!("Native RAR extraction failed, falling back to 7z binary: {}", e);
-                extract_all_7z_binary(archive_path, output_dir, threads)
+                extract_all_7z_binary(archive_path, output_dir, effective_threads)
             }),
-        _ => extract_all_7z_binary(archive_path, output_dir, threads),
+        _ => extract_all_7z_binary(archive_path, output_dir, effective_threads),
     }
+}
+
+/// Extract files from an archive via callback, avoiding temp dir staging.
+///
+/// For each file in the `wanted` set (normalized, case-insensitive), calls
+/// `callback(original_archive_path, file_data)`. The callback decides where
+/// to write the data. Returns the number of files extracted.
+///
+/// Supports ZIP and RAR natively. 7z archives fall back to `None` (caller
+/// should use temp dir extraction instead).
+pub fn extract_files_callback<F>(
+    archive_path: &Path,
+    wanted: &std::collections::HashSet<String>,
+    callback: F,
+) -> Result<Option<usize>>
+where
+    F: Fn(&str, Vec<u8>) -> Result<()> + Send + Sync,
+{
+    if wanted.is_empty() {
+        return Ok(Some(0));
+    }
+
+    let archive_type = detect_archive_type(archive_path).unwrap_or(ArchiveType::Unknown);
+
+    match archive_type {
+        ArchiveType::Zip => extract_zip_callback(archive_path, wanted, &callback).map(Some),
+        ArchiveType::Rar => {
+            match extract_rar_callback(archive_path, wanted, &callback) {
+                Ok(n) => Ok(Some(n)),
+                Err(e) => {
+                    let msg = format!("{:?}", e);
+                    if msg.contains("reference record") {
+                        // RAR5 reference records — can't do callback, caller falls back
+                        tracing::warn!("RAR5 reference record, callback extraction unavailable");
+                        Ok(None)
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
+        }
+        // 7z: external binary is 8x faster than native Rust LZMA decompression.
+        // Native callback available as fallback if no 7z binary installed.
+        ArchiveType::SevenZ => Ok(None),
+        _ => Ok(None),
+    }
+}
+
+/// ZIP callback extraction: decompress matching entries sequentially.
+///
+/// Phase 1: scan central directory to identify matching entries.
+/// Phase 2: decompress each match and call the callback with (name, data).
+/// Sequential because ZIP is I/O-bound and the pipeline already parallelizes
+/// across archives — per-archive parallelism would starve the rayon pool.
+fn extract_zip_callback<F>(
+    archive_path: &Path,
+    wanted: &std::collections::HashSet<String>,
+    callback: &F,
+) -> Result<usize>
+where
+    F: Fn(&str, Vec<u8>) -> Result<()> + Send + Sync,
+{
+
+    let file = File::open(archive_path)?;
+    let reader = BufReader::new(file);
+    let mut archive = zip::ZipArchive::new(reader)?;
+
+    // Phase 1: identify matching entries (sequential — reads central directory only)
+    let mut matching: Vec<(usize, String)> = Vec::new();
+    for i in 0..archive.len() {
+        let entry = archive.by_index_raw(i)?;
+        let normalized = normalize_path(entry.name());
+        if wanted.contains(&normalized) && !entry.is_dir() {
+            matching.push((i, entry.name().to_string()));
+        }
+    }
+
+    if matching.is_empty() {
+        return Ok(0);
+    }
+
+    // ZIP decompression is I/O bound — parallel extraction adds file handle
+    // overhead that hurts more than it helps. The pipeline already runs multiple
+    // archives concurrently via rayon, so per-archive parallelism would steal
+    // worker threads and starve other archives.
+    let mut count = 0usize;
+    for (idx, name) in &matching {
+        let mut entry = archive.by_index(*idx)?;
+        let mut data = Vec::with_capacity(entry.size() as usize);
+        std::io::Read::read_to_end(&mut entry, &mut data)?;
+        callback(name, data)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// RAR callback extraction: iterate entries, read matching ones to memory, call callback.
+fn extract_rar_callback<F>(
+    archive_path: &Path,
+    wanted: &std::collections::HashSet<String>,
+    callback: &F,
+) -> Result<usize>
+where
+    F: Fn(&str, Vec<u8>) -> Result<()>,
+{
+    let mut archive = unrar::Archive::new(archive_path)
+        .open_for_processing()
+        .map_err(|e| anyhow::anyhow!("Failed to open RAR for callback: {:?}", e))?;
+
+    let mut count = 0usize;
+
+    while let Some(header) = archive
+        .read_header()
+        .map_err(|e| anyhow::anyhow!("RAR read_header error: {:?}", e))?
+    {
+        let original_name = header.entry().filename.to_string_lossy().to_string();
+        let entry_path = normalize_path(&original_name);
+
+        if header.entry().is_file() && wanted.contains(&entry_path) {
+            let (data, next) = header
+                .read()
+                .map_err(|e| {
+                    if e.code == unrar::error::Code::EReference {
+                        anyhow::anyhow!("RAR5 reference record - callback unavailable")
+                    } else {
+                        anyhow::anyhow!("RAR read error: {:?}", e)
+                    }
+                })?;
+            callback(&original_name, data)?;
+            count += 1;
+            archive = next;
+        } else {
+            archive = header
+                .skip()
+                .map_err(|e| anyhow::anyhow!("RAR skip error: {:?}", e))?;
+        }
+    }
+
+    Ok(count)
 }
 
 /// Get the path to the 7z binary (used as fallback for RAR).
@@ -462,6 +625,11 @@ fn normalize_path(path: &str) -> String {
         .replace('\\', "/")
         .trim_matches('/')
         .to_string()
+}
+
+/// Public wrapper for normalize_path (used by callback extraction callers).
+pub fn normalize_path_pub(path: &str) -> String {
+    normalize_path(path)
 }
 
 /// Build a case-insensitive lookup map from archive entries.
@@ -629,6 +797,33 @@ fn list_7z_native(archive_path: &Path) -> Result<Vec<ArchiveEntry>> {
         });
     }
     Ok(entries)
+}
+
+/// Check if a 7z archive uses heavy compression (LZMA/LZMA2/PPMD/BZip2)
+/// that benefits from multiple threads, vs lightweight methods (Copy/Deflate/LZ4/Zstd)
+/// that are fast single-threaded.
+///
+/// Returns `true` if any block uses a CPU-heavy codec.
+pub fn is_heavy_compression(archive_path: &Path) -> bool {
+    let archive = match sevenz_rust2::Archive::open(archive_path) {
+        Ok(a) => a,
+        Err(_) => return true, // assume heavy if we can't read
+    };
+
+    for block in &archive.blocks {
+        for coder in &block.coders {
+            let id = coder.encoder_method_id();
+            if id == sevenz_rust2::EncoderMethod::ID_LZMA
+                || id == sevenz_rust2::EncoderMethod::ID_LZMA2
+                || id == sevenz_rust2::EncoderMethod::ID_PPMD
+                || id == sevenz_rust2::EncoderMethod::ID_BZIP2
+            {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 // ============================================================================
@@ -853,8 +1048,13 @@ fn extract_file_7z_binary(archive_path: &Path, file_path: &str) -> Result<Vec<u8
     Ok(output.stdout)
 }
 
-/// Extract specific files using 7z binary.
-fn extract_files_7z_binary(archive_path: &Path, files: &[&str], output_dir: &Path) -> Result<()> {
+/// Extract specific files using 7z binary with controlled thread count.
+fn extract_files_7z_binary_threaded(
+    archive_path: &Path,
+    files: &[&str],
+    output_dir: &Path,
+    threads: Option<usize>,
+) -> Result<()> {
     if files.is_empty() {
         return Ok(());
     }
@@ -862,12 +1062,17 @@ fn extract_files_7z_binary(archive_path: &Path, files: &[&str], output_dir: &Pat
     let sz_path = get_7z_path()?;
     fs::create_dir_all(output_dir)?;
 
+    let mmt_arg = match threads {
+        Some(n) if n >= 1 => format!("-mmt={}", n.max(2)),
+        _ => "-mmt=2".to_string(),
+    };
+
     let mut cmd = Command::new(&sz_path);
     cmd.arg("x")
         .arg("-y")
         .arg("-aoa")
         .arg("-scsUTF-8")
-        .arg("-mmt=2")
+        .arg(&mmt_arg)
         .arg(format!("-o{}", output_dir.display()))
         .arg(archive_path)
         .arg("--");
@@ -888,7 +1093,7 @@ fn extract_files_7z_binary(archive_path: &Path, files: &[&str], output_dir: &Pat
         if !reparse_paths.is_empty() {
             let mut retry = Command::new(&sz_path);
             retry.arg("x").arg("-y").arg("-aoa").arg("-scsUTF-8")
-                .arg("-mmt=2")
+                .arg(&mmt_arg)
                 .arg(format!("-o{}", output_dir.display()));
 
             for path in &reparse_paths {

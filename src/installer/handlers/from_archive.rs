@@ -97,7 +97,7 @@ pub fn handle_from_archive(ctx: &ProcessContext, directive: &FromArchiveDirectiv
         .with_context(|| format!("Archive not found for hash: {}", archive_hash))?;
 
     let output_path = ctx.resolve_output_path(&directive.to);
-    paths::ensure_parent_dirs(&output_path)?;
+    ctx.dir_cache.ensure_parent_dirs(&output_path)?;
 
     if directive.archive_hash_path.len() == 1 {
         // Single file (GameFileSource): copy directly, no memory allocation

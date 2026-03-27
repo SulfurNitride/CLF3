@@ -822,6 +822,17 @@ pub struct ArchiveInfo {
     pub url_expires: Option<i64>,
 }
 
+/// Lightweight directive summary without full JSON deserialization.
+#[derive(Debug)]
+pub struct DirectiveSummary {
+    pub id: i64,
+    pub directive_type: String,
+    pub to_path: String,
+    pub hash: String,
+    pub size: u64,
+    pub archive_hash: Option<String>,
+}
+
 /// Statistics for directives
 #[derive(Debug, Default)]
 pub struct DirectiveStats {
@@ -989,7 +1000,67 @@ impl ModlistDb {
         Ok(results)
     }
 
+    /// Get all directives targeting a BSA staging directory.
+    ///
+    /// Returns `(to_path, hash, size)` for all directives whose `to_path`
+    /// starts with `TEMP_BSA_FILES/{temp_id}/` (either slash direction).
+    pub fn get_directives_for_bsa_staging(
+        &self,
+        temp_id: &str,
+    ) -> Result<Vec<(String, String, u64)>> {
+        let prefix_fwd = format!("TEMP_BSA_FILES/{}/", temp_id);
+        let prefix_bk = format!("TEMP_BSA_FILES\\{}\\", temp_id);
+        let like_fwd = format!("{}%", prefix_fwd);
+        let like_bk = format!("{}%", prefix_bk);
+
+        let mut stmt = self.conn.prepare(
+            "SELECT to_path, hash, size FROM directives
+             WHERE to_path LIKE ?1 OR to_path LIKE ?2",
+        )?;
+
+        let rows = stmt.query_map(rusqlite::params![like_fwd, like_bk], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u64,
+            ))
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
     /// Get archives by their hashes
+    /// Lightweight summary of all directives without deserializing data_json.
+    ///
+    /// Returns `(id, directive_type, to_path, hash, size, archive_hash)` for every directive.
+    /// Used by pre-validation to quickly classify directives as valid/needs-work.
+    pub fn get_all_directives_summary(&self) -> Result<Vec<DirectiveSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, directive_type, to_path, hash, size, archive_hash FROM directives",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok(DirectiveSummary {
+                id: row.get(0)?,
+                directive_type: row.get(1)?,
+                to_path: row.get(2)?,
+                hash: row.get(3)?,
+                size: row.get::<_, i64>(4)? as u64,
+                archive_hash: row.get(5)?,
+            })
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
     pub fn get_archives_by_hashes(&self, hashes: &[String]) -> Result<Vec<ArchiveInfo>> {
         if hashes.is_empty() {
             return Ok(Vec::new());

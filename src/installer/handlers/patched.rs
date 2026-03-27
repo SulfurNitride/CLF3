@@ -10,7 +10,6 @@
 use crate::installer::processor::ProcessContext;
 use crate::modlist::PatchedFromArchiveDirective;
 use crate::octodiff::DeltaReader;
-use crate::paths;
 
 use crate::installer::handlers::from_archive::extract_from_archive_with_temp;
 
@@ -42,7 +41,7 @@ pub fn handle_patched_from_archive(
 
     // 3. Prepare output file
     let output_path = ctx.resolve_output_path(&directive.to);
-    paths::ensure_parent_dirs(&output_path)?;
+    ctx.dir_cache.ensure_parent_dirs(&output_path)?;
     let out_file = File::create(&output_path)
         .with_context(|| format!("Failed to create output file: {}", output_path.display()))?;
     let mut writer = BufWriter::new(out_file);

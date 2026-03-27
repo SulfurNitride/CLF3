@@ -261,13 +261,10 @@ pub fn process_fused_streaming(
     for (id, json) in from_archive_raw {
         match serde_json::from_str::<Directive>(&json) {
             Ok(Directive::FromArchive(d)) => {
-                // PRE-FILTER: Skip if output already exists with correct size
-                let normalized_to = paths::normalize_for_lookup(&d.to);
-                if let Some(&existing_size) = ctx.existing_files.get(&normalized_to) {
-                    if existing_size == d.size {
-                        pre_skipped += 1;
-                        continue;
-                    }
+                // PRE-FILTER: Skip if pre-validation marked as valid
+                if ctx.skip_set.contains(&id) {
+                    pre_skipped += 1;
+                    continue;
                 }
 
                 if d.archive_hash_path.len() == 1 {
@@ -310,13 +307,9 @@ pub fn process_fused_streaming(
     for (id, json) in patched_raw {
         match serde_json::from_str::<Directive>(&json) {
             Ok(Directive::PatchedFromArchive(d)) => {
-                let normalized_to = paths::normalize_for_lookup(&d.to);
-                if let Some(&existing_size) = ctx.existing_files.get(&normalized_to) {
-                    if existing_size == d.size {
-                        // counted in shared pre_skipped
-                        pre_skipped += 1;
-                        continue;
-                    }
+                if ctx.skip_set.contains(&id) {
+                    pre_skipped += 1;
+                    continue;
                 }
 
                 if let Some(hash) = d.archive_hash_path.first() {
@@ -545,13 +538,67 @@ pub fn process_fused_streaming(
     });
     let bsa_archive_workers = config.max_parallel_bsa_archives.unwrap_or(1).max(1);
 
-    // Unified extraction pool for all archive types (7z, ZIP, RAR).
-    // All archives share one pool so all worker slots stay busy.
-    let extract_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(extract_workers)
-        .thread_name(|i| format!("extract-{}", i))
+    // Classify extract archives into Complex vs Simple pools.
+    // Complex: has patched directives, nested BSA reads, DDS textures, or BSA-feeding targets.
+    // Simple: only direct FromArchive (extract → write to output, no post-processing).
+    let (complex_archives, simple_archives_unsorted): (Vec<_>, Vec<_>) = extract_archives
+        .into_iter()
+        .partition(|(hash, directives, _path, _kind)| {
+            let has_patched = directives.iter().any(|d| matches!(d, ArchiveDirective::Patched { .. }));
+            let has_nested = directives.iter().any(|d| matches!(d, ArchiveDirective::FromArchive { file_in_bsa: Some(_), .. }));
+            let has_dds = texture_depth2.contains_key(hash) || texture_depth3.contains_key(hash);
+            let feeds_bsa = directives.iter().any(|d| {
+                let to_path = match d {
+                    ArchiveDirective::FromArchive { directive, .. } => &directive.to,
+                    ArchiveDirective::Patched { directive, .. } => &directive.to,
+                };
+                to_path.contains("TEMP_BSA_FILES")
+            });
+            has_patched || has_nested || has_dds || feeds_bsa
+        });
+
+    // Sort simple archives by compressed file size for optimal scheduling:
+    // largest first gets a head start, smallest clears queue fast, rest fills gaps.
+    let simple_archives: Vec<_> = {
+        let mut with_sizes: Vec<(u64, _)> = simple_archives_unsorted
+            .into_iter()
+            .map(|a| {
+                let size = std::fs::metadata(&a.2).map(|m| m.len()).unwrap_or(0);
+                (size, a)
+            })
+            .collect();
+        // Sort ascending by size
+        with_sizes.sort_by_key(|(size, _)| *size);
+
+        if with_sizes.len() >= 2 {
+            // Pull largest (last) to front, smallest (first) second — rest follows
+            let largest = with_sizes.pop().unwrap();
+            let smallest = with_sizes.remove(0);
+            let mut sorted = Vec::with_capacity(with_sizes.len() + 2);
+            sorted.push(largest.1);
+            sorted.push(smallest.1);
+            sorted.extend(with_sizes.into_iter().map(|(_, a)| a));
+            sorted
+        } else {
+            with_sizes.into_iter().map(|(_, a)| a).collect()
+        }
+    };
+
+    // Dual-pool extraction: complex and simple each get half the cores.
+    // When one pool finishes, remaining work from the other gets a full-size pool.
+    let half_cores = (extract_workers / 2).max(2);
+
+    let complex_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(half_cores)
+        .thread_name(|i| format!("complex-{}", i))
         .build()
-        .expect("Failed to build extraction thread pool");
+        .expect("Failed to build complex extraction pool");
+
+    let simple_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(half_cores)
+        .thread_name(|i| format!("simple-{}", i))
+        .build()
+        .expect("Failed to build simple extraction pool");
 
     let bsa_archive_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(bsa_archive_workers)
@@ -559,11 +606,13 @@ pub fn process_fused_streaming(
         .build()
         .expect("Failed to build BSA archive pool");
 
-    if !extract_archives.is_empty() {
+    if !complex_archives.is_empty() || !simple_archives.is_empty() {
         reporter.log(&format!(
-            "  Extract queue: {} archives ({} concurrent workers)",
-            extract_archives.len(),
-            extract_workers
+            "  Extract queue: {} complex + {} simple archives ({} cores each, {} total)",
+            complex_archives.len(),
+            simple_archives.len(),
+            half_cores,
+            extract_workers,
         ));
     }
     if !bsa_archives.is_empty() {
@@ -590,8 +639,9 @@ pub fn process_fused_streaming(
     let listing_cache = sevenzip::ArchiveListingCache::new()
         .expect("Failed to create archive listing cache");
     {
-        let archive_paths: Vec<&Path> = extract_archives
+        let archive_paths: Vec<&Path> = complex_archives
             .iter()
+            .chain(simple_archives.iter())
             .map(|(_, _, path, _)| path.as_path())
             .collect();
         let total = archive_paths.len();
@@ -645,16 +695,19 @@ pub fn process_fused_streaming(
             None
         };
 
-        // Clone sender for BSA and extract threads; original dropped after both finish
+        // Clone sender for BSA, complex, and simple threads; original dropped after all finish
         // to signal DDS handler to stop.
         let bsa_dds_tx = dds_tx.clone();
-        let extract_dds_tx = dds_tx.clone();
-        drop(dds_tx); // Only clones remain — when both threads finish, channel closes
+        let complex_dds_tx = dds_tx.clone();
+        let simple_dds_tx = dds_tx.clone();
+        drop(dds_tx); // Only clones remain — when all threads finish, channel closes
 
         let bsa_tex_d2 = texture_depth2.clone();
         let bsa_tex_d3 = texture_depth3.clone();
-        let ext_tex_d2 = texture_depth2.clone();
-        let ext_tex_d3 = texture_depth3.clone();
+        let complex_tex_d2 = texture_depth2.clone();
+        let complex_tex_d3 = texture_depth3.clone();
+        let simple_tex_d2 = texture_depth2.clone();
+        let simple_tex_d3 = texture_depth3.clone();
 
         // BSA-direct: spawn into main rayon pool
         let bsa_handle = {
@@ -903,6 +956,7 @@ pub fn process_fused_streaming(
                         &ctx.config.output_dir,
                         logged_failures,
                         reporter,
+                        &ctx.dir_cache,
                     );
 
                     let rss_after_finalize = crate::installer::current_rss_kb().unwrap_or(0);
@@ -957,7 +1011,13 @@ pub fn process_fused_streaming(
             ));
         };
 
-        // All extract archives (7z, ZIP, RAR) in one unified pool.
+        // Dual-pool extraction with dynamic rebalancing.
+        //
+        // Complex and simple archives each start on their own half-size pool.
+        // Workers claim archives via atomic cursors (one per queue). When one
+        // pool's queue is drained, those threads create a rebalance pool that
+        // also drains the other queue's cursor — so the finishing pool's cores
+        // join the slower pool for the remainder of the work.
         let extract_handle = {
             let extracted = extracted.clone();
             let written = written.clone();
@@ -968,35 +1028,162 @@ pub fn process_fused_streaming(
             let reporter = reporter.clone();
             let failed_hashes = failed_archive_hashes.clone();
             thread_scope.spawn(move || {
-                let dds_tx = extract_dds_tx;
-                let tex_d2 = ext_tex_d2;
-                let tex_d3 = ext_tex_d3;
-                extract_pool.scope(|s| {
-                    for (archive_hash, directives, archive_path, _kind) in &extract_archives {
-                        let extracted = &extracted;
-                        let written = &written;
-                        let skipped = &skipped;
-                        let failed = &failed;
-                        let logged_failures = &logged_failures;
-                        let completed_archives = &completed_archives;
-                        let reporter = &reporter;
-                        let dds_tx = &dds_tx;
-                        let tex_d2 = &tex_d2;
-                        let tex_d3 = &tex_d3;
-                        let failed_hashes = &failed_hashes;
-                        let listing_cache = &listing_cache;
+                let complex_dds_tx = complex_dds_tx;
+                let simple_dds_tx = simple_dds_tx;
+                let complex_tex_d2 = complex_tex_d2;
+                let complex_tex_d3 = complex_tex_d3;
+                let simple_tex_d2 = simple_tex_d2;
+                let simple_tex_d3 = simple_tex_d3;
 
-                        s.spawn(move |_| {
-                            process_archive(
-                                archive_hash, directives, archive_path,
-                                extracted, written, skipped, failed,
-                                logged_failures, completed_archives,
-                                reporter, dds_tx, tex_d2, tex_d3,
-                                failed_hashes, listing_cache,
-                            );
+                // Atomic cursors: workers fetch_add to claim the next archive index.
+                // Multiple pools can drain the same cursor concurrently (rebalancing).
+                let complex_cursor = AtomicUsize::new(0);
+                let simple_cursor = AtomicUsize::new(0);
+                let complex_finished = std::sync::atomic::AtomicBool::new(false);
+                let simple_finished = std::sync::atomic::AtomicBool::new(false);
+
+                let pool_start = std::time::Instant::now();
+
+                std::thread::scope(|inner| {
+                    let complex_handle = inner.spawn(|| {
+                        // Phase 1: drain complex queue on half-size pool
+                        complex_pool.scope(|s| {
+                            for _ in 0..half_cores {
+                                s.spawn(|_| {
+                                    loop {
+                                        let idx = complex_cursor.fetch_add(1, Ordering::Relaxed);
+                                        if idx >= complex_archives.len() { break; }
+                                        let (hash, dirs, path, _) = &complex_archives[idx];
+                                        process_archive(
+                                            hash, dirs, path,
+                                            &extracted, &written, &skipped, &failed,
+                                            &logged_failures, &completed_archives,
+                                            &reporter, &complex_dds_tx,
+                                            &*complex_tex_d2, &*complex_tex_d3,
+                                            &failed_hashes, &listing_cache,
+                                        );
+                                    }
+                                });
+                            }
                         });
-                    }
+                        let elapsed = pool_start.elapsed();
+                        complex_finished.store(true, Ordering::Release);
+                        reporter.log(&format!(
+                            "  Complex pool done in {:.1}s ({} archives)",
+                            elapsed.as_secs_f64(), complex_archives.len()
+                        ));
+
+                        // Phase 2: rebalance — help simple if it still has queued work
+                        if !simple_finished.load(Ordering::Acquire) {
+                            let cur = simple_cursor.load(Ordering::Relaxed);
+                            if cur < simple_archives.len() {
+                                let remaining = simple_archives.len() - cur;
+                                reporter.log(&format!(
+                                    "  Rebalancing: +{} cores → simple (~{} remaining)",
+                                    half_cores, remaining
+                                ));
+                                let rebalance = rayon::ThreadPoolBuilder::new()
+                                    .num_threads(half_cores)
+                                    .thread_name(|i| format!("rebal-cs-{}", i))
+                                    .build()
+                                    .expect("Failed to build rebalance pool");
+                                rebalance.scope(|s| {
+                                    for _ in 0..half_cores {
+                                        s.spawn(|_| {
+                                            loop {
+                                                let idx = simple_cursor.fetch_add(1, Ordering::Relaxed);
+                                                if idx >= simple_archives.len() { break; }
+                                                let (hash, dirs, path, _) = &simple_archives[idx];
+                                                process_archive(
+                                                    hash, dirs, path,
+                                                    &extracted, &written, &skipped, &failed,
+                                                    &logged_failures, &completed_archives,
+                                                    &reporter, &complex_dds_tx,
+                                                    &*simple_tex_d2, &*simple_tex_d3,
+                                                    &failed_hashes, &listing_cache,
+                                                );
+                                            }
+                                        });
+                                    }
+                                });
+                            }
+                        }
+                    });
+
+                    let simple_handle = inner.spawn(|| {
+                        // Phase 1: drain simple queue on half-size pool
+                        simple_pool.scope(|s| {
+                            for _ in 0..half_cores {
+                                s.spawn(|_| {
+                                    loop {
+                                        let idx = simple_cursor.fetch_add(1, Ordering::Relaxed);
+                                        if idx >= simple_archives.len() { break; }
+                                        let (hash, dirs, path, _) = &simple_archives[idx];
+                                        process_archive(
+                                            hash, dirs, path,
+                                            &extracted, &written, &skipped, &failed,
+                                            &logged_failures, &completed_archives,
+                                            &reporter, &simple_dds_tx,
+                                            &*simple_tex_d2, &*simple_tex_d3,
+                                            &failed_hashes, &listing_cache,
+                                        );
+                                    }
+                                });
+                            }
+                        });
+                        let elapsed = pool_start.elapsed();
+                        simple_finished.store(true, Ordering::Release);
+                        reporter.log(&format!(
+                            "  Simple pool done in {:.1}s ({} archives)",
+                            elapsed.as_secs_f64(), simple_archives.len()
+                        ));
+
+                        // Phase 2: rebalance — help complex if it still has queued work
+                        if !complex_finished.load(Ordering::Acquire) {
+                            let cur = complex_cursor.load(Ordering::Relaxed);
+                            if cur < complex_archives.len() {
+                                let remaining = complex_archives.len() - cur;
+                                reporter.log(&format!(
+                                    "  Rebalancing: +{} cores → complex (~{} remaining)",
+                                    half_cores, remaining
+                                ));
+                                let rebalance = rayon::ThreadPoolBuilder::new()
+                                    .num_threads(half_cores)
+                                    .thread_name(|i| format!("rebal-sc-{}", i))
+                                    .build()
+                                    .expect("Failed to build rebalance pool");
+                                rebalance.scope(|s| {
+                                    for _ in 0..half_cores {
+                                        s.spawn(|_| {
+                                            loop {
+                                                let idx = complex_cursor.fetch_add(1, Ordering::Relaxed);
+                                                if idx >= complex_archives.len() { break; }
+                                                let (hash, dirs, path, _) = &complex_archives[idx];
+                                                process_archive(
+                                                    hash, dirs, path,
+                                                    &extracted, &written, &skipped, &failed,
+                                                    &logged_failures, &completed_archives,
+                                                    &reporter, &simple_dds_tx,
+                                                    &*complex_tex_d2, &*complex_tex_d3,
+                                                    &failed_hashes, &listing_cache,
+                                                );
+                                            }
+                                        });
+                                    }
+                                });
+                            }
+                        }
+                    });
+
+                    // inner scope blocks until both handles finish
+                    let _ = (complex_handle, simple_handle);
                 });
+
+                let total_elapsed = pool_start.elapsed();
+                reporter.log(&format!(
+                    "  Dual-pool extraction completed in {:.1}s",
+                    total_elapsed.as_secs_f64()
+                ));
             })
         };
 
@@ -1131,7 +1318,6 @@ pub(crate) fn process_single_archive_fused(
 ) -> Result<ArchiveResult> {
     const MAX_LOGGED_FAILURES: usize = 100;
 
-    let temp_dir = tempfile::tempdir_in(&ctx.config.output_dir)?;
     let output_dir = &ctx.config.output_dir;
 
     // Separate directive types
@@ -1164,6 +1350,43 @@ pub(crate) fn process_single_archive_fused(
             }
         }
     }
+
+    // === Direct extraction path: no patches, no nested BSAs ===
+    // Try callback-based extraction that writes directly to output paths.
+    let can_direct = patched_directives.is_empty() && from_nested.is_empty();
+    if can_direct && !from_simple.is_empty() {
+        match process_archive_direct(
+            archive_path,
+            _archive_hash,
+            &from_simple,
+            ctx,
+            extra_needed_paths,
+        ) {
+            Ok(Some(direct_result)) => {
+                // Success — return with empty staged_files (no finalize needed)
+                let temp_dir = tempfile::tempdir_in(output_dir)?;
+                return Ok(ArchiveResult {
+                    staged_files: Vec::new(),
+                    temp_dir,
+                    nested_temp_dirs: Vec::new(),
+                    skipped_count: direct_result.skipped_count,
+                    extracted_count: direct_result.extracted_count,
+                    patched_count: 0,
+                    failed_count: direct_result.failed_count,
+                });
+            }
+            Ok(None) => {
+                // Archive format doesn't support callback — fall through to temp dir path
+                debug!("Direct extraction unavailable for {}, using temp dir", archive_path.display());
+            }
+            Err(e) => {
+                // Callback extraction failed — fall through to temp dir path
+                warn!("Direct extraction failed for {}: {:#}, falling back to temp dir", archive_path.display(), e);
+            }
+        }
+    }
+
+    let temp_dir = tempfile::tempdir_in(output_dir)?;
 
     // Filter patched directives: check cache and existing outputs first
     let mut patched_to_process: Vec<(i64, &PatchedFromArchiveDirective, Option<&str>)> =
@@ -1765,6 +1988,7 @@ pub(crate) fn finalize_archive(
     _output_dir: &Path,
     logged_failures: &Arc<AtomicUsize>,
     _reporter: &Arc<dyn ProgressReporter>,
+    dir_cache: &crate::paths::DirCache,
 ) -> FinalizeStats {
     const MAX_LOGGED_FAILURES: usize = 100;
 
@@ -1784,7 +2008,7 @@ pub(crate) fn finalize_archive(
 
     result.staged_files.par_iter().for_each(|sf| {
         // Create output directory
-        if let Err(e) = paths::ensure_parent_dirs(&sf.output_path) {
+        if let Err(e) = dir_cache.ensure_parent_dirs(&sf.output_path) {
             let count = logged_failures.fetch_add(1, Ordering::Relaxed);
             if count < MAX_LOGGED_FAILURES {
                 error!(
@@ -2109,7 +2333,7 @@ fn process_nested_bsa_directives_staged(
                     }
 
                     let out_path = paths::join_windows_path(output_dir, &directive.to);
-                    if let Err(_e) = paths::ensure_parent_dirs(&out_path) {
+                    if let Err(_e) = ctx.dir_cache.ensure_parent_dirs(&out_path) {
                         results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!(
                             "FAIL [{}]: Cannot create parent dirs",
                             id
@@ -2264,7 +2488,7 @@ pub(crate) fn process_whole_file_directives(
         }
 
         let output_path = paths::join_windows_path(&ctx.config.output_dir, &directive.to);
-        if let Err(e) = paths::ensure_parent_dirs(&output_path) {
+        if let Err(e) = ctx.dir_cache.ensure_parent_dirs(&output_path) {
             failed.fetch_add(1, Ordering::Relaxed);
             error!("FAIL [{}]: cannot create parent dirs: {}", id, e);
             return;
@@ -2605,7 +2829,7 @@ fn process_spilled_dds_batched(jobs: Vec<SpilledDdsJob>, ctx: &ProcessContext) -
                     match result {
                         Ok(processed) => {
                             let out = paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
-                            if paths::ensure_parent_dirs(&out).is_ok()
+                            if ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
                                 && fs::write(&out, &processed.data).is_ok()
                             {
                                 // Only write sidecar for final output paths (not BSA staging dirs)
@@ -2640,7 +2864,7 @@ fn process_spilled_dds_batched(jobs: Vec<SpilledDdsJob>, ctx: &ProcessContext) -
                         fmt,
                     )?;
                     let out = paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
-                    paths::ensure_parent_dirs(&out)?;
+                    ctx.dir_cache.ensure_parent_dirs(&out)?;
                     fs::write(&out, &tex.data)?;
                     if !job.directive.to.contains("TEMP_BSA_FILES") {
                         let _ = sidecar::write_sidecar(&out, &job.directive.hash);
@@ -2819,7 +3043,7 @@ pub(crate) fn process_dds_jobs_inline(jobs: Vec<DdsJob>, ctx: &ProcessContext) -
                     Ok(processed) => {
                         let out =
                             paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
-                        if paths::ensure_parent_dirs(&out).is_ok()
+                        if ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
                             && fs::write(&out, &processed.data).is_ok()
                         {
                             ok_count.fetch_add(1, Ordering::Relaxed);
@@ -2847,7 +3071,7 @@ pub(crate) fn process_dds_jobs_inline(jobs: Vec<DdsJob>, ctx: &ProcessContext) -
                         fmt,
                     )?;
                     let out = paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
-                    paths::ensure_parent_dirs(&out)?;
+                    ctx.dir_cache.ensure_parent_dirs(&out)?;
                     fs::write(&out, &tex.data)?;
                     Ok(())
                 })();
@@ -2869,6 +3093,151 @@ pub(crate) fn process_dds_jobs_inline(jobs: Vec<DdsJob>, ctx: &ProcessContext) -
     }
 
     (ok_count.load(Ordering::Relaxed), fail_count.load(Ordering::Relaxed))
+}
+
+/// Result of direct (callback-based) extraction — no temp dir, no finalize needed.
+pub(crate) struct DirectExtractResult {
+    pub(crate) extracted_count: usize,
+    pub(crate) skipped_count: usize,
+    pub(crate) failed_count: usize,
+}
+
+/// Target info for a single directive during direct extraction.
+struct DirectiveTarget {
+    id: i64,
+    output_path: PathBuf,
+    expected_size: u64,
+    archive_hash_path: Vec<String>,
+}
+
+/// Build a lookup from normalized archive-internal path to directive targets.
+fn build_directive_lookup(
+    from_simple: &[(i64, &FromArchiveDirective, Option<&str>)],
+    output_dir: &Path,
+) -> HashMap<String, Vec<DirectiveTarget>> {
+    let mut lookup: HashMap<String, Vec<DirectiveTarget>> = HashMap::new();
+    for (id, directive, resolved) in from_simple {
+        let path_in_archive = resolved
+            .or_else(|| directive.archive_hash_path.get(1).map(|s| s.as_str()))
+            .unwrap_or("");
+        if path_in_archive.is_empty() {
+            continue;
+        }
+        let normalized = normalize_archive_lookup_path(path_in_archive);
+        let output_path = paths::join_windows_path(output_dir, &directive.to);
+        lookup.entry(normalized).or_default().push(DirectiveTarget {
+            id: *id,
+            output_path,
+            expected_size: directive.size,
+            archive_hash_path: directive.archive_hash_path.clone(),
+        });
+    }
+    lookup
+}
+
+/// Process an archive directly via callback extraction — no temp dir staging.
+///
+/// Uses `sevenzip::extract_files_callback` to decompress files one at a time,
+/// writing each directly to its final output path. No temp dir, no finalize.
+///
+/// Returns `None` if the archive format doesn't support callback extraction
+/// (caller should fall back to temp dir flow).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_archive_direct(
+    archive_path: &Path,
+    _archive_hash: &str,
+    from_simple: &[(i64, &FromArchiveDirective, Option<&str>)],
+    ctx: &ProcessContext,
+    extra_needed_paths: &[String],
+) -> Result<Option<DirectExtractResult>> {
+    let output_dir = &ctx.config.output_dir;
+    let mut skipped_count = 0usize;
+    let extracted_count = AtomicUsize::new(0);
+    let failed_count = AtomicUsize::new(0);
+
+    // Build directive lookup: normalized_archive_path -> Vec<DirectiveTarget>
+    let directive_lookup = build_directive_lookup(from_simple, output_dir);
+
+    // Pre-filter: skip directives whose output already exists with correct size
+    let mut actually_wanted = HashSet::new();
+    for (norm_path, targets) in &directive_lookup {
+        let mut all_exist = true;
+        for target in targets {
+            if let Ok(meta) = fs::metadata(&target.output_path) {
+                if meta.len() != target.expected_size {
+                    all_exist = false;
+                    break;
+                }
+            } else {
+                all_exist = false;
+                break;
+            }
+        }
+        if all_exist {
+            skipped_count += targets.len();
+        } else {
+            actually_wanted.insert(norm_path.clone());
+        }
+    }
+    // Always include extra texture paths
+    for extra in extra_needed_paths {
+        actually_wanted.insert(crate::archive::sevenzip::normalize_path_pub(extra));
+    }
+
+    if actually_wanted.is_empty() {
+        return Ok(Some(DirectExtractResult {
+            extracted_count: 0,
+            skipped_count,
+            failed_count: 0,
+        }));
+    }
+
+    // Attempt callback extraction — writes directly to output in the callback
+    let result = sevenzip::extract_files_callback(archive_path, &actually_wanted, |path, data| {
+        let normalized = normalize_archive_lookup_path(path);
+
+        if let Some(targets) = directive_lookup.get(&normalized) {
+            for target in targets.iter() {
+                // Verify size
+                if data.len() as u64 != target.expected_size {
+                    error!(
+                        "FAIL [{}]: size mismatch: expected {} got {}",
+                        target.id, target.expected_size, data.len()
+                    );
+                    failed_count.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
+                // Write directly to final output
+                ctx.dir_cache.ensure_parent_dirs(&target.output_path)?;
+                fs::write(&target.output_path, &data)?;
+                extracted_count.fetch_add(1, Ordering::Relaxed);
+
+                // Record patch basis
+                if let Some(ahash) = target.archive_hash_path.first() {
+                    let path_in_archive = target.archive_hash_path.get(1).map(|s| s.as_str());
+                    let basis_key = build_patch_basis_key(ahash, path_in_archive, None);
+                    ctx.record_patch_basis_candidate_path_dual(
+                        &basis_key,
+                        &target.archive_hash_path,
+                        &target.output_path,
+                        &target.output_path,
+                        target.expected_size,
+                    );
+                }
+            }
+        }
+        Ok(())
+    })?;
+
+    match result {
+        Some(_) => Ok(Some(DirectExtractResult {
+            extracted_count: extracted_count.load(Ordering::Relaxed),
+            skipped_count,
+            failed_count: failed_count.load(Ordering::Relaxed),
+        })),
+        None => Ok(None), // Format doesn't support callback — fall back to temp dir
+    }
 }
 
 /// Process a BSA/BA2 archive directly using batch extraction.
@@ -2949,7 +3318,7 @@ pub(crate) fn process_bsa_archive(
             }
 
             let out_path = paths::join_windows_path(output_dir, &directive.to);
-            if let Err(e) = paths::ensure_parent_dirs(&out_path) {
+            if let Err(e) = ctx.dir_cache.ensure_parent_dirs(&out_path) {
                 failed.fetch_add(1, Ordering::Relaxed);
                 error!("FAIL [{}]: cannot create dirs for {}: {}", id, out_path.display(), e);
                 continue;
@@ -3078,7 +3447,7 @@ pub(crate) fn process_bsa_patched_directives(
             }
 
             let final_output = paths::join_windows_path(output_dir, &directive.to);
-            if let Err(e) = paths::ensure_parent_dirs(&final_output) {
+            if let Err(e) = ctx.dir_cache.ensure_parent_dirs(&final_output) {
                 failed.fetch_add(1, Ordering::Relaxed);
                 tracing::error!("FAIL [{}]: cannot create dirs: {}", id, e);
                 continue;
@@ -3278,7 +3647,7 @@ pub(crate) fn process_spilled_dds_jobs(dds_jobs: Vec<SpilledDdsJob>, ctx: &Proce
                     Ok(processed) => {
                         let out =
                             paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
-                        if paths::ensure_parent_dirs(&out).is_ok()
+                        if ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
                             && fs::write(&out, &processed.data).is_ok()
                         {
                             dds_ok.fetch_add(1, Ordering::Relaxed);
@@ -3310,7 +3679,7 @@ pub(crate) fn process_spilled_dds_jobs(dds_jobs: Vec<SpilledDdsJob>, ctx: &Proce
                         fmt,
                     )?;
                     let out = paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
-                    paths::ensure_parent_dirs(&out)?;
+                    ctx.dir_cache.ensure_parent_dirs(&out)?;
                     fs::write(&out, &tex.data)?;
                     Ok(())
                 })();

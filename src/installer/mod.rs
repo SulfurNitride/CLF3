@@ -10,16 +10,19 @@
 //! 6. BSA Build     — CreateBSA directives
 //! 7. Cleanup       — extra files + BSA temp dirs
 
+pub mod bsa_reuse;
 pub mod config;
 pub mod config_cache;
 pub mod downloader;
 pub mod handlers;
 pub mod pipeline;
+pub mod prevalidation;
 pub mod processor;
 pub mod progress;
 pub mod progress_cli;
 pub mod sidecar;
 pub mod streaming;
+pub mod thread_budget;
 
 #[allow(unused_imports)] // ProgressCallback/ProgressEvent used by lib crate (GUI)
 pub use config::{InstallConfig, ProgressCallback, ProgressEvent};
@@ -47,6 +50,98 @@ pub(crate) fn current_rss_kb() -> Option<u64> {
         }
     }
     None
+}
+
+/// Memory usage stats from /proc/self/status.
+struct MemoryStats {
+    /// Current RSS in KB
+    current_rss_kb: u64,
+    /// Peak RSS (VmHWM) in KB — kernel-tracked high water mark
+    peak_rss_kb: u64,
+}
+
+fn read_memory_stats() -> Option<MemoryStats> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    let mut current = 0u64;
+    let mut peak = 0u64;
+    for line in status.lines() {
+        if line.starts_with("VmRSS:") {
+            current = line.split_whitespace().nth(1)?.parse().ok()?;
+        } else if line.starts_with("VmHWM:") {
+            peak = line.split_whitespace().nth(1)?.parse().ok()?;
+        }
+    }
+    Some(MemoryStats {
+        current_rss_kb: current,
+        peak_rss_kb: peak,
+    })
+}
+
+/// Log a post-install performance summary.
+fn log_install_summary(
+    stats: &InstallStats,
+    total_start: Instant,
+    reporter: &Arc<dyn progress::ProgressReporter>,
+) {
+    let total_secs = total_start.elapsed().as_secs_f64();
+    let total_min = total_secs / 60.0;
+
+    reporter.log("--- Performance Summary ---");
+    reporter.log(&format!("Total time: {:.1}m ({:.0}s)", total_min, total_secs));
+
+    for (phase, duration) in &stats.phase_durations {
+        if *duration >= 0.1 {
+            reporter.log(&format!("  {:<30} {:>6.1}s", phase, duration));
+        }
+    }
+
+    let total_directives = stats.directives_completed + stats.directives_skipped + stats.directives_failed;
+    if total_directives > 0 && total_secs > 0.0 {
+        reporter.log(&format!(
+            "Directives: {} completed, {} skipped, {} failed ({:.0}/s)",
+            stats.directives_completed,
+            stats.directives_skipped,
+            stats.directives_failed,
+            stats.directives_completed as f64 / total_secs,
+        ));
+    }
+
+    if stats.archives_downloaded > 0 {
+        // Find the download+extract phase duration
+        let extract_secs = stats.phase_durations.iter()
+            .find(|(name, _)| name.contains("Download") || name.contains("Pipelined"))
+            .map(|(_, d)| *d)
+            .unwrap_or(total_secs);
+        if extract_secs > 0.0 {
+            reporter.log(&format!(
+                "Archives: {} downloaded, {} skipped ({:.1} archives/min)",
+                stats.archives_downloaded,
+                stats.archives_skipped,
+                stats.archives_downloaded as f64 / (extract_secs / 60.0),
+            ));
+        }
+    }
+
+    // Memory usage
+    if let Some(mem) = read_memory_stats() {
+        let mut mem_line = format!(
+            "Memory: current {} MB, peak {} MB",
+            mem.current_rss_kb / 1024,
+            mem.peak_rss_kb / 1024,
+        );
+        // Child process peak RSS (7z binary etc.) via getrusage
+        #[cfg(target_os = "linux")]
+        {
+            let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+            if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage) } == 0 {
+                let child_peak_kb = usage.ru_maxrss as u64; // already in KB on Linux
+                if child_peak_kb > 0 {
+                    mem_line.push_str(&format!(", child peak {} MB", child_peak_kb / 1024));
+                }
+            }
+        }
+        reporter.log(&mem_line);
+    }
 }
 
 fn log_phase_metrics(phase: &str, started: Instant) {
@@ -84,6 +179,8 @@ pub struct InstallStats {
     pub failed_downloads: Vec<downloader::FailedDownloadInfo>,
     /// Details of manual downloads needed
     pub manual_downloads: Vec<downloader::ManualDownloadInfo>,
+    /// Phase durations in seconds
+    pub phase_durations: Vec<(String, f64)>,
 }
 
 /// Main installer orchestrator
@@ -243,6 +340,7 @@ impl Installer {
         &mut self,
     ) -> Result<InstallStats> {
         let mut stats = InstallStats::default();
+        let total_start = Instant::now();
 
         // === Phase 1: Game Check ===
         let game_check_start = Instant::now();
@@ -331,7 +429,32 @@ impl Installer {
         }
 
         // Create the directive processor for phases 3b-8
-        let dp = processor::DirectiveProcessor::new(&self.db, &self.config)?;
+        let mut dp = processor::DirectiveProcessor::new(&self.db, &self.config)?;
+
+        // Pre-validation: classify all directives as valid/needs-work
+        let prevalidation_result = prevalidation::run_prevalidation(
+            &self.db,
+            &dp.ctx.existing_files,
+            &self.config.output_dir,
+            &self.config.reporter,
+        )?;
+        prevalidation_result.log_summary(&self.config.reporter);
+        dp.ctx.prevalidation_stats = prevalidation_result.stats_as_tuples();
+        dp.ctx.extra_files_for_cleanup = prevalidation_result.extra_files;
+        dp.ctx.skip_set = prevalidation_result.skip_set;
+
+        // BSA partial reuse: extract unchanged files from existing BSAs
+        let reuse_stats = bsa_reuse::pre_extract_reusable_bsa_files(
+            &self.db,
+            &mut dp.ctx,
+            &self.config.reporter,
+        )?;
+        if reuse_stats.files_reused > 0 {
+            self.reporter().log(&format!(
+                "BSA reuse: {} files pre-extracted from {} existing BSAs ({} changed, need download)",
+                reuse_stats.files_reused, reuse_stats.bsas_with_reuse, reuse_stats.files_changed
+            ));
+        }
 
         // Pre-flight: check archives and index (same phase)
         dp.preflight_check()?;
@@ -345,7 +468,9 @@ impl Installer {
         self.reporter().status("Installing + patching files...");
         dp.install_phase()?;
         trim_allocator_rss("install phase");
+        let install_secs = install_start.elapsed().as_secs_f64();
         log_phase_metrics("Install+Patch", install_start);
+        stats.phase_durations.push(("Install+Patch".into(), install_secs));
 
         // Check for install failures — abort early so user can fix and retry
         let install_failures = dp.failed_count();
@@ -362,6 +487,7 @@ impl Installer {
         dp.texture_phase()?;
         trim_allocator_rss("texture phase");
         log_phase_metrics("DDS Transform", dds_start);
+        stats.phase_durations.push(("DDS Transform".into(), dds_start.elapsed().as_secs_f64()));
 
         // === Phase 6: BSA Building ===
         let bsa_start = Instant::now();
@@ -369,6 +495,7 @@ impl Installer {
         dp.bsa_phase()?;
         trim_allocator_rss("bsa build phase");
         log_phase_metrics("BSA Build", bsa_start);
+        stats.phase_durations.push(("BSA Build".into(), bsa_start.elapsed().as_secs_f64()));
 
         // === Phase 7: Cleanup ===
         let cleanup_start = Instant::now();
@@ -376,6 +503,7 @@ impl Installer {
         dp.cleanup_phase()?;
         trim_allocator_rss("cleanup phase");
         log_phase_metrics("Cleanup", cleanup_start);
+        stats.phase_durations.push(("Cleanup".into(), cleanup_start.elapsed().as_secs_f64()));
 
         let process_stats = dp.finish();
         stats.directives_completed = process_stats.completed;
@@ -391,6 +519,8 @@ impl Installer {
             self.reporter().log("Installation complete!");
         }
 
+        log_install_summary(&stats, total_start, &self.config.reporter);
+
         Ok(stats)
     }
 
@@ -401,6 +531,7 @@ impl Installer {
     /// sequentially after all extraction completes (Phase 1 MVP).
     pub async fn run_pipelined(&mut self) -> Result<InstallStats> {
         let mut stats = InstallStats::default();
+        let total_start = Instant::now();
 
         // === Phase 1: Game Check ===
         let game_check_start = Instant::now();
@@ -420,7 +551,19 @@ impl Installer {
         self.reporter().phase_start(Phase::Downloading);
 
         // Create the directive processor early (needs DB + config)
-        let dp = processor::DirectiveProcessor::new(&self.db, &self.config)?;
+        let mut dp = processor::DirectiveProcessor::new(&self.db, &self.config)?;
+
+        // Pre-validation: classify all directives as valid/needs-work
+        let prevalidation_result = prevalidation::run_prevalidation(
+            &self.db,
+            &dp.ctx.existing_files,
+            &self.config.output_dir,
+            &self.config.reporter,
+        )?;
+        prevalidation_result.log_summary(&self.config.reporter);
+        dp.ctx.prevalidation_stats = prevalidation_result.stats_as_tuples();
+        dp.ctx.extra_files_for_cleanup = prevalidation_result.extra_files;
+        dp.ctx.skip_set = prevalidation_result.skip_set;
 
         // Pre-load and group all directives by archive hash (no index needed yet)
         let grouped = pipeline::load_and_group_directives(&self.db, &dp.ctx)?;
@@ -432,6 +575,24 @@ impl Installer {
             "Grouped directives: {} FromArchive, {} Patched, {} Textures, {} whole-file ({} pre-skipped)",
             total_from, total_patched, total_textures, total_whole, grouped.pre_skipped
         ));
+        let (direct, conflict, patch) = grouped.tier_counts;
+        self.reporter().log(&format!(
+            "Extraction tiers: {} direct, {} conflict, {} patch",
+            direct, conflict, patch
+        ));
+
+        // BSA partial reuse: extract unchanged files from existing BSAs
+        let reuse_stats = bsa_reuse::pre_extract_reusable_bsa_files(
+            &self.db,
+            &mut dp.ctx,
+            &self.config.reporter,
+        )?;
+        if reuse_stats.files_reused > 0 {
+            self.reporter().log(&format!(
+                "BSA reuse: {} files pre-extracted from {} existing BSAs ({} changed, need download)",
+                reuse_stats.files_reused, reuse_stats.bsas_with_reuse, reuse_stats.files_changed
+            ));
+        }
 
         // Create channel for archive events
         let (tx, rx) = std::sync::mpsc::sync_channel::<downloader::ArchiveEvent>(32);
@@ -504,7 +665,9 @@ impl Installer {
             log_phase_metrics("Pipelined Download+Extract", pipeline_start);
             return Ok(stats);
         }
+        let pipeline_secs = pipeline_start.elapsed().as_secs_f64();
         log_phase_metrics("Pipelined Download+Extract", pipeline_start);
+        stats.phase_durations.push(("Download+Extract".into(), pipeline_secs));
 
         // === Phase 3: InlineFile + RemappedInlineFile ===
         let inline_start = Instant::now();
@@ -512,6 +675,7 @@ impl Installer {
         dp.inline_phase()?;
         trim_allocator_rss("inline files");
         log_phase_metrics("Inline Files", inline_start);
+        stats.phase_durations.push(("Inline Files".into(), inline_start.elapsed().as_secs_f64()));
 
         // === Phase 4: DDS Transformations ===
         let dds_start = Instant::now();
@@ -519,6 +683,7 @@ impl Installer {
         dp.texture_phase()?;
         trim_allocator_rss("texture phase");
         log_phase_metrics("DDS Transform", dds_start);
+        stats.phase_durations.push(("DDS Transform".into(), dds_start.elapsed().as_secs_f64()));
 
         // === Phase 5: BSA Building ===
         let bsa_start = Instant::now();
@@ -526,6 +691,7 @@ impl Installer {
         dp.bsa_phase()?;
         trim_allocator_rss("bsa build phase");
         log_phase_metrics("BSA Build", bsa_start);
+        stats.phase_durations.push(("BSA Build".into(), bsa_start.elapsed().as_secs_f64()));
 
         // === Phase 6: Cleanup ===
         let cleanup_start = Instant::now();
@@ -533,6 +699,7 @@ impl Installer {
         dp.cleanup_phase()?;
         trim_allocator_rss("cleanup phase");
         log_phase_metrics("Cleanup", cleanup_start);
+        stats.phase_durations.push(("Cleanup".into(), cleanup_start.elapsed().as_secs_f64()));
 
         let process_stats = dp.finish();
         stats.directives_completed += process_stats.completed;
@@ -547,6 +714,8 @@ impl Installer {
         } else {
             self.reporter().log("Installation complete!");
         }
+
+        log_install_summary(&stats, total_start, &self.config.reporter);
 
         Ok(stats)
     }

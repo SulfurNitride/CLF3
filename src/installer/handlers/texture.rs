@@ -5,7 +5,6 @@
 
 use crate::installer::processor::ProcessContext;
 use crate::modlist::TransformedTextureDirective;
-use crate::paths;
 use crate::textures::{process_texture_with_fallback, OutputFormat};
 
 use anyhow::{Context, Result};
@@ -158,7 +157,7 @@ pub fn handle_transformed_texture(
 
     // Write to output
     let output_path = ctx.resolve_output_path(&directive.to);
-    paths::ensure_parent_dirs(&output_path)?;
+    ctx.dir_cache.ensure_parent_dirs(&output_path)?;
 
     let mut file = File::create(&output_path)
         .with_context(|| format!("Failed to create output file: {}", output_path.display()))?;

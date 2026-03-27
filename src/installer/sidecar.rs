@@ -4,11 +4,18 @@
 //! sidecar file is written next to the output containing the directive's expected
 //! hash and the output file's actual size. On subsequent runs, if the sidecar
 //! matches the directive and the file size is correct, the work is skipped.
+//!
+//! BSA archives also get a `.clf3manifest` companion that stores per-file hashes.
+//! On update, this allows partial reuse: unchanged files are extracted from the
+//! existing BSA instead of re-downloading their source archives.
 
+use std::collections::HashMap;
 use std::fs;
+use std::io::BufRead;
 use std::path::Path;
 
 const SIDECAR_EXT: &str = "clf3hash";
+const MANIFEST_EXT: &str = "clf3manifest";
 
 /// Build the sidecar path for a given output file.
 fn sidecar_path(output_path: &Path) -> std::path::PathBuf {
@@ -77,6 +84,88 @@ pub fn remove_sidecar(output_path: &Path) {
     let _ = fs::remove_file(sidecar_path(output_path));
 }
 
+// ---------------------------------------------------------------------------
+// BSA per-file manifest
+// ---------------------------------------------------------------------------
+
+/// Build the manifest path for a given BSA output file.
+fn manifest_path(output_path: &Path) -> std::path::PathBuf {
+    let mut p = output_path.as_os_str().to_owned();
+    p.push(".");
+    p.push(MANIFEST_EXT);
+    std::path::PathBuf::from(p)
+}
+
+/// Normalize a BSA-internal path for manifest storage.
+///
+/// Converts backslashes to forward slashes and lowercases everything so that
+/// comparisons are consistent regardless of BSA vs BA2 conventions.
+pub fn normalize_manifest_path(path: &str) -> String {
+    path.replace('\\', "/").to_lowercase()
+}
+
+/// Write a per-file manifest after BSA creation.
+///
+/// Each entry is `(normalized_bsa_path, xxhash64_base64)`.
+/// Format: one `path=hash` pair per line, sorted for determinism.
+pub fn write_manifest(
+    output_path: &Path,
+    entries: &[(String, String)],
+) -> std::io::Result<()> {
+    let mp = manifest_path(output_path);
+
+    let mut sorted: Vec<_> = entries.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut content = String::with_capacity(sorted.len() * 60);
+    for (path, hash) in &sorted {
+        content.push_str(path);
+        content.push('=');
+        content.push_str(hash);
+        content.push('\n');
+    }
+
+    tracing::info!(
+        "Writing BSA manifest: {} ({} files)",
+        mp.display(),
+        sorted.len()
+    );
+    fs::write(&mp, content)
+}
+
+/// Read an existing per-file manifest.
+///
+/// Returns `None` if the manifest doesn't exist or can't be parsed.
+/// Keys are normalized paths (lowercase, forward slashes).
+pub fn read_manifest(output_path: &Path) -> Option<HashMap<String, String>> {
+    let mp = manifest_path(output_path);
+    let file = fs::File::open(&mp).ok()?;
+    let reader = std::io::BufReader::new(file);
+
+    let mut map = HashMap::new();
+    for line in reader.lines() {
+        let line = line.ok()?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((path, hash)) = line.split_once('=') {
+            map.insert(path.to_string(), hash.to_string());
+        }
+    }
+
+    if map.is_empty() {
+        None
+    } else {
+        Some(map)
+    }
+}
+
+/// Delete a stale manifest.
+pub fn remove_manifest(output_path: &Path) {
+    let _ = fs::remove_file(manifest_path(output_path));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +209,43 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("nonexistent.dds");
         assert!(!sidecar_valid(&output, "abc123"));
+    }
+
+    #[test]
+    fn test_manifest_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("test.bsa");
+
+        // No manifest yet
+        assert!(read_manifest(&output).is_none());
+
+        // Write manifest
+        let entries = vec![
+            ("textures/armor/iron.dds".to_string(), "hash1".to_string()),
+            ("meshes/armor/iron.nif".to_string(), "hash2".to_string()),
+        ];
+        write_manifest(&output, &entries).unwrap();
+
+        // Read it back
+        let manifest = read_manifest(&output).unwrap();
+        assert_eq!(manifest.len(), 2);
+        assert_eq!(manifest.get("textures/armor/iron.dds").unwrap(), "hash1");
+        assert_eq!(manifest.get("meshes/armor/iron.nif").unwrap(), "hash2");
+
+        // Remove manifest
+        remove_manifest(&output);
+        assert!(read_manifest(&output).is_none());
+    }
+
+    #[test]
+    fn test_normalize_manifest_path() {
+        assert_eq!(
+            normalize_manifest_path("Textures\\Armor\\Iron.dds"),
+            "textures/armor/iron.dds"
+        );
+        assert_eq!(
+            normalize_manifest_path("textures/armor/iron.dds"),
+            "textures/armor/iron.dds"
+        );
     }
 }

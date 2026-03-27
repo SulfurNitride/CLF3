@@ -4,9 +4,8 @@
 
 use crate::bsa::{Ba2Builder, Ba2CompressionFormat, Ba2Version, BsaBuilder};
 use crate::installer::processor::ProcessContext;
+use crate::installer::sidecar;
 use crate::modlist::{BSAState, CreateBSADirective};
-use crate::paths;
-
 use anyhow::{Context, Result};
 use ba2::tes4::{ArchiveFlags, ArchiveTypes, Version};
 use std::fs;
@@ -117,7 +116,7 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
 
     // Write the archive
     let output_path = ctx.resolve_output_path(&directive.to);
-    paths::ensure_parent_dirs(&output_path)?;
+    ctx.dir_cache.ensure_parent_dirs(&output_path)?;
 
     match archive_kind {
         ArchiveKind::Bsa {
@@ -175,11 +174,11 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
                 .with_version(version)
                 .with_compression(Ba2CompressionFormat::Zlib);
 
-            for (path, disk_path) in files {
-                let data = fs::read(&disk_path).with_context(|| {
+            for (path, disk_path) in &files {
+                let data = fs::read(disk_path).with_context(|| {
                     format!("Failed to read staged file: {}", disk_path.display())
                 })?;
-                builder.add_file(&path, data);
+                builder.add_file(path, data);
             }
 
             builder
@@ -189,8 +188,29 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
     }
 
     // Write sidecar hash cache so re-runs can skip this BSA
-    if let Err(e) = crate::installer::sidecar::write_sidecar(&output_path, &directive.hash) {
+    if let Err(e) = sidecar::write_sidecar(&output_path, &directive.hash) {
         tracing::warn!("Failed to write BSA sidecar for {}: {}", output_path.display(), e);
+    }
+
+    // Write per-file manifest for partial reuse on future updates.
+    // Files are still in staging and likely in page cache from the build.
+    let manifest_entries: Vec<(String, String)> = files
+        .iter()
+        .filter_map(|(archive_path, disk_path)| {
+            crate::hash::compute_file_hash(disk_path).ok().map(|h| {
+                (sidecar::normalize_manifest_path(archive_path), h)
+            })
+        })
+        .collect();
+
+    if !manifest_entries.is_empty() {
+        if let Err(e) = sidecar::write_manifest(&output_path, &manifest_entries) {
+            tracing::warn!(
+                "Failed to write BSA manifest for {}: {}",
+                output_path.display(),
+                e
+            );
+        }
     }
 
     // Clean up staging directory

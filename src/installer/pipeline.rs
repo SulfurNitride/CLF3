@@ -20,8 +20,6 @@ use crate::modlist::{
     CreateBSADirective, Directive, FromArchiveDirective, ModlistDb, PatchedFromArchiveDirective,
     TransformedTextureDirective,
 };
-use crate::paths;
-
 use super::downloader::ArchiveEvent;
 use super::processor::{
     build_patch_basis_key, build_patch_basis_key_from_archive_hash_path, index_single_archive,
@@ -39,7 +37,7 @@ use super::streaming::{
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -63,6 +61,234 @@ pub(crate) struct GroupedDirectives {
     pub priority: HashMap<String, u32>,
     /// Total number of unique archive hashes that have directives
     pub total_archives: usize,
+    /// Extraction tier counts: (direct, conflict, patch)
+    pub tier_counts: (usize, usize, usize),
+}
+
+/// Per-format timing bucket (thread-safe via atomics).
+struct FormatBucket {
+    bytes: AtomicU64,
+    /// Cumulative thread-time spent extracting (sum across all workers).
+    extract_ms: AtomicU64,
+    dds_ms: AtomicU64,
+    finalize_ms: AtomicU64,
+    count: AtomicUsize,
+}
+
+impl FormatBucket {
+    fn new() -> Self {
+        Self {
+            bytes: AtomicU64::new(0),
+            extract_ms: AtomicU64::new(0),
+            dds_ms: AtomicU64::new(0),
+            finalize_ms: AtomicU64::new(0),
+            count: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Per-format extraction metrics (thread-safe via atomics).
+pub(crate) struct ExtractionMetrics {
+    zip: FormatBucket,
+    sevenz: FormatBucket,
+    rar: FormatBucket,
+    bsa: FormatBucket,
+    // Tier metrics
+    direct_count: AtomicUsize,
+    direct_bytes: AtomicU64,
+    conflict_count: AtomicUsize,
+    conflict_bytes: AtomicU64,
+    patch_count: AtomicUsize,
+    patch_bytes: AtomicU64,
+    /// Wall-clock start of the extraction phase.
+    wall_start: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Wall-clock end of the extraction phase.
+    wall_end: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Number of concurrent extraction workers.
+    worker_count: AtomicUsize,
+}
+
+impl ExtractionMetrics {
+    pub fn new() -> Self {
+        Self {
+            zip: FormatBucket::new(),
+            sevenz: FormatBucket::new(),
+            rar: FormatBucket::new(),
+            bsa: FormatBucket::new(),
+            direct_count: AtomicUsize::new(0),
+            direct_bytes: AtomicU64::new(0),
+            conflict_count: AtomicUsize::new(0),
+            conflict_bytes: AtomicU64::new(0),
+            patch_count: AtomicUsize::new(0),
+            patch_bytes: AtomicU64::new(0),
+            wall_start: std::sync::Mutex::new(None),
+            wall_end: std::sync::Mutex::new(None),
+            worker_count: AtomicUsize::new(0),
+        }
+    }
+
+    /// Mark the start of extraction (call once before spawning workers).
+    pub fn start_wall_clock(&self, workers: usize) {
+        *self.wall_start.lock().expect("wall_start lock") = Some(std::time::Instant::now());
+        self.worker_count.store(workers, Ordering::Relaxed);
+    }
+
+    /// Mark the end of extraction (call once after all workers finish).
+    pub fn stop_wall_clock(&self) {
+        *self.wall_end.lock().expect("wall_end lock") = Some(std::time::Instant::now());
+    }
+
+    /// Record which extraction tier was used for an archive.
+    /// `tier`: 0 = direct, 1 = conflict (staged), 2 = patch (staged)
+    pub fn record_tier(&self, tier: u8, bytes: u64) {
+        match tier {
+            0 => {
+                self.direct_count.fetch_add(1, Ordering::Relaxed);
+                self.direct_bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
+            1 => {
+                self.conflict_count.fetch_add(1, Ordering::Relaxed);
+                self.conflict_bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
+            _ => {
+                self.patch_count.fetch_add(1, Ordering::Relaxed);
+                self.patch_bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn bucket(&self, archive_type: &NestedArchiveType) -> &FormatBucket {
+        match archive_type {
+            NestedArchiveType::Zip => &self.zip,
+            NestedArchiveType::SevenZ | NestedArchiveType::Unknown => &self.sevenz,
+            NestedArchiveType::Rar => &self.rar,
+            NestedArchiveType::Bsa | NestedArchiveType::Ba2 | NestedArchiveType::Tes3Bsa => &self.bsa,
+        }
+    }
+
+    pub fn record(
+        &self,
+        archive_type: &NestedArchiveType,
+        bytes: u64,
+        extract_ms: u64,
+        dds_ms: u64,
+        finalize_ms: u64,
+    ) {
+        let b = self.bucket(archive_type);
+        b.bytes.fetch_add(bytes, Ordering::Relaxed);
+        b.extract_ms.fetch_add(extract_ms, Ordering::Relaxed);
+        b.dds_ms.fetch_add(dds_ms, Ordering::Relaxed);
+        b.finalize_ms.fetch_add(finalize_ms, Ordering::Relaxed);
+        b.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Log per-format throughput summary.
+    pub fn log_summary(&self, reporter: &Arc<dyn super::progress::ProgressReporter>) {
+        let formats: &[(&str, &FormatBucket)] = &[
+            ("ZIP", &self.zip),
+            ("7z", &self.sevenz),
+            ("RAR", &self.rar),
+            ("BSA/BA2", &self.bsa),
+        ];
+
+        // Wall-clock duration and worker count
+        let wall_secs = match (
+            *self.wall_start.lock().expect("lock"),
+            *self.wall_end.lock().expect("lock"),
+        ) {
+            (Some(start), Some(end)) => Some(end.duration_since(start).as_secs_f64()),
+            _ => None,
+        };
+        let workers = self.worker_count.load(Ordering::Relaxed).max(1);
+
+        // Total bytes across all formats for overall rate
+        let total_bytes: u64 = formats.iter().map(|(_, b)| b.bytes.load(Ordering::Relaxed)).sum();
+        let total_mb = total_bytes as f64 / (1024.0 * 1024.0);
+
+        let mut has_data = false;
+        for (name, bucket) in formats {
+            let c = bucket.count.load(Ordering::Relaxed);
+            if c == 0 {
+                continue;
+            }
+            if !has_data {
+                // Header with wall-clock info
+                if let Some(ws) = wall_secs {
+                    reporter.log(&format!(
+                        "Extraction: {:.1} GB in {:.0}s ({:.0} MB/s effective, {} workers)",
+                        total_mb / 1024.0, ws,
+                        total_mb / ws,
+                        workers,
+                    ));
+                } else {
+                    reporter.log("Extraction throughput:");
+                }
+                has_data = true;
+            }
+
+            let bytes = bucket.bytes.load(Ordering::Relaxed);
+            let ext_ms = bucket.extract_ms.load(Ordering::Relaxed);
+            let dds_ms = bucket.dds_ms.load(Ordering::Relaxed);
+            let fin_ms = bucket.finalize_ms.load(Ordering::Relaxed);
+            let mb = bytes as f64 / (1024.0 * 1024.0);
+
+            let ext_s = ext_ms as f64 / 1000.0;
+            let dds_s = dds_ms as f64 / 1000.0;
+            let fin_s = fin_ms as f64 / 1000.0;
+
+            // Show per-thread rate and effective rate (cumulative / workers)
+            let per_thread_rate = if ext_s > 0.0 { mb / ext_s } else { 0.0 };
+            let effective_s = ext_s / workers as f64;
+            let effective_rate = if effective_s > 0.0 { mb / effective_s } else { 0.0 };
+
+            let mut parts = vec![format!(
+                "  {:<8} {} archives, {:.1} MB — {:.0}s cpu-time ({:.0} MB/s/thread, ~{:.0} MB/s effective)",
+                format!("{}:", name), c, mb, ext_s, per_thread_rate, effective_rate,
+            )];
+            if dds_ms > 0 {
+                parts.push(format!(", dds: {:.1}s", dds_s));
+            }
+            if fin_ms > 0 {
+                let fin_rate = if fin_s > 0.0 { format!("{:.0} MB/s", mb / fin_s) } else { "-".into() };
+                parts.push(format!(", finalize: {:.1}s ({})", fin_s, fin_rate));
+            }
+            reporter.log(&parts.join(""));
+        }
+
+        // Bottleneck analysis
+        if let Some(ws) = wall_secs {
+            let total_cpu_s: f64 = formats.iter()
+                .map(|(_, b)| b.extract_ms.load(Ordering::Relaxed) as f64 / 1000.0)
+                .sum();
+            let total_fin_s: f64 = formats.iter()
+                .map(|(_, b)| b.finalize_ms.load(Ordering::Relaxed) as f64 / 1000.0)
+                .sum();
+            let total_dds_s: f64 = formats.iter()
+                .map(|(_, b)| b.dds_ms.load(Ordering::Relaxed) as f64 / 1000.0)
+                .sum();
+            let available_s = ws * workers as f64;
+            let utilization = if available_s > 0.0 { total_cpu_s / available_s * 100.0 } else { 0.0 };
+            reporter.log(&format!(
+                "  Bottleneck: decompression ({:.0}% CPU utilization, {:.0}s decompress + {:.0}s finalize + {:.0}s dds of {:.0}s available)",
+                utilization, total_cpu_s, total_fin_s, total_dds_s, available_s,
+            ));
+        }
+
+        // Tier breakdown
+        let dc = self.direct_count.load(Ordering::Relaxed);
+        let cc = self.conflict_count.load(Ordering::Relaxed);
+        let pc = self.patch_count.load(Ordering::Relaxed);
+        let total = dc + cc + pc;
+        if total > 0 {
+            let db = self.direct_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
+            let cb = self.conflict_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
+            let pb = self.patch_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
+            reporter.log(&format!(
+                "Extraction tiers: {} direct ({:.0} MB), {} conflict ({:.0} MB), {} patch ({:.0} MB)",
+                dc, db, cc, cb, pc, pb,
+            ));
+        }
+    }
 }
 
 /// Load and group all directives by source archive hash.
@@ -83,13 +309,10 @@ pub(crate) fn load_and_group_directives(
     let from_archive_raw = db.get_all_pending_directives_of_type("FromArchive")?;
     for (id, json) in from_archive_raw {
         if let Ok(Directive::FromArchive(d)) = serde_json::from_str::<Directive>(&json) {
-            // Pre-filter: skip if output already exists with correct size
-            let normalized_to = paths::normalize_for_lookup(&d.to);
-            if let Some(&existing_size) = ctx.existing_files.get(&normalized_to) {
-                if existing_size == d.size {
-                    pre_skipped += 1;
-                    continue;
-                }
+            // Pre-filter: skip if pre-validation marked as valid
+            if ctx.skip_set.contains(&id) {
+                pre_skipped += 1;
+                continue;
             }
 
             if d.archive_hash_path.len() == 1 {
@@ -107,12 +330,9 @@ pub(crate) fn load_and_group_directives(
     let patched_raw = db.get_all_pending_directives_of_type("PatchedFromArchive")?;
     for (id, json) in patched_raw {
         if let Ok(Directive::PatchedFromArchive(d)) = serde_json::from_str::<Directive>(&json) {
-            let normalized_to = paths::normalize_for_lookup(&d.to);
-            if let Some(&existing_size) = ctx.existing_files.get(&normalized_to) {
-                if existing_size == d.size {
-                    pre_skipped += 1;
-                    continue;
-                }
+            if ctx.skip_set.contains(&id) {
+                pre_skipped += 1;
+                continue;
             }
 
             if let Some(hash) = d.archive_hash_path.first() {
@@ -128,8 +348,8 @@ pub(crate) fn load_and_group_directives(
     let texture_raw = db.get_all_pending_directives_of_type("TransformedTexture")?;
     for (id, json) in texture_raw {
         if let Ok(Directive::TransformedTexture(d)) = serde_json::from_str::<Directive>(&json) {
-            let output_path = paths::join_windows_path(&ctx.config.output_dir, &d.to);
-            if output_path.exists() {
+            if ctx.skip_set.contains(&id) {
+                pre_skipped += 1;
                 continue;
             }
             if let Some(hash) = d.archive_hash_path.first() {
@@ -197,6 +417,27 @@ pub(crate) fn load_and_group_directives(
 
     let total_archives = all_hashes.len();
 
+    // Compute tier counts:
+    // - Direct: no patches, no nested BSA reads — callback extraction to output
+    // - Conflict: no patches, but has nested BSA reads — needs temp dir
+    // - Patch: has PatchedFromArchive — needs temp dir for basis files
+    let mut tier_direct = 0usize;
+    let mut tier_conflict = 0usize;
+    let mut tier_patch = 0usize;
+    for hash in &all_hashes {
+        let has_patched = patched.contains_key(*hash);
+        let has_nested = from_archive.get(*hash).map_or(false, |ds| {
+            ds.iter().any(|(_, d)| d.archive_hash_path.len() >= 3)
+        });
+        if has_patched {
+            tier_patch += 1;
+        } else if has_nested {
+            tier_conflict += 1;
+        } else {
+            tier_direct += 1;
+        }
+    }
+
     Ok(GroupedDirectives {
         from_archive,
         patched,
@@ -205,11 +446,12 @@ pub(crate) fn load_and_group_directives(
         pre_skipped,
         priority,
         total_archives,
+        tier_counts: (tier_direct, tier_conflict, tier_patch),
     })
 }
 
 /// Extract BSA temp_id from a directive `to` path like `TEMP_BSA_FILES\{uuid}\path\file`.
-fn extract_bsa_temp_id(to_path: &str) -> Option<Uuid> {
+pub(crate) fn extract_bsa_temp_id(to_path: &str) -> Option<Uuid> {
     let normalized = to_path.replace('\\', "/");
     let parts: Vec<&str> = normalized.split('/').collect();
     if parts.len() >= 2 && parts[0] == "TEMP_BSA_FILES" {
@@ -571,8 +813,10 @@ fn extract_prepared_archive(
     dds_status: &Mutex<Option<Arc<dyn super::progress::ProgressHandle>>>,
     dds_counter: &AtomicUsize,
     total_textures: usize,
+    metrics: &ExtractionMetrics,
 ) {
     const MAX_LOGGED_FAILURES: usize = 100;
+    let extract_start = std::time::Instant::now();
 
     let archive_name_for_progress = prepared.archive_name.clone();
     let rss_before = crate::installer::current_rss_kb().unwrap_or(0);
@@ -678,8 +922,15 @@ fn extract_prepared_archive(
         written.fetch_add(arc_written.load(Ordering::Relaxed), Ordering::Relaxed);
         skipped.fetch_add(arc_skipped.load(Ordering::Relaxed), Ordering::Relaxed);
         failed.fetch_add(arc_failed.load(Ordering::Relaxed), Ordering::Relaxed);
+
+        // BSA reads don't have separate finalization — record all time as extraction
+        let archive_bytes = std::fs::metadata(&prepared.archive_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        metrics.record(&archive_type, archive_bytes, extract_start.elapsed().as_millis() as u64, 0, 0);
     } else {
         // Extract via 7z/ZIP/RAR, then finalize
+        let phase_extract_start = std::time::Instant::now();
         let result = process_single_archive_fused(
             &prepared.archive_path,
             &prepared.archive_hash,
@@ -689,6 +940,7 @@ fn extract_prepared_archive(
             &prepared.extra_paths,
             None, // pipeline path doesn't use listing cache yet
         );
+        let extract_elapsed = phase_extract_start.elapsed();
 
         match result {
             Ok(archive_result) => {
@@ -707,6 +959,7 @@ fn extract_prepared_archive(
 
                 // Process textures one at a time before finalization
                 // (temp dir still exists, so we can read source files)
+                let phase_dds_start = std::time::Instant::now();
                 if !prepared.tex_d2.is_empty() {
                     let (ok, fail) = process_textures_from_temp_streaming(
                         archive_result.temp_dir.path(), &prepared.tex_d2, ctx,
@@ -729,9 +982,11 @@ fn extract_prepared_archive(
                         s.set_count(done, total_textures);
                     }
                 }
+                let dds_elapsed = phase_dds_start.elapsed();
 
+                let phase_fin_start = std::time::Instant::now();
                 let fin_stats =
-                    finalize_archive(archive_result, &ctx.config.output_dir, logged_failures, reporter);
+                    finalize_archive(archive_result, &ctx.config.output_dir, logged_failures, reporter, &ctx.dir_cache);
                 written.fetch_add(fin_stats.written, Ordering::Relaxed);
                 skipped.fetch_add(fin_stats.skipped, Ordering::Relaxed);
                 if fin_stats.failed > 0 {
@@ -741,6 +996,26 @@ fn extract_prepared_archive(
                     );
                 }
                 failed.fetch_add(fin_stats.failed, Ordering::Relaxed);
+                let fin_elapsed = phase_fin_start.elapsed();
+
+                // Record per-phase metrics
+                let archive_bytes = std::fs::metadata(&prepared.archive_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let is_direct = fin_stats.written == 0 && fin_stats.failed == 0
+                    && fin_stats.skipped == 0;
+                metrics.record(
+                    &archive_type,
+                    archive_bytes,
+                    extract_elapsed.as_millis() as u64,
+                    dds_elapsed.as_millis() as u64,
+                    if is_direct { 0 } else { fin_elapsed.as_millis() as u64 },
+                );
+                // Determine tier based on directive types (not finalize outcome)
+                let has_patched = prepared.resolved.iter().any(|d| matches!(d, super::streaming::ArchiveDirective::Patched { .. }));
+                let has_nested = prepared.resolved.iter().any(|d| matches!(d, super::streaming::ArchiveDirective::FromArchive { file_in_bsa: Some(_), .. }));
+                let tier = if has_patched { 2u8 } else if has_nested { 1 } else { 0 };
+                metrics.record_tier(tier, archive_bytes);
             }
             Err(e) => {
                 let count = logged_failures.fetch_add(1, Ordering::Relaxed);
@@ -790,6 +1065,7 @@ pub(crate) fn run_processing_loop(
     let skipped = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
     let logged_failures = Arc::new(AtomicUsize::new(0));
+    let extraction_metrics = Arc::new(ExtractionMetrics::new());
 
     // Pre-compute counts for status counters (created later, after download scan)
     let total_archives: usize = grouped.from_archive.len()
@@ -856,9 +1132,13 @@ pub(crate) fn run_processing_loop(
             .map(|n| n.get().max(2))
             .unwrap_or(4)
     });
+
     // Concurrency limiter for parallel archive extraction.
     // Limits how many archives are being extracted simultaneously.
     let max_concurrent = extract_workers.max(2);
+
+    // Initialize the global thread budget for 7z processes
+    super::thread_budget::init(extract_workers, max_concurrent);
     let active_count = std::sync::Mutex::new(0usize);
     let active_cvar = std::sync::Condvar::new();
 
@@ -874,6 +1154,8 @@ pub(crate) fn run_processing_loop(
     let bsa_status: Mutex<Option<Arc<dyn super::progress::ProgressHandle>>> = Mutex::new(None);
     let bsa_built = AtomicUsize::new(0);
     let status_bars_created = AtomicBool::new(false);
+
+    extraction_metrics.start_wall_clock(max_concurrent);
 
     std::thread::scope(|thread_scope| {
         let mut archives_processed = 0usize;
@@ -940,6 +1222,10 @@ pub(crate) fn run_processing_loop(
             }
         };
 
+        // Update progress bar for extraction phase
+        reporter.overall_set_total(total_archives as u64);
+        reporter.overall_set_message("Extracting archives...");
+
         // Main processing loop: receive archive events, prepare (DB work) on this thread,
         // then spawn extraction threads in parallel.
         while let Ok(event) = rx.recv() {
@@ -999,6 +1285,7 @@ pub(crate) fn run_processing_loop(
                         let done_tx = done_tx.clone();
                         let hash_done = hash.clone();
 
+                        let metrics = extraction_metrics.clone();
                         thread_scope.spawn(move || {
                             extract_prepared_archive(
                                 prepared,
@@ -1015,6 +1302,7 @@ pub(crate) fn run_processing_loop(
                                 dds_status,
                                 dds_counter,
                                 texture_count,
+                                &metrics,
                             );
 
                             // Signal completion for BSA readiness tracking
@@ -1028,6 +1316,11 @@ pub(crate) fn run_processing_loop(
                     }
 
                     archives_processed += 1;
+                    reporter.overall_set_message(&format!(
+                        "Extracting {} ({}/{})",
+                        name, archives_processed, total_archives,
+                    ));
+                    reporter.overall_inc();
                 }
                 ArchiveEvent::Failed { hash, name, error } => {
                     warn!("Archive download failed: {} ({}): {}", name, hash, error);
@@ -1096,10 +1389,14 @@ pub(crate) fn run_processing_loop(
         }
     });
 
+    extraction_metrics.stop_wall_clock();
+
     // Finish status counters
     if let Some(ref s) = *extract_status.lock().expect("lock") { s.finish(); }
     if let Some(ref s) = *bsa_status.lock().expect("lock") { s.finish(); }
     if let Some(ref s) = *dds_status.lock().expect("lock") { s.finish(); }
+
+    extraction_metrics.log_summary(reporter);
 
     Ok(StreamingStats {
         extracted: extracted.load(Ordering::Relaxed),

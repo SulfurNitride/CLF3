@@ -34,7 +34,7 @@ thiserror = "2.0"
 # sevenz-rust2: native 7z extraction (pure Rust, multi-threaded LZMA2)
 # unrar: native RAR extraction (FFI to unrar library)
 # 7z binary used as fallback for RAR if needed
-zip = "7.2"
+zip = "8.4"
 sevenz-rust2 = "0.20"
 unrar = "0.5"
 flate2 = "1.1"

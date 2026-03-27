@@ -4,7 +4,6 @@
 
 use crate::installer::processor::ProcessContext;
 use crate::modlist::{InlineFileDirective, RemappedInlineFileDirective};
-use crate::paths;
 
 use anyhow::{Context, Result};
 use std::fs::File;
@@ -31,7 +30,7 @@ pub fn handle_inline_file(ctx: &ProcessContext, directive: &InlineFileDirective)
 
     // Write to output
     let output_path = ctx.resolve_output_path(&directive.to);
-    paths::ensure_parent_dirs(&output_path)?;
+    ctx.dir_cache.ensure_parent_dirs(&output_path)?;
 
     let mut file = File::create(&output_path)
         .with_context(|| format!("Failed to create output file: {}", output_path.display()))?;
@@ -64,7 +63,7 @@ pub fn handle_remapped_inline_file(
 
     // Write to output
     let output_path = ctx.resolve_output_path(&directive.to);
-    paths::ensure_parent_dirs(&output_path)?;
+    ctx.dir_cache.ensure_parent_dirs(&output_path)?;
 
     let mut file = File::create(&output_path)
         .with_context(|| format!("Failed to create output file: {}", output_path.display()))?;
