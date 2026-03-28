@@ -2092,18 +2092,15 @@ pub(crate) fn finalize_archive(
 
         let _ = fs::remove_file(&sf.output_path);
 
-        // Determine if we're the last consumer of this source file.
-        // If so, rename (instant, zero I/O). Otherwise, copy to preserve the source.
-        // fetch_sub returns the PREVIOUS value, so remaining==1 means we just decremented to 0.
-        let remaining = source_ref_counts
+        // Determine if this source is shared by multiple directives.
+        // Shared sources (initial count > 1) are always copied to avoid a race
+        // where one thread renames (deletes) the source while another copies from it.
+        // Unshared sources (initial count == 1) can use rename for zero-copy.
+        let initial_count = source_ref_counts
             .get(&sf.temp_path)
-            .map(|c| {
-                let prev = c.fetch_sub(1, Ordering::SeqCst);
-                debug_assert!(prev >= 1, "ref count underflow for {:?}", sf.temp_path);
-                prev
-            })
+            .map(|c| c.load(Ordering::SeqCst))
             .unwrap_or(0);
-        let can_rename = remaining <= 1;
+        let can_rename = initial_count <= 1;
 
         let move_result = if can_rename {
             // Try rename first (free on same filesystem)

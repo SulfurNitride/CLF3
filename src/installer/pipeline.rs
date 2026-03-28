@@ -42,6 +42,34 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+/// Total system RAM in KB, cached at first access.
+fn total_ram_kb() -> u64 {
+    static TOTAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TOTAL.get_or_init(|| {
+        let sys = sysinfo::System::new_with_specifics(
+            sysinfo::RefreshKind::nothing()
+                .with_memory(sysinfo::MemoryRefreshKind::everything()),
+        );
+        sys.total_memory() / 1024
+    })
+}
+
+/// Check if RSS exceeds `pct`% of total RAM. If so, call malloc_trim and
+/// sleep briefly to let other threads finish and free memory.
+/// Returns true if throttling was applied.
+fn memory_pressure_gate(pct: u64) -> bool {
+    if let Some(rss) = crate::installer::current_rss_kb() {
+        let limit = total_ram_kb() * pct / 100;
+        if rss > limit {
+            #[cfg(target_os = "linux")]
+            unsafe { libc::malloc_trim(0); }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            return true;
+        }
+    }
+    false
+}
+
 /// Pre-parsed directives grouped by source archive hash.
 ///
 /// Built at startup from the modlist DB before any downloads start.
@@ -1301,6 +1329,9 @@ pub(crate) fn run_processing_loop(
                     );
 
                     if let Some(prepared) = prepared {
+                        // Throttle if RSS exceeds 90% of total RAM
+                        memory_pressure_gate(90);
+
                         // Wait for a concurrency slot
                         {
                             let mut count = active_count.lock().expect("active_count lock");
@@ -1614,6 +1645,10 @@ pub(crate) fn run_processing_loop_phased(
                     loop {
                         let idx = cursor.fetch_add(1, Ordering::Relaxed);
                         if idx >= complex.len() { break; }
+
+                        // Throttle if RSS exceeds 95% of total RAM
+                        memory_pressure_gate(95);
+
                         let prepared = &complex[idx];
                         let owned = PreparedArchive {
                             archive_hash: prepared.archive_hash.clone(),
@@ -1778,6 +1813,10 @@ pub(crate) fn run_processing_loop_phased(
                     loop {
                         let idx = cursor.fetch_add(1, Ordering::Relaxed);
                         if idx >= simple.len() { break; }
+
+                        // Throttle if RSS exceeds 90% of total RAM
+                        memory_pressure_gate(90);
+
                         let prepared = &simple[idx];
                         let owned = PreparedArchive {
                             archive_hash: prepared.archive_hash.clone(),

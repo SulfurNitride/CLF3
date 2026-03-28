@@ -6,12 +6,18 @@
 use anyhow::{Context, Result};
 use block_compression::{BC6HSettings, BC7Settings, CompressionVariant, GpuBlockCompressor};
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use tracing::{debug, error, info, warn};
 use wgpu::{
     Backends, Buffer, BufferDescriptor, BufferUsages, CommandEncoderDescriptor, Device, Extent3d,
     Instance, Queue, Texture, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
     TextureView, TextureViewDescriptor,
 };
+
+/// Timeout for GPU operations. If the device doesn't respond within this
+/// duration, we assume it's lost and bail out to CPU fallback.
+const GPU_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// GPU information for display/selection
 #[derive(Debug, Clone)]
@@ -53,6 +59,9 @@ pub struct GpuEncoder {
     compressor: GpuBlockCompressor,
     batch_budget_bytes: u64,
     pub gpu_info: GpuInfo,
+    /// Set to true when the GPU device is detected as lost.
+    /// All subsequent operations will immediately bail to CPU fallback.
+    device_lost: Arc<AtomicBool>,
 }
 
 impl GpuEncoder {
@@ -183,7 +192,48 @@ impl GpuEncoder {
             compressor,
             batch_budget_bytes,
             gpu_info,
+            device_lost: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Check if the GPU device has been marked as lost.
+    pub fn is_device_lost(&self) -> bool {
+        self.device_lost.load(Ordering::Relaxed)
+    }
+
+    /// Poll the device with a timeout. Returns an error if the device is lost
+    /// or the poll times out.
+    fn poll_with_timeout(&self) -> Result<()> {
+        if self.device_lost.load(Ordering::Relaxed) {
+            anyhow::bail!("GPU device previously lost");
+        }
+        match self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(GPU_POLL_TIMEOUT),
+        }) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                error!("GPU device poll failed: {e}, marking device as lost");
+                self.device_lost.store(true, Ordering::Relaxed);
+                anyhow::bail!("GPU device lost: {e}");
+            }
+        }
+    }
+
+    /// Wait for a mapped buffer result with timeout.
+    fn recv_map_result(&self, rx: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>) -> Result<()> {
+        match rx.recv_timeout(GPU_POLL_TIMEOUT) {
+            Ok(map_result) => map_result.context("Failed to map buffer"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                error!("GPU buffer map timed out after {}s, marking device as lost", GPU_POLL_TIMEOUT.as_secs());
+                self.device_lost.store(true, Ordering::Relaxed);
+                anyhow::bail!("GPU buffer map timed out");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.device_lost.store(true, Ordering::Relaxed);
+                anyhow::bail!("GPU buffer map channel disconnected (device lost?)");
+            }
+        }
     }
 
     /// Encode RGBA data to BC7 using GPU
@@ -315,14 +365,9 @@ impl GpuEncoder {
             tx.send(result).unwrap();
         });
 
-        // Poll until the buffer is mapped
-        let _ = self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
-        rx.recv()
-            .context("Channel closed")?
-            .context("Failed to map buffer")?;
+        // Poll until the buffer is mapped (with timeout to avoid hanging on device loss)
+        self.poll_with_timeout()?;
+        self.recv_map_result(rx)?;
 
         let data = buffer_slice.get_mapped_range();
         let result = data.to_vec();
@@ -439,16 +484,11 @@ impl GpuEncoder {
         let buffer_slice = staging_buffer.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            tx.send(result).unwrap();
+            let _ = tx.send(result);
         });
 
-        let _ = self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
-        rx.recv()
-            .context("Channel closed")?
-            .context("Failed to map buffer")?;
+        self.poll_with_timeout()?;
+        self.recv_map_result(rx)?;
 
         let data = buffer_slice.get_mapped_range();
         let result = data.to_vec();
@@ -633,18 +673,13 @@ impl GpuEncoder {
             })
             .collect();
 
-        // Wait for GPU
-        let _ = self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
+        // Wait for GPU (with timeout to avoid hanging on device loss)
+        self.poll_with_timeout()?;
 
         // Collect all results
         let mut results = Vec::with_capacity(batch.tasks.len());
         for (task, rx) in batch.tasks.iter().zip(channels) {
-            rx.recv()
-                .context("Channel closed")?
-                .context("Failed to map buffer")?;
+            self.recv_map_result(rx)?;
 
             let data = task.staging_buffer.slice(..).get_mapped_range();
             results.push(data.to_vec());

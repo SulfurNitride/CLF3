@@ -226,6 +226,32 @@ fn get_gpu_encoder() -> Option<Arc<Mutex<Option<GpuEncoder>>>> {
     GPU_ENCODER.get().cloned()
 }
 
+/// Try to re-initialize the GPU encoder after a device loss.
+/// Returns true if a new encoder was successfully created.
+fn try_reinit_gpu() -> bool {
+    if let Some(encoder_arc) = get_gpu_encoder() {
+        if let Ok(mut guard) = encoder_arc.lock() {
+            // Only reinit if current encoder is lost
+            let should_reinit = guard.as_ref().is_some_and(|e| e.is_device_lost());
+            if should_reinit {
+                info!("Attempting GPU encoder re-initialization after device loss...");
+                match GpuEncoder::new() {
+                    Ok(new_enc) => {
+                        info!("GPU encoder re-initialized: {}", new_enc.gpu_info);
+                        *guard = Some(new_enc);
+                        return true;
+                    }
+                    Err(e) => {
+                        warn!("GPU re-initialization failed, staying on CPU: {}", e);
+                        *guard = None;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Calculate mipmap levels for a texture
 fn calculate_mip_levels(width: u32, height: u32) -> u32 {
     let max_dim = width.max(height);
@@ -420,6 +446,28 @@ fn create_bc7_dds_with_mips(
     Ok(output)
 }
 
+/// CPU fallback for a prepared BC7 texture (already has RGBA mip data).
+/// Used when GPU batch encoding fails (device lost, timeout, etc.)
+fn encode_prepared_bc7_cpu(texture: &PreparedBc7Texture) -> Result<ProcessedTexture> {
+    let mut mip_data: Vec<Vec<u8>> = Vec::with_capacity(texture.mip_images.len());
+    for (rgba, w, h) in &texture.mip_images {
+        let rgba_image = RgbaImage::from_raw(*w, *h, rgba.clone())
+            .context("Failed to create RGBA image for CPU BC7")?;
+        let surface = SurfaceRgba8::from_image(&rgba_image);
+        let encoded = surface
+            .encode(ImageFormat::BC7RgbaUnorm, Quality::Fast, Mipmaps::Disabled)
+            .context("CPU BC7 encode failed")?;
+        mip_data.push(encoded.data.to_vec());
+    }
+    create_bc7_dds_with_mips(mip_data, texture.target_width, texture.target_height)
+        .map(|data| ProcessedTexture {
+            data,
+            width: texture.target_width,
+            height: texture.target_height,
+            format: OutputFormat::BC7,
+        })
+}
+
 /// Process a DDS texture: decode, resize, re-encode
 /// Uses GPU for BC7 encoding, CPU for other formats
 pub fn process_texture(
@@ -457,22 +505,24 @@ pub fn process_texture(
         rgba
     };
 
-    // For BC7, try GPU encoding first
+    // For BC7, try GPU encoding first (skip if device previously lost)
     if output_format == OutputFormat::BC7 {
         if let Some(encoder_arc) = get_gpu_encoder() {
             if let Ok(mut guard) = encoder_arc.lock() {
                 if let Some(ref mut encoder) = *guard {
-                    match process_texture_bc7_gpu(encoder, &resized) {
-                        Ok(data) => {
-                            return Ok(ProcessedTexture {
-                                data,
-                                width: target_width,
-                                height: target_height,
-                                format: output_format,
-                            });
-                        }
-                        Err(e) => {
-                            warn!("GPU BC7 failed, using CPU: {}", e);
+                    if !encoder.is_device_lost() {
+                        match process_texture_bc7_gpu(encoder, &resized) {
+                            Ok(data) => {
+                                return Ok(ProcessedTexture {
+                                    data,
+                                    width: target_width,
+                                    height: target_height,
+                                    format: output_format,
+                                });
+                            }
+                            Err(e) => {
+                                warn!("GPU BC7 failed, using CPU: {}", e);
+                            }
                         }
                     }
                 }
@@ -564,23 +614,25 @@ fn process_texture_bc6h_directxtex(
     if let Some(encoder_arc) = get_gpu_encoder() {
         if let Ok(mut guard) = encoder_arc.lock() {
             if let Some(ref mut encoder) = *guard {
-                match encode_bc6h_gpu(encoder, &with_mips, target_width, target_height) {
-                    Ok(dds_data) => {
-                        info!(
-                            "GPU BC6H: {}x{} -> {} bytes",
-                            target_width,
-                            target_height,
-                            dds_data.len()
-                        );
-                        return Ok(ProcessedTexture {
-                            data: dds_data,
-                            width: target_width,
-                            height: target_height,
-                            format: OutputFormat::BC6H,
-                        });
-                    }
-                    Err(e) => {
-                        warn!("GPU BC6H failed, falling back to DirectXTex CPU: {}", e);
+                if !encoder.is_device_lost() {
+                    match encode_bc6h_gpu(encoder, &with_mips, target_width, target_height) {
+                        Ok(dds_data) => {
+                            info!(
+                                "GPU BC6H: {}x{} -> {} bytes",
+                                target_width,
+                                target_height,
+                                dds_data.len()
+                            );
+                            return Ok(ProcessedTexture {
+                                data: dds_data,
+                                width: target_width,
+                                height: target_height,
+                                format: OutputFormat::BC6H,
+                            });
+                        }
+                        Err(e) => {
+                            warn!("GPU BC6H failed, falling back to DirectXTex CPU: {}", e);
+                        }
                     }
                 }
             }
@@ -789,25 +841,24 @@ pub fn process_texture_batch(
     if !bc7_jobs.is_empty() {
         info!("GPU batch processing {} BC7 textures", bc7_jobs.len());
 
+        let mut used_gpu = false;
         if let Some(encoder_arc) = get_gpu_encoder() {
+            // If device was previously lost, try to re-initialize before giving up
+            if encoder_arc.lock().ok().and_then(|g| g.as_ref().map(|e| e.is_device_lost())).unwrap_or(false) {
+                try_reinit_gpu();
+            }
             if let Ok(mut guard) = encoder_arc.lock() {
                 if let Some(ref mut encoder) = *guard {
-                    // Budget-aware batching: prepares on CPU in parallel,
-                    // then submits to GPU in batches sized by memory budget
-                    let chunk_results = process_bc7_batch_gpu(encoder, &bc7_jobs, &completed);
-                    results.extend(chunk_results);
-                } else {
-                    // No GPU, fall back to CPU
-                    let cpu_results = process_batch_cpu(bc7_jobs, &completed);
-                    results.extend(cpu_results);
+                    if !encoder.is_device_lost() {
+                        let chunk_results = process_bc7_batch_gpu(encoder, &bc7_jobs, &completed);
+                        results.extend(chunk_results);
+                        used_gpu = true;
+                    }
                 }
-            } else {
-                // Lock failed, fall back to CPU
-                let cpu_results = process_batch_cpu(bc7_jobs, &completed);
-                results.extend(cpu_results);
             }
-        } else {
-            // No GPU encoder, fall back to CPU
+        }
+        if !used_gpu {
+            warn!("No GPU available, falling back to CPU for {} BC7 textures", bc7_jobs.len());
             let cpu_results = process_batch_cpu(bc7_jobs, &completed);
             results.extend(cpu_results);
         }
@@ -879,6 +930,21 @@ fn process_bc7_batch_gpu(
         if !batch_textures.is_empty() && batch_bytes + tex_bytes > budget {
             flush_gpu_batch(encoder, &mut batch_textures, &mut results, completed);
             batch_bytes = 0;
+
+            // If device was lost during this batch, try to re-initialize
+            if encoder.is_device_lost() {
+                warn!("GPU device lost during batch, {} textures remain", pending.len() + 1);
+                // CPU fallback for remaining textures (including current one)
+                let cpu_result = encode_prepared_bc7_cpu(&texture);
+                completed.fetch_add(1, Ordering::Relaxed);
+                results.push((texture.id.clone(), cpu_result));
+                for remaining in pending {
+                    let cpu_result = encode_prepared_bc7_cpu(&remaining);
+                    completed.fetch_add(1, Ordering::Relaxed);
+                    results.push((remaining.id.clone(), cpu_result));
+                }
+                return results;
+            }
         }
 
         batch_bytes += tex_bytes;
@@ -936,10 +1002,12 @@ fn flush_gpu_batch(
             }
         }
         Err(e) => {
-            warn!("GPU batch failed: {}, falling back to CPU", e);
-            for (id, _w, _h, _) in job_meta {
+            warn!("GPU batch failed: {}, falling back to CPU for {} textures", e, textures.len());
+            // Fall back to CPU encoding for each texture using the prepared mip data
+            for texture in textures.iter() {
+                let cpu_result = encode_prepared_bc7_cpu(texture);
                 completed.fetch_add(1, Ordering::Relaxed);
-                results.push((id, Err(anyhow!("GPU batch failed: {}", e))));
+                results.push((texture.id.clone(), cpu_result));
             }
         }
     }
