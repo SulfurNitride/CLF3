@@ -201,10 +201,87 @@ async fn main() -> Result<()> {
         .with(console_layer)
         .init();
 
-    tracing::info!(
-        "CLF3 started, logging to {}",
-        log_dir.join(&log_filename).display()
-    );
+    let log_path = log_dir.join(&log_filename);
+    tracing::info!("CLF3 started, logging to {}", log_path.display());
+
+    // Panic hook: log panics from ANY thread to the log file before aborting.
+    // Without this, panics on worker threads silently kill the process.
+    let panic_log = log_path.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>");
+        let location = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".into());
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Box<dyn Any>".into()
+        };
+        let msg = format!(
+            "PANIC on thread '{}' at {}:\n  {}\n  backtrace: {:?}",
+            thread_name, location, payload, std::backtrace::Backtrace::force_capture()
+        );
+        tracing::error!("{}", msg);
+        // Also append directly to log file in case tracing is broken
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&panic_log) {
+            use std::io::Write;
+            let _ = writeln!(f, "\n[PANIC] {}", msg);
+        }
+        eprintln!("PANIC: {}", msg);
+    }));
+
+    // Signal handler: log SIGTERM/SIGHUP so we know what killed the process.
+    {
+        let signal_log = log_path.clone();
+        std::thread::spawn(move || {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static TERM: AtomicBool = AtomicBool::new(false);
+            static HUP: AtomicBool = AtomicBool::new(false);
+
+            // Register signal handlers via simple flag-setting
+            unsafe {
+                libc::signal(libc::SIGTERM, sigterm_handler as *const () as libc::sighandler_t);
+                libc::signal(libc::SIGHUP, sighup_handler as *const () as libc::sighandler_t);
+            }
+
+            extern "C" fn sigterm_handler(_: libc::c_int) {
+                TERM.store(true, Ordering::SeqCst);
+            }
+            extern "C" fn sighup_handler(_: libc::c_int) {
+                HUP.store(true, Ordering::SeqCst);
+            }
+
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if TERM.load(Ordering::SeqCst) {
+                    let rss = installer::current_rss_kb().unwrap_or(0);
+                    let msg = format!(
+                        "Received SIGTERM — process being killed externally. RSS: {}MB",
+                        rss / 1024
+                    );
+                    tracing::error!("{}", msg);
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&signal_log) {
+                        use std::io::Write;
+                        let _ = writeln!(f, "\n[SIGNAL] {}", msg);
+                    }
+                    eprintln!("{}", msg);
+                    std::process::exit(143);
+                }
+                if HUP.load(Ordering::SeqCst) {
+                    let msg = "Received SIGHUP — terminal closed or session ended";
+                    tracing::error!("{}", msg);
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&signal_log) {
+                        use std::io::Write;
+                        let _ = writeln!(f, "\n[SIGNAL] {}", msg);
+                    }
+                    eprintln!("{}", msg);
+                    std::process::exit(129);
+                }
+            }
+        });
+    }
 
     match cli.command {
         None => {
