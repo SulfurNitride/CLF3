@@ -814,6 +814,9 @@ fn extract_prepared_archive(
     dds_counter: &AtomicUsize,
     total_textures: usize,
     metrics: &ExtractionMetrics,
+    // When Some, spill DDS data to channel instead of processing inline.
+    // Used by phased path to defer all DDS to a dedicated phase.
+    dds_spill_tx: Option<&std::sync::mpsc::SyncSender<super::streaming::DdsJob>>,
 ) {
     const MAX_LOGGED_FAILURES: usize = 100;
     let extract_start = std::time::Instant::now();
@@ -905,16 +908,24 @@ fn extract_prepared_archive(
             );
         }
 
-        // Process textures from BSA — one at a time to avoid loading all into memory
+        // Process textures from BSA
         if !prepared.tex_d2.is_empty() {
-            let (ok, fail) = process_textures_from_bsa_streaming(
-                &prepared.archive_path, &prepared.tex_d2, ctx,
-            );
-            written.fetch_add(ok, Ordering::Relaxed);
-            failed.fetch_add(fail, Ordering::Relaxed);
-            let done = dds_counter.fetch_add(ok + fail, Ordering::Relaxed) + ok + fail;
-            if let Some(ref s) = *dds_status.lock().expect("dds lock") {
-                s.set_count(done, total_textures);
+            if let Some(tx) = dds_spill_tx {
+                // Phased path: spill raw texture data for deferred processing
+                super::streaming::extract_textures_from_bsa(
+                    &prepared.archive_path, &prepared.tex_d2, tx,
+                );
+            } else {
+                // Overlapped path: process inline
+                let (ok, fail) = process_textures_from_bsa_streaming(
+                    &prepared.archive_path, &prepared.tex_d2, ctx,
+                );
+                written.fetch_add(ok, Ordering::Relaxed);
+                failed.fetch_add(fail, Ordering::Relaxed);
+                let done = dds_counter.fetch_add(ok + fail, Ordering::Relaxed) + ok + fail;
+                if let Some(ref s) = *dds_status.lock().expect("dds lock") {
+                    s.set_count(done, total_textures);
+                }
             }
         }
 
@@ -957,29 +968,43 @@ fn extract_prepared_archive(
                 }
                 failed.fetch_add(archive_result.failed_count, Ordering::Relaxed);
 
-                // Process textures one at a time before finalization
-                // (temp dir still exists, so we can read source files)
+                // DDS textures: spill raw data for deferred processing, or process inline
                 let phase_dds_start = std::time::Instant::now();
-                if !prepared.tex_d2.is_empty() {
-                    let (ok, fail) = process_textures_from_temp_streaming(
-                        archive_result.temp_dir.path(), &prepared.tex_d2, ctx,
-                    );
-                    written.fetch_add(ok, Ordering::Relaxed);
-                    failed.fetch_add(fail, Ordering::Relaxed);
-                    let done = dds_counter.fetch_add(ok + fail, Ordering::Relaxed) + ok + fail;
-                    if let Some(ref s) = *dds_status.lock().expect("dds lock") {
-                        s.set_count(done, total_textures);
+                if let Some(tx) = dds_spill_tx {
+                    // Phased path: spill raw texture data to channel for Phase 2
+                    if !prepared.tex_d2.is_empty() {
+                        super::streaming::extract_textures_from_temp_dir(
+                            archive_result.temp_dir.path(), &prepared.tex_d2, tx,
+                        );
                     }
-                }
-                if !prepared.tex_d3.is_empty() {
-                    let (ok, fail) = process_textures_from_nested_bsas_streaming(
-                        archive_result.temp_dir.path(), &prepared.tex_d3, ctx,
-                    );
-                    written.fetch_add(ok, Ordering::Relaxed);
-                    failed.fetch_add(fail, Ordering::Relaxed);
-                    let done = dds_counter.fetch_add(ok + fail, Ordering::Relaxed) + ok + fail;
-                    if let Some(ref s) = *dds_status.lock().expect("dds lock") {
-                        s.set_count(done, total_textures);
+                    if !prepared.tex_d3.is_empty() {
+                        super::streaming::extract_textures_from_nested_bsas(
+                            archive_result.temp_dir.path(), &prepared.tex_d3, tx,
+                        );
+                    }
+                } else {
+                    // Overlapped path: process inline while temp dir exists
+                    if !prepared.tex_d2.is_empty() {
+                        let (ok, fail) = process_textures_from_temp_streaming(
+                            archive_result.temp_dir.path(), &prepared.tex_d2, ctx,
+                        );
+                        written.fetch_add(ok, Ordering::Relaxed);
+                        failed.fetch_add(fail, Ordering::Relaxed);
+                        let done = dds_counter.fetch_add(ok + fail, Ordering::Relaxed) + ok + fail;
+                        if let Some(ref s) = *dds_status.lock().expect("dds lock") {
+                            s.set_count(done, total_textures);
+                        }
+                    }
+                    if !prepared.tex_d3.is_empty() {
+                        let (ok, fail) = process_textures_from_nested_bsas_streaming(
+                            archive_result.temp_dir.path(), &prepared.tex_d3, ctx,
+                        );
+                        written.fetch_add(ok, Ordering::Relaxed);
+                        failed.fetch_add(fail, Ordering::Relaxed);
+                        let done = dds_counter.fetch_add(ok + fail, Ordering::Relaxed) + ok + fail;
+                        if let Some(ref s) = *dds_status.lock().expect("dds lock") {
+                            s.set_count(done, total_textures);
+                        }
                     }
                 }
                 let dds_elapsed = phase_dds_start.elapsed();
@@ -1307,6 +1332,7 @@ pub(crate) fn run_processing_loop(
                                 dds_counter,
                                 texture_count,
                                 &metrics,
+                                None, // overlapped path: process DDS inline
                             );
 
                             // Signal completion for BSA readiness tracking
@@ -1401,6 +1427,368 @@ pub(crate) fn run_processing_loop(
     if let Some(ref s) = *dds_status.lock().expect("lock") { s.finish(); }
 
     extraction_metrics.log_summary(reporter);
+
+    Ok(StreamingStats {
+        extracted: extracted.load(Ordering::Relaxed),
+        written: written.load(Ordering::Relaxed),
+        skipped: skipped.load(Ordering::Relaxed) + grouped.pre_skipped,
+        failed: failed.load(Ordering::Relaxed),
+        failed_archive_hashes: Vec::new(),
+    })
+}
+
+/// Phased processing loop for re-installs where all archives are already downloaded.
+///
+/// Instead of overlapping extraction/DDS/BSA, runs sequential phases where each
+/// gets full CPU:
+///
+/// Phase 1: Complex extraction (patched, BSA-feeding, DDS, nested) — full cores
+/// Phase 2: DDS processing safety net (near-empty, textures done inline)
+/// Phase 3: BSA building — full cores for compression
+/// Phase 4: Simple extraction (direct FromArchive only) — full cores
+pub(crate) fn run_processing_loop_phased(
+    db: &ModlistDb,
+    ctx: &ProcessContext,
+    rx: &std::sync::mpsc::Receiver<ArchiveEvent>,
+    grouped: &GroupedDirectives,
+    config: StreamingConfig,
+    reporter: &Arc<dyn super::progress::ProgressReporter>,
+) -> Result<StreamingStats> {
+    cleanup_temp_dirs(&ctx.config.downloads_dir, reporter);
+
+    let rss_start = crate::installer::current_rss_kb().unwrap_or(0);
+    reporter.log(&format!("[RSS-PHASED] start: {}MB", rss_start / 1024));
+
+    // Stats (Arc-wrapped for compatibility with streaming helpers)
+    let extracted = Arc::new(AtomicUsize::new(0));
+    let written = Arc::new(AtomicUsize::new(0));
+    let skipped = Arc::new(AtomicUsize::new(0));
+    let failed = Arc::new(AtomicUsize::new(0));
+    let logged_failures = Arc::new(AtomicUsize::new(0));
+    let extraction_metrics = Arc::new(ExtractionMetrics::new());
+
+    let total_archives: usize = {
+        let mut all_hashes = HashSet::new();
+        all_hashes.extend(grouped.from_archive.keys());
+        all_hashes.extend(grouped.patched.keys());
+        all_hashes.extend(grouped.textures.keys());
+        all_hashes.len()
+    };
+    let texture_count: usize = grouped.textures.values().map(|v| v.len()).sum();
+
+    let extract_workers = config.max_extract_workers.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get().max(2))
+            .unwrap_or(4)
+    });
+
+    // Process whole-file directives first
+    if !grouped.whole_file.is_empty() {
+        reporter.log(&format!(
+            "Copying {} whole-file directives...", grouped.whole_file.len()
+        ));
+        process_whole_file_directives(&grouped.whole_file, ctx, &extracted, &skipped, &failed);
+    }
+
+    // === Drain all archive events from channel ===
+    reporter.log("Draining archive events...");
+    let mut all_events: Vec<(String, String, PathBuf)> = Vec::new();
+    while let Ok(event) = rx.recv() {
+        match event {
+            ArchiveEvent::Ready { hash, name, path } => {
+                ctx.register_archive_path(hash.clone(), path.clone());
+                all_events.push((hash, name, path));
+            }
+            ArchiveEvent::Failed { name, error, .. } => {
+                error!("Archive download failed: {}: {}", name, error);
+            }
+            ArchiveEvent::Manual { name, .. } => {
+                warn!("Manual download needed: {}", name);
+            }
+        }
+    }
+
+    // === Prepare all archives (DB work on main thread) ===
+    reporter.log(&format!("Preparing {} archives...", all_events.len()));
+    let mut all_prepared: Vec<PreparedArchive> = Vec::new();
+    for (hash, name, path) in &all_events {
+        if let Some(prepared) = prepare_archive(db, ctx, hash, name, path, grouped) {
+            all_prepared.push(prepared);
+        }
+    }
+
+    // === Classify into complex vs simple ===
+    let (complex, simple): (Vec<_>, Vec<_>) = all_prepared.into_iter().partition(|p| {
+        let has_patched = p.resolved.iter().any(|d| matches!(d, ArchiveDirective::Patched { .. }));
+        let has_nested = p.resolved.iter().any(|d| {
+            matches!(d, ArchiveDirective::FromArchive { file_in_bsa: Some(_), .. })
+        });
+        let has_dds = !p.tex_d2.is_empty() || !p.tex_d3.is_empty();
+        let feeds_bsa = p.resolved.iter().any(|d| {
+            let to_path = match d {
+                ArchiveDirective::FromArchive { directive, .. } => &directive.to,
+                ArchiveDirective::Patched { directive, .. } => &directive.to,
+            };
+            to_path.contains("TEMP_BSA_FILES")
+        });
+        has_patched || has_nested || has_dds || feeds_bsa
+    });
+
+    reporter.log(&format!(
+        "  Phased extraction: {} complex + {} simple archives ({} cores)",
+        complex.len(), simple.len(), extract_workers,
+    ));
+
+    // Status bars
+    let extract_status: Arc<dyn super::progress::ProgressHandle> =
+        reporter.begin_status("Extracted");
+    extract_status.set_count(0, total_archives);
+    let extract_counter = AtomicUsize::new(0);
+
+    let dds_status: Option<Arc<dyn super::progress::ProgressHandle>> = if texture_count > 0 {
+        let s = reporter.begin_status("DDS");
+        s.set_count(0, texture_count);
+        Some(s)
+    } else {
+        None
+    };
+    let dds_counter = AtomicUsize::new(0);
+
+    reporter.overall_set_total(total_archives as u64);
+    reporter.overall_set_message("Phase 1: Complex extraction...");
+
+    extraction_metrics.start_wall_clock(extract_workers);
+
+    // DDS spill: extraction threads send raw texture data through this channel.
+    // A collector thread writes them to temp files on disk. Phase 2 processes them all at once.
+    let dds_spill_dir = ctx.config.output_dir.join(".clf3_dds_spill");
+    if dds_spill_dir.exists() {
+        let _ = std::fs::remove_dir_all(&dds_spill_dir);
+    }
+    let _ = std::fs::create_dir_all(&dds_spill_dir);
+    let collected_dds_jobs: Arc<Mutex<Vec<super::streaming::SpilledDdsJob>>> =
+        Arc::new(Mutex::new(Vec::new()));
+
+    let (dds_tx, dds_rx) = std::sync::mpsc::sync_channel::<super::streaming::DdsJob>(32);
+
+    // === Phase 1: Complex Extraction (full CPU, DDS spilled) ===
+    let phase1_start = std::time::Instant::now();
+    if !complex.is_empty() {
+        reporter.log(&format!("  Phase 1: {} complex archives...", complex.len()));
+        super::thread_budget::init(extract_workers, extract_workers.min(4).max(2));
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(extract_workers)
+            .thread_name(|i| format!("phase1-{}", i))
+            .build()
+            .expect("Failed to build phase 1 pool");
+
+        // Collector thread: spills DDS data to disk as extraction runs
+        let collected_jobs = collected_dds_jobs.clone();
+        let spill_dir_clone = dds_spill_dir.clone();
+        let collector_handle = std::thread::spawn(move || {
+            let mut jobs = Vec::new();
+            let mut idx = 0u64;
+            while let Ok(job) = dds_rx.recv() {
+                let data_path = spill_dir_clone.join(format!("dds_{}.tmp", idx));
+                if let Err(e) = std::fs::write(&data_path, &job.data) {
+                    warn!("DDS spill write failed: {}", e);
+                    continue;
+                }
+                jobs.push(super::streaming::SpilledDdsJob {
+                    id: job.id,
+                    directive: job.directive,
+                    data_path,
+                });
+                idx += 1;
+            }
+            let count = jobs.len();
+            collected_jobs.lock().unwrap_or_else(|e| e.into_inner()).extend(jobs);
+            count
+        });
+
+        let cursor = AtomicUsize::new(0);
+        pool.scope(|s| {
+            for _ in 0..extract_workers {
+                s.spawn(|_| {
+                    loop {
+                        let idx = cursor.fetch_add(1, Ordering::Relaxed);
+                        if idx >= complex.len() { break; }
+                        let prepared = &complex[idx];
+                        let owned = PreparedArchive {
+                            archive_hash: prepared.archive_hash.clone(),
+                            archive_name: prepared.archive_name.clone(),
+                            archive_path: prepared.archive_path.clone(),
+                            resolved: prepared.resolved.clone(),
+                            tex_d2: prepared.tex_d2.clone(),
+                            tex_d3: prepared.tex_d3.clone(),
+                            extra_paths: prepared.extra_paths.clone(),
+                        };
+                        let wrap_status = Mutex::new(Some(extract_status.clone()));
+                        let wrap_dds = Mutex::new(dds_status.clone());
+                        extract_prepared_archive(
+                            owned, ctx,
+                            &extracted, &written, &skipped, &failed,
+                            &logged_failures, reporter,
+                            &wrap_status, &extract_counter, total_archives,
+                            &wrap_dds, &dds_counter, texture_count,
+                            &extraction_metrics,
+                            Some(&dds_tx), // spill DDS to channel
+                        );
+                        reporter.overall_inc();
+                    }
+                });
+            }
+        });
+
+        // Drop sender so collector thread finishes
+        drop(dds_tx);
+        let spilled_count = collector_handle.join().unwrap_or(0);
+        if spilled_count > 0 {
+            reporter.log(&format!("  Collected {} DDS textures for Phase 2", spilled_count));
+        }
+    } else {
+        drop(dds_tx);
+    }
+    reporter.log(&format!(
+        "  Phase 1 complete in {:.1}s ({} complex archives)",
+        phase1_start.elapsed().as_secs_f64(), complex.len()
+    ));
+
+    // === Phase 2: DDS Processing (full CPU + GPU) ===
+    let phase2_start = std::time::Instant::now();
+    reporter.overall_set_message("Phase 2: DDS processing...");
+    {
+        let dds_jobs = std::mem::take(
+            &mut *collected_dds_jobs.lock().unwrap_or_else(|e| e.into_inner()),
+        );
+        if !dds_jobs.is_empty() {
+            reporter.log(&format!("  Phase 2: Processing {} DDS textures...", dds_jobs.len()));
+            super::streaming::process_spilled_dds_jobs(dds_jobs, ctx);
+            reporter.log(&format!(
+                "  Phase 2 complete in {:.1}s",
+                phase2_start.elapsed().as_secs_f64()
+            ));
+        }
+    }
+    // Clean up spill directory
+    if dds_spill_dir.exists() {
+        let _ = std::fs::remove_dir_all(&dds_spill_dir);
+    }
+
+    // === Phase 3: BSA Building (full CPU for compression) ===
+    let phase3_start = std::time::Instant::now();
+    reporter.overall_set_message("Phase 3: BSA building...");
+    {
+        let bsa_directives: Vec<(i64, CreateBSADirective)> = {
+            let raw = db.get_all_pending_directives_of_type("CreateBSA")
+                .unwrap_or_default();
+            raw.into_iter()
+                .filter_map(|(id, json)| {
+                    match serde_json::from_str::<crate::modlist::Directive>(&json) {
+                        Ok(crate::modlist::Directive::CreateBSA(d)) => {
+                            if !output_bsa_valid(ctx, &d) {
+                                Some((id, d))
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                })
+                .collect()
+        };
+
+        if !bsa_directives.is_empty() {
+            reporter.log(&format!("  Phase 3: Building {} BSA archives...", bsa_directives.len()));
+            let bsa_status = reporter.begin_status("BSA");
+            bsa_status.set_count(0, bsa_directives.len());
+
+            for (i, (_id, directive)) in bsa_directives.iter().enumerate() {
+                let bsa_name = std::path::Path::new(&directive.to)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| directive.to.clone());
+                match handle_create_bsa(ctx, directive) {
+                    Ok(()) => {
+                        bsa_status.set_count(i + 1, bsa_directives.len());
+                    }
+                    Err(e) => {
+                        error!("Failed to build BSA {}: {:#}", bsa_name, e);
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            bsa_status.finish();
+        }
+    }
+    reporter.log(&format!(
+        "  Phase 3 complete in {:.1}s",
+        phase3_start.elapsed().as_secs_f64()
+    ));
+
+    // === Phase 4: Simple Extraction (full CPU) ===
+    let phase4_start = std::time::Instant::now();
+    reporter.overall_set_message("Phase 4: Simple extraction...");
+    if !simple.is_empty() {
+        reporter.log(&format!("  Phase 4: {} simple archives...", simple.len()));
+        super::thread_budget::init(extract_workers, extract_workers);
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(extract_workers)
+            .thread_name(|i| format!("phase4-{}", i))
+            .build()
+            .expect("Failed to build phase 4 pool");
+
+        let cursor = AtomicUsize::new(0);
+        pool.scope(|s| {
+            for _ in 0..extract_workers {
+                s.spawn(|_| {
+                    loop {
+                        let idx = cursor.fetch_add(1, Ordering::Relaxed);
+                        if idx >= simple.len() { break; }
+                        let prepared = &simple[idx];
+                        let owned = PreparedArchive {
+                            archive_hash: prepared.archive_hash.clone(),
+                            archive_name: prepared.archive_name.clone(),
+                            archive_path: prepared.archive_path.clone(),
+                            resolved: prepared.resolved.clone(),
+                            tex_d2: prepared.tex_d2.clone(),
+                            tex_d3: prepared.tex_d3.clone(),
+                            extra_paths: prepared.extra_paths.clone(),
+                        };
+                        let wrap_status = Mutex::new(Some(extract_status.clone()));
+                        let wrap_dds = Mutex::new(dds_status.clone());
+                        extract_prepared_archive(
+                            owned, ctx,
+                            &extracted, &written, &skipped, &failed,
+                            &logged_failures, reporter,
+                            &wrap_status, &extract_counter, total_archives,
+                            &wrap_dds, &dds_counter, texture_count,
+                            &extraction_metrics,
+                            None, // simple archives have no DDS
+                        );
+                        reporter.overall_inc();
+                    }
+                });
+            }
+        });
+    }
+    reporter.log(&format!(
+        "  Phase 4 complete in {:.1}s ({} simple archives)",
+        phase4_start.elapsed().as_secs_f64(), simple.len()
+    ));
+
+    extraction_metrics.stop_wall_clock();
+    extract_status.finish();
+    if let Some(ref s) = dds_status { s.finish(); }
+
+    extraction_metrics.log_summary(reporter);
+
+    reporter.log(&format!(
+        "Phased pipeline complete: {} complex + {} simple archives",
+        complex.len(), simple.len()
+    ));
 
     Ok(StreamingStats {
         extracted: extracted.load(Ordering::Relaxed),

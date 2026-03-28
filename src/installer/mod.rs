@@ -674,8 +674,12 @@ impl Installer {
             })
         });
 
-        // Run the processing loop on the main thread (owns &self.db)
-        let streaming_stats = pipeline::run_processing_loop(
+        // Run the phased processing loop on the main thread (owns &self.db).
+        // Drains all archive events, then processes in sequential phases:
+        // Phase 1: Complex extraction → Phase 2: DDS → Phase 3: BSA → Phase 4: Simple extraction.
+        // Each phase gets full CPU. Falls back gracefully for fresh installs
+        // (blocks until downloads complete, then runs phases).
+        let streaming_stats = pipeline::run_processing_loop_phased(
             &self.db,
             &dp.ctx,
             &rx,

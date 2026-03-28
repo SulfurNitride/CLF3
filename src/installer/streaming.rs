@@ -84,6 +84,7 @@ pub(crate) struct ArchiveResult {
 }
 
 /// Unified directive enum for grouping both types by archive.
+#[derive(Clone)]
 pub(crate) enum ArchiveDirective {
     FromArchive {
         id: i64,
