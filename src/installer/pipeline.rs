@@ -42,30 +42,42 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-/// Total system RAM in KB, cached at first access.
-fn total_ram_kb() -> u64 {
-    static TOTAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *TOTAL.get_or_init(|| {
-        let sys = sysinfo::System::new_with_specifics(
-            sysinfo::RefreshKind::nothing()
-                .with_memory(sysinfo::MemoryRefreshKind::everything()),
-        );
-        sys.total_memory() / 1024
-    })
-}
+/// Number of threads currently waiting in the memory pressure gate.
+static GATE_WAITERS: AtomicUsize = AtomicUsize::new(0);
 
-/// Check if RSS exceeds `pct`% of total RAM. If so, call malloc_trim and
-/// sleep briefly to let other threads finish and free memory.
-/// Returns true if throttling was applied.
-fn memory_pressure_gate(pct: u64) -> bool {
-    if let Some(rss) = crate::installer::current_rss_kb() {
-        let limit = total_ram_kb() * pct / 100;
-        if rss > limit {
-            #[cfg(target_os = "linux")]
-            unsafe { libc::malloc_trim(0); }
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            return true;
+/// Block until available system memory exceeds `min_avail_mb` megabytes.
+/// Uses system-wide available memory (accounts for child 7z processes too).
+/// Calls malloc_trim and sleeps in a loop until memory is reclaimed.
+/// Always lets at least one thread through to avoid deadlock.
+/// Returns true if any throttling was applied.
+fn memory_pressure_gate(min_avail_mb: u64) -> bool {
+    let min_avail_bytes = min_avail_mb * 1024 * 1024;
+    let mut throttled = false;
+    loop {
+        let available = crate::bsa::available_memory();
+        if available >= min_avail_bytes {
+            break;
         }
+        // Always let at least one thread through to make progress and free memory
+        let waiters = GATE_WAITERS.load(Ordering::Relaxed);
+        let active_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        if waiters + 1 >= active_threads {
+            break;
+        }
+        if !throttled {
+            warn!(
+                "Memory pressure: only {}MB available (need {}MB free), waiting...",
+                available / 1024 / 1024, min_avail_mb
+            );
+        }
+        throttled = true;
+        GATE_WAITERS.fetch_add(1, Ordering::Relaxed);
+        #[cfg(target_os = "linux")]
+        unsafe { libc::malloc_trim(0); }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        GATE_WAITERS.fetch_sub(1, Ordering::Relaxed);
     }
     false
 }
@@ -1329,8 +1341,8 @@ pub(crate) fn run_processing_loop(
                     );
 
                     if let Some(prepared) = prepared {
-                        // Throttle if RSS exceeds 90% of total RAM
-                        memory_pressure_gate(90);
+                        // Block if system memory is too low (< 1GB free)
+                        memory_pressure_gate(1024);
 
                         // Wait for a concurrency slot
                         {
@@ -1646,8 +1658,8 @@ pub(crate) fn run_processing_loop_phased(
                         let idx = cursor.fetch_add(1, Ordering::Relaxed);
                         if idx >= complex.len() { break; }
 
-                        // Throttle if RSS exceeds 95% of total RAM
-                        memory_pressure_gate(95);
+                        // Block if system memory is too low (< 512MB free)
+                        memory_pressure_gate(512);
 
                         let prepared = &complex[idx];
                         let owned = PreparedArchive {
@@ -1814,8 +1826,8 @@ pub(crate) fn run_processing_loop_phased(
                         let idx = cursor.fetch_add(1, Ordering::Relaxed);
                         if idx >= simple.len() { break; }
 
-                        // Throttle if RSS exceeds 90% of total RAM
-                        memory_pressure_gate(90);
+                        // Block if system memory is too low (< 1GB free)
+                        memory_pressure_gate(1024);
 
                         let prepared = &simple[idx];
                         let owned = PreparedArchive {

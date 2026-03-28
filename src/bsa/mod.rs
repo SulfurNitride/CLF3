@@ -20,8 +20,8 @@ mod writer;
 
 pub use cache::BsaCache;
 pub use reader::{
-    extract_batch_parallel, extract_batch_streaming, extract_file, list_files, BsaFileEntry,
-    BsaReader,
+    available_memory, extract_batch_parallel, extract_batch_streaming, extract_file, list_files,
+    BsaFileEntry, BsaReader,
 };
 pub use writer::{BsaBuilder, BsaWriterManager};
 
