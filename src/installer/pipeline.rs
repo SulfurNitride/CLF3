@@ -1663,8 +1663,22 @@ pub(crate) fn run_processing_loop_phased(
             &mut *collected_dds_jobs.lock().unwrap_or_else(|e| e.into_inner()),
         );
         if !dds_jobs.is_empty() {
-            reporter.log(&format!("  Phase 2: Processing {} DDS textures...", dds_jobs.len()));
-            super::streaming::process_spilled_dds_jobs(dds_jobs, ctx);
+            let dds_total = dds_jobs.len();
+            reporter.log(&format!("  Phase 2: Processing {} DDS textures...", dds_total));
+            if let Some(ref s) = dds_status {
+                s.set_count(0, dds_total);
+            }
+            let dds_status_ref = &dds_status;
+            super::streaming::process_spilled_dds_jobs_with_progress(
+                dds_jobs,
+                ctx,
+                Some(&|done, total| {
+                    if let Some(ref s) = *dds_status_ref {
+                        s.set_count(done, total);
+                    }
+                }),
+                Some(&written),
+            );
             reporter.log(&format!(
                 "  Phase 2 complete in {:.1}s",
                 phase2_start.elapsed().as_secs_f64()
@@ -1700,25 +1714,42 @@ pub(crate) fn run_processing_loop_phased(
         };
 
         if !bsa_directives.is_empty() {
-            reporter.log(&format!("  Phase 3: Building {} BSA archives...", bsa_directives.len()));
+            let bsa_total = bsa_directives.len();
+            reporter.log(&format!("  Phase 3: Building {} BSA archives (2 concurrent)...", bsa_total));
             let bsa_status = reporter.begin_status("BSA");
-            bsa_status.set_count(0, bsa_directives.len());
+            bsa_status.set_count(0, bsa_total);
+            let bsa_built = AtomicUsize::new(0);
 
-            for (i, (_id, directive)) in bsa_directives.iter().enumerate() {
-                let bsa_name = std::path::Path::new(&directive.to)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| directive.to.clone());
-                match handle_create_bsa(ctx, directive) {
-                    Ok(()) => {
-                        bsa_status.set_count(i + 1, bsa_directives.len());
-                    }
-                    Err(e) => {
-                        error!("Failed to build BSA {}: {:#}", bsa_name, e);
-                        failed.fetch_add(1, Ordering::Relaxed);
-                    }
+            // Process 2 BSAs concurrently: while one compresses (CPU), the next
+            // reads its staged files from disk (I/O). This eliminates the gap
+            // between sequential BSA builds.
+            let bsa_cursor = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..2 {
+                    s.spawn(|| {
+                        loop {
+                            let idx = bsa_cursor.fetch_add(1, Ordering::Relaxed);
+                            if idx >= bsa_total { break; }
+                            let (_id, directive) = &bsa_directives[idx];
+                            let bsa_name = std::path::Path::new(&directive.to)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| directive.to.clone());
+                            match handle_create_bsa(ctx, directive) {
+                                Ok(()) => {
+                                    let done = bsa_built.fetch_add(1, Ordering::Relaxed) + 1;
+                                    bsa_status.set_count(done, bsa_total);
+                                }
+                                Err(e) => {
+                                    error!("Failed to build BSA {}: {:#}", bsa_name, e);
+                                    failed.fetch_add(1, Ordering::Relaxed);
+                                    bsa_built.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    });
                 }
-            }
+            });
             bsa_status.finish();
         }
     }

@@ -3596,7 +3596,20 @@ fn find_file_case_insensitive(base: &Path, normalized_rel: &str) -> Option<PathB
 /// This is shared between the streaming and pipelined install flows.
 /// Successfully processed textures are recorded in `ctx.textures_processed_during_install`
 /// so that the subsequent `texture_phase()` can skip them.
-pub(crate) fn process_spilled_dds_jobs(dds_jobs: Vec<SpilledDdsJob>, ctx: &ProcessContext) {
+pub(crate) fn process_spilled_dds_jobs(
+    dds_jobs: Vec<SpilledDdsJob>,
+    ctx: &ProcessContext,
+) {
+    process_spilled_dds_jobs_with_progress(dds_jobs, ctx, None, None)
+}
+
+/// Process spilled DDS jobs with optional progress counter updates.
+pub(crate) fn process_spilled_dds_jobs_with_progress(
+    dds_jobs: Vec<SpilledDdsJob>,
+    ctx: &ProcessContext,
+    progress_handle: Option<&(dyn Fn(usize, usize) + Sync)>,
+    written_counter: Option<&AtomicUsize>,
+) {
     if dds_jobs.is_empty() {
         return;
     }
@@ -3636,6 +3649,7 @@ pub(crate) fn process_spilled_dds_jobs(dds_jobs: Vec<SpilledDdsJob>, ctx: &Proce
 
     let dds_ok = AtomicUsize::new(0);
     let dds_fail = AtomicUsize::new(0);
+    let dds_done = AtomicUsize::new(0);
 
     // Process each format group. BC7 uses GPU batch pipeline, everything else uses CPU par_iter.
     for (fmt_str, jobs) in by_format {
@@ -3646,56 +3660,67 @@ pub(crate) fn process_spilled_dds_jobs(dds_jobs: Vec<SpilledDdsJob>, ctx: &Proce
         });
 
         if fmt == OutputFormat::BC7 {
-            // BC7: parallel CPU prep → GPU batch encode
+            // BC7: GPU batch encode in chunks of 64 to bound memory
             ctx.config.reporter.log(&format!("  BC7: {} textures (GPU+CPU pipeline)...", jobs.len()));
+            const BC7_BATCH: usize = 64;
 
-            let tex_jobs: Vec<TextureJob> = jobs
-                .iter()
-                .filter_map(|j| {
-                    match j.read_data() {
-                        Ok(data) => Some(TextureJob {
-                            data,
-                            width: j.directive.image_state.width,
-                            height: j.directive.image_state.height,
-                            format: OutputFormat::BC7,
-                            id: Some(format!("{}", j.id)),
-                        }),
+            for chunk in jobs.chunks(BC7_BATCH) {
+                let tex_jobs: Vec<TextureJob> = chunk
+                    .iter()
+                    .filter_map(|j| {
+                        match j.read_data() {
+                            Ok(data) => Some(TextureJob {
+                                data,
+                                width: j.directive.image_state.width,
+                                height: j.directive.image_state.height,
+                                format: OutputFormat::BC7,
+                                id: Some(format!("{}", j.id)),
+                            }),
+                            Err(e) => {
+                                warn!("DDS spill read failed for texture {}: {:#}", j.id, e);
+                                dds_fail.fetch_add(1, Ordering::Relaxed);
+                                None
+                            }
+                        }
+                    })
+                    .collect();
+
+                let results = process_texture_batch(tex_jobs);
+
+                for (job, (_job_id, result)) in chunk.iter().zip(results.into_iter()) {
+                    match result {
+                        Ok(processed) => {
+                            let out =
+                                paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
+                            if ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
+                                && fs::write(&out, &processed.data).is_ok()
+                            {
+                                dds_ok.fetch_add(1, Ordering::Relaxed);
+                                if let Some(wc) = written_counter {
+                                    wc.fetch_add(1, Ordering::Relaxed);
+                                }
+                                ctx.textures_processed_during_install
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .insert(job.id);
+                            } else {
+                                dds_fail.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                         Err(e) => {
-                            warn!("DDS spill read failed for texture {}: {:#}", j.id, e);
                             dds_fail.fetch_add(1, Ordering::Relaxed);
-                            None
+                            warn!("DDS BC7 fail [{}]: {:#}", job.id, e);
                         }
                     }
-                })
-                .collect();
+                }
 
-            let results = process_texture_batch(tex_jobs);
-
-            for (job, (_job_id, result)) in jobs.iter().zip(results.into_iter()) {
-                match result {
-                    Ok(processed) => {
-                        let out =
-                            paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
-                        if ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
-                            && fs::write(&out, &processed.data).is_ok()
-                        {
-                            dds_ok.fetch_add(1, Ordering::Relaxed);
-                            ctx.textures_processed_during_install
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .insert(job.id);
-                        } else {
-                            dds_fail.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    Err(e) => {
-                        dds_fail.fetch_add(1, Ordering::Relaxed);
-                        warn!("DDS BC7 fail [{}]: {:#}", job.id, e);
-                    }
+                let done = dds_done.fetch_add(chunk.len(), Ordering::Relaxed) + chunk.len();
+                if let Some(cb) = progress_handle {
+                    cb(done, total_tex);
                 }
             }
         } else {
-            // Non-BC7: full CPU parallelism (like Radium)
+            // Non-BC7: full CPU parallelism
             ctx.config.reporter.log(&format!("  {}: {} textures (CPU parallel)...", fmt.name(), jobs.len()));
 
             jobs.par_iter().for_each(|job| {
@@ -3715,10 +3740,17 @@ pub(crate) fn process_spilled_dds_jobs(dds_jobs: Vec<SpilledDdsJob>, ctx: &Proce
                 match result {
                     Ok(()) => {
                         dds_ok.fetch_add(1, Ordering::Relaxed);
+                        if let Some(wc) = written_counter {
+                            wc.fetch_add(1, Ordering::Relaxed);
+                        }
                         ctx.textures_processed_during_install
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .insert(job.id);
+                        let done = dds_done.fetch_add(1, Ordering::Relaxed) + 1;
+                        if let Some(cb) = progress_handle {
+                            cb(done, total_tex);
+                        }
                     }
                     Err(e) => {
                         dds_fail.fetch_add(1, Ordering::Relaxed);
