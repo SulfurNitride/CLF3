@@ -254,8 +254,9 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
     let mut missing_named_count = 0usize;
     let mut missing_named_examples: Vec<String> = Vec::new();
 
-    // First pass: check which archives exist with correct size
+    // First pass: check which archives exist — sidecar cache skips re-hashing
     let mut archives_to_verify: Vec<(ArchiveInfo, PathBuf)> = Vec::new();
+    let mut sidecar_hits = 0usize;
 
     for archive in archives_to_check {
         let output_path = config.downloads_dir.join(&archive.name);
@@ -269,7 +270,18 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
                         meta.len()
                     );
                 }
-                // Always hash-verify — never trust previous status
+                // Fast path: sidecar cache says hash+size+mtime match — skip re-hashing
+                if super::sidecar::archive_hash_valid(&output_path, &archive.hash) {
+                    db.mark_archive_downloaded(
+                        &archive.hash,
+                        output_path.to_string_lossy().as_ref(),
+                    )?;
+                    already_downloaded += 1;
+                    already_downloaded_size += archive.size as u64;
+                    sidecar_hits += 1;
+                    continue;
+                }
+                // Slow path: need to actually hash the file
                 archives_to_verify.push((archive, output_path));
                 continue;
             }
@@ -281,6 +293,12 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
             }
         }
         need_download.push(archive);
+    }
+    if sidecar_hits > 0 {
+        reporter.log(&format!(
+            "  {} archives verified via sidecar cache (skipped re-hashing)",
+            sidecar_hits
+        ));
     }
 
     if missing_named_count > 0 {
@@ -301,8 +319,20 @@ Copied files with different names will not be reused. Examples: {}",
         reporter.overall_set_total(verify_total as u64);
         reporter.overall_set_message("Verifying archives...");
 
-        // Verify hashes in parallel using rayon — pipelining reads helps even on slow storage
-        // Each result: Ok(true) = valid, Ok(false) = hash mismatch, Err = read error
+        // Kick off readahead on all archives — tells the kernel to start loading
+        // files into the page cache in the background. By the time the hash loop
+        // reaches each file, it's likely already cached.
+        #[cfg(target_os = "linux")]
+        for (_, output_path) in &archives_to_verify {
+            if let Ok(file) = std::fs::File::open(output_path) {
+                use std::os::unix::io::AsRawFd;
+                unsafe {
+                    libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED);
+                }
+            }
+        }
+
+        // Verify hashes in parallel using rayon
         let verify_results: Vec<Result<(bool, String)>> = archives_to_verify
             .par_iter()
             .map(|(archive, output_path)| {
@@ -323,11 +353,14 @@ Copied files with different names will not be reused. Examples: {}",
         {
             match result {
                 Ok((true, _actual_hash)) => {
-                    // Hash matches - archive is valid
+                    // Hash matches - archive is valid, write sidecar for next run
                     db.mark_archive_downloaded(
                         &archive.hash,
                         output_path.to_string_lossy().as_ref(),
                     )?;
+                    if let Err(e) = super::sidecar::write_archive_hash(output_path, &archive.hash) {
+                        tracing::debug!("Failed to write archive sidecar for {}: {}", output_path.display(), e);
+                    }
                     already_downloaded += 1;
                     already_downloaded_size += archive.size as u64;
                 }
@@ -664,12 +697,23 @@ pub async fn download_archives_streaming(
     let mut already_downloaded_size: u64 = 0;
     let mut need_download: Vec<ArchiveInfo> = Vec::new();
     let mut archives_to_verify: Vec<(ArchiveInfo, PathBuf)> = Vec::new();
+    let mut sidecar_verified: Vec<(ArchiveInfo, PathBuf)> = Vec::new();
 
     for archive in archives_to_check {
         let output_path = config.downloads_dir.join(&archive.name);
         if output_path.exists() {
             if fs::metadata(&output_path).is_ok() {
-                // Always hash-verify — never trust previous status
+                // Fast path: sidecar cache says hash+size+mtime match
+                if super::sidecar::archive_hash_valid(&output_path, &archive.hash) {
+                    db.mark_archive_downloaded(
+                        &archive.hash,
+                        output_path.to_string_lossy().as_ref(),
+                    )?;
+                    already_downloaded += 1;
+                    already_downloaded_size += archive.size as u64;
+                    sidecar_verified.push((archive, output_path));
+                    continue;
+                }
                 archives_to_verify.push((archive, output_path));
                 continue;
             }
@@ -677,12 +721,45 @@ pub async fn download_archives_streaming(
         need_download.push(archive);
     }
 
-    // Verify hashes of existing archives (threaded)
+    // Emit sidecar-verified archives immediately (no hashing needed)
+    if !sidecar_verified.is_empty() {
+        reporter.log(&format!(
+            "  {} archives verified via sidecar cache (skipped re-hashing)",
+            sidecar_verified.len()
+        ));
+        if let Some(prio) = priority {
+            sidecar_verified.sort_by(|a, b| {
+                let pa = prio.get(&a.0.hash).copied().unwrap_or(0);
+                let pb = prio.get(&b.0.hash).copied().unwrap_or(0);
+                pb.cmp(&pa)
+            });
+        }
+        for (archive, output_path) in sidecar_verified {
+            let _ = tx.send(ArchiveEvent::Ready {
+                hash: archive.hash.clone(),
+                name: archive.name.clone(),
+                path: output_path,
+            });
+        }
+    }
+
+    // Verify hashes of remaining archives (threaded)
     if !archives_to_verify.is_empty() {
         let verify_total = archives_to_verify.len();
         reporter.log(&format!("Verifying {} existing archives...", verify_total));
         reporter.overall_set_total(verify_total as u64);
         reporter.overall_set_message("Verifying archives...");
+
+        // Readahead: tell kernel to start loading archive files into page cache
+        #[cfg(target_os = "linux")]
+        for (_, output_path) in &archives_to_verify {
+            if let Ok(file) = std::fs::File::open(output_path) {
+                use std::os::unix::io::AsRawFd;
+                unsafe {
+                    libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED);
+                }
+            }
+        }
 
         let verify_results: Vec<Result<(bool, String)>> = archives_to_verify
             .par_iter()
@@ -708,6 +785,9 @@ pub async fn download_archives_streaming(
                         &archive.hash,
                         output_path.to_string_lossy().as_ref(),
                     )?;
+                    if let Err(e) = super::sidecar::write_archive_hash(&output_path, &archive.hash) {
+                        tracing::debug!("Failed to write archive sidecar for {}: {}", output_path.display(), e);
+                    }
                     already_downloaded += 1;
                     already_downloaded_size += archive.size as u64;
                     verified_archives.push((archive, output_path));

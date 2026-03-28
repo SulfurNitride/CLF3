@@ -1027,7 +1027,6 @@ fn extract_prepared_archive(
         }
     }
 
-    unsafe { libmimalloc_sys::mi_collect(false); }
     #[cfg(target_os = "linux")]
     unsafe { libc::malloc_trim(0); }
 
@@ -1069,9 +1068,13 @@ pub(crate) fn run_processing_loop(
     let extraction_metrics = Arc::new(ExtractionMetrics::new());
 
     // Pre-compute counts for status counters (created later, after download scan)
-    let total_archives: usize = grouped.from_archive.len()
-        + grouped.patched.len()
-        + grouped.textures.len();
+    let total_archives: usize = {
+        let mut all_hashes = std::collections::HashSet::new();
+        all_hashes.extend(grouped.from_archive.keys());
+        all_hashes.extend(grouped.patched.keys());
+        all_hashes.extend(grouped.textures.keys());
+        all_hashes.len()
+    };
     let texture_count: usize = grouped.textures.values().map(|v| v.len()).sum();
 
     // Initialize GPU once for inline DDS processing (BC7 textures)

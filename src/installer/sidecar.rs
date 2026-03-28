@@ -85,6 +85,81 @@ pub fn remove_sidecar(output_path: &Path) {
 }
 
 // ---------------------------------------------------------------------------
+// Archive download verification sidecar
+// ---------------------------------------------------------------------------
+
+/// Check if a downloaded archive's hash sidecar is still valid.
+///
+/// The sidecar records the verified xxHash64 + file size + mtime.
+/// On re-runs, we just stat() the file — if size and mtime match,
+/// the hash is trusted without re-reading the entire archive.
+pub fn archive_hash_valid(archive_path: &Path, expected_hash: &str) -> bool {
+    let sp = sidecar_path(archive_path);
+
+    let content = match fs::read_to_string(&sp) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    let mut stored_hash: Option<&str> = None;
+    let mut stored_size: Option<u64> = None;
+    let mut stored_mtime: Option<u64> = None;
+    for line in content.lines() {
+        if let Some(h) = line.strip_prefix("hash=") {
+            stored_hash = Some(h.trim());
+        } else if let Some(s) = line.strip_prefix("size=") {
+            stored_size = s.trim().parse().ok();
+        } else if let Some(m) = line.strip_prefix("mtime=") {
+            stored_mtime = m.trim().parse().ok();
+        }
+    }
+
+    let (Some(stored_hash), Some(stored_size), Some(stored_mtime)) =
+        (stored_hash, stored_size, stored_mtime)
+    else {
+        return false;
+    };
+
+    if stored_hash != expected_hash {
+        return false;
+    }
+
+    // Check actual file size and mtime match what we recorded
+    let meta = match fs::metadata(archive_path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+
+    if meta.len() != stored_size {
+        return false;
+    }
+
+    // Compare mtime (seconds since epoch)
+    if let Ok(mtime) = meta.modified() {
+        if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
+            return dur.as_secs() == stored_mtime;
+        }
+    }
+
+    false
+}
+
+/// Write an archive hash sidecar after successful verification.
+pub fn write_archive_hash(archive_path: &Path, hash: &str) -> std::io::Result<()> {
+    let meta = fs::metadata(archive_path)?;
+    let mtime_secs = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let sp = sidecar_path(archive_path);
+    let content = format!("hash={}\nsize={}\nmtime={}\n", hash, meta.len(), mtime_secs);
+    fs::write(&sp, content)
+}
+
+// ---------------------------------------------------------------------------
 // BSA per-file manifest
 // ---------------------------------------------------------------------------
 

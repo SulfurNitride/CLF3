@@ -648,6 +648,17 @@ pub fn process_fused_streaming(
             .collect();
         let total = archive_paths.len();
         if total > 0 {
+            // Readahead: tell kernel to start loading archives into page cache
+            // while pre-listing runs. These files will be extracted shortly after.
+            #[cfg(target_os = "linux")]
+            for path in &archive_paths {
+                if let Ok(file) = std::fs::File::open(path) {
+                    use std::os::unix::io::AsRawFd;
+                    unsafe {
+                        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED);
+                    }
+                }
+            }
             reporter.log(&format!("  Pre-listing {} archives...", total));
             let listed = AtomicUsize::new(0);
             let prelist_reporter = reporter.clone();
@@ -844,7 +855,6 @@ pub fn process_fused_streaming(
 
                         handle.finish();
 
-                        unsafe { libmimalloc_sys::mi_collect(false); }
                         #[cfg(target_os = "linux")]
                         unsafe { libc::malloc_trim(0); }
 
@@ -1007,9 +1017,7 @@ pub fn process_fused_streaming(
             item_handle.finish();
 
             // Return freed memory to the OS after each archive.
-            // mi_collect: mimalloc pages (Rust allocations)
             // malloc_trim: glibc pages (C library allocations: SQLite, etc.)
-            unsafe { libmimalloc_sys::mi_collect(false); }
             #[cfg(target_os = "linux")]
             unsafe { libc::malloc_trim(0); }
 
