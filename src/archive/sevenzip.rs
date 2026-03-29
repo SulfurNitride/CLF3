@@ -36,8 +36,6 @@ use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 use std::process::{Command, Stdio};
 
-use std::sync::Mutex;
-
 /// Run a Command and capture output, using spawn() instead of output().
 ///
 /// `Command::output()` uses `fork()` on Linux, which copies the entire
@@ -56,128 +54,6 @@ fn spawn_output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
 /// Windows file attribute flag for reparse points (symlinks, junctions).
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 
-
-// ============================================================================
-// Archive listing cache — pre-lists archives into SQLite so extraction
-// workers can resolve paths without spawning 7zz/reading archive headers.
-// ============================================================================
-
-/// SQLite-backed cache for archive file listings.
-/// Stores normalized_path → actual_path mappings per archive.
-pub struct ArchiveListingCache {
-    conn: Mutex<rusqlite::Connection>,
-}
-
-impl ArchiveListingCache {
-    /// Create a new in-memory listing cache.
-    pub fn new() -> Result<Self> {
-        let conn = rusqlite::Connection::open_in_memory()
-            .context("Failed to create archive listing cache")?;
-        conn.execute_batch(
-            "CREATE TABLE archive_paths (
-                archive TEXT NOT NULL,
-                normalized TEXT NOT NULL,
-                actual TEXT NOT NULL
-            );
-            CREATE INDEX idx_archive_paths ON archive_paths(archive, normalized);",
-        )
-        .context("Failed to create cache tables")?;
-        // Use WAL mode and relaxed sync for speed — this is a transient cache
-        conn.pragma_update(None, "journal_mode", "WAL").ok();
-        conn.pragma_update(None, "synchronous", "OFF").ok();
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
-    }
-
-    /// Pre-list an archive and store its path mappings in the cache.
-    pub fn populate(&self, archive_path: &Path) -> Result<()> {
-        let entries = list_archive(archive_path)?;
-        let lookup = build_path_lookup(&entries);
-        let archive_key = archive_path.to_string_lossy().to_string();
-
-        let conn = self.conn.lock().expect("listing cache lock");
-        let mut stmt = conn
-            .prepare_cached(
-                "INSERT INTO archive_paths (archive, normalized, actual) VALUES (?1, ?2, ?3)",
-            )
-            .context("Failed to prepare cache insert")?;
-
-        for (normalized, actual) in &lookup {
-            stmt.execute(rusqlite::params![archive_key, normalized, actual])?;
-        }
-        Ok(())
-    }
-
-    /// Resolve multiple files at once, returning the actual paths.
-    pub fn resolve_files(
-        &self,
-        archive_path: &Path,
-        files: &[String],
-    ) -> Result<Vec<String>> {
-        let archive_key = archive_path.to_string_lossy().to_string();
-        let conn = self.conn.lock().expect("listing cache lock");
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT actual FROM archive_paths WHERE archive = ?1 AND normalized = ?2",
-            )
-            .context("Failed to prepare cache query")?;
-
-        let mut resolved = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut not_found = Vec::new();
-
-        for file in files {
-            let normalized = normalize_path(file);
-            match stmt.query_row(rusqlite::params![archive_key, normalized], |row| {
-                row.get::<_, String>(0)
-            }) {
-                Ok(actual) => {
-                    if seen.insert(actual.clone()) {
-                        resolved.push(actual);
-                    }
-                }
-                Err(_) => {
-                    not_found.push(file.clone());
-                }
-            }
-        }
-
-        if !not_found.is_empty() {
-            let archive_name = archive_path.file_name()
-                .unwrap_or_default().to_string_lossy();
-            tracing::warn!(
-                "[selective-miss] {} of {} files not in cache for '{}'. Missing: {:?}",
-                not_found.len(),
-                files.len(),
-                archive_name,
-                if not_found.len() <= 5 { &not_found[..] } else { &not_found[..5] },
-            );
-        }
-
-        if resolved.is_empty() && !files.is_empty() {
-            bail!(
-                "None of {} requested files found in cache for '{}'",
-                files.len(),
-                archive_key
-            );
-        }
-
-        Ok(resolved)
-    }
-
-    /// Check if an archive has been listed.
-    pub fn has_archive(&self, archive_path: &Path) -> bool {
-        let archive_key = archive_path.to_string_lossy().to_string();
-        let conn = self.conn.lock().expect("listing cache lock");
-        conn.query_row(
-            "SELECT 1 FROM archive_paths WHERE archive = ?1 LIMIT 1",
-            rusqlite::params![archive_key],
-            |_| Ok(()),
-        )
-        .is_ok()
-    }
-}
 
 /// Archive type detected by magic bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,25 +183,11 @@ pub fn extract_file_case_insensitive(archive_path: &Path, file_path: &str) -> Re
     );
 }
 
-/// Extract multiple files from an archive to a directory.
-pub fn extract_files(archive_path: &Path, files: &[&str], output_dir: &Path) -> Result<()> {
-    let archive_type = detect_archive_type(archive_path).unwrap_or(ArchiveType::Unknown);
-    let threads = if matches!(archive_type, ArchiveType::SevenZ) {
-        Some(crate::installer::thread_budget::threads_per_7z())
-    } else {
-        None
-    };
-    extract_files_with_threads(archive_path, files, output_dir, threads)
-}
-
-/// Extract multiple files from an archive with controlled thread count.
-///
-/// `threads`: thread budget for 7z processes. ZIP/RAR are I/O bound and ignore this.
-pub fn extract_files_with_threads(
+/// Extract multiple files from an archive.
+pub fn extract_files(
     archive_path: &Path,
     files: &[&str],
     output_dir: &Path,
-    threads: Option<usize>,
 ) -> Result<()> {
     if files.is_empty() {
         return Ok(());
@@ -335,11 +197,11 @@ pub fn extract_files_with_threads(
 
     match archive_type {
         ArchiveType::Zip => extract_zip_files(archive_path, files, output_dir)
-            .or_else(|_| extract_files_7z_binary_threaded(archive_path, files, output_dir, threads)),
-        ArchiveType::SevenZ => extract_files_7z_binary_threaded(archive_path, files, output_dir, threads),
+            .or_else(|_| extract_files_7z_binary(archive_path, files, output_dir)),
+        ArchiveType::SevenZ => extract_files_7z_binary(archive_path, files, output_dir),
         ArchiveType::Rar => extract_rar_files(archive_path, files, output_dir)
-            .or_else(|_| extract_files_7z_binary_threaded(archive_path, files, output_dir, threads)),
-        _ => extract_files_7z_binary_threaded(archive_path, files, output_dir, threads),
+            .or_else(|_| extract_files_7z_binary(archive_path, files, output_dir)),
+        _ => extract_files_7z_binary(archive_path, files, output_dir),
     }
 }
 
@@ -403,72 +265,22 @@ pub fn extract_files_case_insensitive(
     Ok(resolved_refs.len())
 }
 
-/// Extract multiple files using case-insensitive matching with a pre-populated listing cache.
-///
-/// Skips the `list_archive` call entirely — path resolution comes from the cache.
-/// Falls back to `extract_files_case_insensitive` if the archive isn't cached.
-pub fn extract_files_cached(
-    archive_path: &Path,
-    files: &[String],
-    output_dir: &Path,
-    cache: &ArchiveListingCache,
-) -> Result<usize> {
-    if files.is_empty() {
-        return Ok(0);
-    }
-
-    if !cache.has_archive(archive_path) {
-        return extract_files_case_insensitive(archive_path, files, output_dir);
-    }
-
-    let resolved = cache.resolve_files(archive_path, files)?;
-    let resolved_refs: Vec<&str> = resolved.iter().map(|s| s.as_str()).collect();
-    extract_files(archive_path, &resolved_refs, output_dir)?;
-    Ok(resolved_refs.len())
-}
-
-/// Extract all files from an archive to a directory.
 pub fn extract_all(archive_path: &Path, output_dir: &Path) -> Result<usize> {
-    extract_all_with_threads(archive_path, output_dir, None)
-}
-
-/// Extract all files from an archive to a directory with controlled threading.
-///
-/// # Arguments
-/// * `threads` - Number of threads:
-///   - `None` = use smart thread budget (recommended)
-///   - `Some(n)` = use exactly n threads
-pub fn extract_all_with_threads(
-    archive_path: &Path,
-    output_dir: &Path,
-    threads: Option<usize>,
-) -> Result<usize> {
     let archive_type = detect_archive_type(archive_path).unwrap_or(ArchiveType::Unknown);
-
-    // Use thread budget for 7z when no explicit thread count given
-    let effective_threads = threads.or_else(|| {
-        if matches!(archive_type, ArchiveType::SevenZ) {
-            Some(crate::installer::thread_budget::threads_per_7z())
-        } else {
-            None
-        }
-    });
 
     match archive_type {
         ArchiveType::Zip => extract_zip_all(archive_path, output_dir)
             .or_else(|e| {
                 tracing::warn!("Native ZIP extraction failed, falling back to 7z binary: {}", e);
-                extract_all_7z_binary(archive_path, output_dir, effective_threads)
+                extract_all_7z_binary(archive_path, output_dir)
             }),
-        // 7z: external binary with multi-threading is fastest
-        ArchiveType::SevenZ => extract_all_7z_binary(archive_path, output_dir, effective_threads),
-
+        ArchiveType::SevenZ => extract_all_7z_binary(archive_path, output_dir),
         ArchiveType::Rar => extract_rar_all(archive_path, output_dir)
             .or_else(|e| {
                 tracing::warn!("Native RAR extraction failed, falling back to 7z binary: {}", e);
-                extract_all_7z_binary(archive_path, output_dir, effective_threads)
+                extract_all_7z_binary(archive_path, output_dir)
             }),
-        _ => extract_all_7z_binary(archive_path, output_dir, effective_threads),
+        _ => extract_all_7z_binary(archive_path, output_dir),
     }
 }
 
@@ -860,34 +672,6 @@ fn list_7z_native(archive_path: &Path) -> Result<Vec<ArchiveEntry>> {
     }
     Ok(entries)
 }
-
-/// Check if a 7z archive uses heavy compression (LZMA/LZMA2/PPMD/BZip2)
-/// that benefits from multiple threads, vs lightweight methods (Copy/Deflate/LZ4/Zstd)
-/// that are fast single-threaded.
-///
-/// Returns `true` if any block uses a CPU-heavy codec.
-pub fn is_heavy_compression(archive_path: &Path) -> bool {
-    let archive = match sevenz_rust2::Archive::open(archive_path) {
-        Ok(a) => a,
-        Err(_) => return true, // assume heavy if we can't read
-    };
-
-    for block in &archive.blocks {
-        for coder in &block.coders {
-            let id = coder.encoder_method_id();
-            if id == sevenz_rust2::EncoderMethod::ID_LZMA
-                || id == sevenz_rust2::EncoderMethod::ID_LZMA2
-                || id == sevenz_rust2::EncoderMethod::ID_PPMD
-                || id == sevenz_rust2::EncoderMethod::ID_BZIP2
-            {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
 // ============================================================================
 // Native RAR implementation (using `unrar` crate)
 // ============================================================================
@@ -1070,7 +854,7 @@ fn extract_file_7z_binary(archive_path: &Path, file_path: &str) -> Result<Vec<u8
             .arg("-y")
             .arg("-spd")
             .arg("-scsUTF-8")
-            .arg("-mmt=2")
+            .arg("-mmt=1")
             .arg(archive_path)
             .arg(&normalized_path),
     )
@@ -1112,31 +896,31 @@ fn extract_file_7z_binary(archive_path: &Path, file_path: &str) -> Result<Vec<u8
     Ok(output.stdout)
 }
 
-/// Extract specific files using 7z binary with controlled thread count.
-fn extract_files_7z_binary_threaded(
+/// Extract specific files using 7z binary.
+fn extract_files_7z_binary(
     archive_path: &Path,
     files: &[&str],
     output_dir: &Path,
-    threads: Option<usize>,
 ) -> Result<()> {
     if files.is_empty() {
         return Ok(());
     }
 
+    let archive_size_mb = fs::metadata(archive_path).map(|m| m.len() / (1024 * 1024)).unwrap_or(0);
+    tracing::info!(
+        "[7z-selective] {} ({} MB, {} files)",
+        archive_path.display(), archive_size_mb, files.len()
+    );
+
     let sz_path = get_7z_path()?;
     fs::create_dir_all(output_dir)?;
-
-    let mmt_arg = match threads {
-        Some(n) if n >= 1 => format!("-mmt={}", n.max(2)),
-        _ => "-mmt=2".to_string(),
-    };
 
     let mut cmd = Command::new(&sz_path);
     cmd.arg("x")
         .arg("-y")
         .arg("-aoa")
         .arg("-scsUTF-8")
-        .arg(&mmt_arg)
+        .arg("-mmt=1")
         .arg(format!("-o{}", output_dir.display()))
         .arg(archive_path)
         .arg("--");
@@ -1156,7 +940,7 @@ fn extract_files_7z_binary_threaded(
         if !reparse_paths.is_empty() {
             let mut retry = Command::new(&sz_path);
             retry.arg("x").arg("-y").arg("-aoa").arg("-scsUTF-8")
-                .arg(&mmt_arg)
+                .arg("-mmt=1")
                 .arg(format!("-o{}", output_dir.display()));
 
             for path in &reparse_paths {
@@ -1203,22 +987,21 @@ fn extract_files_7z_binary_threaded(
 fn extract_all_7z_binary(
     archive_path: &Path,
     output_dir: &Path,
-    threads: Option<usize>,
 ) -> Result<usize> {
     let sz_path = get_7z_path()?;
     fs::create_dir_all(output_dir)?;
 
-    let mut cmd = Command::new(&sz_path);
-    cmd.arg("x").arg("-y").arg("-aoa").arg("-scsUTF-8");
+    let archive_size_mb = fs::metadata(archive_path).map(|m| m.len() / (1024 * 1024)).unwrap_or(0);
+    tracing::info!(
+        "[7z-full] {} ({} MB)",
+        archive_path.display(), archive_size_mb
+    );
 
-    match threads {
-        Some(n) if n >= 1 => {
-            cmd.arg(format!("-mmt={}", n.max(2)));
-        }
-        _ => {
-            cmd.arg("-mmt=on");
-        }
-    }
+    let mmt_arg = "-mmt=1";
+
+    let mut cmd = Command::new(&sz_path);
+    cmd.arg("x").arg("-y").arg("-aoa").arg("-scsUTF-8")
+        .arg(mmt_arg);
 
     cmd.arg(format!("-o{}", output_dir.display()))
         .arg(archive_path);
@@ -1233,16 +1016,8 @@ fn extract_all_7z_binary(
 
         if !reparse_paths.is_empty() {
             let mut retry = Command::new(&sz_path);
-            retry.arg("x").arg("-y").arg("-aoa").arg("-scsUTF-8");
-
-            match threads {
-                Some(n) if n >= 1 => {
-                    retry.arg(format!("-mmt={}", n.max(2)));
-                }
-                _ => {
-                    retry.arg("-mmt=on");
-                }
-            }
+            retry.arg("x").arg("-y").arg("-aoa").arg("-scsUTF-8")
+                .arg(mmt_arg);
 
             retry.arg(format!("-o{}", output_dir.display()));
             for path in &reparse_paths {

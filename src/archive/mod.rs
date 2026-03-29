@@ -11,6 +11,6 @@ pub mod sevenzip;
 // Re-export commonly used functions for convenience
 #[allow(unused_imports)] // Used by lib crate consumers
 pub use sevenzip::{
-    extract_all, extract_all_with_threads, extract_file, extract_file_case_insensitive,
+    extract_all, extract_file, extract_file_case_insensitive,
     get_7z_path, list_archive,
 };

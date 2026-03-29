@@ -3,6 +3,8 @@
 //! Registers as a handler for nxm:// links and uses a Unix domain socket
 //! to receive download requests from browser clicks.
 
+#![allow(dead_code)]
+
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;

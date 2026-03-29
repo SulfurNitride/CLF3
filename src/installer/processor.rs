@@ -1344,94 +1344,6 @@ impl<'a> DirectiveProcessor<'a> {
         );
         Ok(())
     }
-
-    /// Install + Patch phase: FromArchive + PatchedFromArchive + InlineFile + RemappedInlineFile
-    pub fn install_phase(&self) -> Result<()> {
-        let stats = self.db.get_directive_stats()?;
-        let total_pending = stats.pending;
-
-        if total_pending == 0 {
-            println!("No directives to process");
-            return Ok(());
-        }
-
-        // Signal phase change to Installing
-        self.reporter.phase_start(super::progress::Phase::Installing);
-
-        let from_archive_count = self.get_type_count("FromArchive")?;
-        let patched_count = self.get_type_count("PatchedFromArchive")?;
-        let inline_count = self.get_type_count("InlineFile")?;
-        let remapped_count = self.get_type_count("RemappedInlineFile")?;
-
-        let install_total = from_archive_count + patched_count + inline_count + remapped_count;
-        self.reporter.overall_set_total(install_total as u64);
-
-        // FromArchive + PatchedFromArchive (fused streaming pipeline)
-        let streaming_config = super::streaming::StreamingConfig {
-            max_extract_workers: Some(self.ctx.config.max_install_workers),
-            max_parallel_7z_archives: Some(self.ctx.config.max_parallel_7z_archives),
-            max_parallel_bsa_archives: Some(self.ctx.config.max_parallel_bsa_archives),
-        };
-        self.reporter.overall_set_message("FromArchive+Patch");
-
-        println!(
-            "Patch basis DB: {} candidate local files for {} patch directives",
-            self.ctx.patch_basis_db_count(),
-            patched_count
-        );
-
-        let streaming_stats = super::streaming::process_fused_streaming(
-            self.db,
-            &self.ctx,
-            streaming_config,
-            &self.ctx.config.reporter,
-        )?;
-        self.completed
-            .fetch_add(streaming_stats.extracted, Ordering::Relaxed);
-        self.skipped
-            .fetch_add(streaming_stats.skipped, Ordering::Relaxed);
-        self.failed
-            .fetch_add(streaming_stats.failed, Ordering::Relaxed);
-        self.record_phase_failures("FromArchive+Patch", streaming_stats.failed);
-
-        // InlineFile
-        let failed_before = self.failed.load(Ordering::Relaxed);
-        self.reporter.overall_set_message("InlineFile");
-        process_simple_directives(
-            self.db,
-            &self.ctx,
-            "InlineFile",
-            &self.completed,
-            &self.skipped,
-            &self.failed,
-            &self.reporter,
-        )?;
-        self.record_phase_failures(
-            "InlineFile",
-            self.failed.load(Ordering::Relaxed) - failed_before,
-        );
-
-        // RemappedInlineFile
-        let failed_before = self.failed.load(Ordering::Relaxed);
-        self.reporter.overall_set_message("RemappedInlineFile");
-        process_simple_directives(
-            self.db,
-            &self.ctx,
-            "RemappedInlineFile",
-            &self.completed,
-            &self.skipped,
-            &self.failed,
-            &self.reporter,
-        )?;
-        self.record_phase_failures(
-            "RemappedInlineFile",
-            self.failed.load(Ordering::Relaxed) - failed_before,
-        );
-
-        self.reporter.overall_finish();
-        Ok(())
-    }
-
     /// Inline files phase only: InlineFile + RemappedInlineFile.
     /// Used by pipelined mode where FromArchive/Patched are handled separately.
     pub fn inline_phase(&self) -> Result<()> {
@@ -2312,57 +2224,71 @@ fn process_create_bsa(
     // Sort by file count (smallest first) for faster feedback.
     directives.sort_by_key(|(_, d)| d.file_states.len());
 
-    let workers = ctx.config.max_parallel_bsa_archives.max(1);
+    let bsa_total = directives.len();
     reporter.log(&format!(
-        "Processing {} BSA/BA2 archives one-at-a-time (configured workers: {}, inner compression stays fully threaded)",
-        directives.len(),
-        workers
+        "Processing {} BSA/BA2 archives (2 concurrent: overlap compress + write/hash)",
+        bsa_total
     ));
 
-    let process_one = |id: i64, directive: CreateBSADirective| {
-        if ctx.skip_set.contains(&id) || handlers::output_bsa_valid(ctx, &directive) {
-            skipped.fetch_add(1, Ordering::Relaxed);
-            reporter.overall_inc();
-            return;
+    let cursor = AtomicUsize::new(0);
+
+    // 2 worker threads: while one compresses (CPU-bound on rayon), the other
+    // writes to disk / hashes manifest / cleans staging. This eliminates the
+    // dead gap between sequential archive builds.
+    std::thread::scope(|s| {
+        for _ in 0..2 {
+            s.spawn(|| {
+                loop {
+                    let idx = cursor.fetch_add(1, Ordering::Relaxed);
+                    if idx >= bsa_total { break; }
+                    let (id, directive) = &directives[idx];
+
+                    if ctx.skip_set.contains(id) || handlers::output_bsa_valid(ctx, directive) {
+                        skipped.fetch_add(1, Ordering::Relaxed);
+                        reporter.overall_inc();
+                        continue;
+                    }
+
+                    let bsa_name = std::path::Path::new(&directive.to)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| directive.to.clone());
+
+                    let archive_type = match &directive.state {
+                        crate::modlist::BSAState::BSA(_) => "BSA",
+                        crate::modlist::BSAState::BA2(_) => "BA2",
+                    };
+
+                    match handlers::handle_create_bsa(ctx, directive) {
+                        Ok(()) => {
+                            completed.fetch_add(1, Ordering::Relaxed);
+                            reporter.log(&format!(
+                                "Created {}: {} ({} files)",
+                                archive_type,
+                                bsa_name,
+                                directive.file_states.len()
+                            ));
+                        }
+                        Err(e) => {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                            reporter.log(&format!(
+                                "FAIL [{}] create {} {}: {:#}",
+                                id, archive_type, bsa_name, e
+                            ));
+                        }
+                    }
+
+                    reporter.overall_inc();
+                }
+
+                // Reclaim rayon thread-local mimalloc heaps when this worker finishes.
+                rayon::broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true); });
+                unsafe { libmimalloc_sys::mi_collect(true); }
+                #[cfg(target_os = "linux")]
+                unsafe { libc::malloc_trim(0); }
+            });
         }
-
-        let bsa_name = std::path::Path::new(&directive.to)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| directive.to.clone());
-
-        let archive_type = match &directive.state {
-            crate::modlist::BSAState::BSA(_) => "BSA",
-            crate::modlist::BSAState::BA2(_) => "BA2",
-        };
-
-        match handlers::handle_create_bsa(ctx, &directive) {
-            Ok(()) => {
-                completed.fetch_add(1, Ordering::Relaxed);
-                reporter.log(&format!(
-                    "Created {}: {} ({} files)",
-                    archive_type,
-                    bsa_name,
-                    directive.file_states.len()
-                ));
-            }
-            Err(e) => {
-                failed.fetch_add(1, Ordering::Relaxed);
-                reporter.log(&format!(
-                    "FAIL [{}] create {} {}: {:#}",
-                    id, archive_type, bsa_name, e
-                ));
-            }
-        }
-
-        reporter.overall_inc();
-    };
-
-    // Always process one archive at a time. This avoids nested rayon pool throttling
-    // while still letting BSA/BA2 builders use full parallelism internally.
-    for (id, directive) in directives {
-        process_one(id, directive);
-    }
+    });
 
     Ok(())
 }

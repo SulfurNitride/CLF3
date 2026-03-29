@@ -8,6 +8,7 @@ use crate::installer::sidecar;
 use crate::modlist::{BSAState, CreateBSADirective};
 use anyhow::{Context, Result};
 use ba2::tes4::{ArchiveFlags, ArchiveTypes, Version};
+use rayon::prelude::*;
 use std::fs;
 use std::path::PathBuf;
 use walkdir::WalkDir;
@@ -169,33 +170,15 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
             }
         }
         ArchiveKind::Ba2 { version } => {
-            // BA2 builder still takes Vec<u8> — read files for it.
-            // WARNING: This loads ALL staged files into RAM at once.
-            // For large BA2s (1GB+), this is a major memory spike.
-            let rss_before = crate::installer::current_rss_kb().unwrap_or(0);
-            let mut total_bytes = 0u64;
+            // BA2 builder reads files from disk on demand during build(),
+            // keeping peak memory at ~1 file per rayon thread.
             let mut builder = Ba2Builder::from_name(&directive.to)
                 .with_version(version)
                 .with_compression(Ba2CompressionFormat::Zlib);
 
             for (path, disk_path) in &files {
-                let data = fs::read(disk_path).with_context(|| {
-                    format!("Failed to read staged file: {}", disk_path.display())
-                })?;
-                total_bytes += data.len() as u64;
-                builder.add_file(path, data);
+                builder.add_file(path, disk_path.clone());
             }
-
-            let rss_after_load = crate::installer::current_rss_kb().unwrap_or(0);
-            tracing::info!(
-                "[RSS-BA2] {} : loaded {}MB into builder ({} files), RSS {}MB → {}MB (+{}MB)",
-                directive.to,
-                total_bytes / (1024 * 1024),
-                files.len(),
-                rss_before / 1024,
-                rss_after_load / 1024,
-                rss_after_load.saturating_sub(rss_before) / 1024,
-            );
 
             builder
                 .build(&output_path)
@@ -211,7 +194,7 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
     // Write per-file manifest for partial reuse on future updates.
     // Files are still in staging and likely in page cache from the build.
     let manifest_entries: Vec<(String, String)> = files
-        .iter()
+        .par_iter()
         .filter_map(|(archive_path, disk_path)| {
             crate::hash::compute_file_hash(disk_path).ok().map(|h| {
                 (sidecar::normalize_manifest_path(archive_path), h)

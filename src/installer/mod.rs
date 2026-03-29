@@ -22,7 +22,6 @@ pub mod progress;
 pub mod progress_cli;
 pub mod sidecar;
 pub mod streaming;
-pub mod thread_budget;
 
 #[allow(unused_imports)] // ProgressCallback/ProgressEvent used by lib crate (GUI)
 pub use config::{InstallConfig, ProgressCallback, ProgressEvent};
@@ -38,7 +37,7 @@ use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Tracks peak RSS and logs whenever a new high-water mark is hit.
 /// Thread-safe — share via Arc or &reference.
@@ -200,6 +199,8 @@ fn trim_allocator_rss(reason: &str) {
     // Return free pages to the OS from both allocators:
     // - mi_collect: mimalloc (Rust allocations via #[global_allocator])
     // - malloc_trim: glibc (C library allocations: SQLite, libcurl, etc.)
+    // Broadcast to all rayon threads so their thread-local mimalloc heaps get collected too.
+    rayon::broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true); });
     unsafe { libmimalloc_sys::mi_collect(true); }
     unsafe { libc::malloc_trim(0); }
     info!("allocator collect after {}", reason);
@@ -207,6 +208,7 @@ fn trim_allocator_rss(reason: &str) {
 
 #[cfg(not(target_os = "linux"))]
 fn trim_allocator_rss(_reason: &str) {
+    rayon::broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true); });
     unsafe { libmimalloc_sys::mi_collect(true); }
 }
 
@@ -374,199 +376,6 @@ impl Installer {
         ));
 
         Ok(errors)
-    }
-
-    /// Run the full installation using streaming pipeline.
-    ///
-    /// Phases:
-    /// 1. Game Check → 2. Download → 3. Validate → 4. Install →
-    /// 5. Patch → 6. DDS Transform → 7. BSA Build → 8. Cleanup
-    pub async fn run_streaming(
-        &mut self,
-    ) -> Result<InstallStats> {
-        let mut stats = InstallStats::default();
-        let total_start = Instant::now();
-
-        // === Phase 1: Game Check ===
-        let game_check_start = Instant::now();
-        self.reporter().phase_start(Phase::GameCheck);
-        self.reporter().log(&format!("Game directory: {}", self.config.game_dir.display()));
-        if !self.config.game_dir.exists() {
-            bail!(
-                "Game directory does not exist: {}",
-                self.config.game_dir.display()
-            );
-        }
-        self.reporter().log("Game directory validated");
-        log_phase_metrics("Game Check", game_check_start);
-
-        // === Phase 2: Download Archives ===
-        let download_start = Instant::now();
-        self.reporter().phase_start(Phase::Downloading);
-        let download_stats = self.download_phase().await?;
-        stats.archives_downloaded = download_stats.downloaded;
-        stats.archives_skipped = download_stats.skipped;
-        stats.archives_failed = download_stats.failed;
-        stats.archives_manual = download_stats.manual;
-        stats.failed_downloads = download_stats.failed_downloads;
-        stats.manual_downloads = download_stats.manual_downloads;
-
-        if stats.archives_manual > 0 || stats.archives_failed > 0 {
-            log_phase_metrics("Downloading", download_start);
-            return Ok(stats);
-        }
-        log_phase_metrics("Downloading", download_start);
-
-        // === Phase 3: Validate + Index Archives ===
-        let validate_start = Instant::now();
-        self.reporter().phase_start(Phase::Validating);
-        let mut validation_attempts = 0;
-        const MAX_VALIDATION_ATTEMPTS: usize = 3;
-
-        loop {
-            validation_attempts += 1;
-            let validation_errors = self.validate_archives()?;
-
-            if validation_errors.is_empty() {
-                self.reporter().log("All archives validated successfully!");
-                break;
-            }
-
-            if validation_attempts >= MAX_VALIDATION_ATTEMPTS {
-                self.reporter().log(&format!(
-                    "Validation failed after {} attempts! {} archives still have issues:",
-                    MAX_VALIDATION_ATTEMPTS,
-                    validation_errors.len()
-                ));
-                for (name, error) in &validation_errors {
-                    self.reporter().log(&format!("  - {}: {}", name, error));
-                }
-                bail!("Archive validation failed");
-            }
-
-            self.reporter().log(&format!(
-                "Found {} corrupted archives, auto-fixing...",
-                validation_errors.len()
-            ));
-            for (name, error) in &validation_errors {
-                self.reporter().log(&format!("  - {}: {}", name, error));
-                let file_path = self.config.downloads_dir.join(name);
-                if let Err(e) = fs::remove_file(&file_path) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        warn!(
-                            "Failed to remove corrupted file {}: {}",
-                            file_path.display(),
-                            e
-                        );
-                    }
-                }
-                if let Err(e) = self.db.reset_archive_download_status(name) {
-                    warn!("Failed to reset download status for {}: {}", name, e);
-                }
-            }
-
-            self.reporter().log(&format!("Re-downloading {} files...", validation_errors.len()));
-            let redownload_stats = self.download_phase().await?;
-
-            if redownload_stats.failed > 0 {
-                self.reporter().log(&format!("Re-download had {} failures", redownload_stats.failed));
-            }
-        }
-
-        // Create the directive processor for phases 3b-8
-        let mut dp = processor::DirectiveProcessor::new(&self.db, &self.config)?;
-
-        // Pre-validation: classify all directives as valid/needs-work
-        let prevalidation_result = prevalidation::run_prevalidation(
-            &self.db,
-            &dp.ctx.existing_files,
-            &self.config.output_dir,
-            &self.config.reporter,
-        )?;
-        prevalidation_result.log_summary(&self.config.reporter);
-        dp.ctx.prevalidation_stats = prevalidation_result.stats_as_tuples();
-        dp.ctx.extra_files_for_cleanup = prevalidation_result.extra_files;
-        dp.ctx.skip_set = prevalidation_result.skip_set;
-
-        // BSA partial reuse: extract unchanged files from existing BSAs
-        let reuse_stats = bsa_reuse::pre_extract_reusable_bsa_files(
-            &self.db,
-            &mut dp.ctx,
-            &self.config.reporter,
-        )?;
-        if reuse_stats.files_reused > 0 {
-            self.reporter().log(&format!(
-                "BSA reuse: {} files pre-extracted from {} existing BSAs ({} changed, need download)",
-                reuse_stats.files_reused, reuse_stats.bsas_with_reuse, reuse_stats.files_changed
-            ));
-        }
-
-        // Pre-flight: check archives and index (same phase)
-        dp.preflight_check()?;
-        dp.index_archives()?;
-        dp.prepare_patch_basis_db()?;
-        log_phase_metrics("Validate+Index", validate_start);
-
-        // === Phase 4: Install + Patch Files ===
-        let install_start = Instant::now();
-        self.reporter().phase_start(Phase::Installing);
-        self.reporter().status("Installing + patching files...");
-        dp.install_phase()?;
-        trim_allocator_rss("install phase");
-        let install_secs = install_start.elapsed().as_secs_f64();
-        log_phase_metrics("Install+Patch", install_start);
-        stats.phase_durations.push(("Install+Patch".into(), install_secs));
-
-        // Check for install failures — abort early so user can fix and retry
-        let install_failures = dp.failed_count();
-        if install_failures > 0 {
-            bail!(
-                "Install + Patch phase had {} failures. Please fix the issues above and re-run.",
-                install_failures
-            );
-        }
-
-        // === Phase 5: DDS Transformations ===
-        let dds_start = Instant::now();
-        self.reporter().phase_start(Phase::DdsTransform);
-        dp.texture_phase()?;
-        trim_allocator_rss("texture phase");
-        log_phase_metrics("DDS Transform", dds_start);
-        stats.phase_durations.push(("DDS Transform".into(), dds_start.elapsed().as_secs_f64()));
-
-        // === Phase 6: BSA Building ===
-        let bsa_start = Instant::now();
-        self.reporter().phase_start(Phase::BsaBuild);
-        dp.bsa_phase()?;
-        trim_allocator_rss("bsa build phase");
-        log_phase_metrics("BSA Build", bsa_start);
-        stats.phase_durations.push(("BSA Build".into(), bsa_start.elapsed().as_secs_f64()));
-
-        // === Phase 7: Cleanup ===
-        let cleanup_start = Instant::now();
-        self.reporter().phase_start(Phase::Cleanup);
-        dp.cleanup_phase()?;
-        trim_allocator_rss("cleanup phase");
-        log_phase_metrics("Cleanup", cleanup_start);
-        stats.phase_durations.push(("Cleanup".into(), cleanup_start.elapsed().as_secs_f64()));
-
-        let process_stats = dp.finish();
-        stats.directives_completed = process_stats.completed;
-        stats.directives_skipped = process_stats.skipped;
-        stats.directives_failed = process_stats.failed;
-
-        if stats.directives_failed > 0 {
-            self.reporter().log(&format!(
-                "Directive processing incomplete. {} failures.",
-                stats.directives_failed
-            ));
-        } else {
-            self.reporter().log("Installation complete!");
-        }
-
-        log_install_summary(&stats, total_start, &self.config.reporter);
-
-        Ok(stats)
     }
 
     /// Run pipelined installation: download and extract in parallel.

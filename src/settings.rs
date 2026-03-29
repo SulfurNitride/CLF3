@@ -1,6 +1,9 @@
-//! Settings management for CLF3 GUI
+//! Settings management for CLF3
 //!
 //! Stores user preferences in ~/.config/clf3/settings.json
+
+// Used by lib crate
+#![allow(dead_code)]
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -69,7 +72,7 @@ impl Settings {
     }
 
     /// Get the settings file path
-    fn settings_path() -> Result<PathBuf> {
+    pub fn settings_path() -> Result<PathBuf> {
         Ok(Self::config_dir()?.join("settings.json"))
     }
 
@@ -124,7 +127,6 @@ impl Settings {
 
     /// Check if TTW settings are configured
     pub fn has_ttw_config(&self) -> bool {
-        // User needs either a pre-existing TTW output OR the installer + MPI + FO3
         !self.ttw_output_path.is_empty()
             || (!self.ttw_installer_path.is_empty()
                 && !self.ttw_mpi_path.is_empty()
@@ -137,19 +139,6 @@ impl Settings {
             && !self.ttw_mpi_path.is_empty()
             && !self.fallout3_path.is_empty()
     }
-}
-
-/// Get available GPUs for selection
-pub fn get_available_gpus() -> Vec<(usize, String)> {
-    crate::textures::list_gpus()
-        .into_iter()
-        .map(|gpu| {
-            (
-                gpu.adapter_index,
-                format!("{} ({}, {})", gpu.name, gpu.backend, gpu.device_type),
-            )
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -194,11 +183,9 @@ mod tests {
         assert!(!settings.has_ttw_config());
         assert!(!settings.can_install_ttw());
 
-        // With just output path
         settings.ttw_output_path = "/path/to/ttw".into();
         assert!(settings.has_ttw_config());
 
-        // With installer setup
         let mut settings2 = Settings::default();
         settings2.ttw_installer_path = "/path/to/installer".into();
         settings2.ttw_mpi_path = "/path/to/file.mpi".into();

@@ -14,7 +14,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs;
 use std::io::BufWriter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::info;
 
 /// Compression format for BA2 archives
@@ -83,10 +83,20 @@ impl Ba2Version {
     }
 }
 
+/// File entry that reads from disk on demand instead of holding data in memory
+struct FileEntry {
+    archive_path: String,
+    disk_path: PathBuf,
+}
+
 /// Builder for creating BA2 archives
+///
+/// Stores file paths on disk instead of raw data. Files are read one at a time
+/// during build(), keeping peak memory at ~1 file per rayon thread instead of
+/// the entire archive's worth of data.
 pub struct Ba2Builder {
-    /// Files organized by path -> data
-    files: HashMap<String, Vec<u8>>,
+    /// Files: archive_path -> disk path (no data loaded)
+    files: HashMap<String, PathBuf>,
     /// Archive format (General or DX10)
     format: Ba2Format,
     /// Compression format
@@ -168,12 +178,25 @@ impl Ba2Builder {
         self
     }
 
-    /// Add a file to the archive
-    pub fn add_file(&mut self, path: &str, data: Vec<u8>) {
-        // Normalize: forward slashes, strip leading slash
+    /// Register a staged file for inclusion. The file is NOT read — only the path is stored.
+    pub fn add_file(&mut self, path: &str, disk_path: PathBuf) {
         let normalized = path.replace('\\', "/");
         let normalized = normalized.trim_start_matches('/').to_string();
-        self.files.insert(normalized, data);
+        self.files.insert(normalized, disk_path);
+    }
+
+    /// Add a file with data already in memory (for callers that already have it)
+    pub fn add_file_data(&mut self, path: &str, data: Vec<u8>, staging_dir: &Path) -> Result<()> {
+        let normalized = path.replace('\\', "/");
+        let normalized = normalized.trim_start_matches('/').to_string();
+        // Write to staging dir so we can read it back on demand
+        let disk_path = staging_dir.join(&normalized);
+        if let Some(parent) = disk_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&disk_path, &data)?;
+        self.files.insert(normalized, disk_path);
+        Ok(())
     }
 
     /// Get number of files
@@ -186,55 +209,64 @@ impl Ba2Builder {
         self.files.is_empty()
     }
 
-    /// Build and write the BA2 to disk
+    /// Build and write the BA2 to disk.
+    ///
+    /// Reads files from disk on demand during parallel compression.
+    /// Peak memory ≈ num_rayon_threads * largest_file_size (not total archive size).
     pub fn build(self, output_path: &Path) -> Result<()> {
         if self.is_empty() {
             bail!("Cannot create empty BA2 archive");
         }
 
         let file_count = self.file_count();
-        let total_size: u64 = self.files.values().map(|data| data.len() as u64).sum();
 
         info!(
-            "Building BA2: {} ({} files, {} MB, format {:?}, compression {:?})",
+            "Building BA2: {} ({} files, format {:?}, compression {:?})",
             output_path.display(),
             file_count,
-            total_size / 1_000_000,
             self.format,
             self.compression
         );
 
         // For DX10 (texture) archives, we need special handling
-        // For now, only support General archives
         if self.format == Ba2Format::DX10 {
             return self.build_dx10(output_path);
         }
 
-        // Build archive entries in parallel
-        let entries: Vec<(String, Vec<u8>)> = self.files.into_iter().collect();
+        // Flatten to FileEntry structs — no data loaded yet, just paths
+        let entries: Vec<FileEntry> = self
+            .files
+            .into_iter()
+            .map(|(archive_path, disk_path)| FileEntry {
+                archive_path,
+                disk_path,
+            })
+            .collect();
 
+        let compress = self.compression != Ba2CompressionFormat::None;
+
+        // Read + compress files in parallel. Each thread reads one file at a time.
         let archive_entries: Result<Vec<(ArchiveKey<'static>, Ba2File<'static>)>> = entries
-            .par_iter()
-            .map(|(path, data)| {
-                // Create chunk from data
-                let chunk = Chunk::from_decompressed(data.clone().into_boxed_slice());
+            .into_par_iter()
+            .map(|entry| {
+                let data = fs::read(&entry.disk_path).with_context(|| {
+                    format!("Failed to read staged file: {}", entry.disk_path.display())
+                })?;
 
-                // Optionally compress the chunk
-                let chunk = if self.compression != Ba2CompressionFormat::None {
+                let chunk = Chunk::from_decompressed(data.into_boxed_slice());
+
+                let chunk = if compress {
                     let options = ChunkCompressionOptions::default();
                     match chunk.compress(&options) {
                         Ok(compressed) => compressed,
-                        Err(_) => chunk, // Fall back to uncompressed if compression fails
+                        Err(_) => chunk,
                     }
                 } else {
                     chunk
                 };
 
-                // Create file from chunk
                 let file: Ba2File = [chunk].into_iter().collect();
-
-                // Create key from path
-                let key: ArchiveKey = path.as_bytes().into();
+                let key: ArchiveKey = entry.archive_path.as_bytes().into();
 
                 Ok((key, file))
             })
@@ -279,10 +311,18 @@ impl Ba2Builder {
     fn build_dx10(self, output_path: &Path) -> Result<()> {
         let file_count = self.file_count();
         let compress = self.compression != Ba2CompressionFormat::None;
-        let entries: Vec<(String, Vec<u8>)> = self.files.into_iter().collect();
+
+        // Flatten to FileEntry structs — no data loaded
+        let entries: Vec<FileEntry> = self
+            .files
+            .into_iter()
+            .map(|(archive_path, disk_path)| FileEntry {
+                archive_path,
+                disk_path,
+            })
+            .collect();
 
         // Build read options for DX10 format
-        // This tells ba2 to parse DDS files and create proper texture chunks
         let read_options = FileReadOptionsBuilder::new()
             .format(Format::DX10)
             .compression_format(Ba2CrateCompression::Zip)
@@ -294,16 +334,18 @@ impl Ba2Builder {
             })
             .build();
 
+        // Read + compress files in parallel — one file per rayon thread
         let archive_entries: Result<Vec<(ArchiveKey<'static>, Ba2File<'static>)>> = entries
-            .par_iter()
-            .map(|(path, data)| {
-                // Use ba2's DX10 reader to properly parse the DDS file
-                // This extracts metadata, creates DX10 header, and chunks mip levels
-                // Use Copied to make a deep copy so the File doesn't borrow from entries
-                let file = Ba2File::read(Copied(data), &read_options)
-                    .with_context(|| format!("Failed to parse DDS texture: {}", path))?;
+            .into_par_iter()
+            .map(|entry| {
+                let data = fs::read(&entry.disk_path).with_context(|| {
+                    format!("Failed to read staged file: {}", entry.disk_path.display())
+                })?;
 
-                let key: ArchiveKey = path.as_bytes().into();
+                let file = Ba2File::read(Copied(&data), &read_options)
+                    .with_context(|| format!("Failed to parse DDS texture: {}", entry.archive_path))?;
+
+                let key: ArchiveKey = entry.archive_path.as_bytes().into();
                 Ok((key, file))
             })
             .collect();
@@ -366,8 +408,15 @@ mod tests {
         let output = dir.path().join("test.ba2");
 
         let mut builder = Ba2Builder::new().with_compression(Ba2CompressionFormat::None);
-        builder.add_file("test/hello.txt", b"Hello world!".to_vec());
-        builder.add_file("test/sub/world.txt", b"World!".to_vec());
+
+        // Write staged files to disk
+        let f1 = dir.path().join("hello.txt");
+        let f2 = dir.path().join("world.txt");
+        fs::write(&f1, b"Hello world!")?;
+        fs::write(&f2, b"World!")?;
+
+        builder.add_file("test/hello.txt", f1);
+        builder.add_file("test/sub/world.txt", f2);
 
         builder.build(&output)?;
 

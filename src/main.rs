@@ -12,12 +12,14 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod archive;
 mod bsa;
 mod downloaders;
+mod game_finder;
 mod hash;
 mod installer;
 mod modlist;
 mod nxm_handler;
 mod octodiff;
 mod paths;
+mod settings;
 mod textures;
 
 use anyhow::Result;
@@ -36,7 +38,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 
     /// Enable verbose logging (use RUST_LOG=debug for more detail)
     #[arg(short, long, global = true)]
@@ -50,21 +52,19 @@ enum Commands {
         /// Path to the .wabbajack file
         wabbajack_file: PathBuf,
 
-        /// Installation target directory (where mods will be installed)
-        #[arg(short, long)]
-        output: PathBuf,
-
         /// Directory for downloaded archives
-        #[arg(short, long)]
         downloads: PathBuf,
 
-        /// Game installation directory (for GameFileSource archives)
-        #[arg(short, long)]
-        game: PathBuf,
+        /// Installation target directory (where mods will be installed)
+        output: PathBuf,
 
-        /// Nexus Mods API key (required for download links)
+        /// Game installation directory (overrides auto-detection)
+        #[arg(short, long)]
+        game: Option<PathBuf>,
+
+        /// Nexus Mods API key (overrides saved setting)
         #[arg(long, env = "NEXUS_API_KEY")]
-        nexus_key: String,
+        nexus_key: Option<String>,
 
         /// Maximum concurrent downloads (defaults to CPU thread count)
         #[arg(short, long)]
@@ -90,67 +90,45 @@ enum Commands {
         #[arg(long, default_value = "xdg-open")]
         browser: String,
 
-        /// LoversLab email for automated downloads
+        /// LoversLab email (overrides saved setting)
         #[arg(long, env = "LOVERSLAB_EMAIL")]
         ll_email: Option<String>,
 
-        /// LoversLab password for automated downloads
+        /// LoversLab password (overrides saved setting)
         #[arg(long, env = "LOVERSLAB_PASSWORD")]
         ll_password: Option<String>,
     },
+
+    /// Set and verify your Nexus Mods API key
+    SetApiKey {
+        /// Your Nexus Mods API key
+        key: String,
+    },
+
+    /// Set and verify your LoversLab login credentials
+    SetLlLogin {
+        /// LoversLab email or username
+        email: String,
+        /// LoversLab password
+        password: String,
+    },
+
+    /// List available GPUs for texture encoding
+    ListGpu,
+
+    /// Select a GPU for texture encoding (use list-gpu to see indices)
+    SelectGpu {
+        /// GPU index from list-gpu (or "auto" for automatic selection)
+        index: String,
+    },
+
+    /// Show current saved settings
+    Config,
 
     /// Show information about a Wabbajack modlist
     Info {
         /// Path to the .wabbajack file
         wabbajack_file: PathBuf,
-    },
-
-    /// Register CLF3 as the system handler for nxm:// links
-    NxmRegister,
-
-    /// Handle an nxm:// link (called by the system)
-    NxmHandle {
-        /// The nxm:// URL to handle
-        url: String,
-    },
-
-    /// List files inside a BSA archive
-    ListBsa {
-        /// Path to the BSA file
-        bsa_file: PathBuf,
-    },
-
-    /// Extract a single file from a BSA archive
-    ExtractBsa {
-        /// Path to the BSA file
-        bsa_file: PathBuf,
-        /// Internal path of file to extract
-        file_path: String,
-        /// Output file path
-        output: PathBuf,
-    },
-
-    /// List files inside a BA2 archive (Fallout 4/Starfield)
-    ListBa2 {
-        /// Path to the BA2 file
-        ba2_file: PathBuf,
-    },
-
-    /// Extract a single file from a BA2 archive (Fallout 4/Starfield)
-    ExtractBa2 {
-        /// Path to the BA2 file
-        ba2_file: PathBuf,
-        /// Internal path of file to extract
-        file_path: String,
-        /// Output file path
-        output: PathBuf,
-    },
-
-    /// Launch the graphical interface
-    Gui {
-        /// Nexus Mods API key
-        #[arg(long, env = "NEXUS_API_KEY")]
-        nexus_key: Option<String>,
     },
 }
 
@@ -188,7 +166,6 @@ async fn main() -> Result<()> {
 
     // Create CLI reporter for progress bars — must exist before tracing init
     // so its writer factory can route tracing output through MultiProgress.
-    // Pool size is generous; unused bars stay hidden.
     let cli_reporter = CliReporter::new(16);
 
     // Console layer — routes through CliReporter's MultiProgress
@@ -205,7 +182,6 @@ async fn main() -> Result<()> {
     tracing::info!("CLF3 started, logging to {}", log_path.display());
 
     // Panic hook: log panics from ANY thread to the log file before aborting.
-    // Without this, panics on worker threads silently kill the process.
     let panic_log = log_path.clone();
     std::panic::set_hook(Box::new(move |info| {
         let thread = std::thread::current();
@@ -224,7 +200,6 @@ async fn main() -> Result<()> {
             thread_name, location, payload, std::backtrace::Backtrace::force_capture()
         );
         tracing::error!("{}", msg);
-        // Also append directly to log file in case tracing is broken
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&panic_log) {
             use std::io::Write;
             let _ = writeln!(f, "\n[PANIC] {}", msg);
@@ -240,7 +215,6 @@ async fn main() -> Result<()> {
             static TERM: AtomicBool = AtomicBool::new(false);
             static HUP: AtomicBool = AtomicBool::new(false);
 
-            // Register signal handlers via simple flag-setting
             unsafe {
                 libc::signal(libc::SIGTERM, sigterm_handler as *const () as libc::sighandler_t);
                 libc::signal(libc::SIGHUP, sighup_handler as *const () as libc::sighandler_t);
@@ -284,15 +258,109 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        None => {
-            // No command = launch GUI (double-click behavior)
-            println!("Launching CLF3...");
-            clf3::gui::run()?;
+        Commands::SetApiKey { key } => {
+            println!("Verifying Nexus API key...");
+            let nexus = downloaders::NexusDownloader::new(&key)?;
+            match nexus.validate().await {
+                Ok(user_info) => {
+                    let mut settings = settings::Settings::load();
+                    settings.nexus_api_key = key;
+                    settings.save()?;
+                    println!(
+                        "API key verified! Logged in as: {} (Premium: {})",
+                        user_info.name,
+                        if user_info.is_premium { "Yes" } else { "No" }
+                    );
+                }
+                Err(e) => {
+                    eprintln!("API key verification failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
-        Some(Commands::Install {
+
+        Commands::SetLlLogin { email, password } => {
+            println!("Verifying LoversLab login...");
+            match downloaders::LoversLabDownloader::login(&email, &password).await {
+                Ok(_) => {
+                    let mut settings = settings::Settings::load();
+                    settings.loverslab_email = email;
+                    settings.loverslab_password = password;
+                    settings.save()?;
+                    println!("LoversLab login verified and saved!");
+                }
+                Err(e) => {
+                    eprintln!("LoversLab login failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::ListGpu => {
+            let gpus = textures::list_gpus();
+            if gpus.is_empty() {
+                println!("No GPUs detected.");
+            } else {
+                println!("Available GPUs:");
+                for gpu in &gpus {
+                    println!(
+                        "  [{}] {} ({}, {})",
+                        gpu.adapter_index, gpu.name, gpu.backend, gpu.device_type
+                    );
+                }
+                let settings = settings::Settings::load();
+                match settings.gpu_index {
+                    Some(idx) => println!("\nCurrently selected: [{}] {}", idx, settings.gpu_name),
+                    None => println!("\nCurrently selected: auto"),
+                }
+            }
+        }
+
+        Commands::SelectGpu { index } => {
+            if index == "auto" {
+                let mut settings = settings::Settings::load();
+                settings.gpu_index = None;
+                settings.gpu_name = String::new();
+                settings.save()?;
+                println!("GPU selection set to: auto (recommended)");
+            } else {
+                let idx: usize = index.parse().map_err(|_| {
+                    anyhow::anyhow!("Invalid GPU index '{}'. Use a number from list-gpu or 'auto'.", index)
+                })?;
+                let gpus = textures::list_gpus();
+                let gpu = gpus.iter().find(|g| g.adapter_index == idx).ok_or_else(|| {
+                    anyhow::anyhow!("GPU index {} not found. Run 'clf3 list-gpu' to see available GPUs.", idx)
+                })?;
+                let mut settings = settings::Settings::load();
+                settings.gpu_index = Some(idx);
+                settings.gpu_name = gpu.name.clone();
+                settings.save()?;
+                println!("GPU selected: [{}] {} ({}, {})", idx, gpu.name, gpu.backend, gpu.device_type);
+            }
+        }
+
+        Commands::Config => {
+            let settings = settings::Settings::load();
+            let path = settings::Settings::settings_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "unknown".into());
+            println!("Settings file: {}", path);
+            println!();
+            println!("Nexus API key:    {}", if settings.nexus_api_key.is_empty() { "(not set)" } else { "(set)" });
+            println!("LoversLab login:  {}", if settings.loverslab_email.is_empty() { "(not set)".into() } else { format!("{}", settings.loverslab_email) });
+            println!("GPU:              {}", match settings.gpu_index {
+                Some(idx) => format!("[{}] {}", idx, settings.gpu_name),
+                None => "auto".into(),
+            });
+            if !settings.patch_cache_dir.is_empty() {
+                println!("Patch cache:      {}", settings.patch_cache_dir);
+            }
+        }
+
+        Commands::Install {
             wabbajack_file,
-            output,
             downloads,
+            output,
             game,
             nexus_key,
             concurrent,
@@ -303,7 +371,43 @@ async fn main() -> Result<()> {
             browser,
             ll_email,
             ll_password,
-        }) => {
+        } => {
+            let settings = settings::Settings::load();
+
+            // Resolve API key: CLI arg > env var > saved settings
+            let nexus_key = nexus_key
+                .or_else(|| {
+                    if settings.nexus_api_key.is_empty() { None }
+                    else { Some(settings.nexus_api_key.clone()) }
+                })
+                .ok_or_else(|| anyhow::anyhow!(
+                    "Nexus API key required. Set it with: clf3 set-api-key YOUR_KEY"
+                ))?;
+
+            // Resolve LL credentials: CLI arg > env var > saved settings
+            let ll_email = ll_email.unwrap_or_else(|| settings.loverslab_email.clone());
+            let ll_password = ll_password.unwrap_or_else(|| settings.loverslab_password.clone());
+
+            // Game dir: CLI arg > auto-detect from modlist
+            let game_dir = match game {
+                Some(g) => g,
+                None => {
+                    // Try to auto-detect game path from the modlist's game type
+                    let game_dir = auto_detect_game_dir(&wabbajack_file);
+                    match game_dir {
+                        Some(p) => {
+                            println!("Auto-detected game directory: {}", p.display());
+                            p
+                        }
+                        None => {
+                            anyhow::bail!(
+                                "Could not auto-detect game directory. Specify it with --game PATH"
+                            );
+                        }
+                    }
+                }
+            };
+
             // Default to CPU thread count
             let thread_count = std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -325,11 +429,17 @@ async fn main() -> Result<()> {
             }
             println!();
 
+            let patch_cache_dir = if settings.patch_cache_dir.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(&settings.patch_cache_dir))
+            };
+
             let config = InstallConfig {
                 wabbajack_path: wabbajack_file,
                 output_dir: output,
                 downloads_dir: downloads,
-                game_dir: game,
+                game_dir,
                 nexus_api_key: nexus_key,
                 max_concurrent_downloads: concurrent,
                 max_install_workers: install_workers,
@@ -337,11 +447,11 @@ async fn main() -> Result<()> {
                 max_parallel_7z_archives: sevenzip_workers,
                 nxm_mode,
                 browser,
-                patch_cache_dir: None,
+                patch_cache_dir,
                 progress_callback: None,
                 reporter: cli_reporter.clone() as Arc<dyn ProgressReporter>,
-                loverslab_email: ll_email.unwrap_or_default(),
-                loverslab_password: ll_password.unwrap_or_default(),
+                loverslab_email: ll_email,
+                loverslab_password: ll_password,
             };
 
             let mut installer = Installer::new(config)?;
@@ -367,7 +477,6 @@ async fn main() -> Result<()> {
                 total_processed
             ));
 
-            // Show manual download details
             if !stats.manual_downloads.is_empty() {
                 reporter.log(&format!(
                     "\n=== Manual Downloads Needed ({}) ===",
@@ -383,7 +492,6 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Show failed download details
             if !stats.failed_downloads.is_empty() {
                 reporter.log(&format!(
                     "\n=== Failed Downloads ({}) ===",
@@ -405,53 +513,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Some(Commands::NxmRegister) => {
-            let exe = std::env::current_exe()?.to_string_lossy().to_string();
-            nxm_handler::register_handler(&exe)?;
-        }
-
-        Some(Commands::NxmHandle { url }) => {
-            nxm_handler::send_to_socket(&url)?;
-        }
-
-        Some(Commands::ListBsa { bsa_file }) => {
-            let files = bsa::list_files(&bsa_file)?;
-            for f in &files {
-                println!("{}", f.path.to_lowercase());
-            }
-            eprintln!("\nTotal: {} files", files.len());
-        }
-
-        Some(Commands::ExtractBsa {
-            bsa_file,
-            file_path,
-            output,
-        }) => {
-            let data = bsa::extract_file(&bsa_file, &file_path)?;
-            std::fs::write(&output, &data)?;
-            println!("Extracted {} bytes to {}", data.len(), output.display());
-        }
-
-        Some(Commands::ListBa2 { ba2_file }) => {
-            let files = bsa::list_ba2_files(&ba2_file)?;
-            for f in &files {
-                let tex_marker = if f.is_texture { " [DX10]" } else { "" };
-                println!("{}{}", f.path, tex_marker);
-            }
-            eprintln!("\nTotal: {} files", files.len());
-        }
-
-        Some(Commands::ExtractBa2 {
-            ba2_file,
-            file_path,
-            output,
-        }) => {
-            let data = bsa::extract_ba2_file(&ba2_file, &file_path)?;
-            std::fs::write(&output, &data)?;
-            println!("Extracted {} bytes to {}", data.len(), output.display());
-        }
-
-        Some(Commands::Info { wabbajack_file }) => {
+        Commands::Info { wabbajack_file } => {
             println!("Parsing {}...\n", wabbajack_file.display());
 
             let modlist = modlist::parse_wabbajack_file(&wabbajack_file)?;
@@ -470,7 +532,6 @@ async fn main() -> Result<()> {
             println!("Archives:          {}", modlist.archives.len());
             println!("Directives:        {}", modlist.directives.len());
 
-            // Count directives by type
             let mut type_counts = std::collections::HashMap::with_capacity(10);
             for directive in &modlist.directives {
                 *type_counts.entry(directive.directive_type()).or_insert(0) += 1;
@@ -483,7 +544,6 @@ async fn main() -> Result<()> {
                 println!("{:>8}  {}", count, dtype);
             }
 
-            // Count download sources
             let mut source_counts = std::collections::HashMap::with_capacity(10);
             for archive in &modlist.archives {
                 let source_type = match &archive.state {
@@ -506,12 +566,29 @@ async fn main() -> Result<()> {
                 println!("{:>8}  {}", count, source);
             }
         }
-
-        Some(Commands::Gui { nexus_key: _ }) => {
-            println!("Launching CLF3 GUI...");
-            clf3::gui::run()?;
-        }
     }
 
     Ok(())
+}
+
+/// Try to auto-detect the game installation directory from the modlist's game type.
+fn auto_detect_game_dir(wabbajack_path: &std::path::Path) -> Option<PathBuf> {
+    // Quick-parse just the modlist header to get game_type
+    let modlist = modlist::parse_wabbajack_file(wabbajack_path).ok()?;
+
+    // Map Wabbajack game type names to Steam App IDs
+    let app_id = match modlist.game_type.as_str() {
+        "SkyrimSE" | "SkyrimSpecialEdition" => "489830",
+        "Skyrim" => "72850",
+        "Fallout4" => "377160",
+        "FalloutNewVegas" | "FalloutNV" => "22380",
+        "Fallout3" => "22300",
+        "Oblivion" => "22330",
+        "Morrowind" => "22320",
+        "Enderal" | "EnderalSE" => "976620",
+        "Starfield" => "1716740",
+        _ => return None,
+    };
+
+    game_finder::find_game_install_path(app_id)
 }

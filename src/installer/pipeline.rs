@@ -987,9 +987,7 @@ fn extract_prepared_archive(
             &prepared.archive_hash,
             &prepared.resolved,
             ctx,
-            Some(1),
             &prepared.extra_paths,
-            None, // pipeline path doesn't use listing cache yet
         );
         let extract_elapsed = phase_extract_start.elapsed();
 
@@ -1206,8 +1204,6 @@ pub(crate) fn run_processing_loop(
     // Limits how many archives are being extracted simultaneously.
     let max_concurrent = extract_workers.max(2);
 
-    // Initialize the global thread budget for 7z processes
-    super::thread_budget::init(extract_workers, max_concurrent);
     let active_count = std::sync::Mutex::new(0usize);
     let active_cvar = std::sync::Condvar::new();
 
@@ -1322,6 +1318,9 @@ pub(crate) fn run_processing_loop(
                                     failed.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
+                            // Collect this thread's mimalloc heap (don't broadcast —
+                            // other threads may be mid-compression on rayon)
+                            unsafe { libmimalloc_sys::mi_collect(true); }
                         });
                         bsa_tracker.built_count += 1;
                     }
@@ -1444,6 +1443,10 @@ pub(crate) fn run_processing_loop(
                             failed.fetch_add(1, Ordering::Relaxed);
                         }
                     }
+                    rayon::broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true); });
+                    unsafe { libmimalloc_sys::mi_collect(true); }
+                    #[cfg(target_os = "linux")]
+                    unsafe { libc::malloc_trim(0); }
                     bsa_tracker.built_count += 1;
                 }
             }
@@ -1618,7 +1621,6 @@ pub(crate) fn run_processing_loop_phased(
     let phase1_start = std::time::Instant::now();
     if !complex.is_empty() {
         reporter.log(&format!("  Phase 1: {} complex archives...", complex.len()));
-        super::thread_budget::init(extract_workers, extract_workers.min(4).max(2));
 
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(extract_workers)
@@ -1793,6 +1795,10 @@ pub(crate) fn run_processing_loop_phased(
                                     bsa_built.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
+                            rayon::broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true); });
+                            unsafe { libmimalloc_sys::mi_collect(true); }
+                            #[cfg(target_os = "linux")]
+                            unsafe { libc::malloc_trim(0); }
                         }
                     });
                 }
@@ -1810,7 +1816,6 @@ pub(crate) fn run_processing_loop_phased(
     reporter.overall_set_message("Phase 4: Simple extraction...");
     if !simple.is_empty() {
         reporter.log(&format!("  Phase 4: {} simple archives...", simple.len()));
-        super::thread_budget::init(extract_workers, extract_workers);
 
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(extract_workers)
