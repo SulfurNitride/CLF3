@@ -46,6 +46,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Install a Wabbajack modlist
     Install {
@@ -347,7 +348,7 @@ async fn main() -> Result<()> {
             println!("Settings file: {}", path);
             println!();
             println!("Nexus API key:    {}", if settings.nexus_api_key.is_empty() { "(not set)" } else { "(set)" });
-            println!("LoversLab login:  {}", if settings.loverslab_email.is_empty() { "(not set)".into() } else { format!("{}", settings.loverslab_email) });
+            println!("LoversLab login:  {}", if settings.loverslab_email.is_empty() { "(not set)" } else { settings.loverslab_email.as_str() });
             println!("GPU:              {}", match settings.gpu_index {
                 Some(idx) => format!("[{}] {}", idx, settings.gpu_name),
                 None => "auto".into(),

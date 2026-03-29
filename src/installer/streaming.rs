@@ -1586,9 +1586,8 @@ pub(crate) fn process_textures_from_temp_streaming(
         for (id, directive) in directives {
             // Symlink or copy the source to spill dir (avoids reading into memory now)
             let data_path = spill_dir.path().join(format!("tex_{}.tmp", idx));
-            if std::os::unix::fs::symlink(file_path, &data_path).is_err() {
-                if fs::copy(file_path, &data_path).is_err() { continue; }
-            }
+            if std::os::unix::fs::symlink(file_path, &data_path).is_err()
+                && fs::copy(file_path, &data_path).is_err() { continue; }
             spilled.push(SpilledDdsJob {
                 id: *id,
                 directive: directive.clone(),

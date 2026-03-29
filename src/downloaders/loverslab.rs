@@ -581,10 +581,8 @@ fn match_filename<'a>(expected: &str, entries: &'a [FileEntry]) -> Option<&'a Fi
     for entry in entries {
         let entry_stem = strip_extension(&entry.name.to_lowercase());
         let common = common_prefix_len(&expected_stem, &entry_stem);
-        if common > 0 {
-            if best.map_or(true, |(best_len, _)| common > best_len) {
-                best = Some((common, entry));
-            }
+        if common > 0 && best.is_none_or(|(best_len, _)| common > best_len) {
+            best = Some((common, entry));
         }
     }
 
@@ -633,7 +631,7 @@ fn extract_mega_url(html: &str) -> Option<String> {
         let rest = &html[start..];
         // Find the end of the URL (quote, space, or angle bracket)
         let end = rest
-            .find(|c: char| c == '"' || c == '\'' || c == ' ' || c == '<' || c == '>')
+            .find(['"', '\'', ' ', '<', '>'])
             .unwrap_or(rest.len());
         let url = &rest[..end];
         if url.len() > 20 {
@@ -644,7 +642,7 @@ fn extract_mega_url(html: &str) -> Option<String> {
     if let Some(start) = html.find("https://mega.nz/#!") {
         let rest = &html[start..];
         let end = rest
-            .find(|c: char| c == '"' || c == '\'' || c == ' ' || c == '<' || c == '>')
+            .find(['"', '\'', ' ', '<', '>'])
             .unwrap_or(rest.len());
         let url = &rest[..end];
         if url.len() > 20 {

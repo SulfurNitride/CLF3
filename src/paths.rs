@@ -229,11 +229,17 @@ pub struct DirCache {
     known: std::sync::RwLock<std::collections::HashSet<PathBuf>>,
 }
 
-impl DirCache {
-    pub fn new() -> Self {
+impl Default for DirCache {
+    fn default() -> Self {
         Self {
             known: std::sync::RwLock::new(std::collections::HashSet::new()),
         }
+    }
+}
+
+impl DirCache {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Ensure parent directories exist for `path`, using the cache to skip

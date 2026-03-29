@@ -466,7 +466,7 @@ pub(crate) fn load_and_group_directives(
     let mut tier_patch = 0usize;
     for hash in &all_hashes {
         let has_patched = patched.contains_key(*hash);
-        let has_nested = from_archive.get(*hash).map_or(false, |ds| {
+        let has_nested = from_archive.get(*hash).is_some_and(|ds| {
             ds.iter().any(|(_, d)| d.archive_hash_path.len() >= 3)
         });
         if has_patched {
@@ -1232,7 +1232,6 @@ pub(crate) fn run_processing_loop(
         let skipped = &skipped;
         let failed = &failed;
         let logged_failures = &logged_failures;
-        let reporter = reporter;
         let active_count = &active_count;
         let active_cvar = &active_cvar;
         let extract_status = &extract_status;

@@ -56,7 +56,7 @@ fn is_bsa_staging_path(to_path: &str, valid_temp_ids: &std::collections::HashSet
     if !to_path.contains("TEMP_BSA_FILES") {
         return false;
     }
-    let parts: Vec<&str> = to_path.split(|c: char| c == '/' || c == '\\').collect();
+    let parts: Vec<&str> = to_path.split(['/', '\\']).collect();
     if let Some(idx) = parts.iter().position(|&p| p == "TEMP_BSA_FILES") {
         if let Some(temp_id) = parts.get(idx + 1) {
             return valid_temp_ids.contains(*temp_id);
@@ -701,22 +701,20 @@ pub async fn download_archives_streaming(
 
     for archive in archives_to_check {
         let output_path = config.downloads_dir.join(&archive.name);
-        if output_path.exists() {
-            if fs::metadata(&output_path).is_ok() {
-                // Fast path: sidecar cache says hash+size+mtime match
-                if super::sidecar::archive_hash_valid(&output_path, &archive.hash) {
-                    db.mark_archive_downloaded(
-                        &archive.hash,
-                        output_path.to_string_lossy().as_ref(),
-                    )?;
-                    already_downloaded += 1;
-                    already_downloaded_size += archive.size as u64;
-                    sidecar_verified.push((archive, output_path));
-                    continue;
-                }
-                archives_to_verify.push((archive, output_path));
+        if output_path.exists() && fs::metadata(&output_path).is_ok() {
+            // Fast path: sidecar cache says hash+size+mtime match
+            if super::sidecar::archive_hash_valid(&output_path, &archive.hash) {
+                db.mark_archive_downloaded(
+                    &archive.hash,
+                    output_path.to_string_lossy().as_ref(),
+                )?;
+                already_downloaded += 1;
+                already_downloaded_size += archive.size as u64;
+                sidecar_verified.push((archive, output_path));
                 continue;
             }
+            archives_to_verify.push((archive, output_path));
+            continue;
         }
         need_download.push(archive);
     }
