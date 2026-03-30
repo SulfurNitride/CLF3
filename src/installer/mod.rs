@@ -37,7 +37,7 @@ use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Tracks peak RSS and logs whenever a new high-water mark is hit.
 /// Thread-safe — share via Arc or &reference.
@@ -518,10 +518,11 @@ impl Installer {
             return Ok(stats);
         }
 
-        // Check for extraction failures — return early with stats so summary is shown
         if streaming_stats.failed > 0 {
-            log_phase_metrics("Pipelined Download+Extract", pipeline_start);
-            return Ok(stats);
+            warn!(
+                "{} directive(s) failed during extraction — continuing with remaining phases",
+                streaming_stats.failed
+            );
         }
         let pipeline_secs = pipeline_start.elapsed().as_secs_f64();
         log_phase_metrics("Pipelined Download+Extract", pipeline_start);

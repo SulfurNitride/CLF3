@@ -1181,7 +1181,7 @@ pub(crate) fn run_processing_loop(
         let arc_extracted = Arc::new(AtomicUsize::new(0));
         let arc_skipped = Arc::new(AtomicUsize::new(0));
         let arc_failed = Arc::new(AtomicUsize::new(0));
-        process_whole_file_directives(
+        let _ = process_whole_file_directives(
             &grouped.whole_file,
             ctx,
             &arc_extracted,
@@ -1527,15 +1527,9 @@ pub(crate) fn run_processing_loop_phased(
             .unwrap_or(4)
     });
 
-    // Process whole-file directives first
-    if !grouped.whole_file.is_empty() {
-        reporter.log(&format!(
-            "Copying {} whole-file directives...", grouped.whole_file.len()
-        ));
-        process_whole_file_directives(&grouped.whole_file, ctx, &extracted, &skipped, &failed);
-    }
-
     // === Drain all archive events from channel ===
+    // Must happen before whole-file processing so that GameFileSource archives
+    // (copied from game dir by the download thread) have their paths registered.
     reporter.log("Draining archive events...");
     let mut all_events: Vec<(String, String, PathBuf)> = Vec::new();
     while let Ok(event) = rx.recv() {
@@ -1550,6 +1544,36 @@ pub(crate) fn run_processing_loop_phased(
             ArchiveEvent::Manual { name, .. } => {
                 warn!("Manual download needed: {}", name);
             }
+        }
+    }
+
+    // Process whole-file directives after drain so all archive paths are known
+    if !grouped.whole_file.is_empty() {
+        reporter.log(&format!(
+            "Copying {} whole-file directives...", grouped.whole_file.len()
+        ));
+        let mut wf_failed = process_whole_file_directives(
+            &grouped.whole_file, ctx, &extracted, &skipped, &failed,
+        );
+
+        // Retry failed whole-file directives up to 3 times
+        for attempt in 1..=3 {
+            if wf_failed.is_empty() {
+                break;
+            }
+            let retry_directives: Vec<(i64, FromArchiveDirective)> = wf_failed
+                .iter()
+                .map(|&idx| grouped.whole_file[idx].clone())
+                .collect();
+            reporter.log(&format!(
+                "Retrying {} failed whole-file directives (attempt {}/3)...",
+                retry_directives.len(), attempt,
+            ));
+            // Undo the failure counts for items we're retrying
+            failed.fetch_sub(retry_directives.len(), Ordering::Relaxed);
+            wf_failed = process_whole_file_directives(
+                &retry_directives, ctx, &extracted, &skipped, &failed,
+            );
         }
     }
 

@@ -698,6 +698,11 @@ impl<'a> ProcessContext<'a> {
                         &config.game_dir, &format!("Data/{}", game_file),
                     ) {
                         archive_paths.insert(archive.hash.clone(), resolved);
+                    } else {
+                        warn!(
+                            "GameFileSource '{}' not found in game dir: {}",
+                            game_file, config.game_dir.display()
+                        );
                     }
                 }
             } else {

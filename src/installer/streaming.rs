@@ -1331,14 +1331,17 @@ pub(crate) fn truncate_name(name: &str, max_len: usize) -> String {
 }
 
 /// Process whole-file directives (archive IS the file, just copy it).
+/// Returns indices of directives that failed (for retry).
 pub(crate) fn process_whole_file_directives(
     directives: &[(i64, FromArchiveDirective)],
     ctx: &ProcessContext,
     extracted: &Arc<AtomicUsize>,
     skipped: &Arc<AtomicUsize>,
     failed: &Arc<AtomicUsize>,
-) {
-    directives.par_iter().for_each(|(id, directive)| {
+) -> Vec<usize> {
+    let failed_indices: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+    directives.par_iter().enumerate().for_each(|(idx, (id, directive))| {
         let archive_hash = &directive.archive_hash_path[0];
 
         let normalized_to = paths::normalize_for_lookup(&directive.to);
@@ -1357,6 +1360,7 @@ pub(crate) fn process_whole_file_directives(
                     id, archive_hash, directive.to
                 );
                 failed.fetch_add(1, Ordering::Relaxed);
+                failed_indices.lock().expect("failed_indices lock").push(idx);
                 return;
             }
         };
@@ -1369,12 +1373,14 @@ pub(crate) fn process_whole_file_directives(
                     id, archive_path.display(), e
                 );
                 failed.fetch_add(1, Ordering::Relaxed);
+                failed_indices.lock().expect("failed_indices lock").push(idx);
                 return;
             }
         };
 
         if archive_size != directive.size {
             failed.fetch_add(1, Ordering::Relaxed);
+            failed_indices.lock().expect("failed_indices lock").push(idx);
             error!(
                 "FAIL [{}]: whole-file size mismatch {} vs {}",
                 id, archive_size, directive.size
@@ -1385,12 +1391,14 @@ pub(crate) fn process_whole_file_directives(
         let output_path = paths::join_windows_path(&ctx.config.output_dir, &directive.to);
         if let Err(e) = ctx.dir_cache.ensure_parent_dirs(&output_path) {
             failed.fetch_add(1, Ordering::Relaxed);
+            failed_indices.lock().expect("failed_indices lock").push(idx);
             error!("FAIL [{}]: cannot create parent dirs: {}", id, e);
             return;
         }
 
         if let Err(e) = fs::copy(&archive_path, &output_path) {
             failed.fetch_add(1, Ordering::Relaxed);
+            failed_indices.lock().expect("failed_indices lock").push(idx);
             error!("FAIL [{}]: copy failed: {}", id, e);
             return;
         }
@@ -1405,6 +1413,8 @@ pub(crate) fn process_whole_file_directives(
 
         extracted.fetch_add(1, Ordering::Relaxed);
     });
+
+    failed_indices.into_inner().expect("failed_indices lock")
 }
 
 /// Extract texture source files from a BSA/BA2 archive and send to DDS handler channel.
