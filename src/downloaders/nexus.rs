@@ -378,6 +378,7 @@ impl NexusDownloader {
             | "vampirethemasqueradebloodlines"
             | "vampire the masquerade bloodlines"
             | "vampire: the masquerade - bloodlines" => "vampirebloodlines",
+            "nierautomata" | "nier automata" => "nierautomata",
             "site" | "moddingtools" => "site", // Modding tools
             _ => game_name,                    // Pass through unknown
         }

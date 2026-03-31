@@ -210,6 +210,18 @@ pub const KNOWN_GAMES: &[KnownGame] = &[
         registry_value: "InstallDir",
         steam_folder: "Baldurs Gate 3",
     },
+    // Square Enix Games
+    KnownGame {
+        name: "NieR: Automata",
+        steam_app_id: "524220",
+        gog_app_id: None,
+        my_games_folder: None,
+        appdata_local_folder: None,
+        appdata_roaming_folder: None,
+        registry_path: r"Software\Square Enix\NieR:Automata",
+        registry_value: "Install_Dir",
+        steam_folder: "NieRAutomata",
+    },
 ];
 
 /// Find a known game by Steam App ID

@@ -588,6 +588,7 @@ fn auto_detect_game_dir(wabbajack_path: &std::path::Path) -> Option<PathBuf> {
         "Morrowind" => "22320",
         "Enderal" | "EnderalSE" => "976620",
         "Starfield" => "1716740",
+        "NieRAutomata" => "524220",
         _ => return None,
     };
 
