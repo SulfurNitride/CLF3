@@ -2017,9 +2017,17 @@ fn copy_game_file(
         }
     }
 
+    // Fallback: check downloads dir (Jackify and other tools may stage CC files there)
+    if source_path.is_none() {
+        let dl_path = config.downloads_dir.join(&archive.name);
+        if dl_path.exists() {
+            source_path = Some(dl_path);
+        }
+    }
+
     let source = source_path.with_context(|| {
         format!(
-            "Game file not found: {} in {}",
+            "Game file not found: {} in {} or downloads dir",
             game_file_path,
             config.game_dir.display()
         )

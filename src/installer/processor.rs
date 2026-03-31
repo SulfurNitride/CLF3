@@ -699,10 +699,17 @@ impl<'a> ProcessContext<'a> {
                     ) {
                         archive_paths.insert(archive.hash.clone(), resolved);
                     } else {
-                        warn!(
-                            "GameFileSource '{}' not found in game dir: {}",
-                            game_file, config.game_dir.display()
-                        );
+                        // Game dir doesn't have this file — check downloads dir
+                        // (Jackify and other tools may stage CC files there)
+                        let path = config.downloads_dir.join(&archive.name);
+                        if path.exists() {
+                            archive_paths.insert(archive.hash.clone(), path);
+                        } else {
+                            warn!(
+                                "GameFileSource '{}' not found in game dir ({}) or downloads dir",
+                                game_file, config.game_dir.display()
+                            );
+                        }
                     }
                 }
             } else {
