@@ -2001,14 +2001,12 @@ fn copy_game_file(
 ) -> Result<()> {
     let game_file_path = &state.game_file;
 
-    // Try different potential base locations with case-insensitive lookup
-    let potential_bases = [
-        (&config.game_dir, game_file_path.as_str()),
-        (&config.game_dir, &format!("Data/{}", game_file_path)),
-    ];
-
+    // Check game directory and downloads directory
     let mut source_path: Option<PathBuf> = None;
-    for (base, relative) in &potential_bases {
+    for (base, relative) in [
+        (&config.game_dir, game_file_path.as_str()),
+        (&config.game_dir, &format!("Data/{}", game_file_path) as &str),
+    ] {
         if let Some(resolved) = crate::paths::resolve_case_insensitive(base, relative) {
             if resolved.exists() {
                 source_path = Some(resolved);
@@ -2016,8 +2014,6 @@ fn copy_game_file(
             }
         }
     }
-
-    // Fallback: check downloads dir (Jackify and other tools may stage CC files there)
     if source_path.is_none() {
         let dl_path = config.downloads_dir.join(&archive.name);
         if dl_path.exists() {
@@ -2032,6 +2028,11 @@ fn copy_game_file(
             config.game_dir.display()
         )
     })?;
+
+    // Skip copy if source and output are the same file
+    if source == output_path {
+        return Ok(());
+    }
 
     // Create parent directory
     if let Some(parent) = output_path.parent() {

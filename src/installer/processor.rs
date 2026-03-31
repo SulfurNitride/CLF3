@@ -685,7 +685,7 @@ impl<'a> ProcessContext<'a> {
                 // local_path points to a non-existent file — fall through
             }
             if archive.state_json.contains("GameFileSourceDownloader") {
-                // GameFileSource: resolve from game directory, not downloads
+                // GameFileSource: check game directory and downloads directory
                 if let Ok(crate::modlist::DownloadState::GameFileSource(gf)) =
                     serde_json::from_str::<crate::modlist::DownloadState>(&archive.state_json)
                 {
@@ -699,8 +699,6 @@ impl<'a> ProcessContext<'a> {
                     ) {
                         archive_paths.insert(archive.hash.clone(), resolved);
                     } else {
-                        // Game dir doesn't have this file — check downloads dir
-                        // (Jackify and other tools may stage CC files there)
                         let path = config.downloads_dir.join(&archive.name);
                         if path.exists() {
                             archive_paths.insert(archive.hash.clone(), path);
