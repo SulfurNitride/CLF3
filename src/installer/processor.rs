@@ -475,6 +475,8 @@ impl FailureTracker {
         for (name, (count, sample_error)) in failures.iter().take(20) {
             reporter.log(&format!("  {} failures: {}", count, name));
             reporter.log(&format!("    Sample error: {}", sample_error));
+            // Also log to tracing so it appears in the log file
+            warn!("{} failures for {}: {}", count, name, sample_error);
         }
 
         if failures.len() > 20 {
@@ -2125,37 +2127,80 @@ fn process_transformed_texture(
             // BC7: parallel CPU prep → GPU batch encode
             reporter.overall_set_message(&format!("BC7: {} textures (GPU+CPU)...", jobs.len()));
 
-            let tex_jobs: Vec<TextureJob> = jobs.iter().filter_map(|st| {
-                fs::read(&st.staged_path).ok().map(|data| TextureJob {
-                    data,
-                    width: st.directive.image_state.width,
-                    height: st.directive.image_state.height,
-                    format: OutputFormat::BC7,
-                    id: Some(format!("{}", st.id)),
-                })
-            }).collect();
+            // Build (index, TextureJob) pairs so we can match results back to
+            // the correct StagedTexture even when some reads fail.
+            let mut indexed_jobs: Vec<(usize, TextureJob)> = Vec::new();
+            for (i, st) in jobs.iter().enumerate() {
+                match fs::read(&st.staged_path) {
+                    Ok(data) => {
+                        indexed_jobs.push((i, TextureJob {
+                            data,
+                            width: st.directive.image_state.width,
+                            height: st.directive.image_state.height,
+                            format: OutputFormat::BC7,
+                            id: Some(format!("{}", st.id)),
+                        }));
+                    }
+                    Err(e) => {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        error!(
+                            "FAIL [{}] BC7 texture read: {} — {}",
+                            st.id, st.directive.to, e
+                        );
+                        failure_tracker.record_failure("texture", &e.to_string());
+                        reporter.overall_inc();
+                    }
+                }
+            }
 
+            let indices: Vec<usize> = indexed_jobs.iter().map(|(i, _)| *i).collect();
+            let tex_jobs: Vec<TextureJob> = indexed_jobs.into_iter().map(|(_, j)| j).collect();
             let results = process_texture_batch(tex_jobs);
 
-            for (st, (_job_id, result)) in jobs.iter().zip(results.into_iter()) {
+            for (idx, (_job_id, result)) in indices.into_iter().zip(results.into_iter()) {
+                let st = &jobs[idx];
                 match result {
                     Ok(processed) => {
                         let output_path = ctx.resolve_output_path(&st.directive.to);
                         if let Err(e) = ctx.dir_cache.ensure_parent_dirs(&output_path)
                             .and_then(|_| fs::write(&output_path, &processed.data))
                         {
-                            failed.fetch_add(1, Ordering::Relaxed);
-                            failure_tracker.record_failure("texture", &e.to_string());
+                            // Retry up to 3 times — transient ENOENT on slow/external filesystems
+                            let mut retry_ok = false;
+                            for attempt in 1..=3 {
+                                if ctx.dir_cache.ensure_parent_dirs(&output_path).is_ok()
+                                    && fs::write(&output_path, &processed.data).is_ok()
+                                {
+                                    warn!(
+                                        "BC7 texture write for {} succeeded on retry {} (first error: {})",
+                                        st.directive.to, attempt, e
+                                    );
+                                    retry_ok = true;
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(100 * attempt as u64));
+                            }
+                            if !retry_ok {
+                                failed.fetch_add(1, Ordering::Relaxed);
+                                error!(
+                                    "FAIL [{}] BC7 texture write: {} — {}",
+                                    st.id, st.directive.to, e
+                                );
+                                failure_tracker.record_failure("texture", &e.to_string());
+                            } else {
+                                completed.fetch_add(1, Ordering::Relaxed);
+                            }
                         } else {
                             completed.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     Err(e) => {
                         failed.fetch_add(1, Ordering::Relaxed);
+                        error!(
+                            "FAIL [{}] BC7 texture: {} — {:#}",
+                            st.id, st.directive.to, e
+                        );
                         failure_tracker.record_failure("texture", &format!("{:#}", e));
-                        if failed.load(Ordering::Relaxed) <= 10 {
-                            reporter.log(&format!("FAIL [{}] BC7 texture: {:#}", st.id, e));
-                        }
                     }
                 }
                 reporter.overall_inc();
@@ -2173,14 +2218,40 @@ fn process_transformed_texture(
                     )?;
                     let output_path = ctx.resolve_output_path(&st.directive.to);
                     ctx.dir_cache.ensure_parent_dirs(&output_path)?;
-                    fs::write(&output_path, &processed.data)?;
+                    if let Err(first_err) = fs::write(&output_path, &processed.data) {
+                        // Retry up to 3 times — transient ENOENT on slow/external filesystems
+                        let mut succeeded = false;
+                        for attempt in 1..=3 {
+                            std::thread::sleep(std::time::Duration::from_millis(100 * attempt as u64));
+                            if ctx.dir_cache.ensure_parent_dirs(&output_path).is_ok()
+                                && fs::write(&output_path, &processed.data).is_ok()
+                            {
+                                warn!(
+                                    "Texture write for {} succeeded on retry {} (first error: {})",
+                                    st.directive.to, attempt, first_err
+                                );
+                                succeeded = true;
+                                break;
+                            }
+                        }
+                        if !succeeded {
+                            anyhow::bail!(
+                                "write failed after 3 retries for {}: {}",
+                                st.directive.to, first_err
+                            );
+                        }
+                    }
                     Ok(())
                 })();
                 match result {
                     Ok(()) => { completed.fetch_add(1, Ordering::Relaxed); }
                     Err(e) => {
                         failed.fetch_add(1, Ordering::Relaxed);
-                        failure_tracker.record_failure("texture", &e.to_string());
+                        error!(
+                            "FAIL [{}] {} texture: {} — {:#}",
+                            st.id, fmt_str, st.directive.to, e
+                        );
+                        failure_tracker.record_failure("texture", &format!("{}: {}", st.directive.to, e));
                     }
                 }
                 reporter.overall_inc();

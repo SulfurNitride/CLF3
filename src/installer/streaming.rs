@@ -1733,9 +1733,25 @@ fn process_spilled_dds_batched(jobs: Vec<SpilledDdsJob>, ctx: &ProcessContext) -
                     match result {
                         Ok(processed) => {
                             let out = paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
-                            if ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
-                                && fs::write(&out, &processed.data).is_ok()
-                            {
+                            let mut written = ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
+                                && fs::write(&out, &processed.data).is_ok();
+                            // Retry up to 3 times for transient filesystem errors
+                            if !written {
+                                for attempt in 1..=3u64 {
+                                    std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
+                                    if ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
+                                        && fs::write(&out, &processed.data).is_ok()
+                                    {
+                                        warn!(
+                                            "DDS BC7 write for {} succeeded on retry {}",
+                                            job.directive.to, attempt
+                                        );
+                                        written = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if written {
                                 // Only write sidecar for final output paths (not BSA staging dirs)
                                 if !job.directive.to.contains("TEMP_BSA_FILES") {
                                     let _ = sidecar::write_sidecar(&out, &job.directive.hash);
@@ -1746,11 +1762,12 @@ fn process_spilled_dds_batched(jobs: Vec<SpilledDdsJob>, ctx: &ProcessContext) -
                                     .insert(job.id);
                             } else {
                                 fail_count += 1;
+                                warn!("DDS BC7 write fail [{}]: {}", job.id, job.directive.to);
                             }
                         }
                         Err(e) => {
                             fail_count += 1;
-                            warn!("DDS BC7 fail [{}]: {:#}", job.id, e);
+                            warn!("DDS BC7 fail [{}]: {} — {:#}", job.id, job.directive.to, e);
                         }
                     }
                 }
@@ -1769,7 +1786,29 @@ fn process_spilled_dds_batched(jobs: Vec<SpilledDdsJob>, ctx: &ProcessContext) -
                     )?;
                     let out = paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
                     ctx.dir_cache.ensure_parent_dirs(&out)?;
-                    fs::write(&out, &tex.data)?;
+                    if let Err(first_err) = fs::write(&out, &tex.data) {
+                        // Retry up to 3 times for transient filesystem errors
+                        let mut succeeded = false;
+                        for attempt in 1..=3u64 {
+                            std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
+                            if ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
+                                && fs::write(&out, &tex.data).is_ok()
+                            {
+                                warn!(
+                                    "DDS {} write for {} succeeded on retry {}",
+                                    fmt.name(), job.directive.to, attempt
+                                );
+                                succeeded = true;
+                                break;
+                            }
+                        }
+                        if !succeeded {
+                            anyhow::bail!(
+                                "write failed after 3 retries for {}: {}",
+                                job.directive.to, first_err
+                            );
+                        }
+                    }
                     if !job.directive.to.contains("TEMP_BSA_FILES") {
                         let _ = sidecar::write_sidecar(&out, &job.directive.hash);
                     }
@@ -1784,7 +1823,7 @@ fn process_spilled_dds_batched(jobs: Vec<SpilledDdsJob>, ctx: &ProcessContext) -
                     }
                     Err(e) => {
                         fail_count += 1;
-                        warn!("DDS {} fail [{}]: {}", fmt.name(), job.id, e);
+                        warn!("DDS {} fail [{}]: {} — {}", fmt.name(), job.id, job.directive.to, e);
                     }
                 }
             }
@@ -2567,9 +2606,25 @@ pub(crate) fn process_spilled_dds_jobs_with_progress(
                         Ok(processed) => {
                             let out =
                                 paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
-                            if ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
-                                && fs::write(&out, &processed.data).is_ok()
-                            {
+                            let mut written = ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
+                                && fs::write(&out, &processed.data).is_ok();
+                            // Retry up to 3 times for transient filesystem errors
+                            if !written {
+                                for attempt in 1..=3u64 {
+                                    std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
+                                    if ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
+                                        && fs::write(&out, &processed.data).is_ok()
+                                    {
+                                        warn!(
+                                            "DDS BC7 write for {} succeeded on retry {}",
+                                            job.directive.to, attempt
+                                        );
+                                        written = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if written {
                                 dds_ok.fetch_add(1, Ordering::Relaxed);
                                 if let Some(wc) = written_counter {
                                     wc.fetch_add(1, Ordering::Relaxed);
@@ -2580,11 +2635,12 @@ pub(crate) fn process_spilled_dds_jobs_with_progress(
                                     .insert(job.id);
                             } else {
                                 dds_fail.fetch_add(1, Ordering::Relaxed);
+                                warn!("DDS BC7 write fail [{}]: {}", job.id, job.directive.to);
                             }
                         }
                         Err(e) => {
                             dds_fail.fetch_add(1, Ordering::Relaxed);
-                            warn!("DDS BC7 fail [{}]: {:#}", job.id, e);
+                            warn!("DDS BC7 fail [{}]: {} — {:#}", job.id, job.directive.to, e);
                         }
                     }
                 }
@@ -2609,7 +2665,29 @@ pub(crate) fn process_spilled_dds_jobs_with_progress(
                     )?;
                     let out = paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
                     ctx.dir_cache.ensure_parent_dirs(&out)?;
-                    fs::write(&out, &tex.data)?;
+                    if let Err(first_err) = fs::write(&out, &tex.data) {
+                        // Retry up to 3 times for transient filesystem errors
+                        let mut succeeded = false;
+                        for attempt in 1..=3u64 {
+                            std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
+                            if ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
+                                && fs::write(&out, &tex.data).is_ok()
+                            {
+                                warn!(
+                                    "DDS {} write for {} succeeded on retry {}",
+                                    fmt.name(), job.directive.to, attempt
+                                );
+                                succeeded = true;
+                                break;
+                            }
+                        }
+                        if !succeeded {
+                            anyhow::bail!(
+                                "write failed after 3 retries for {}: {}",
+                                job.directive.to, first_err
+                            );
+                        }
+                    }
                     Ok(())
                 })();
                 match result {
@@ -2629,7 +2707,7 @@ pub(crate) fn process_spilled_dds_jobs_with_progress(
                     }
                     Err(e) => {
                         dds_fail.fetch_add(1, Ordering::Relaxed);
-                        warn!("DDS {} fail [{}]: {}", fmt.name(), job.id, e);
+                        warn!("DDS {} fail [{}]: {} — {}", fmt.name(), job.id, job.directive.to, e);
                     }
                 }
             });
