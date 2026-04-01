@@ -62,7 +62,7 @@ pub struct WabbajackCdnDownloader {
 impl WabbajackCdnDownloader {
     pub fn new() -> Result<Self> {
         let client = Client::builder()
-            .user_agent(concat!("clf3/", env!("CARGO_PKG_VERSION")))
+            .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
             .build()
             .context("Failed to create HTTP client")?;
 
@@ -75,6 +75,10 @@ impl WabbajackCdnDownloader {
         for (from, to) in CDN_REMAPS {
             result = result.replace(from, to);
         }
+        // authored_files/download/{name} URLs need /download stripped —
+        // the CDN endpoints (definition.json.gz, parts/) live under
+        // authored_files/{name}/ directly.
+        result = result.replace("/authored_files/download/", "/authored_files/");
         result
     }
 

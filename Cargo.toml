@@ -122,6 +122,11 @@ mimalloc = "0.1"
 libmimalloc-sys = { version = "0.1", features = ["extended"] }  # FFI for mi_collect()
 console = "0.16.3"
 
+# GUI browser (egui)
+eframe = "0.31"
+egui_extras = { version = "0.31", features = ["image"] }
+rfd = "0.15"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

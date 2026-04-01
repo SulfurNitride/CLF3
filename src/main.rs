@@ -10,6 +10,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod archive;
+mod browser_gui;
 mod bsa;
 mod downloaders;
 mod game_finder;
@@ -48,10 +49,13 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
+    /// Browse available Wabbajack modlists
+    Browser,
+
     /// Install a Wabbajack modlist
     Install {
-        /// Path to the .wabbajack file
-        wabbajack_file: PathBuf,
+        /// Path or URL to the .wabbajack file
+        wabbajack_file: String,
 
         /// Directory for downloaded archives
         downloads: PathBuf,
@@ -259,6 +263,13 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
+        Commands::Browser => {
+            if let Err(e) = browser_gui::launch_browser() {
+                eprintln!("Browser GUI error: {}", e);
+                std::process::exit(1);
+            }
+        }
+
         Commands::SetApiKey { key } => {
             println!("Verifying Nexus API key...");
             let nexus = downloaders::NexusDownloader::new(&key)?;
@@ -373,6 +384,65 @@ async fn main() -> Result<()> {
             ll_email,
             ll_password,
         } => {
+            // If wabbajack_file is a URL, download it first.
+            let wabbajack_file = if wabbajack_file.starts_with("http://")
+                || wabbajack_file.starts_with("https://")
+            {
+                println!("Downloading .wabbajack file from URL...");
+                let cache_dir = dirs::cache_dir()
+                    .unwrap_or_else(|| PathBuf::from("/tmp"))
+                    .join("clf3")
+                    .join("modlists");
+                std::fs::create_dir_all(&cache_dir)?;
+
+                // Derive filename from URL path or use a default.
+                // Wabbajack authored_files URLs look like:
+                //   .../Name.wabbajack_bbe12eee-2a70-4030-8f7a-7d7341150d7b
+                // Strip the _UUID suffix to get the real filename.
+                let filename = wabbajack_file
+                    .rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        let decoded = urlencoded_decode(s);
+                        // If it contains ".wabbajack_", trim the UUID suffix.
+                        if let Some(idx) = decoded.find(".wabbajack_") {
+                            decoded[..idx + ".wabbajack".len()].to_string()
+                        } else if decoded.ends_with(".wabbajack") {
+                            decoded
+                        } else {
+                            format!("{}.wabbajack", decoded)
+                        }
+                    })
+                    .unwrap_or_else(|| "download.wabbajack".into());
+                let dest = cache_dir.join(&filename);
+
+                let cdn = downloaders::wabbajack_cdn::WabbajackCdnDownloader::new()?;
+                let pb = indicatif::ProgressBar::new(0);
+                pb.set_style(
+                    indicatif::ProgressStyle::default_bar()
+                        .template("{msg} [{bar:40}] {bytes}/{total_bytes}")
+                        .expect("valid template")
+                        .progress_chars("=> "),
+                );
+                pb.set_message("Downloading");
+
+                let pb_clone = pb.clone();
+                cdn.download_with_progress(&wabbajack_file, &dest, 0, move |downloaded, total| {
+                    if pb_clone.length() == Some(0) && total > 0 {
+                        pb_clone.set_length(total);
+                    }
+                    pb_clone.set_position(downloaded);
+                })
+                .await?;
+                pb.finish_with_message("Downloaded");
+
+                println!("Saved to: {}", dest.display());
+                dest
+            } else {
+                PathBuf::from(&wabbajack_file)
+            };
+
             let settings = settings::Settings::load();
 
             // Resolve API key: CLI arg > env var > saved settings
@@ -593,4 +663,22 @@ fn auto_detect_game_dir(wabbajack_path: &std::path::Path) -> Option<PathBuf> {
     };
 
     game_finder::find_game_install_path(app_id)
+}
+
+/// Simple percent-decoding for URL filenames (e.g. %20 -> space).
+fn urlencoded_decode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let hi = chars.next().and_then(|c| (c as char).to_digit(16));
+            let lo = chars.next().and_then(|c| (c as char).to_digit(16));
+            if let (Some(h), Some(l)) = (hi, lo) {
+                result.push((h * 16 + l) as u8 as char);
+            }
+        } else {
+            result.push(b as char);
+        }
+    }
+    result
 }
