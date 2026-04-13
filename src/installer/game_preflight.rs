@@ -117,6 +117,35 @@ impl PreflightReport {
     }
 }
 
+/// Files that ship in known-different bytes across editions or stores but
+/// behave identically at runtime — accept a hash mismatch rather than failing
+/// preflight. Match is case-insensitive against the basename of the modlist's
+/// `game_file` path. Mirrors `is_curios` in `downloader.rs` so preflight and
+/// download accept the same set.
+///
+/// Add new entries here when modlist authors hit known alt-variant pain.
+const ALT_VARIANT_FILE_BASENAMES: &[&str] = &[
+    // Skyrim SE Curios Creation Club content — Steam vs Bethesda.net builds
+    // ship different bytes but the same content. Wabbajack's downloader has
+    // accepted this since forever.
+    "ccbgssse037-curios.esl",
+    "ccbgssse037-curios.bsa",
+];
+
+/// Returns true if the given modlist `game_file` path matches a known alternate
+/// variant. Hash mismatches on these files are warned-and-accepted instead of
+/// failed.
+fn has_known_alt_variant(game_file: &str) -> bool {
+    let basename = game_file
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(game_file)
+        .to_lowercase();
+    ALT_VARIANT_FILE_BASENAMES
+        .iter()
+        .any(|alt| basename == *alt)
+}
+
 /// Iterate a modlist's archives and collect just the GameFileSource entries we
 /// need to verify.
 fn collect_game_files_from_archives(archives: &[Archive]) -> Vec<GameFileSourceState> {
@@ -170,6 +199,17 @@ fn verify(game_files: &[GameFileSourceState], game_dir: &Path) -> PreflightRepor
                 None => CheckStatus::Missing,
                 Some(path) => match compute_file_hash(&path) {
                     Ok(h) if h == expected_hash => CheckStatus::Ok,
+                    Ok(h) if has_known_alt_variant(&file) => {
+                        // Same content, different store/edition variant
+                        // (e.g. Curios Steam vs Bethesda) — accept hash
+                        // mismatch but keep a debug log via Ok status.
+                        tracing::warn!(
+                            "Game file '{}' hash differs from expected ({} vs {}) but \
+                             is on known-alternate-variant list — accepting",
+                            file, h, expected_hash
+                        );
+                        CheckStatus::Ok
+                    }
                     Ok(h) => CheckStatus::Mismatch(h),
                     Err(e) => CheckStatus::ReadError(e.to_string()),
                 },
