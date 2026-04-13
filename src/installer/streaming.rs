@@ -1736,10 +1736,11 @@ fn process_spilled_dds_batched(jobs: Vec<SpilledDdsJob>, ctx: &ProcessContext) -
                             let mut written = ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
                                 && fs::write(&out, &processed.data).is_ok();
                             // Retry up to 3 times for transient filesystem errors
+                            // Use force_ensure_parent_dirs to bypass DirCache stale entries
                             if !written {
                                 for attempt in 1..=3u64 {
                                     std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
-                                    if ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
+                                    if ctx.dir_cache.force_ensure_parent_dirs(&out).is_ok()
                                         && fs::write(&out, &processed.data).is_ok()
                                     {
                                         warn!(
@@ -1788,10 +1789,11 @@ fn process_spilled_dds_batched(jobs: Vec<SpilledDdsJob>, ctx: &ProcessContext) -
                     ctx.dir_cache.ensure_parent_dirs(&out)?;
                     if let Err(first_err) = fs::write(&out, &tex.data) {
                         // Retry up to 3 times for transient filesystem errors
+                        // Use force_ensure_parent_dirs to bypass DirCache stale entries
                         let mut succeeded = false;
                         for attempt in 1..=3u64 {
                             std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
-                            if ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
+                            if ctx.dir_cache.force_ensure_parent_dirs(&out).is_ok()
                                 && fs::write(&out, &tex.data).is_ok()
                             {
                                 warn!(
@@ -1986,9 +1988,24 @@ pub(crate) fn process_dds_jobs_inline(jobs: Vec<DdsJob>, ctx: &ProcessContext) -
                     Ok(processed) => {
                         let out =
                             paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
-                        if ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
-                            && fs::write(&out, &processed.data).is_ok()
-                        {
+                        let mut written = ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
+                            && fs::write(&out, &processed.data).is_ok();
+                        if !written {
+                            for attempt in 1..=3u64 {
+                                std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
+                                if ctx.dir_cache.force_ensure_parent_dirs(&out).is_ok()
+                                    && fs::write(&out, &processed.data).is_ok()
+                                {
+                                    warn!(
+                                        "DDS BC7 write for {} succeeded on retry {}",
+                                        job.directive.to, attempt
+                                    );
+                                    written = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if written {
                             ok_count.fetch_add(1, Ordering::Relaxed);
                             ctx.textures_processed_during_install
                                 .lock()
@@ -1996,6 +2013,7 @@ pub(crate) fn process_dds_jobs_inline(jobs: Vec<DdsJob>, ctx: &ProcessContext) -
                                 .insert(job.id);
                         } else {
                             fail_count.fetch_add(1, Ordering::Relaxed);
+                            warn!("DDS BC7 write fail [{}]: {}", job.id, job.directive.to);
                         }
                     }
                     Err(e) => {
@@ -2609,10 +2627,11 @@ pub(crate) fn process_spilled_dds_jobs_with_progress(
                             let mut written = ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
                                 && fs::write(&out, &processed.data).is_ok();
                             // Retry up to 3 times for transient filesystem errors
+                            // Use force_ensure_parent_dirs to bypass DirCache stale entries
                             if !written {
                                 for attempt in 1..=3u64 {
                                     std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
-                                    if ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
+                                    if ctx.dir_cache.force_ensure_parent_dirs(&out).is_ok()
                                         && fs::write(&out, &processed.data).is_ok()
                                     {
                                         warn!(
@@ -2667,10 +2686,11 @@ pub(crate) fn process_spilled_dds_jobs_with_progress(
                     ctx.dir_cache.ensure_parent_dirs(&out)?;
                     if let Err(first_err) = fs::write(&out, &tex.data) {
                         // Retry up to 3 times for transient filesystem errors
+                        // Use force_ensure_parent_dirs to bypass DirCache stale entries
                         let mut succeeded = false;
                         for attempt in 1..=3u64 {
                             std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
-                            if ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
+                            if ctx.dir_cache.force_ensure_parent_dirs(&out).is_ok()
                                 && fs::write(&out, &tex.data).is_ok()
                             {
                                 warn!(

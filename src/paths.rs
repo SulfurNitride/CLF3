@@ -304,6 +304,25 @@ impl DirCache {
         Ok(())
     }
 
+    /// Like `ensure_parent_dirs` but bypasses the cache, always hitting the filesystem.
+    /// Use this in retry paths where a prior attempt cached the directory but the
+    /// actual mkdir may have failed or the directory was removed.
+    pub fn force_ensure_parent_dirs(&self, path: &Path) -> std::io::Result<()> {
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => return Ok(()),
+        };
+
+        // Remove from cache so we re-check
+        {
+            let mut known = self.known.write().unwrap_or_else(|e| e.into_inner());
+            known.remove(parent);
+        }
+
+        // Delegate to the normal method which will now take the slow path
+        self.ensure_parent_dirs(path)
+    }
+
     /// Pre-seed the cache with directories that already exist on disk.
     /// Call once before extraction starts with the output directory.
     pub fn seed_from_disk(&self, root: &Path) {

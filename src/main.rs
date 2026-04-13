@@ -24,8 +24,27 @@ mod settings;
 mod textures;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
-use installer::{CliReporter, InstallConfig, Installer, ProgressReporter};
+use clap::{Parser, Subcommand, ValueEnum};
+use installer::{CliReporter, ExtractStrategy, InstallConfig, Installer, ProgressReporter};
+
+/// CLI-facing enum for the `--extract` flag. Maps to the internal
+/// `installer::ExtractStrategy` used by the install pipeline.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum ExtractStrategyArg {
+    /// Extract archives as they finish downloading. Network + CPU overlap.
+    Streaming,
+    /// Download everything first, then run 4 sequential extract phases.
+    Phased,
+}
+
+impl From<ExtractStrategyArg> for ExtractStrategy {
+    fn from(arg: ExtractStrategyArg) -> Self {
+        match arg {
+            ExtractStrategyArg::Streaming => ExtractStrategy::Streaming,
+            ExtractStrategyArg::Phased => ExtractStrategy::Phased,
+        }
+    }
+}
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
@@ -102,6 +121,18 @@ enum Commands {
         /// LoversLab password (overrides saved setting)
         #[arg(long, env = "LOVERSLAB_PASSWORD")]
         ll_password: Option<String>,
+
+        /// Extraction strategy.
+        ///
+        /// - `streaming` (default): extract archives incrementally as they
+        ///   finish downloading — best for large (>50 GB) modlists where the
+        ///   download dominates wall-clock time. CPU and network run fully in
+        ///   parallel.
+        /// - `phased`: wait for all downloads to finish, then run 4 sequential
+        ///   phases at full CPU. Better for small modlists where download is
+        ///   short and CPU-heavy work (DDS, BSA) dominates.
+        #[arg(long, value_enum, default_value_t = ExtractStrategyArg::Streaming)]
+        extract: ExtractStrategyArg,
     },
 
     /// Set and verify your Nexus Mods API key
@@ -383,6 +414,7 @@ async fn main() -> Result<()> {
             browser,
             ll_email,
             ll_password,
+            extract,
         } => {
             // If wabbajack_file is a URL, download it first.
             let wabbajack_file = if wabbajack_file.starts_with("http://")
@@ -463,16 +495,22 @@ async fn main() -> Result<()> {
             let game_dir = match game {
                 Some(g) => g,
                 None => {
-                    // Try to auto-detect game path from the modlist's game type
-                    let game_dir = auto_detect_game_dir(&wabbajack_file);
-                    match game_dir {
-                        Some(p) => {
-                            println!("Auto-detected game directory: {}", p.display());
+                    // Try to auto-detect game path from the modlist's game type,
+                    // preferring installs whose game files actually match the
+                    // modlist's expected hashes (Steam first, then Heroic/GOG).
+                    match auto_detect_game_dir(&wabbajack_file) {
+                        Some((p, store)) => {
+                            println!(
+                                "Auto-detected game directory: {} ({})",
+                                p.display(),
+                                store
+                            );
                             p
                         }
                         None => {
                             anyhow::bail!(
-                                "Could not auto-detect game directory. Specify it with --game PATH"
+                                "Could not auto-detect a game directory with matching files. \
+                                 Specify one with --game PATH"
                             );
                         }
                     }
@@ -523,6 +561,7 @@ async fn main() -> Result<()> {
                 reporter: cli_reporter.clone() as Arc<dyn ProgressReporter>,
                 loverslab_email: ll_email,
                 loverslab_password: ll_password,
+                extract_strategy: extract.into(),
             };
 
             let mut installer = Installer::new(config)?;
@@ -643,26 +682,85 @@ async fn main() -> Result<()> {
 }
 
 /// Try to auto-detect the game installation directory from the modlist's game type.
-fn auto_detect_game_dir(wabbajack_path: &std::path::Path) -> Option<PathBuf> {
-    // Quick-parse just the modlist header to get game_type
+///
+/// Strategy:
+/// 1. Parse modlist header to get `game_type`.
+/// 2. Look up that game_type in `KNOWN_GAMES` to get Steam + (optional) GOG IDs.
+/// 3. Try Steam install first. If game files hash-match → return (path, "Steam").
+/// 4. Fall back to Heroic/GOG if available. Hash-match → return (path, "Heroic/GOG").
+/// 5. If any install exists but hashes mismatch, log the diagnostic and keep
+///    trying the next candidate.
+/// 6. Last resort: return the first install that *exists* even if hashes can't
+///    be checked (e.g. modlist has no GameFileSource entries at all — common
+///    for Cyberpunk/Witcher3/BG3). Prefer Steam in this case.
+///
+/// Returns `(install_path, store_label)` for display.
+fn auto_detect_game_dir(wabbajack_path: &std::path::Path) -> Option<(PathBuf, &'static str)> {
+    use installer::game_preflight::check_game_files_from_modlist;
+
     let modlist = modlist::parse_wabbajack_file(wabbajack_path).ok()?;
 
-    // Map Wabbajack game type names to Steam App IDs
-    let app_id = match modlist.game_type.as_str() {
-        "SkyrimSE" | "SkyrimSpecialEdition" => "489830",
-        "Skyrim" => "72850",
-        "Fallout4" => "377160",
-        "FalloutNewVegas" | "FalloutNV" => "22380",
-        "Fallout3" => "22300",
-        "Oblivion" => "22330",
-        "Morrowind" => "22320",
-        "Enderal" | "EnderalSE" => "976620",
-        "Starfield" => "1716740",
-        "NieRAutomata" => "524220",
-        _ => return None,
-    };
+    let (steam_id, gog_id) = game_finder::ids_for_wabbajack_type(&modlist.game_type)?;
 
-    game_finder::find_game_install_path(app_id)
+    // Build an ordered candidate list: Steam first, then Heroic/GOG.
+    let mut candidates: Vec<(PathBuf, &'static str)> = Vec::new();
+
+    if let Some(p) = game_finder::find_game_install_path(steam_id) {
+        candidates.push((p, "Steam"));
+    }
+
+    if let Some(gog_app_id) = gog_id {
+        for g in game_finder::detect_heroic_games() {
+            if g.app_id == gog_app_id {
+                candidates.push((g.install_path.clone(), "Heroic/GOG"));
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Hash-verify each candidate against the modlist's GameFileSource entries.
+    let mut first_fallback: Option<(PathBuf, &'static str)> = None;
+
+    for (path, store) in &candidates {
+        let report = check_game_files_from_modlist(&modlist, path);
+
+        if report.total == 0 {
+            // Modlist has no pinned game files — any install for the right
+            // game works. Remember the first such candidate (Steam wins due
+            // to ordering) and keep scanning in case a later candidate also
+            // has no pins; the first one still wins.
+            if first_fallback.is_none() {
+                first_fallback = Some((path.clone(), store));
+            }
+            continue;
+        }
+
+        if report.all_ok() {
+            println!(
+                "Game file preflight passed on {} candidate: {}",
+                store,
+                path.display()
+            );
+            return Some((path.clone(), store));
+        }
+
+        // Preflight failed on this candidate — log and try next.
+        eprintln!(
+            "Skipping {} install at {}: {} file(s) missing, {} hash mismatch. \
+             Trying next candidate...",
+            store,
+            path.display(),
+            report.missing().len(),
+            report.mismatched().len()
+        );
+    }
+
+    // All hash-gated candidates failed. Fall back to the first install that
+    // had no game files to pin (if any).
+    first_fallback
 }
 
 /// Simple percent-decoding for URL filenames (e.g. %20 -> space).

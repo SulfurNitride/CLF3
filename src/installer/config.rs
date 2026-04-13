@@ -6,6 +6,25 @@ use super::progress::ProgressReporter;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// How the install pipeline schedules download vs. extraction work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractStrategy {
+    /// Extract archives incrementally as each one finishes downloading.
+    /// Network and CPU run concurrently — best when the download dominates
+    /// wall-clock (large modlists, slow connections).
+    Streaming,
+    /// Wait for all downloads to finish, then run 4 sequential extraction
+    /// phases at full CPU. Best for small modlists where download is short
+    /// and the CPU-heavy phases (DDS, BSA build) dominate.
+    Phased,
+}
+
+impl Default for ExtractStrategy {
+    fn default() -> Self {
+        ExtractStrategy::Streaming
+    }
+}
+
 /// Progress callback type for reporting download/installation progress
 pub type ProgressCallback = Arc<dyn Fn(ProgressEvent) + Send + Sync>;
 
@@ -104,6 +123,10 @@ pub struct InstallConfig {
 
     /// LoversLab password for automated downloads (empty = manual)
     pub loverslab_password: String,
+
+    /// Extraction scheduling strategy. Defaults to `Streaming` so large
+    /// modlists overlap CPU extract work with network downloads.
+    pub extract_strategy: ExtractStrategy,
 }
 
 impl std::fmt::Debug for InstallConfig {

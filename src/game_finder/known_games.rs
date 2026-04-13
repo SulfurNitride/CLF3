@@ -27,6 +27,9 @@ pub struct KnownGame {
     pub registry_value: &'static str,
     /// Expected folder name in steamapps/common/
     pub steam_folder: &'static str,
+    /// Wabbajack `GameType` string from modlist JSON (e.g. "FalloutNewVegas").
+    /// None for store variants that don't have their own Wabbajack enum entry.
+    pub wabbajack_type: Option<&'static str>,
 }
 
 /// All known games that CLF3 supports
@@ -42,6 +45,7 @@ pub const KNOWN_GAMES: &[KnownGame] = &[
         registry_path: r"Software\SureAI\Enderal",
         registry_value: "Install_Path",
         steam_folder: "Enderal",
+        wabbajack_type: Some("Enderal"),
     },
     KnownGame {
         name: "Enderal Special Edition",
@@ -53,6 +57,7 @@ pub const KNOWN_GAMES: &[KnownGame] = &[
         registry_path: r"Software\SureAI\Enderal SE",
         registry_value: "installed path",
         steam_folder: "Enderal Special Edition",
+        wabbajack_type: Some("EnderalSpecialEdition"),
     },
     KnownGame {
         name: "Fallout 3",
@@ -64,6 +69,7 @@ pub const KNOWN_GAMES: &[KnownGame] = &[
         registry_path: r"Software\Bethesda Softworks\Fallout3",
         registry_value: "Installed Path",
         steam_folder: "Fallout 3",
+        wabbajack_type: Some("Fallout3"),
     },
     KnownGame {
         name: "Fallout 3 GOTY",
@@ -75,6 +81,7 @@ pub const KNOWN_GAMES: &[KnownGame] = &[
         registry_path: r"Software\Bethesda Softworks\Fallout3",
         registry_value: "Installed Path",
         steam_folder: "Fallout 3 goty",
+        wabbajack_type: None, // store variant — Wabbajack treats as Fallout3
     },
     KnownGame {
         name: "Fallout 4",
@@ -86,6 +93,7 @@ pub const KNOWN_GAMES: &[KnownGame] = &[
         registry_path: r"Software\Bethesda Softworks\Fallout4",
         registry_value: "Installed Path",
         steam_folder: "Fallout 4",
+        wabbajack_type: Some("Fallout4"),
     },
     KnownGame {
         name: "Fallout 4 VR",
@@ -97,6 +105,7 @@ pub const KNOWN_GAMES: &[KnownGame] = &[
         registry_path: r"Software\Bethesda Softworks\Fallout 4 VR",
         registry_value: "Installed Path",
         steam_folder: "Fallout 4 VR",
+        wabbajack_type: Some("Fallout4VR"),
     },
     KnownGame {
         name: "Fallout New Vegas",
@@ -108,6 +117,7 @@ pub const KNOWN_GAMES: &[KnownGame] = &[
         registry_path: r"Software\Bethesda Softworks\FalloutNV",
         registry_value: "Installed Path",
         steam_folder: "Fallout New Vegas",
+        wabbajack_type: Some("FalloutNewVegas"),
     },
     KnownGame {
         name: "Morrowind",
@@ -119,6 +129,7 @@ pub const KNOWN_GAMES: &[KnownGame] = &[
         registry_path: r"Software\Bethesda Softworks\Morrowind",
         registry_value: "Installed Path",
         steam_folder: "Morrowind",
+        wabbajack_type: Some("Morrowind"),
     },
     KnownGame {
         name: "Oblivion",
@@ -130,6 +141,7 @@ pub const KNOWN_GAMES: &[KnownGame] = &[
         registry_path: r"Software\Bethesda Softworks\Oblivion",
         registry_value: "Installed Path",
         steam_folder: "Oblivion",
+        wabbajack_type: Some("Oblivion"),
     },
     KnownGame {
         name: "Skyrim",
@@ -141,6 +153,7 @@ pub const KNOWN_GAMES: &[KnownGame] = &[
         registry_path: r"Software\Bethesda Softworks\Skyrim",
         registry_value: "Installed Path",
         steam_folder: "Skyrim",
+        wabbajack_type: Some("Skyrim"),
     },
     KnownGame {
         name: "Skyrim Special Edition",
@@ -152,6 +165,7 @@ pub const KNOWN_GAMES: &[KnownGame] = &[
         registry_path: r"Software\Bethesda Softworks\Skyrim Special Edition",
         registry_value: "Installed Path",
         steam_folder: "Skyrim Special Edition",
+        wabbajack_type: Some("SkyrimSpecialEdition"),
     },
     KnownGame {
         name: "Skyrim VR",
@@ -163,6 +177,7 @@ pub const KNOWN_GAMES: &[KnownGame] = &[
         registry_path: r"Software\Bethesda Softworks\Skyrim VR",
         registry_value: "Installed Path",
         steam_folder: "Skyrim VR",
+        wabbajack_type: Some("SkyrimVR"),
     },
     KnownGame {
         name: "Starfield",
@@ -174,6 +189,7 @@ pub const KNOWN_GAMES: &[KnownGame] = &[
         registry_path: r"Software\Bethesda Softworks\Starfield",
         registry_value: "Installed Path",
         steam_folder: "Starfield",
+        wabbajack_type: Some("Starfield"),
     },
     // CD Projekt RED Games
     KnownGame {
@@ -186,6 +202,7 @@ pub const KNOWN_GAMES: &[KnownGame] = &[
         registry_path: r"Software\CD Projekt Red\The Witcher 3",
         registry_value: "InstallFolder",
         steam_folder: "The Witcher 3 Wild Hunt",
+        wabbajack_type: Some("Witcher3"),
     },
     KnownGame {
         name: "Cyberpunk 2077",
@@ -197,6 +214,7 @@ pub const KNOWN_GAMES: &[KnownGame] = &[
         registry_path: r"Software\CD Projekt Red\Cyberpunk 2077",
         registry_value: "InstallFolder",
         steam_folder: "Cyberpunk 2077",
+        wabbajack_type: Some("Cyberpunk2077"),
     },
     // Other popular moddable games
     KnownGame {
@@ -209,6 +227,7 @@ pub const KNOWN_GAMES: &[KnownGame] = &[
         registry_path: r"Software\Larian Studios\Baldur's Gate 3",
         registry_value: "InstallDir",
         steam_folder: "Baldurs Gate 3",
+        wabbajack_type: Some("BaldursGate3"),
     },
     // Square Enix Games
     KnownGame {
@@ -221,6 +240,7 @@ pub const KNOWN_GAMES: &[KnownGame] = &[
         registry_path: r"Software\Square Enix\NieR:Automata",
         registry_value: "Install_Dir",
         steam_folder: "NieRAutomata",
+        wabbajack_type: Some("NieRAutomata"),
     },
 ];
 
@@ -240,4 +260,35 @@ pub fn find_by_name(name: &str) -> Option<&'static KnownGame> {
     KNOWN_GAMES
         .iter()
         .find(|g| g.name.to_lowercase() == name_lower)
+}
+
+/// Find a known game by its Wabbajack `GameType` string (e.g. "FalloutNewVegas",
+/// "SkyrimSpecialEdition"). Accepts common aliases Wabbajack has used across versions.
+pub fn find_by_wabbajack_type(wj_type: &str) -> Option<&'static KnownGame> {
+    // Direct match against the canonical wabbajack_type field
+    if let Some(g) = KNOWN_GAMES
+        .iter()
+        .find(|g| g.wabbajack_type == Some(wj_type))
+    {
+        return Some(g);
+    }
+
+    // Alias fallback — older modlists / short-form names
+    let aliased = match wj_type {
+        "SkyrimSE" => "SkyrimSpecialEdition",
+        "FalloutNV" => "FalloutNewVegas",
+        "EnderalSE" => "EnderalSpecialEdition",
+        "TheWitcher3" => "Witcher3",
+        _ => return None,
+    };
+    KNOWN_GAMES
+        .iter()
+        .find(|g| g.wabbajack_type == Some(aliased))
+}
+
+/// Convenience: return `(steam_app_id, gog_app_id)` for a Wabbajack game_type.
+/// GOG id is `None` for games without a known GOG variant.
+pub fn ids_for_wabbajack_type(wj_type: &str) -> Option<(&'static str, Option<&'static str>)> {
+    let g = find_by_wabbajack_type(wj_type)?;
+    Some((g.steam_app_id, g.gog_app_id))
 }

@@ -489,6 +489,15 @@ Copied files with different names will not be reused. Examples: {}",
         match result {
             DownloadResult::Success => {
                 db.mark_archive_downloaded(&hash, output_path.to_string_lossy().as_ref())?;
+                // Write sidecar so future resumes skip re-hashing. download_archive()
+                // already verified the hash before returning Success, so this is safe.
+                if let Err(e) = super::sidecar::write_archive_hash(&output_path, &hash) {
+                    tracing::debug!(
+                        "Failed to write archive sidecar for {}: {}",
+                        output_path.display(),
+                        e
+                    );
+                }
             }
             DownloadResult::Skipped => {
                 db.mark_archive_downloaded(&hash, output_path.to_string_lossy().as_ref())?;
@@ -904,6 +913,22 @@ pub async fn download_archives_streaming(
                         &archive.hash,
                         output_path.to_string_lossy().as_ref(),
                     );
+                    // On Success path, download_archive() already verified the
+                    // hash; on Skipped path, process_archive() only checked
+                    // size, so this is best-effort. In either case a sidecar
+                    // makes subsequent resumes O(1) via stat() instead of
+                    // re-hashing every archive.
+                    if matches!(result, DownloadResult::Success) {
+                        if let Err(e) =
+                            super::sidecar::write_archive_hash(&output_path, &archive.hash)
+                        {
+                            tracing::debug!(
+                                "Failed to write archive sidecar for {}: {}",
+                                output_path.display(),
+                                e
+                            );
+                        }
+                    }
                     let _ = tx.send(ArchiveEvent::Ready {
                         hash: archive.hash.clone(),
                         name: archive.name.clone(),
@@ -2332,6 +2357,15 @@ async fn download_archives_nxm(
                                     &hash,
                                     output_path.to_string_lossy().as_ref(),
                                 )?;
+                                if let Err(e) =
+                                    super::sidecar::write_archive_hash(&output_path, &hash)
+                                {
+                                    tracing::debug!(
+                                        "Failed to write archive sidecar for {}: {}",
+                                        output_path.display(),
+                                        e
+                                    );
+                                }
                             }
                             Ok(false) => {
                                 reporter.log(&format!("FAIL {} - hash mismatch", output_path.display()));
@@ -2453,6 +2487,15 @@ async fn download_non_nexus_files(
         match result {
             DownloadResult::Success | DownloadResult::Skipped => {
                 db.mark_archive_downloaded(&hash, output_path.to_string_lossy().as_ref())?;
+                if matches!(result, DownloadResult::Success) {
+                    if let Err(e) = super::sidecar::write_archive_hash(&output_path, &hash) {
+                        tracing::debug!(
+                            "Failed to write archive sidecar for {}: {}",
+                            output_path.display(),
+                            e
+                        );
+                    }
+                }
             }
             DownloadResult::Manual | DownloadResult::Failed => {}
         }

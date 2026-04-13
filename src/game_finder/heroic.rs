@@ -67,7 +67,17 @@ struct GogInstalledGame {
     platform: Option<String>,
 }
 
-/// Detect GOG games from Heroic
+/// Wrapper for the newer Heroic format: `{"installed": [ ... ]}`.
+#[derive(Debug, Deserialize)]
+struct GogInstalledFile {
+    installed: Vec<GogInstalledGame>,
+}
+
+/// Detect GOG games from Heroic.
+///
+/// Supports two installed.json shapes:
+/// - Legacy: a bare JSON array of game entries.
+/// - Current (Heroic 2.14+): `{"installed": [...]}` object.
 fn detect_gog_games(heroic_path: &Path) -> Vec<Game> {
     let mut games = Vec::new();
     let installed_json = heroic_path.join("gog_store/installed.json");
@@ -76,10 +86,24 @@ fn detect_gog_games(heroic_path: &Path) -> Vec<Game> {
         return games;
     };
 
-    let Ok(installed): Result<Vec<GogInstalledGame>, _> = serde_json::from_str(&content) else {
-        eprintln!("[game_finder] Warning: Failed to parse Heroic GOG installed.json");
-        return games;
-    };
+    // Try the wrapped-object format first (current Heroic).
+    let installed: Vec<GogInstalledGame> =
+        match serde_json::from_str::<GogInstalledFile>(&content) {
+            Ok(wrapped) => wrapped.installed,
+            Err(_) => {
+                // Fall back to the legacy bare-array format.
+                match serde_json::from_str::<Vec<GogInstalledGame>>(&content) {
+                    Ok(arr) => arr,
+                    Err(e) => {
+                        eprintln!(
+                            "[game_finder] Warning: Failed to parse Heroic GOG installed.json: {}",
+                            e
+                        );
+                        return games;
+                    }
+                }
+            }
+        };
 
     for gog_game in installed {
         // Skip non-Windows games (we only care about Wine prefixes)

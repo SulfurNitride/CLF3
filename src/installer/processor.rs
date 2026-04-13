@@ -761,10 +761,10 @@ impl<'a> ProcessContext<'a> {
                 Ok(store) => {
                     let entries = store.load_verified().unwrap_or_default();
                     if !entries.is_empty() {
-                        println!(
+                        config.reporter.log(&format!(
                             "Loaded {} verified patch basis entries from cache",
                             entries.len()
-                        );
+                        ));
                     }
                     (Some(store), entries)
                 }
@@ -1131,7 +1131,7 @@ fn check_missing_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<Vec<(S
         }
     }
 
-    println!(
+    tracing::info!(
         "Need {} unique archives for pending directives",
         needed_hashes.len()
     );
@@ -1227,15 +1227,16 @@ impl<'a> DirectiveProcessor<'a> {
     pub fn new(db: &'a ModlistDb, config: &'a InstallConfig) -> Result<Self> {
         let ctx = ProcessContext::new(config, db)?;
 
-        // Show directive counts
-        let type_counts = db.get_directive_type_counts()?;
-        println!("Directive types:");
-        for (dtype, count) in &type_counts {
-            println!("  {:>8}  {}", count, dtype);
-        }
-        println!();
-
         let reporter = config.reporter.clone();
+
+        // Show directive counts — route through reporter so indicatif bars
+        // don't get clobbered by raw stdout writes.
+        let type_counts = db.get_directive_type_counts()?;
+        reporter.log("Directive types:");
+        for (dtype, count) in &type_counts {
+            reporter.log(&format!("  {:>8}  {}", count, dtype));
+        }
+        reporter.log("");
 
         Ok(Self {
             ctx,
@@ -1273,17 +1274,18 @@ impl<'a> DirectiveProcessor<'a> {
     pub fn preflight_check(&self) -> Result<()> {
         let missing_archives = check_missing_archives(self.db, &self.ctx)?;
         if !missing_archives.is_empty() {
-            println!(
-                "ERROR: {} archives are missing! Re-run to download them:\n",
+            self.reporter.log(&format!(
+                "ERROR: {} archives are missing! Re-run to download them:",
                 missing_archives.len()
-            );
+            ));
             warn!("=== Missing Archives ({}) ===", missing_archives.len());
             for (name, hash) in missing_archives.iter().take(20) {
-                println!("  - {} ({})", name, hash);
+                self.reporter.log(&format!("  - {} ({})", name, hash));
                 warn!("[MISSING] {} ({})", name, hash);
             }
             if missing_archives.len() > 20 {
-                println!("  ... and {} more", missing_archives.len() - 20);
+                self.reporter
+                    .log(&format!("  ... and {} more", missing_archives.len() - 20));
                 for (name, hash) in missing_archives.iter().skip(20) {
                     warn!("[MISSING] {} ({})", name, hash);
                 }
@@ -1291,7 +1293,7 @@ impl<'a> DirectiveProcessor<'a> {
             }
             bail!("Missing archives - re-run the installer to download them");
         }
-        println!("All needed archives present\n");
+        self.reporter.log("All needed archives present");
         Ok(())
     }
 
@@ -1349,11 +1351,11 @@ impl<'a> DirectiveProcessor<'a> {
         }
 
         self.ctx.set_needed_patch_basis_keys(keys);
-        println!(
+        self.reporter.log(&format!(
             "Patch basis prep: tracking {} basis keys ({} parse failures)",
             self.ctx.needed_patch_basis_count(),
             parse_failures
-        );
+        ));
         Ok(())
     }
     /// Inline files phase only: InlineFile + RemappedInlineFile.
@@ -1363,7 +1365,7 @@ impl<'a> DirectiveProcessor<'a> {
         let remapped_count = self.get_type_count("RemappedInlineFile")?;
 
         if inline_count + remapped_count == 0 {
-            println!("No inline directives to process");
+            self.reporter.log("No inline directives to process");
             return Ok(());
         }
 
@@ -1487,13 +1489,13 @@ impl<'a> DirectiveProcessor<'a> {
             failed: self.failed.load(Ordering::Relaxed),
         };
 
-        println!(
+        self.reporter.log(&format!(
             "Processed {} directives ({} completed, {} skipped, {} failed)",
             stats.completed + stats.skipped + stats.failed,
             stats.completed,
             stats.skipped,
             stats.failed
-        );
+        ));
 
         let phase_failures = self
             .phase_failures
@@ -1522,7 +1524,9 @@ fn cleanup_extra_files(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
         .map(|p| paths::normalize_for_lookup(p))
         .collect();
 
-    println!("Expected {} files in output directory", expected_set.len());
+    ctx.config
+        .reporter
+        .log(&format!("Expected {} files in output directory", expected_set.len()));
 
     // Walk the output directory
     let output_dir = &ctx.config.output_dir;
@@ -1635,14 +1639,14 @@ fn cleanup_extra_files(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
     }
 
     if deleted_files > 0 || deleted_dirs > 0 {
-        println!(
+        ctx.config.reporter.log(&format!(
             "Cleaned up {} extra files ({:.1} MB) and {} empty directories",
             deleted_files,
             deleted_bytes as f64 / 1024.0 / 1024.0,
             deleted_dirs
-        );
+        ));
     } else {
-        println!("No extra files to clean up");
+        ctx.config.reporter.log("No extra files to clean up");
     }
 
     Ok(())
@@ -2166,9 +2170,11 @@ fn process_transformed_texture(
                             .and_then(|_| fs::write(&output_path, &processed.data))
                         {
                             // Retry up to 3 times — transient ENOENT on slow/external filesystems
+                            // Use force_ensure_parent_dirs to bypass DirCache (it cached Ok from the first attempt)
                             let mut retry_ok = false;
                             for attempt in 1..=3 {
-                                if ctx.dir_cache.ensure_parent_dirs(&output_path).is_ok()
+                                std::thread::sleep(std::time::Duration::from_millis(100 * attempt as u64));
+                                if ctx.dir_cache.force_ensure_parent_dirs(&output_path).is_ok()
                                     && fs::write(&output_path, &processed.data).is_ok()
                                 {
                                     warn!(
@@ -2178,7 +2184,6 @@ fn process_transformed_texture(
                                     retry_ok = true;
                                     break;
                                 }
-                                std::thread::sleep(std::time::Duration::from_millis(100 * attempt as u64));
                             }
                             if !retry_ok {
                                 failed.fetch_add(1, Ordering::Relaxed);
@@ -2220,10 +2225,11 @@ fn process_transformed_texture(
                     ctx.dir_cache.ensure_parent_dirs(&output_path)?;
                     if let Err(first_err) = fs::write(&output_path, &processed.data) {
                         // Retry up to 3 times — transient ENOENT on slow/external filesystems
+                        // Use force_ensure_parent_dirs to bypass DirCache stale entries
                         let mut succeeded = false;
                         for attempt in 1..=3 {
                             std::thread::sleep(std::time::Duration::from_millis(100 * attempt as u64));
-                            if ctx.dir_cache.ensure_parent_dirs(&output_path).is_ok()
+                            if ctx.dir_cache.force_ensure_parent_dirs(&output_path).is_ok()
                                 && fs::write(&output_path, &processed.data).is_ok()
                             {
                                 warn!(
@@ -2417,7 +2423,10 @@ fn process_simple_directives(
         })
         .collect();
 
-    // Process in parallel
+    // Process in parallel. Update the overall bar and stat counters INSIDE
+    // the rayon closure so progress ticks live instead of waiting for every
+    // task to finish before reporting (large phases with 100k+ InlineFile
+    // directives were showing 0/N until completion).
     let results: Vec<(i64, Result<bool, String>)> = parsed
         .into_par_iter()
         .map(|(id, parsed_result)| {
@@ -2427,26 +2436,34 @@ fn process_simple_directives(
                     process_single_directive(ctx, &directive).map_err(|e| format!("{:#}", e))
                 }
             };
+
+            match &result {
+                Ok(true) => {
+                    completed.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(false) => {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            reporter.overall_inc();
+
             (id, result)
         })
         .collect();
 
-    for (id, result) in results {
-        match result {
-            Ok(true) => {
-                completed.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(false) => {
-                skipped.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(e) => {
-                failed.fetch_add(1, Ordering::Relaxed);
-                if failed.load(Ordering::Relaxed) <= 10 {
-                    reporter.log(&format!("FAIL [{}]: {}", id, e));
-                }
+    // Log early failures outside the parallel region so we don't serialize on
+    // reporter.log() under contention.
+    let mut logged = 0usize;
+    for (id, result) in &results {
+        if let Err(e) = result {
+            if logged < 10 {
+                reporter.log(&format!("FAIL [{}]: {}", id, e));
+                logged += 1;
             }
         }
-        reporter.overall_inc();
     }
 
     Ok(())

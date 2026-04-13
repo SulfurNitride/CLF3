@@ -14,6 +14,7 @@ pub mod bsa_reuse;
 pub mod config;
 pub mod config_cache;
 pub mod downloader;
+pub mod game_preflight;
 pub mod handlers;
 pub mod pipeline;
 pub mod prevalidation;
@@ -24,7 +25,7 @@ pub mod sidecar;
 pub mod streaming;
 
 #[allow(unused_imports)] // ProgressCallback/ProgressEvent used by lib crate (GUI)
-pub use config::{InstallConfig, ProgressCallback, ProgressEvent};
+pub use config::{ExtractStrategy, InstallConfig, ProgressCallback, ProgressEvent};
 #[allow(unused_imports)] // NullReporter used by lib crate (GUI)
 pub use progress::{NullReporter, Phase, ProgressHandle, ProgressReporter};
 pub use progress_cli::CliReporter;
@@ -398,6 +399,40 @@ impl Installer {
             );
         }
         self.reporter().log("Game directory validated");
+
+        // Hash every GameFileSource archive against the chosen game directory
+        // BEFORE spending bandwidth. Catches: game updated since modlist
+        // authored, missing DLC, wrong store variant (Steam vs GOG), etc.
+        //
+        // Runs parallel via rayon; typical cost <2s for Bethesda modlists.
+        let preflight =
+            game_preflight::check_game_files_from_db(&self.db, &self.config.game_dir)?;
+        if preflight.total == 0 {
+            self.reporter()
+                .log("No game files required by this modlist — skipping hash preflight");
+        } else {
+            self.reporter()
+                .log(&format!("Verifying {} game files...", preflight.total));
+            if preflight.all_ok() {
+                self.reporter().log(&format!(
+                    "All {} game files verified",
+                    preflight.total
+                ));
+            } else {
+                // Dump per-file diagnostics so user knows which files are bad.
+                for line in preflight.format_summary().lines() {
+                    self.reporter().log(line);
+                }
+                bail!(
+                    "Game file preflight failed: {} missing, {} hash mismatch. \
+                     Game likely updated or wrong store version — no downloads started. \
+                     Fix game files and re-run.",
+                    preflight.missing().len(),
+                    preflight.mismatched().len()
+                );
+            }
+        }
+
         log_phase_metrics("Game Check", game_check_start);
 
         // === Phase 2: Pipelined Download + Extract ===
@@ -483,19 +518,50 @@ impl Installer {
             })
         });
 
-        // Run the phased processing loop on the main thread (owns &self.db).
-        // Drains all archive events, then processes in sequential phases:
-        // Phase 1: Complex extraction → Phase 2: DDS → Phase 3: BSA → Phase 4: Simple extraction.
-        // Each phase gets full CPU. Falls back gracefully for fresh installs
-        // (blocks until downloads complete, then runs phases).
-        let streaming_stats = pipeline::run_processing_loop_phased(
-            &self.db,
-            &dp.ctx,
-            &rx,
-            &grouped,
-            streaming_config,
-            &self.config.reporter,
-        )?;
+        // Run the processing loop on the main thread (owns &self.db).
+        //
+        // Two strategies exist:
+        //
+        // - Streaming (default): `run_processing_loop` processes each archive
+        //   as soon as the download thread hands it over. Download and extract
+        //   run fully in parallel — best for large modlists where the
+        //   download dominates wall-clock time. BSAs are built incrementally
+        //   via `BsaReadinessTracker` as their source archives complete.
+        //
+        // - Phased: `run_processing_loop_phased` drains all events first,
+        //   then runs 4 sequential phases (complex extract → DDS → BSA build
+        //   → simple extract) at full CPU. Better on small modlists where
+        //   download is short and CPU-heavy phases dominate.
+        //
+        // Selection comes from `config.extract_strategy` via the `--extract`
+        // CLI flag.
+        let streaming_stats = match self.config.extract_strategy {
+            ExtractStrategy::Streaming => {
+                self.reporter().log(
+                    "Using streaming extraction (download and extract run concurrently)",
+                );
+                pipeline::run_processing_loop(
+                    &self.db,
+                    &dp.ctx,
+                    &rx,
+                    &grouped,
+                    streaming_config,
+                    &self.config.reporter,
+                )?
+            }
+            ExtractStrategy::Phased => {
+                self.reporter()
+                    .log("Using phased extraction (download completes, then 4 sequential phases)");
+                pipeline::run_processing_loop_phased(
+                    &self.db,
+                    &dp.ctx,
+                    &rx,
+                    &grouped,
+                    streaming_config,
+                    &self.config.reporter,
+                )?
+            }
+        };
 
         // Wait for download thread to finish
         let download_stats = download_handle

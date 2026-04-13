@@ -151,7 +151,7 @@ pub struct WabbajackCDNState {
     pub url: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct GameFileSourceState {
     pub game: String,

@@ -4,10 +4,11 @@
 //! lazy-loaded thumbnail images, search/filter controls, and generates a CLI
 //! install command for the user to copy-paste.
 
+use crate::game_finder::{detect_all_games, find_by_gog_id, find_by_steam_id, Launcher};
 use crate::modlist::browser::{ModlistBrowser, ModlistMetadata};
 use eframe::egui;
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// How many images to fetch concurrently during background loading.
@@ -41,8 +42,6 @@ pub fn launch_browser() -> Result<(), eframe::Error> {
 
 /// Image loading state for a single modlist.
 enum ImageState {
-    /// Not yet requested.
-    Pending,
     /// Download in flight.
     Loading,
     /// Raw image bytes ready to be turned into a texture.
@@ -73,8 +72,21 @@ struct BrowserApp {
     show_nsfw: bool,
     /// Show unavailable lists.
     show_unavailable: bool,
+    /// Show only modlists for games the user has installed (Steam or Heroic/GOG).
+    show_installed_only: bool,
+    /// Set of canonical Wabbajack `GameType` strings the user has installed.
+    /// Populated once at startup via `detect_all_games()`. Case-insensitive
+    /// match to `ModlistMetadata.game` in `filtered_modlists`.
+    installed_game_types: HashSet<String>,
+    /// Count of launcher installs detected, shown next to the checkbox.
+    installed_game_count: usize,
     /// Currently selected modlist machine_name (if any).
     selected: Option<String>,
+    /// A pre-downloaded `.wabbajack` file the user browsed to. When set, the
+    /// bottom panel switches into "local file" mode — no modlist metadata,
+    /// just directory inputs and an install-command builder pointing at the
+    /// on-disk path.
+    local_wabbajack: Option<PathBuf>,
     /// User-entered downloads directory.
     downloads_dir: String,
     /// User-entered output/install directory.
@@ -83,12 +95,27 @@ struct BrowserApp {
     generated_command: Option<String>,
     /// Whether we've kicked off the initial fetch.
     fetch_started: bool,
-    /// tokio runtime for async operations.
-    rt: tokio::runtime::Runtime,
+    /// tokio runtime for async operations. Held as `Option` so `Drop` can
+    /// take ownership and call `shutdown_background()` — otherwise dropping
+    /// the runtime while reqwest's connection pool is still tearing down
+    /// panics with "Cannot drop a runtime in a context where blocking is
+    /// not allowed".
+    rt: Option<tokio::runtime::Runtime>,
     /// Image cache directory.
     image_cache_dir: PathBuf,
     /// Whether background image loading has been kicked off.
     image_load_started: bool,
+}
+
+impl Drop for BrowserApp {
+    fn drop(&mut self) {
+        // Hand the runtime off to a background shutdown so in-flight
+        // reqwest connections can close cleanly without blocking the
+        // main thread's async context.
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
+        }
+    }
 }
 
 impl BrowserApp {
@@ -98,6 +125,25 @@ impl BrowserApp {
             .join("clf3")
             .join("images");
         let _ = std::fs::create_dir_all(&image_cache_dir);
+
+        // Detect all installed games (Steam, Heroic/GOG, Epic) once at startup.
+        // Map each detected Game's app_id back to its canonical Wabbajack
+        // `GameType` string via KNOWN_GAMES, so we can filter modlists by
+        // "do you own this game in any launcher".
+        let detected = detect_all_games();
+        let installed_game_count = detected.games.len();
+        let mut installed_game_types: HashSet<String> = HashSet::new();
+        for game in &detected.games {
+            let known = match game.launcher {
+                Launcher::Steam { .. } => find_by_steam_id(&game.app_id),
+                Launcher::Heroic { .. } => find_by_gog_id(&game.app_id),
+            };
+            if let Some(k) = known {
+                if let Some(wj) = k.wabbajack_type {
+                    installed_game_types.insert(wj.to_lowercase());
+                }
+            }
+        }
 
         Self {
             shared: Arc::new(Mutex::new(SharedState {
@@ -111,15 +157,27 @@ impl BrowserApp {
             game_filter: String::new(),
             show_nsfw: false,
             show_unavailable: false,
+            show_installed_only: false,
+            installed_game_types,
+            installed_game_count,
             selected: None,
+            local_wabbajack: None,
             downloads_dir: String::new(),
             install_dir: String::new(),
             generated_command: None,
             fetch_started: false,
-            rt: tokio::runtime::Runtime::new().expect("Failed to create tokio runtime"),
+            rt: Some(
+                tokio::runtime::Runtime::new().expect("Failed to create tokio runtime"),
+            ),
             image_cache_dir,
             image_load_started: false,
         }
+    }
+
+    /// Reference to the tokio runtime. Always present while the app is alive;
+    /// only taken in `Drop`.
+    fn rt(&self) -> &tokio::runtime::Runtime {
+        self.rt.as_ref().expect("runtime taken outside Drop")
     }
 
     /// Kick off async modlist fetch in the background.
@@ -132,7 +190,7 @@ impl BrowserApp {
         let shared = Arc::clone(&self.shared);
         let ctx = ctx.clone();
 
-        self.rt.spawn(async move {
+        self.rt().spawn(async move {
             let mut browser = match ModlistBrowser::new() {
                 Ok(b) => b,
                 Err(e) => {
@@ -210,7 +268,7 @@ impl BrowserApp {
             items
         };
 
-        self.rt.spawn(async move {
+        self.rt().spawn(async move {
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
@@ -288,6 +346,11 @@ impl BrowserApp {
                 if !self.show_nsfw && m.nsfw {
                     return false;
                 }
+                if self.show_installed_only
+                    && !self.installed_game_types.contains(&m.game.to_lowercase())
+                {
+                    return false;
+                }
                 if !self.game_filter.is_empty() {
                     // Compare by formatted name so different raw casings match.
                     let selected = Self::format_game_name(&self.game_filter);
@@ -353,16 +416,26 @@ impl BrowserApp {
     /// Generate the CLI command for the selected modlist.
     fn generate_command(&self, modlist: &ModlistMetadata) -> Option<String> {
         let url = modlist.download_url()?;
+        self.build_install_command(url)
+    }
+
+    /// Generate the CLI command for a local .wabbajack path.
+    fn generate_command_for_local(&self, path: &Path) -> Option<String> {
+        self.build_install_command(&path.display().to_string())
+    }
+
+    /// Shared command builder — both modlist-URL and local-path callers
+    /// produce the same `clf3 install <src> <downloads> <install>` shape.
+    fn build_install_command(&self, source: &str) -> Option<String> {
         if self.downloads_dir.is_empty() || self.install_dir.is_empty() {
             return None;
         }
-        // Use the current executable path so the command works from anywhere.
         let exe = std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "clf3".into());
         Some(format!(
             "\"{}\" install \"{}\" \"{}\" \"{}\"",
-            exe, url, self.downloads_dir, self.install_dir
+            exe, source, self.downloads_dir, self.install_dir
         ))
     }
 }
@@ -396,11 +469,29 @@ impl eframe::App for BrowserApp {
                     state
                         .games
                         .iter()
+                        .filter(|g| {
+                            // When the installed-only filter is on, hide games
+                            // from the dropdown that the user doesn't actually
+                            // own — dropdown and list view stay in sync.
+                            if self.show_installed_only {
+                                self.installed_game_types.contains(&g.to_lowercase())
+                            } else {
+                                true
+                            }
+                        })
                         .map(|g| (g.clone(), Self::format_game_name(g)))
                         .collect()
                 };
                 games.sort_by(|a, b| a.1.cmp(&b.1));
                 games.dedup_by(|a, b| a.1 == b.1);
+
+                // If the current selection is filtered out, reset it so the
+                // combobox doesn't display a stale label.
+                if !self.game_filter.is_empty()
+                    && !games.iter().any(|(raw, _)| raw == &self.game_filter)
+                {
+                    self.game_filter.clear();
+                }
 
                 let selected_text = if self.game_filter.is_empty() {
                     "All Games".to_string()
@@ -423,97 +514,156 @@ impl eframe::App for BrowserApp {
                 ui.separator();
                 ui.checkbox(&mut self.show_nsfw, "NSFW");
                 ui.checkbox(&mut self.show_unavailable, "Unavailable");
+
+                // "Installed only" is disabled when we didn't detect any
+                // supported launcher installs — keeps the hint visible to the
+                // user but prevents toggling into an empty list.
+                let installed_label = if self.installed_game_count > 0 {
+                    format!("Installed only ({} games)", self.installed_game_types.len())
+                } else {
+                    "Installed only (no games detected)".to_string()
+                };
+                ui.add_enabled(
+                    !self.installed_game_types.is_empty(),
+                    egui::Checkbox::new(&mut self.show_installed_only, installed_label),
+                );
+
+                ui.separator();
+
+                // Let the user skip the browser entirely and point at an
+                // already-downloaded `.wabbajack` file on disk.
+                if ui.button("Open .wabbajack file...").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Wabbajack modlist", &["wabbajack"])
+                        .pick_file()
+                    {
+                        self.local_wabbajack = Some(path);
+                        // Picking a local file clears any network selection so
+                        // the bottom panel doesn't show two competing titles.
+                        self.selected = None;
+                        self.generated_command = None;
+                    }
+                }
             });
             ui.add_space(4.0);
         });
 
         // Bottom panel: selected modlist details + command generation.
-        if self.selected.is_some() {
+        // Shows for either a modlist picked from the grid OR a local
+        // .wabbajack file opened via the top-panel button.
+        if self.selected.is_some() || self.local_wabbajack.is_some() {
             egui::TopBottomPanel::bottom("bottom_panel")
                 .min_height(120.0)
                 .show(ctx, |ui| {
                     ui.add_space(8.0);
 
-                    let selected_modlist = {
+                    // Resolve the selected modlist once (needed if we're in
+                    // modlist-selection mode).
+                    let selected_modlist = self.selected.as_ref().and_then(|name| {
                         let state = self.shared.lock().expect("lock shared state");
-                        let name = self.selected.as_ref().unwrap();
                         state
                             .modlists
                             .iter()
                             .find(|m| &m.machine_name == name)
                             .cloned()
-                    };
+                    });
 
-                    if let Some(modlist) = selected_modlist {
-                        ui.horizontal(|ui| {
+                    // Header row — title/author/game or local filename
+                    ui.horizontal(|ui| {
+                        if let Some(modlist) = &selected_modlist {
                             ui.heading(&modlist.title);
                             ui.label(format!("by {}", modlist.author));
                             ui.label(format!("({})", Self::format_game_name(&modlist.game)));
+                        } else if let Some(path) = &self.local_wabbajack {
+                            let filename = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.display().to_string());
+                            ui.heading(filename);
+                            ui.label("Local .wabbajack file");
+                        }
 
-                            if ui.button("X Close").clicked() {
-                                self.selected = None;
-                                self.generated_command = None;
+                        if ui.button("X Close").clicked() {
+                            self.selected = None;
+                            self.local_wabbajack = None;
+                            self.generated_command = None;
+                        }
+                    });
+
+                    if let Some(path) = &self.local_wabbajack {
+                        ui.label(
+                            egui::RichText::new(path.display().to_string())
+                                .size(11.0)
+                                .color(egui::Color32::from_gray(160)),
+                        );
+                    }
+
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label("Downloads dir:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.downloads_dir)
+                                .desired_width(300.0),
+                        );
+                        if ui.button("Browse...").clicked() {
+                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                self.downloads_dir = path.display().to_string();
                             }
-                        });
+                        }
 
-                        ui.add_space(4.0);
+                        ui.separator();
 
+                        ui.label("Install dir:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.install_dir)
+                                .desired_width(300.0),
+                        );
+                        if ui.button("Browse...").clicked() {
+                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                self.install_dir = path.display().to_string();
+                            }
+                        }
+                    });
+
+                    ui.add_space(4.0);
+
+                    // Build the install command from whichever source is set.
+                    // Local file takes precedence over an online selection
+                    // because picking a file clears `selected`.
+                    let generated = if let Some(path) = self.local_wabbajack.clone() {
+                        self.generate_command_for_local(&path)
+                    } else if let Some(modlist) = &selected_modlist {
+                        self.generate_command(modlist)
+                    } else {
+                        None
+                    };
+                    if let Some(cmd) = generated {
+                        self.generated_command = Some(cmd);
+                    }
+
+                    if let Some(ref cmd) = self.generated_command {
                         ui.horizontal(|ui| {
-                            ui.label("Downloads dir:");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.downloads_dir)
-                                    .desired_width(300.0),
+                            ui.label("Command:");
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut cmd.clone())
+                                    .desired_width(ui.available_width() - 80.0)
+                                    .font(egui::TextStyle::Monospace),
                             );
-                            if ui.button("Browse...").clicked() {
-                                if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                    self.downloads_dir = path.display().to_string();
-                                }
+                            if ui.button("Copy").clicked() {
+                                ui.ctx().copy_text(cmd.clone());
                             }
-
-                            ui.separator();
-
-                            ui.label("Install dir:");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.install_dir)
-                                    .desired_width(300.0),
-                            );
-                            if ui.button("Browse...").clicked() {
-                                if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                    self.install_dir = path.display().to_string();
-                                }
+                            // Select all on click for easy manual copy.
+                            if response.clicked() {
+                                ui.ctx().copy_text(cmd.clone());
                             }
                         });
-
-                        ui.add_space(4.0);
-
-                        // Generate command button.
-                        if let Some(cmd) = self.generate_command(&modlist) {
-                            self.generated_command = Some(cmd);
-                        }
-
-                        if let Some(ref cmd) = self.generated_command {
-                            ui.horizontal(|ui| {
-                                ui.label("Command:");
-                                let response = ui.add(
-                                    egui::TextEdit::singleline(&mut cmd.clone())
-                                        .desired_width(ui.available_width() - 80.0)
-                                        .font(egui::TextStyle::Monospace),
-                                );
-                                if ui.button("Copy").clicked() {
-                                    ui.ctx().copy_text(cmd.clone());
-                                }
-                                // Select all on click for easy manual copy.
-                                if response.clicked() {
-                                    ui.ctx().copy_text(cmd.clone());
-                                }
-                            });
-                        } else if !self.downloads_dir.is_empty() || !self.install_dir.is_empty() {
-                            ui.label("Fill in both directories to generate the install command.");
-                        } else {
-                            ui.label(
-                                "Enter your downloads and install directories to generate the command.",
-                            );
-                        }
+                    } else if !self.downloads_dir.is_empty() || !self.install_dir.is_empty() {
+                        ui.label("Fill in both directories to generate the install command.");
+                    } else {
+                        ui.label(
+                            "Enter your downloads and install directories to generate the command.",
+                        );
                     }
 
                     ui.add_space(4.0);
@@ -641,7 +791,7 @@ impl BrowserApp {
                         let state = self.shared.lock().expect("lock shared state");
                         matches!(
                             state.images.get(&modlist.machine_name),
-                            Some(ImageState::Loading) | Some(ImageState::Pending) | Some(ImageState::Downloaded(_)) | None
+                            Some(ImageState::Loading) | Some(ImageState::Downloaded(_)) | None
                         )
                     };
 
