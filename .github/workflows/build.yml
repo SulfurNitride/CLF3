@@ -30,9 +30,9 @@ jobs:
 
       - name: Download 7-Zip
         run: |
-          wget -q https://7-zip.org/a/7z2408-linux-x64.tar.xz
+          wget -q https://github.com/ip7z/7zip/releases/download/26.00/7z2600-linux-x64.tar.xz
           mkdir -p 7z-temp release
-          tar -xf 7z2408-linux-x64.tar.xz -C 7z-temp
+          tar -xf 7z2600-linux-x64.tar.xz -C 7z-temp
           cp 7z-temp/7zz release/
 
       - name: Package release
