@@ -157,8 +157,9 @@ fn remap_paths(content: &str, ctx: &ProcessContext) -> String {
     for line in lines {
         if let Some(value) = line.strip_prefix("download_directory=") {
             // Check if it's a Windows drive path (like E:/ or C:\)
+            // MO2 ini format expects double-backslash escaping for paths.
             if value.len() >= 2 && value.chars().nth(1) == Some(':') {
-                new_lines.push(format!("download_directory={}", downloads_back));
+                new_lines.push(format!("download_directory={}", downloads_double_back));
             } else {
                 new_lines.push(line.to_string());
             }

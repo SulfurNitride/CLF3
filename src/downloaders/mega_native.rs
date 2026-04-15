@@ -40,10 +40,29 @@ fn normalize_mega_url(url: &str) -> String {
     url
 }
 
+/// Extract the `/file/<handle>` suffix from a folder URL, if present.
+/// Folder-file URL: `https://mega.nz/folder/ID#KEY/file/FILEHANDLE`
+fn extract_folder_file_handle(url: &str) -> Option<String> {
+    if !url.contains("/folder/") {
+        return None;
+    }
+    let idx = url.find("/file/")?;
+    let rest = &url[idx + 6..];
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let handle = &rest[..end];
+    (!handle.is_empty()).then(|| handle.to_string())
+}
+
 /// Download a file from a public Mega URL to disk.
+///
+/// Supports both direct file URLs (`/file/ID#KEY`) and folder-file URLs
+/// (`/folder/ID#KEY/file/HANDLE`) where a specific file is selected inside
+/// a shared folder.
 pub async fn download_mega_file(mega_url: &str, output_path: &Path) -> Result<()> {
     let mega_url = normalize_mega_url(mega_url);
     info!("Downloading from Mega: {}", mega_url);
+
+    let file_handle_override = extract_folder_file_handle(&mega_url);
 
     // mega::Client::builder().build() accepts impl mega::http::HttpClient.
     // The mega crate provides an impl for its bundled reqwest 0.12 Client.
@@ -63,10 +82,16 @@ pub async fn download_mega_file(mega_url: &str, output_path: &Path) -> Result<()
         .await
         .context("Failed to fetch Mega file info")?;
 
-    let file_node = nodes
-        .roots()
-        .find(|n| n.kind().is_file())
-        .context("No downloadable file found at Mega URL")?;
+    let file_node = if let Some(handle) = file_handle_override.as_deref() {
+        nodes.get_node_by_handle(handle).with_context(|| {
+            format!("File handle {} not found in Mega folder listing", handle)
+        })?
+    } else {
+        nodes
+            .roots()
+            .find(|n| n.kind().is_file())
+            .context("No downloadable file found at Mega URL")?
+    };
 
     info!(
         "Mega file: {} ({} bytes)",
@@ -114,6 +139,26 @@ pub async fn download_mega_file(mega_url: &str, output_path: &Path) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extract_folder_file_handle() {
+        assert_eq!(
+            extract_folder_file_handle(
+                "https://mega.nz/folder/VsQV2RjY#0hVLXv1g3Y7LkTlt9D7YtQ/file/V4RwQBQR"
+            ),
+            Some("V4RwQBQR".to_string())
+        );
+        // Plain file URL — no folder
+        assert_eq!(
+            extract_folder_file_handle("https://mega.nz/file/ABC#KEY"),
+            None
+        );
+        // Folder URL without file selection
+        assert_eq!(
+            extract_folder_file_handle("https://mega.nz/folder/VsQV2RjY#KEY"),
+            None
+        );
+    }
 
     #[test]
     fn test_normalize_mega_url() {

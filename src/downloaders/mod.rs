@@ -14,6 +14,7 @@ mod mediafire;
 pub mod mega_native;
 mod nexus;
 pub mod wabbajack_cdn;
+pub mod yandex;
 
 pub use google_drive::GoogleDriveDownloader;
 pub use http::{
@@ -24,6 +25,7 @@ pub use loverslab::LoversLabDownloader;
 pub use mediafire::MediaFireDownloader;
 pub use nexus::{NexusDownloader, NexusRateLimits};
 pub use wabbajack_cdn::WabbajackCdnDownloader;
+pub use yandex::YandexDownloader;
 
 use anyhow::{Context, Result};
 use std::future::Future;

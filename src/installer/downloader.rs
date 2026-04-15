@@ -7,7 +7,7 @@
 use crate::downloaders::{
     download_file_with_callback, GoogleDriveDownloader, HttpClient, LoversLabDownloader,
     MediaFireDownloader, NexusDownloader, ProgressCallback as HttpProgressCallback,
-    WabbajackCdnDownloader,
+    WabbajackCdnDownloader, YandexDownloader,
 };
 use crate::hash::{verify_file_hash, verify_file_hash_detailed};
 use crate::modlist::{ArchiveInfo, DownloadState, ModlistDb, NexusState};
@@ -149,6 +149,7 @@ struct DownloadContext {
     cdn: WabbajackCdnDownloader,
     gdrive: GoogleDriveDownloader,
     mediafire: MediaFireDownloader,
+    yandex: YandexDownloader,
     /// LoversLab downloader (only present when credentials are configured)
     loverslab: Option<LoversLabDownloader>,
     /// Semaphore to enforce sequential LoversLab downloads (LL rate-limits concurrent requests)
@@ -182,6 +183,7 @@ async fn build_context(config: &InstallConfig, total_archives: usize) -> Result<
         cdn: WabbajackCdnDownloader::new()?,
         gdrive: GoogleDriveDownloader::new()?,
         mediafire: MediaFireDownloader::new()?,
+        yandex: YandexDownloader::new()?,
         loverslab,
         ll_semaphore: tokio::sync::Semaphore::new(1),
         config: config.clone(),
@@ -1148,6 +1150,14 @@ fn check_manual(
             if is_mediafire_url(&manual_state.url) {
                 return None;
             }
+            // Mega links can be resolved via native API or proxy.
+            if is_mega_url(&manual_state.url) {
+                return None;
+            }
+            // Yandex Disk public shares resolve via the public cloud API.
+            if is_yandex_url(&manual_state.url) {
+                return None;
+            }
             Some(ManualDownloadInfo {
                 name: archive.name.clone(),
                 url: manual_state.url.clone(),
@@ -1185,6 +1195,15 @@ fn is_loverslab_url(url: &str) -> bool {
 fn is_mediafire_url(url: &str) -> bool {
     let lower = url.to_lowercase();
     lower.contains("mediafire.com/")
+}
+
+fn is_mega_url(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    lower.contains("mega.nz/") || lower.contains("mega.co.nz/")
+}
+
+fn is_yandex_url(url: &str) -> bool {
+    crate::downloaders::yandex::is_yandex_url(url)
 }
 
 fn is_moddb_url(url: &str) -> bool {
@@ -1998,6 +2017,64 @@ async fn download_archive_inner(
                     .await
                     .with_context(|| format!("Failed to resolve MediaFire URL: {}", manual_state.url))?;
                 info!("Resolved MediaFire URL for {}: {}", archive.name, url);
+                download_file_with_callback(
+                    &ctx.http,
+                    &url,
+                    output_path,
+                    Some(archive.size as u64),
+                    callback_ref,
+                )
+                .await?;
+                Ok(((), None))
+            } else if is_mega_url(&manual_state.url) {
+                info!("Mega manual download for {} - trying native API", archive.name);
+                handle.set_message(&format!("Mega: {}", truncate_name(&archive.name, 30)));
+
+                match crate::downloaders::mega_native::download_mega_file(
+                    &manual_state.url,
+                    output_path,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        info!("Mega native download succeeded for {}", archive.name);
+                        if let Ok(meta) = std::fs::metadata(output_path) {
+                            handle.set_bytes(meta.len(), meta.len(), 0.0);
+                        }
+                        Ok(((), None))
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Mega native download failed for {}: {} — trying proxy",
+                            archive.name, e
+                        );
+                        download_via_proxy(
+                            &ctx.http,
+                            &manual_state.url,
+                            output_path,
+                            archive.size as u64,
+                            handle,
+                            callback_ref,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Mega download failed for {} ({}) — native and proxy both failed",
+                                archive.name, manual_state.url
+                            )
+                        })?;
+                        Ok(((), None))
+                    }
+                }
+            } else if is_yandex_url(&manual_state.url) {
+                let url = ctx
+                    .yandex
+                    .get_download_url(&manual_state.url, Some(&archive.name))
+                    .await
+                    .with_context(|| {
+                        format!("Failed to resolve Yandex Disk URL: {}", manual_state.url)
+                    })?;
+                info!("Resolved Yandex URL for {}: {}", archive.name, url);
                 download_file_with_callback(
                     &ctx.http,
                     &url,

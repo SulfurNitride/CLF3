@@ -140,8 +140,9 @@ impl LoversLabDownloader {
         expected_name: &str,
         output_path: &Path,
     ) -> Result<()> {
-        // Forum topic URLs have attachments embedded in posts, not download pages
-        if page_url.contains("/topic/") {
+        // Forum topics and blog entries embed attachments as ipsAttachLink
+        // elements rather than exposing a ?do=download file list.
+        if page_url.contains("/topic/") || page_url.contains("/blogs/entry/") {
             return self
                 .download_forum_attachment(page_url, expected_name, output_path)
                 .await;

@@ -420,7 +420,6 @@ async fn main() -> Result<()> {
             let wabbajack_file = if wabbajack_file.starts_with("http://")
                 || wabbajack_file.starts_with("https://")
             {
-                println!("Downloading .wabbajack file from URL...");
                 let cache_dir = dirs::cache_dir()
                     .unwrap_or_else(|| PathBuf::from("/tmp"))
                     .join("clf3")
@@ -449,27 +448,49 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|| "download.wabbajack".into());
                 let dest = cache_dir.join(&filename);
 
-                let cdn = downloaders::wabbajack_cdn::WabbajackCdnDownloader::new()?;
-                let pb = indicatif::ProgressBar::new(0);
-                pb.set_style(
-                    indicatif::ProgressStyle::default_bar()
-                        .template("{msg} [{bar:40}] {bytes}/{total_bytes}")
-                        .expect("valid template")
-                        .progress_chars("=> "),
-                );
-                pb.set_message("Downloading");
+                // Use cached copy if present and non-empty. The .wabbajack
+                // filename derived above includes the upstream UUID suffix,
+                // so a matching cache entry is the same file.
+                let cached = std::fs::metadata(&dest)
+                    .ok()
+                    .filter(|m| m.len() > 0);
 
-                let pb_clone = pb.clone();
-                cdn.download_with_progress(&wabbajack_file, &dest, 0, move |downloaded, total| {
-                    if pb_clone.length() == Some(0) && total > 0 {
-                        pb_clone.set_length(total);
-                    }
-                    pb_clone.set_position(downloaded);
-                })
-                .await?;
-                pb.finish_with_message("Downloaded");
+                if let Some(meta) = cached {
+                    println!(
+                        "Using cached .wabbajack file: {} ({} MiB)",
+                        dest.display(),
+                        meta.len() / (1024 * 1024)
+                    );
+                } else {
+                    println!("Downloading .wabbajack file from URL...");
+                    let cdn = downloaders::wabbajack_cdn::WabbajackCdnDownloader::new()?;
+                    let pb = indicatif::ProgressBar::new(0);
+                    pb.set_style(
+                        indicatif::ProgressStyle::default_bar()
+                            .template("{msg} [{bar:40}] {bytes}/{total_bytes}")
+                            .expect("valid template")
+                            .progress_chars("=> "),
+                    );
+                    pb.set_message("Downloading");
 
-                println!("Saved to: {}", dest.display());
+                    let pb_clone = pb.clone();
+                    cdn.download_with_progress(
+                        &wabbajack_file,
+                        &dest,
+                        0,
+                        move |downloaded, total| {
+                            if pb_clone.length() == Some(0) && total > 0 {
+                                pb_clone.set_length(total);
+                            }
+                            pb_clone.set_position(downloaded);
+                        },
+                    )
+                    .await?;
+                    pb.finish_with_message("Downloaded");
+
+                    println!("Saved to: {}", dest.display());
+                }
+
                 dest
             } else {
                 PathBuf::from(&wabbajack_file)
