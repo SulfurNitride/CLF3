@@ -683,8 +683,7 @@ dependencies = [
 [[package]]
 name = "ba2"
 version = "3.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fdb05c5c954898b463887df1145016492deee06e9a778f8af491c7cde14c210"
+source = "git+https://github.com/SulfurNitride/bsa-rs?rev=1b74444b#1b74444bb4b8a7042835adae4b0bbe7f3a206d32"
 dependencies = [
  "bitflags 2.11.0",
  "bstr",
