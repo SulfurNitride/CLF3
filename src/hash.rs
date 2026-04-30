@@ -49,6 +49,14 @@ pub fn verify_file_hash(path: &Path, expected_hash: &str) -> Result<bool> {
     Ok(actual_hash == expected_hash)
 }
 
+/// Compute xxHash64 of an in-memory byte slice and return as base64 (Wabbajack format).
+pub fn compute_bytes_hash(data: &[u8]) -> String {
+    let mut hasher = xxhash_rust::xxh64::Xxh64::new(0);
+    hasher.update(data);
+    let hash = hasher.digest();
+    STANDARD.encode(hash.to_le_bytes())
+}
+
 /// Verify a file's hash and return detailed result.
 ///
 /// Returns (matches, actual_hash) for logging/debugging.

@@ -101,6 +101,13 @@ which = "8.0"
 quick-xml = "0.39"
 encoding_rs = "0.8.35"
 
+# LOOT plugin sorting (pure Rust, GPL-3 — clf3 is MIT, see TODO before shipping)
+libloot = "0.28"
+
+# Bsdiff binary patches (Vortex collections use bsdiff-node = bsdiff 4.x format)
+qbsdiff = "1.4"
+crc32fast = "1.4"
+
 # Hashing
 md5 = "0.7"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }

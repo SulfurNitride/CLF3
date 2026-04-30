@@ -5,11 +5,14 @@
 
 pub mod archive;
 pub mod bsa;
+pub mod collection;
 pub mod downloaders;
 pub mod game_finder;
+pub mod games;
 pub mod gpu;
 pub mod hash;
 pub mod installer;
+pub mod loot;
 pub mod modlist;
 pub mod nxm_handler;
 pub mod octodiff;

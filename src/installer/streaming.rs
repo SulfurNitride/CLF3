@@ -61,6 +61,8 @@ pub(crate) struct StagedFile {
     pub(crate) output_path: PathBuf,
     /// Expected file size for verification
     pub(crate) expected_size: u64,
+    /// Expected xxh64 base64 hash — authoritative when manifest size disagrees
+    pub(crate) expected_hash: String,
     /// Directive ID for error reporting
     pub(crate) directive_id: i64,
 }
@@ -672,6 +674,7 @@ pub(crate) fn process_single_archive_fused(
             temp_path: src_path,
             output_path: final_output_path,
             expected_size: directive.size,
+            expected_hash: directive.hash.clone(),
             directive_id: *id,
         });
         extracted_count += 1;
@@ -948,15 +951,42 @@ pub(crate) fn finalize_archive(
         };
 
         if src_size != sf.expected_size {
-            let count = logged_failures.fetch_add(1, Ordering::Relaxed);
-            if count < MAX_LOGGED_FAILURES {
-                error!(
-                    "FAIL [{}]: size mismatch: expected {} got {}",
-                    sf.directive_id, sf.expected_size, src_size
-                );
+            // Manifest size can be stale (mod author re-uploaded archive without
+            // bumping modlist). Authoritative check is xxh64 hash. If hash matches,
+            // accept the file with a warning; otherwise fail.
+            match crate::hash::compute_file_hash(&sf.temp_path) {
+                Ok(actual_hash) if actual_hash == sf.expected_hash => {
+                    warn!(
+                        "Size mismatch but hash OK for [{}] {}: manifest size {} vs actual {} — accepting",
+                        sf.directive_id,
+                        sf.output_path.display(),
+                        sf.expected_size,
+                        src_size
+                    );
+                }
+                Ok(actual_hash) => {
+                    let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                    if count < MAX_LOGGED_FAILURES {
+                        error!(
+                            "FAIL [{}]: size+hash mismatch: expected {}/{} got {}/{}",
+                            sf.directive_id, sf.expected_size, sf.expected_hash, src_size, actual_hash
+                        );
+                    }
+                    failed_atomic.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Err(e) => {
+                    let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                    if count < MAX_LOGGED_FAILURES {
+                        error!(
+                            "FAIL [{}]: size mismatch and hash compute failed: expected {} got {}: {}",
+                            sf.directive_id, sf.expected_size, src_size, e
+                        );
+                    }
+                    failed_atomic.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
             }
-            failed_atomic.fetch_add(1, Ordering::Relaxed);
-            return;
         }
 
         let _ = fs::remove_file(&sf.output_path);
@@ -1166,6 +1196,7 @@ fn process_nested_bsa_directives_staged(
                                     temp_path: extracted_path.clone(),
                                     output_path: final_path,
                                     expected_size: directive.size,
+                                    expected_hash: directive.hash.clone(),
                                     directive_id: *id,
                                 }));
                             }
@@ -1259,6 +1290,7 @@ fn process_nested_bsa_directives_staged(
                         temp_path: out_path.clone(),
                         output_path: out_path,
                         expected_size: directive.size,
+                        expected_hash: directive.hash.clone(),
                         directive_id: id,
                     }));
                 }
@@ -2068,6 +2100,7 @@ struct DirectiveTarget {
     id: i64,
     output_path: PathBuf,
     expected_size: u64,
+    expected_hash: String,
     archive_hash_path: Vec<String>,
 }
 
@@ -2090,6 +2123,7 @@ fn build_directive_lookup(
             id: *id,
             output_path,
             expected_size: directive.size,
+            expected_hash: directive.hash.clone(),
             archive_hash_path: directive.archive_hash_path.clone(),
         });
     }
@@ -2159,14 +2193,25 @@ pub(crate) fn process_archive_direct(
 
         if let Some(targets) = directive_lookup.get(&normalized) {
             for target in targets.iter() {
-                // Verify size
+                // Verify size — fall back to hash check if size disagrees
+                // (manifest size can be stale; xxh64 is authoritative).
                 if data.len() as u64 != target.expected_size {
-                    error!(
-                        "FAIL [{}]: size mismatch: expected {} got {}",
-                        target.id, target.expected_size, data.len()
+                    let actual_hash = crate::hash::compute_bytes_hash(&data);
+                    if actual_hash != target.expected_hash {
+                        error!(
+                            "FAIL [{}]: size+hash mismatch: expected {}/{} got {}/{}",
+                            target.id, target.expected_size, target.expected_hash, data.len(), actual_hash
+                        );
+                        failed_count.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    warn!(
+                        "Size mismatch but hash OK for [{}] {}: manifest size {} vs actual {} — accepting",
+                        target.id,
+                        target.output_path.display(),
+                        target.expected_size,
+                        data.len()
                     );
-                    failed_count.fetch_add(1, Ordering::Relaxed);
-                    continue;
                 }
 
                 // Write directly to final output
@@ -2267,15 +2312,22 @@ pub(crate) fn process_bsa_archive(
 
         for &(id, ref directive, _, _) in directive_list {
             if data.len() as u64 != directive.size {
-                let count = logged_failures.fetch_add(1, Ordering::Relaxed);
-                if count < MAX_LOGGED_FAILURES {
-                    error!(
-                        "FAIL [{}]: BSA size mismatch: expected {} got {}",
-                        id, directive.size, data.len()
-                    );
+                let actual_hash = crate::hash::compute_bytes_hash(&data);
+                if actual_hash != directive.hash {
+                    let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                    if count < MAX_LOGGED_FAILURES {
+                        error!(
+                            "FAIL [{}]: BSA size+hash mismatch: expected {}/{} got {}/{}",
+                            id, directive.size, directive.hash, data.len(), actual_hash
+                        );
+                    }
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
-                failed.fetch_add(1, Ordering::Relaxed);
-                continue;
+                warn!(
+                    "BSA size mismatch but hash OK for [{}] {}: manifest size {} vs actual {} — accepting",
+                    id, directive.to, directive.size, data.len()
+                );
             }
 
             let out_path = paths::join_windows_path(output_dir, &directive.to);

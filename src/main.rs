@@ -12,10 +12,13 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod archive;
 mod browser_gui;
 mod bsa;
+mod collection;
 mod downloaders;
 mod game_finder;
+mod games;
 mod hash;
 mod installer;
+mod loot;
 mod modlist;
 mod nxm_handler;
 mod octodiff;
@@ -165,6 +168,31 @@ enum Commands {
     Info {
         /// Path to the .wabbajack file
         wabbajack_file: PathBuf,
+    },
+
+    /// Install a Vortex/Nexus collection (streaming download + extract)
+    InstallCollection {
+        /// Collection source: a Nexus collection URL, the path to a parsed
+        /// `collection.json`, or — TODO — a bare slug.
+        source: String,
+
+        /// Directory for downloaded archives
+        downloads: PathBuf,
+
+        /// Output directory (mods/, profiles/Default/ written here)
+        output: PathBuf,
+
+        /// Game install path (enables LOOT plugin sorting + Root deploy)
+        #[arg(short, long)]
+        game: Option<PathBuf>,
+
+        /// Nexus Mods API key (overrides saved setting). Premium required.
+        #[arg(long, env = "NEXUS_API_KEY")]
+        nexus_key: Option<String>,
+
+        /// Max concurrent downloads (default 4)
+        #[arg(long, default_value_t = 4)]
+        concurrent: usize,
     },
 }
 
@@ -695,6 +723,96 @@ async fn main() -> Result<()> {
             counts.sort_by(|a, b| b.1.cmp(&a.1));
             for (source, count) in counts {
                 println!("{:>8}  {}", count, source);
+            }
+        }
+
+        Commands::InstallCollection {
+            source,
+            downloads,
+            output,
+            game,
+            nexus_key,
+            concurrent,
+        } => {
+            // Resolve API key: CLI flag > env > saved settings.
+            let saved = settings::Settings::load();
+            let api_key = nexus_key
+                .or_else(|| {
+                    if saved.nexus_api_key.is_empty() {
+                        None
+                    } else {
+                        Some(saved.nexus_api_key.clone())
+                    }
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Nexus API key required (`clf3 set-api-key <KEY>` or --nexus-key / NEXUS_API_KEY)"
+                    )
+                })?;
+
+            std::fs::create_dir_all(&output)?;
+            std::fs::create_dir_all(&downloads)?;
+
+            // Resolve source → collection.json on disk.
+            let collection_json = if collection::is_url(&source) {
+                let url_info = collection::parse_collection_url(&source).ok_or_else(|| {
+                    anyhow::anyhow!("could not parse Nexus collection URL: {}", source)
+                })?;
+                println!(
+                    "Fetching collection.json for {}/{}...",
+                    url_info.game, url_info.slug
+                );
+                collection::fetch_collection(&url_info, &api_key, &output).await?
+            } else {
+                let p = PathBuf::from(&source);
+                if !p.exists() {
+                    anyhow::bail!(
+                        "source must be a Nexus collection URL or path to a collection.json: '{}' does not exist",
+                        source
+                    );
+                }
+                p
+            };
+
+            let cfg = collection::InstallConfig {
+                collection_path: collection_json,
+                db_path: None,
+                mods_dir: output.join("mods"),
+                downloads_dir: downloads,
+                output_dir: output,
+                nexus_api_key: api_key,
+                max_concurrent_downloads: concurrent.max(1),
+                game_path: game,
+                collection_root: None,
+            };
+
+            println!("Starting streaming collection install...");
+            let stats = collection::install_collection_streaming(cfg).await?;
+
+            println!(
+                "\n=== Collection install complete ({:.1}s) ===\n\
+                 cached:     {}\n\
+                 downloaded: {}\n\
+                 extracted:  {}\n\
+                 skipped:    {} (marker matched, no work)\n\
+                 manual:     {}\n\
+                 failed:     {}\n\
+                 patches:    {} applied, {} skipped (CRC), {} missing, {} failed",
+                stats.elapsed_secs,
+                stats.mods_cached,
+                stats.mods_downloaded,
+                stats.mods_extracted,
+                stats.mods_skipped,
+                stats.mods_manual,
+                stats.mods_failed,
+                stats.patches_applied,
+                stats.patches_skipped_crc,
+                stats.patches_missing,
+                stats.patches_failed,
+            );
+
+            if stats.mods_failed > 0 || stats.mods_manual > 0 {
+                println!("\nSome mods need attention — check the log for details.");
             }
         }
     }

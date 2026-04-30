@@ -4,7 +4,8 @@
 //! lazy-loaded thumbnail images, search/filter controls, and generates a CLI
 //! install command for the user to copy-paste.
 
-use crate::game_finder::{detect_all_games, find_by_gog_id, find_by_steam_id, Launcher};
+use crate::collection::gallery::{self, CollectionListing, SortBy as CollectionSortBy};
+use crate::game_finder::{detect_all_games, find_by_gog_id, find_by_steam_id, Game, Launcher};
 use crate::modlist::browser::{ModlistBrowser, ModlistMetadata};
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
@@ -35,9 +36,34 @@ pub fn launch_browser() -> Result<(), eframe::Error> {
         Box::new(|cc| {
             // Install image loaders so egui_extras can decode PNG/JPEG/etc.
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            install_emoji_font(&cc.egui_ctx);
             Ok(Box::new(BrowserApp::new(cc)))
         }),
     )
+}
+
+/// Bundle OpenMoji-Black (monochrome, CC-BY-SA 4.0) as a fallback so glyphs
+/// the default font lacks render instead of showing tofu boxes. OpenMoji
+/// covers Unicode 15 (newer than Noto Emoji's discontinued mono variant).
+fn install_emoji_font(ctx: &egui::Context) {
+    const OPENMOJI: &[u8] = include_bytes!("../assets/OpenMoji-Black.ttf");
+
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "openmoji_black".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(OPENMOJI)),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .push("openmoji_black".to_owned());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .push("openmoji_black".to_owned());
+    ctx.set_fonts(fonts);
 }
 
 /// Image loading state for a single modlist.
@@ -62,7 +88,52 @@ struct SharedState {
     fetch_error: Option<String>,
 }
 
+/// State for the Collections gallery (parallel to SharedState for the
+/// Wabbajack tab). Shared between the main thread and async fetch tasks.
+struct CollectionsState {
+    listings: Vec<CollectionListing>,
+    /// Keyed by `slug` — image cache for tile thumbnails.
+    images: HashMap<String, ImageState>,
+    fetch_done: bool,
+    fetch_error: Option<String>,
+}
+
+/// Top-level browser tabs.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BrowserTab {
+    Wabbajack,
+    Collections,
+}
+
 struct BrowserApp {
+    /// Active top-level tab.
+    tab: BrowserTab,
+    /// Collection input fields (URL/slug, downloads, output, game).
+    collection_url: String,
+    collection_downloads: String,
+    collection_output: String,
+    collection_game: String,
+    /// Last generated `clf3 install-collection` command, if any.
+    collection_generated_command: Option<String>,
+
+    /// Collections gallery shared state.
+    collections_shared: Arc<Mutex<CollectionsState>>,
+    /// Game-domain filter for the Collections tab (Nexus URL slug, e.g.
+    /// `skyrimspecialedition`). Empty = use the first known game.
+    collections_game_filter: String,
+    /// Sort selection.
+    collections_sort: CollectionSortBy,
+    /// Whether we've kicked off the initial gallery fetch.
+    collections_fetch_started: bool,
+    /// Whether background image loading has been kicked off.
+    collections_image_load_started: bool,
+    /// Slug of the currently-selected collection (drives "Use this" → form
+    /// fields below).
+    collections_selected_slug: Option<String>,
+    /// All detected games (Steam, Heroic/GOG, etc.) — used for auto-detecting
+    /// the game-dir field on the Collections install form.
+    detected_games: Vec<Game>,
+
     shared: Arc<Mutex<SharedState>>,
     /// Search query string.
     search: String,
@@ -146,6 +217,24 @@ impl BrowserApp {
         }
 
         Self {
+            tab: BrowserTab::Wabbajack,
+            collection_url: String::new(),
+            collection_downloads: String::new(),
+            collection_output: String::new(),
+            collection_game: String::new(),
+            collection_generated_command: None,
+            collections_shared: Arc::new(Mutex::new(CollectionsState {
+                listings: Vec::new(),
+                images: HashMap::new(),
+                fetch_done: false,
+                fetch_error: None,
+            })),
+            collections_game_filter: "skyrimspecialedition".to_string(),
+            collections_sort: CollectionSortBy::Endorsements,
+            collections_fetch_started: false,
+            collections_image_load_started: false,
+            collections_selected_slug: None,
+            detected_games: detected.games.clone(),
             shared: Arc::new(Mutex::new(SharedState {
                 modlists: Vec::new(),
                 games: Vec::new(),
@@ -442,16 +531,33 @@ impl BrowserApp {
 
 impl eframe::App for BrowserApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Kick off fetch on first frame.
-        self.start_fetch(ctx);
+        // Kick off fetch on first frame (Wabbajack tab only — Collection tab
+        // is form-driven, no background fetch yet).
+        if self.tab == BrowserTab::Wabbajack {
+            self.start_fetch(ctx);
 
-        // Once modlists are loaded, start image loading.
-        {
+            // Once modlists are loaded, start image loading.
             let state = self.shared.lock().expect("lock shared state");
             if state.fetch_done && !state.modlists.is_empty() && !self.image_load_started {
                 drop(state);
                 self.start_image_loading(ctx);
             }
+        }
+
+        // Top tab bar.
+        egui::TopBottomPanel::top("tab_bar").show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, BrowserTab::Wabbajack, "Wabbajack");
+                ui.selectable_value(&mut self.tab, BrowserTab::Collections, "Collections");
+            });
+            ui.add_space(2.0);
+        });
+
+        // Collections tab: short-circuit, render its own panel and return.
+        if self.tab == BrowserTab::Collections {
+            self.render_collections_tab(ctx);
+            return;
         }
 
         // Top panel: search and filters.
@@ -670,7 +776,10 @@ impl eframe::App for BrowserApp {
                 });
         }
 
-        // Convert any Downloaded images to GPU textures.
+        // Convert Downloaded → GPU textures, but cap per frame so paint
+        // stays responsive when 100+ images land at once. PNG decode +
+        // GPU upload are both UI-thread-bound and surprisingly expensive.
+        const MAX_TEXTURE_UPLOADS_PER_FRAME: usize = 4;
         {
             let mut state = self.shared.lock().expect("lock shared state");
             let keys_to_convert: Vec<String> = state
@@ -683,7 +792,9 @@ impl eframe::App for BrowserApp {
                         None
                     }
                 })
+                .take(MAX_TEXTURE_UPLOADS_PER_FRAME)
                 .collect();
+            let still_pending = !keys_to_convert.is_empty();
 
             for key in keys_to_convert {
                 if let Some(ImageState::Downloaded(bytes)) = state.images.remove(&key) {
@@ -705,6 +816,11 @@ impl eframe::App for BrowserApp {
                         }
                     }
                 }
+            }
+            // Keep painting next frame so remaining Downloaded entries get
+            // converted without waiting for an unrelated input event.
+            if still_pending {
+                ctx.request_repaint();
             }
         }
 
@@ -916,5 +1032,663 @@ impl BrowserApp {
                     });
                 });
             });
+    }
+
+    /// Collections tab — gallery view of Nexus collections, filterable by
+    /// game, with lazy-loaded thumbnails. Selecting a card prefills the URL
+    /// in the install form below.
+    fn render_collections_tab(&mut self, ctx: &egui::Context) {
+        // Trigger initial fetch + image loading on first render of this tab.
+        self.start_collections_fetch(ctx);
+        if self
+            .collections_shared
+            .lock()
+            .map(|s| s.fetch_done && !s.listings.is_empty())
+            .unwrap_or(false)
+            && !self.collections_image_load_started
+        {
+            self.start_collections_image_loading(ctx);
+        }
+
+        // Convert Downloaded → GPU textures, throttled per frame (see Wabbajack
+        // tab). 4/frame keeps the paint loop responsive while 100+ images land.
+        {
+            const MAX: usize = 4;
+            let mut state = self
+                .collections_shared
+                .lock()
+                .expect("collections lock");
+            let keys: Vec<String> = state
+                .images
+                .iter()
+                .filter_map(|(k, v)| match v {
+                    ImageState::Downloaded(_) => Some(k.clone()),
+                    _ => None,
+                })
+                .take(MAX)
+                .collect();
+            let still_pending = !keys.is_empty();
+            for key in keys {
+                if let Some(ImageState::Downloaded(bytes)) = state.images.remove(&key) {
+                    match image::load_from_memory(&bytes) {
+                        Ok(img) => {
+                            let rgba = img.to_rgba8();
+                            let size =
+                                [rgba.width() as usize, rgba.height() as usize];
+                            let pixels = rgba.into_raw();
+                            let color_image =
+                                egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                            let texture = ctx.load_texture(
+                                &format!("collection_{key}"),
+                                color_image,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            state.images.insert(key, ImageState::Texture(texture));
+                        }
+                        Err(_) => {
+                            state.images.insert(key, ImageState::Failed);
+                        }
+                    }
+                }
+            }
+            if still_pending {
+                ctx.request_repaint();
+            }
+        }
+
+        // Filter bar.
+        egui::TopBottomPanel::top("collections_top").show(ctx, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Game:");
+                let games: &[(&str, &str)] = &[
+                    ("skyrimspecialedition", "Skyrim Special Edition"),
+                    ("skyrim", "Skyrim Legendary Edition"),
+                    ("fallout4", "Fallout 4"),
+                    ("falloutnewvegas", "Fallout: New Vegas"),
+                    ("fallout3", "Fallout 3"),
+                    ("oblivion", "Oblivion"),
+                    ("starfield", "Starfield"),
+                    ("baldursgate3", "Baldur's Gate 3"),
+                    ("cyberpunk2077", "Cyberpunk 2077"),
+                    ("stardewvalley", "Stardew Valley"),
+                ];
+                let current_label = games
+                    .iter()
+                    .find(|(slug, _)| *slug == self.collections_game_filter)
+                    .map(|(_, name)| *name)
+                    .unwrap_or("Custom");
+                let mut new_filter = self.collections_game_filter.clone();
+                egui::ComboBox::from_id_salt("collections_game")
+                    .selected_text(current_label)
+                    .show_ui(ui, |ui| {
+                        for (slug, name) in games {
+                            ui.selectable_value(&mut new_filter, slug.to_string(), *name);
+                        }
+                    });
+                if new_filter != self.collections_game_filter {
+                    self.collections_game_filter = new_filter;
+                    self.reset_collections_fetch();
+                }
+
+                ui.separator();
+                ui.label("Sort:");
+                let mut new_sort = self.collections_sort;
+                egui::ComboBox::from_id_salt("collections_sort")
+                    .selected_text(match self.collections_sort {
+                        CollectionSortBy::Endorsements => "Endorsements",
+                        CollectionSortBy::Downloads => "Downloads",
+                        CollectionSortBy::Recent => "Recent",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut new_sort,
+                            CollectionSortBy::Endorsements,
+                            "Endorsements",
+                        );
+                        ui.selectable_value(
+                            &mut new_sort,
+                            CollectionSortBy::Downloads,
+                            "Downloads",
+                        );
+                        ui.selectable_value(&mut new_sort, CollectionSortBy::Recent, "Recent");
+                    });
+                if !sort_eq(new_sort, self.collections_sort) {
+                    self.collections_sort = new_sort;
+                    self.reset_collections_fetch();
+                }
+
+                ui.separator();
+                if ui.button("Refresh").clicked() {
+                    self.reset_collections_fetch();
+                }
+            });
+            ui.add_space(4.0);
+        });
+
+        // Bottom panel: install form (mirrors Wabbajack tab UX).
+        egui::TopBottomPanel::bottom("collections_form")
+            .min_height(160.0)
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.heading("Install");
+                ui.add_space(4.0);
+
+                if let Some(slug) = &self.collections_selected_slug {
+                    ui.label(
+                        egui::RichText::new(format!("Selected: {slug}"))
+                            .color(egui::Color32::from_rgb(120, 200, 255)),
+                    );
+                }
+
+                egui::Grid::new("collection_inputs")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("URL / slug / path:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.collection_url)
+                                .desired_width(640.0)
+                                .hint_text("Click a card above, or paste a URL"),
+                        );
+                        ui.end_row();
+
+                        ui.label("Downloads dir:");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.collection_downloads)
+                                    .desired_width(540.0),
+                            );
+                            if ui.button("Browse...").clicked() {
+                                if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                                    self.collection_downloads = p.display().to_string();
+                                }
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.label("Output dir:");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.collection_output)
+                                    .desired_width(540.0),
+                            );
+                            if ui.button("Browse...").clicked() {
+                                if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                                    self.collection_output = p.display().to_string();
+                                }
+                            }
+                        });
+                        ui.end_row();
+                    });
+
+                if !self.collection_game.trim().is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Auto-detected game dir for LOOT: {}",
+                            self.collection_game
+                        ))
+                        .size(11.0)
+                        .color(egui::Color32::from_gray(150)),
+                    );
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let can_generate = !self.collection_url.trim().is_empty()
+                        && !self.collection_downloads.trim().is_empty()
+                        && !self.collection_output.trim().is_empty();
+                    if ui
+                        .add_enabled(can_generate, egui::Button::new("Generate command"))
+                        .clicked()
+                    {
+                        self.collection_generated_command =
+                            Some(self.build_collection_command());
+                    }
+                    if self.collection_generated_command.is_some()
+                        && ui.button("Clear").clicked()
+                    {
+                        self.collection_generated_command = None;
+                    }
+                });
+
+                if let Some(cmd) = self.collection_generated_command.clone() {
+                    ui.add_space(6.0);
+                    ui.label("Run this in your terminal:");
+                    let mut display = cmd.clone();
+                    ui.add(
+                        egui::TextEdit::multiline(&mut display)
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    if ui.button("Copy").clicked() {
+                        ctx.copy_text(cmd);
+                    }
+                }
+                ui.add_space(6.0);
+            });
+
+        // Central: gallery grid.
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let (fetch_done, error, count) = {
+                let state = self.collections_shared.lock().expect("collections lock");
+                (
+                    state.fetch_done,
+                    state.fetch_error.clone(),
+                    state.listings.len(),
+                )
+            };
+
+            if let Some(err) = error {
+                ui.colored_label(egui::Color32::RED, format!("Error: {err}"));
+                return;
+            }
+            if !fetch_done {
+                ui.centered_and_justified(|ui| ui.spinner());
+                return;
+            }
+            if count == 0 {
+                ui.label("No collections returned for this game.");
+                return;
+            }
+
+            ui.label(format!("{count} collections"));
+            ui.add_space(4.0);
+
+            // Snapshot listings to render without holding the lock during draw.
+            let snapshot: Vec<CollectionListing> = self
+                .collections_shared
+                .lock()
+                .map(|s| s.listings.clone())
+                .unwrap_or_default();
+
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for c in &snapshot {
+                        self.render_collection_row(ui, c);
+                        ui.add_space(4.0);
+                    }
+                });
+        });
+    }
+
+    fn render_collection_row(&mut self, ui: &mut egui::Ui, c: &CollectionListing) {
+        let is_selected = self
+            .collections_selected_slug
+            .as_deref()
+            .map(|s| s == c.slug)
+            .unwrap_or(false);
+        let stroke = if is_selected {
+            egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 149, 237))
+        } else {
+            egui::Stroke::new(1.0, egui::Color32::from_gray(60))
+        };
+
+        egui::Frame::NONE
+            .fill(egui::Color32::from_gray(30))
+            .stroke(stroke)
+            .corner_radius(6)
+            .inner_margin(8)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.set_min_height(ROW_HEIGHT);
+
+                ui.horizontal(|ui| {
+                    // Thumbnail.
+                    let texture: Option<egui::TextureHandle> = self
+                        .collections_shared
+                        .lock()
+                        .ok()
+                        .and_then(|s| match s.images.get(&c.slug) {
+                            Some(ImageState::Texture(tex)) => Some(tex.clone()),
+                            _ => None,
+                        });
+                    match texture {
+                        Some(tex) => {
+                            ui.add(
+                                egui::Image::from_texture(&tex)
+                                    .fit_to_exact_size(egui::vec2(THUMB_WIDTH, THUMB_HEIGHT)),
+                            );
+                        }
+                        None => {
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(THUMB_WIDTH, THUMB_HEIGHT),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(
+                                rect,
+                                4.0,
+                                egui::Color32::from_gray(50),
+                            );
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "(loading)",
+                                egui::FontId::proportional(11.0),
+                                egui::Color32::from_gray(150),
+                            );
+                        }
+                    }
+
+                    ui.add_space(12.0);
+
+                    // Stack everything in one vertical column to mirror the
+                    // Wabbajack tab card layout: title → author|game → summary
+                    // → stats row + action button.
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(strip_format_chars(&c.name))
+                                .strong()
+                                .size(15.0),
+                        );
+                        let subtitle = if c.game_name.is_empty() {
+                            format!("by {}", strip_format_chars(&c.author))
+                        } else {
+                            format!(
+                                "by {} | {}",
+                                strip_format_chars(&c.author),
+                                strip_format_chars(&c.game_name)
+                            )
+                        };
+                        ui.label(
+                            egui::RichText::new(subtitle)
+                                .size(12.0)
+                                .color(egui::Color32::from_gray(170)),
+                        );
+                        ui.add_space(4.0);
+                        let summary = truncate_chars(&strip_format_chars(&c.summary), 240);
+                        ui.label(
+                            egui::RichText::new(summary)
+                                .size(11.0)
+                                .color(egui::Color32::from_gray(190)),
+                        );
+                        ui.add_space(4.0);
+
+                        ui.horizontal(|ui| {
+                            let mut parts = vec![format!("rev {}", c.latest_revision)];
+                            if c.mod_count > 0 {
+                                parts.push(format!("{} mods", c.mod_count));
+                            }
+                            if c.total_size_bytes > 0 {
+                                parts.push(format!("Download: {}", fmt_size(c.total_size_bytes)));
+                            }
+                            parts.push(format!("{} downloads", fmt_count(c.total_downloads)));
+                            parts.push(format!("{} endorsements", fmt_count(c.endorsements)));
+                            ui.label(
+                                egui::RichText::new(parts.join("  |  "))
+                                    .size(11.0)
+                                    .color(egui::Color32::from_gray(120)),
+                            );
+                            ui.add_space(16.0);
+                            if ui
+                                .button(if is_selected { "Selected" } else { "Use" })
+                                .clicked()
+                            {
+                                self.collections_selected_slug = Some(c.slug.clone());
+                                self.collection_url = c.nexus_url();
+                                // Auto-fill game dir from detected installs if we
+                                // can match the collection's game.
+                                if let Some(path) = self
+                                    .detect_game_path_for_domain(&c.game_domain)
+                                {
+                                    self.collection_game = path;
+                                }
+                            }
+                        });
+                    });
+                });
+            });
+    }
+
+    /// Look up an install path for a Nexus domain (`skyrimspecialedition`)
+    /// among detected Steam/Heroic/etc games, via KnownGames' wabbajack_type
+    /// alias. Returns `None` if no match is detected.
+    fn detect_game_path_for_domain(&self, domain: &str) -> Option<String> {
+        use crate::game_finder::known_games;
+        // Map Nexus domain → wabbajack_type by case-insensitive scan of the
+        // KNOWN_GAMES table.
+        let target_type = known_games::KNOWN_GAMES
+            .iter()
+            .find(|g| {
+                g.wabbajack_type
+                    .map(|wj| wj.eq_ignore_ascii_case(&domain.replace(['_', ' '], "")))
+                    .unwrap_or(false)
+            })
+            .or_else(|| {
+                // Fall back: the Nexus domain `skyrimspecialedition` collapses
+                // to `SkyrimSpecialEdition` after capitalization removal —
+                // direct compare against the lowercased wabbajack_type.
+                known_games::KNOWN_GAMES.iter().find(|g| {
+                    g.wabbajack_type
+                        .map(|wj| wj.to_lowercase() == domain.to_lowercase())
+                        .unwrap_or(false)
+                })
+            })?;
+        let wj = target_type.wabbajack_type?;
+        // Find a detected game with the matching wabbajack_type via
+        // find_by_steam_id / find_by_gog_id.
+        for g in &self.detected_games {
+            let known = match g.launcher {
+                Launcher::Steam { .. } => find_by_steam_id(&g.app_id),
+                Launcher::Heroic { .. } => find_by_gog_id(&g.app_id),
+            };
+            if known.and_then(|k| k.wabbajack_type) == Some(wj) {
+                return Some(g.install_path.display().to_string());
+            }
+        }
+        None
+    }
+
+    /// Reset gallery state and refetch (after game/sort change or refresh).
+    fn reset_collections_fetch(&mut self) {
+        if let Ok(mut s) = self.collections_shared.lock() {
+            s.listings.clear();
+            s.images.clear();
+            s.fetch_done = false;
+            s.fetch_error = None;
+        }
+        self.collections_fetch_started = false;
+        self.collections_image_load_started = false;
+    }
+
+    fn start_collections_fetch(&mut self, ctx: &egui::Context) {
+        if self.collections_fetch_started {
+            return;
+        }
+        self.collections_fetch_started = true;
+
+        let api_key = crate::settings::Settings::load().nexus_api_key;
+        if api_key.is_empty() {
+            if let Ok(mut s) = self.collections_shared.lock() {
+                s.fetch_error = Some(
+                    "No Nexus API key saved. Run `clf3 set-api-key <KEY>` and reopen the browser."
+                        .into(),
+                );
+                s.fetch_done = true;
+            }
+            return;
+        }
+
+        let game = self.collections_game_filter.clone();
+        let sort = self.collections_sort;
+        let shared = Arc::clone(&self.collections_shared);
+        let ctx = ctx.clone();
+
+        self.rt().spawn(async move {
+            let game_ref = if game.is_empty() { None } else { Some(game.as_str()) };
+            match gallery::fetch_page(&api_key, game_ref, sort, 0, None).await {
+                Ok(listings) => {
+                    let mut state = shared.lock().expect("collections lock");
+                    state.listings = listings;
+                    state.fetch_done = true;
+                }
+                Err(e) => {
+                    let mut state = shared.lock().expect("collections lock");
+                    state.fetch_error = Some(format!("{e:#}"));
+                    state.fetch_done = true;
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_collections_image_loading(&mut self, ctx: &egui::Context) {
+        if self.collections_image_load_started {
+            return;
+        }
+        self.collections_image_load_started = true;
+
+        let shared = Arc::clone(&self.collections_shared);
+        let ctx = ctx.clone();
+        let cache_dir = self.image_cache_dir.join("collections");
+        let _ = std::fs::create_dir_all(&cache_dir);
+
+        let to_load: Vec<(String, String)> = {
+            let mut state = shared.lock().expect("collections lock");
+            let items: Vec<(String, String)> = state
+                .listings
+                .iter()
+                .filter_map(|c| {
+                    let url = c.image_url.clone()?;
+                    if url.is_empty() {
+                        return None;
+                    }
+                    Some((c.slug.clone(), url))
+                })
+                .collect();
+            for (key, _) in &items {
+                state.images.insert(key.clone(), ImageState::Loading);
+            }
+            items
+        };
+
+        self.rt().spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .unwrap();
+
+            for batch in to_load.chunks(IMAGE_BATCH_SIZE) {
+                let mut handles = Vec::with_capacity(batch.len());
+                for (key, url) in batch {
+                    let client = client.clone();
+                    let key = key.clone();
+                    let url = url.clone();
+                    let cache_dir = cache_dir.clone();
+                    handles.push(tokio::spawn(async move {
+                        // Disk cache.
+                        let cached = cache_dir.join(&key);
+                        if cached.exists() {
+                            if let Ok(bytes) = std::fs::read(&cached) {
+                                if !bytes.is_empty() {
+                                    return (key, Ok(bytes));
+                                }
+                            }
+                        }
+                        let result: anyhow::Result<Vec<u8>> = async {
+                            let resp = client.get(&url).send().await?;
+                            let bytes = resp.bytes().await?.to_vec();
+                            let _ = std::fs::write(&cached, &bytes);
+                            Ok(bytes)
+                        }
+                        .await;
+                        (key, result)
+                    }));
+                }
+                for h in handles {
+                    let Ok((key, result)) = h.await else { continue };
+                    let mut state = shared.lock().expect("collections lock");
+                    match result {
+                        Ok(bytes) => {
+                            state.images.insert(key, ImageState::Downloaded(bytes));
+                        }
+                        Err(_) => {
+                            state.images.insert(key, ImageState::Failed);
+                        }
+                    }
+                }
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn build_collection_command(&self) -> String {
+        // Quote any path containing whitespace.
+        let q = |s: &str| -> String {
+            if s.chars().any(|c| c.is_whitespace()) {
+                format!("\"{s}\"")
+            } else {
+                s.to_string()
+            }
+        };
+        // Use the running binary's absolute path so the snippet is paste-ready
+        // even when `clf3` isn't on $PATH (e.g. running from target/release).
+        let binary = std::env::current_exe()
+            .ok()
+            .map(|p| q(&p.to_string_lossy()))
+            .unwrap_or_else(|| "clf3".to_string());
+        let mut cmd = format!(
+            "{} install-collection {} {} {}",
+            binary,
+            q(self.collection_url.trim()),
+            q(self.collection_downloads.trim()),
+            q(self.collection_output.trim()),
+        );
+        if !self.collection_game.trim().is_empty() {
+            cmd.push_str(&format!(" --game {}", q(self.collection_game.trim())));
+        }
+        cmd
+    }
+}
+
+fn sort_eq(a: CollectionSortBy, b: CollectionSortBy) -> bool {
+    a == b
+}
+
+/// Truncate a string to at most `max_chars` characters (not bytes), appending
+/// an ellipsis if any characters were dropped. Char-boundary safe — the byte
+/// slice form panics on multi-byte glyphs (emoji).
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
+
+/// Strip Unicode format characters that egui renders as tofu boxes — chiefly
+/// the emoji/text Variation Selectors (U+FE0E, U+FE0F) which appear after
+/// most modern emoji and have no glyph in our bundled fonts.
+fn strip_format_chars(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(*c, '\u{FE0E}' | '\u{FE0F}'))
+        .collect()
+}
+
+fn fmt_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Format a byte count as human-friendly size (matches the Wabbajack tab).
+fn fmt_size(bytes: u64) -> String {
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.0} MB", b / MB)
+    } else {
+        format!("{} B", bytes)
     }
 }
