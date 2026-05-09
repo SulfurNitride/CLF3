@@ -96,10 +96,42 @@ fn apply_one(
         return Ok(PatchOutcome::DiffMissing);
     }
 
-    let src_bytes = std::fs::read(&src_path)
-        .with_context(|| format!("read source: {}", src_path.display()))?;
+    // mmap the source so we don't drag the whole file (could be a 2 GB BSA)
+    // into the process heap just to crc32 + bsdiff against it.
+    let src_file = std::fs::File::open(&src_path)
+        .with_context(|| format!("open source: {}", src_path.display()))?;
+    let src_meta = src_file
+        .metadata()
+        .with_context(|| format!("stat source: {}", src_path.display()))?;
+    if src_meta.len() == 0 {
+        // mmap of an empty file is undefined on some platforms; fall back to
+        // an empty slice. crc32 of empty is 0x00000000.
+        let actual_crc = "00000000".to_string();
+        if !actual_crc.eq_ignore_ascii_case(expected_crc_hex) {
+            return Ok(PatchOutcome::CrcMismatch { actual: actual_crc });
+        }
+        let diff_bytes = std::fs::read(&diff_path)
+            .with_context(|| format!("read diff: {}", diff_path.display()))?;
+        let patcher = Bspatch::new(&diff_bytes)
+            .with_context(|| format!("parse diff header: {}", diff_path.display()))?;
+        let mut target = Vec::with_capacity(patcher.hint_target_size() as usize);
+        patcher
+            .apply(&[], std::io::Cursor::new(&mut target))
+            .with_context(|| format!("apply diff: {}", diff_path.display()))?;
+        write_atomic(&src_path, &target)
+            .with_context(|| format!("write patched: {}", src_path.display()))?;
+        return Ok(PatchOutcome::Applied);
+    }
 
-    let actual_crc = crc32_hex(&src_bytes);
+    // SAFETY: file remains open through `_src_mmap`'s scope; we don't write
+    // to `src_path` until `write_atomic` (which targets the path, not the
+    // mapped fd) and the mmap is dropped before that — but write_atomic uses
+    // a sibling temp + rename, so even a stale mmap is harmless.
+    let src_mmap = unsafe { memmap2::Mmap::map(&src_file) }
+        .with_context(|| format!("mmap source: {}", src_path.display()))?;
+    let src_bytes: &[u8] = &src_mmap;
+
+    let actual_crc = crc32_hex(src_bytes);
     if !actual_crc.eq_ignore_ascii_case(expected_crc_hex) {
         return Ok(PatchOutcome::CrcMismatch { actual: actual_crc });
     }
@@ -111,8 +143,13 @@ fn apply_one(
         .with_context(|| format!("parse diff header: {}", diff_path.display()))?;
     let mut target = Vec::with_capacity(patcher.hint_target_size() as usize);
     patcher
-        .apply(&src_bytes, std::io::Cursor::new(&mut target))
+        .apply(src_bytes, std::io::Cursor::new(&mut target))
         .with_context(|| format!("apply diff: {}", diff_path.display()))?;
+
+    // Drop the mmap before rename so the kernel doesn't have to keep both
+    // the old inode mapped and the new file's inode resident.
+    drop(src_mmap);
+    drop(src_file);
 
     write_atomic(&src_path, &target)
         .with_context(|| format!("write patched: {}", src_path.display()))?;

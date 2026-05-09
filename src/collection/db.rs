@@ -24,6 +24,10 @@ pub enum ModStatus {
     Installing,
     Installed,
     Failed,
+    /// Source needs human action (browse URL, NSFW Nexus without consent,
+    /// etc.). Distinct from `Failed` so resume + reporting don't treat it
+    /// as a hard error.
+    Manual,
 }
 
 impl ModStatus {
@@ -37,6 +41,7 @@ impl ModStatus {
             ModStatus::Installing => "installing",
             ModStatus::Installed => "installed",
             ModStatus::Failed => "failed",
+            ModStatus::Manual => "manual",
         }
     }
 
@@ -51,6 +56,7 @@ impl ModStatus {
             "installing" => ModStatus::Installing,
             "installed" => ModStatus::Installed,
             "failed" => ModStatus::Failed,
+            "manual" => ModStatus::Manual,
             _ => ModStatus::Pending,
         }
     }
@@ -133,6 +139,10 @@ impl CollectionDb {
                 -- Vortex "recommends" rule type → optional=1. Installed but
                 -- left disabled in modlist.txt so the user can flip them on.
                 optional INTEGER NOT NULL DEFAULT 0,
+                -- Vortex `fileOverrides` JSON array of relative paths this
+                -- mod must own in conflicts. Used at modlist-write time to
+                -- bump the mod above unmarked peers.
+                file_overrides_json TEXT,
                 created_at TEXT DEFAULT (datetime('now')),
                 updated_at TEXT DEFAULT (datetime('now'))
             );
@@ -141,6 +151,10 @@ impl CollectionDb {
             CREATE INDEX IF NOT EXISTS idx_mods_status ON mods(status);
             CREATE INDEX IF NOT EXISTS idx_mods_phase ON mods(phase);
             CREATE INDEX IF NOT EXISTS idx_mods_folder ON mods(folder_name);
+            -- Catch dup Nexus mods at INSERT time. Direct/manual sources use
+            -- mod_id=0,file_id=0 — partial WHERE keeps those allowed.
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_mods_nexus_id
+                ON mods(mod_id, file_id) WHERE mod_id > 0;
 
             -- Mod rules (ordering constraints)
             CREATE TABLE IF NOT EXISTS mod_rules (
@@ -155,7 +169,10 @@ impl CollectionDb {
             CREATE INDEX IF NOT EXISTS idx_rules_source ON mod_rules(source_md5);
             CREATE INDEX IF NOT EXISTS idx_rules_reference ON mod_rules(reference_md5);
 
-            -- Plugins (load order)
+            -- Plugins (load order). Bethesda games are case-insensitive on
+            -- plugin filenames; the table-level UNIQUE on `name` is augmented
+            -- with a case-insensitive unique index so `Foo.esp` and `foo.esp`
+            -- collapse to one row instead of stacking.
             CREATE TABLE IF NOT EXISTS plugins (
                 id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE,
@@ -164,6 +181,8 @@ impl CollectionDb {
             );
 
             CREATE INDEX IF NOT EXISTS idx_plugins_order ON plugins(load_order);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_plugins_name_ci
+                ON plugins(LOWER(name));
 
             -- Archive file listings (for path lookup within archives)
             CREATE TABLE IF NOT EXISTS archive_files (
@@ -277,8 +296,8 @@ impl CollectionDb {
         // Import mods
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO mods (name, folder_name, logical_filename, md5, file_size, mod_id, file_id, source_type, source_url, deploy_type, phase, choices_json, hashes_json, patches_json, optional)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
+                "INSERT INTO mods (name, folder_name, logical_filename, md5, file_size, mod_id, file_id, source_type, source_url, deploy_type, phase, choices_json, hashes_json, patches_json, optional, file_overrides_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
             )?;
 
             for mod_entry in &collection.mods {
@@ -345,6 +364,12 @@ impl CollectionDb {
                     .map(|d| d.mod_type.as_str())
                     .unwrap_or("");
 
+                let file_overrides_json = if mod_entry.file_overrides.is_empty() {
+                    None
+                } else {
+                    serde_json::to_string(&mod_entry.file_overrides).ok()
+                };
+
                 stmt.execute(params![
                     mod_entry.name,
                     folder_name,
@@ -361,6 +386,7 @@ impl CollectionDb {
                     hashes_json,
                     patches_json,
                     mod_entry.optional as i64,
+                    file_overrides_json,
                 ])?;
             }
         }
@@ -444,7 +470,7 @@ impl CollectionDb {
     /// Get all mods that need downloading
     pub fn get_pending_downloads(&self) -> Result<Vec<ModDbEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, folder_name, logical_filename, md5, file_size, mod_id, file_id, source_type, source_url, deploy_type, phase, status, local_path, choices_json, error_message, fomod_validated, fomod_valid, fomod_error, fomod_module_name, hashes_json, patches_json, optional
+            "SELECT id, name, folder_name, logical_filename, md5, file_size, mod_id, file_id, source_type, source_url, deploy_type, phase, status, local_path, choices_json, error_message, fomod_validated, fomod_valid, fomod_error, fomod_module_name, hashes_json, patches_json, optional, file_overrides_json
              FROM mods WHERE status = 'pending' ORDER BY phase, id",
         )?;
 
@@ -454,7 +480,7 @@ impl CollectionDb {
     /// Get all mods with a specific status
     pub fn get_mods_by_status(&self, status: ModStatus) -> Result<Vec<ModDbEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, folder_name, logical_filename, md5, file_size, mod_id, file_id, source_type, source_url, deploy_type, phase, status, local_path, choices_json, error_message, fomod_validated, fomod_valid, fomod_error, fomod_module_name, hashes_json, patches_json, optional
+            "SELECT id, name, folder_name, logical_filename, md5, file_size, mod_id, file_id, source_type, source_url, deploy_type, phase, status, local_path, choices_json, error_message, fomod_validated, fomod_valid, fomod_error, fomod_module_name, hashes_json, patches_json, optional, file_overrides_json
              FROM mods WHERE status = ?1 ORDER BY phase, id",
         )?;
 
@@ -464,7 +490,7 @@ impl CollectionDb {
     /// Get a mod by its database ID
     pub fn get_mod_by_id(&self, id: i64) -> Result<Option<ModDbEntry>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT id, name, folder_name, logical_filename, md5, file_size, mod_id, file_id, source_type, source_url, deploy_type, phase, status, local_path, choices_json, error_message, fomod_validated, fomod_valid, fomod_error, fomod_module_name, hashes_json, patches_json, optional
+            "SELECT id, name, folder_name, logical_filename, md5, file_size, mod_id, file_id, source_type, source_url, deploy_type, phase, status, local_path, choices_json, error_message, fomod_validated, fomod_valid, fomod_error, fomod_module_name, hashes_json, patches_json, optional, file_overrides_json
              FROM mods WHERE id = ?1",
         )?;
 
@@ -493,6 +519,7 @@ impl CollectionDb {
                 hashes_json: row.get(20)?,
                 patches_json: row.get(21)?,
                 optional: row.get::<_, i64>(22)? != 0,
+                file_overrides_json: row.get(23)?,
             })
         });
 
@@ -506,7 +533,7 @@ impl CollectionDb {
     /// Get a mod by its MD5 hash
     pub fn get_mod_by_md5(&self, md5: &str) -> Result<Option<ModDbEntry>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT id, name, folder_name, logical_filename, md5, file_size, mod_id, file_id, source_type, source_url, deploy_type, phase, status, local_path, choices_json, error_message, fomod_validated, fomod_valid, fomod_error, fomod_module_name, hashes_json, patches_json, optional
+            "SELECT id, name, folder_name, logical_filename, md5, file_size, mod_id, file_id, source_type, source_url, deploy_type, phase, status, local_path, choices_json, error_message, fomod_validated, fomod_valid, fomod_error, fomod_module_name, hashes_json, patches_json, optional, file_overrides_json
              FROM mods WHERE md5 = ?1",
         )?;
 
@@ -535,6 +562,7 @@ impl CollectionDb {
                 hashes_json: row.get(20)?,
                 patches_json: row.get(21)?,
                 optional: row.get::<_, i64>(22)? != 0,
+                file_overrides_json: row.get(23)?,
             })
         });
 
@@ -576,6 +604,7 @@ impl CollectionDb {
                 hashes_json: row.get(20)?,
                 patches_json: row.get(21)?,
                 optional: row.get::<_, i64>(22)? != 0,
+                file_overrides_json: row.get(23)?,
             })
         })?;
 
@@ -613,6 +642,17 @@ impl CollectionDb {
         Ok(())
     }
 
+    /// Mark mod as needing manual action (browse, manual download, etc.).
+    /// `notes` is stored in `error_message` for surfacing to the user but
+    /// status stays distinct from `failed` so resume logic can differentiate.
+    pub fn mark_mod_manual(&self, id: i64, notes: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE mods SET status = 'manual', error_message = ?2, updated_at = datetime('now') WHERE id = ?1",
+            params![id, notes],
+        )?;
+        Ok(())
+    }
+
     /// Update mod MD5 hash (after computing from downloaded file)
     pub fn update_mod_md5(&self, id: i64, md5: &str) -> Result<()> {
         self.conn.execute(
@@ -643,7 +683,7 @@ impl CollectionDb {
     /// Get FOMOD mods that need validation
     pub fn get_fomod_mods_needing_validation(&self) -> Result<Vec<ModDbEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, folder_name, logical_filename, md5, file_size, mod_id, file_id, source_type, source_url, deploy_type, phase, status, local_path, choices_json, error_message, fomod_validated, fomod_valid, fomod_error, fomod_module_name, hashes_json, patches_json, optional
+            "SELECT id, name, folder_name, logical_filename, md5, file_size, mod_id, file_id, source_type, source_url, deploy_type, phase, status, local_path, choices_json, error_message, fomod_validated, fomod_valid, fomod_error, fomod_module_name, hashes_json, patches_json, optional, file_overrides_json
              FROM mods WHERE choices_json IS NOT NULL AND fomod_validated = 0 AND local_path IS NOT NULL ORDER BY phase, id",
         )?;
 
@@ -653,7 +693,7 @@ impl CollectionDb {
     /// Get FOMOD mods that failed validation
     pub fn get_invalid_fomod_mods(&self) -> Result<Vec<ModDbEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, folder_name, logical_filename, md5, file_size, mod_id, file_id, source_type, source_url, deploy_type, phase, status, local_path, choices_json, error_message, fomod_validated, fomod_valid, fomod_error, fomod_module_name, hashes_json, patches_json, optional
+            "SELECT id, name, folder_name, logical_filename, md5, file_size, mod_id, file_id, source_type, source_url, deploy_type, phase, status, local_path, choices_json, error_message, fomod_validated, fomod_valid, fomod_error, fomod_module_name, hashes_json, patches_json, optional, file_overrides_json
              FROM mods WHERE fomod_validated = 1 AND fomod_valid = 0 ORDER BY phase, id",
         )?;
 
@@ -679,7 +719,7 @@ impl CollectionDb {
     /// Get all mods (preserves original collection order by id)
     pub fn get_all_mods(&self) -> Result<Vec<ModDbEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, folder_name, logical_filename, md5, file_size, mod_id, file_id, source_type, source_url, deploy_type, phase, status, local_path, choices_json, error_message, fomod_validated, fomod_valid, fomod_error, fomod_module_name, hashes_json, patches_json, optional
+            "SELECT id, name, folder_name, logical_filename, md5, file_size, mod_id, file_id, source_type, source_url, deploy_type, phase, status, local_path, choices_json, error_message, fomod_validated, fomod_valid, fomod_error, fomod_module_name, hashes_json, patches_json, optional, file_overrides_json
              FROM mods ORDER BY id",
         )?;
 
@@ -890,6 +930,8 @@ pub struct ModDbEntry {
     pub patches_json: Option<String>,
     /// Vortex "recommends" → optional. Installed but disabled in modlist.txt.
     pub optional: bool,
+    /// JSON-encoded `Vec<String>` of paths the mod owns in conflicts.
+    pub file_overrides_json: Option<String>,
 }
 
 impl ModDbEntry {
@@ -939,6 +981,13 @@ impl ModDbEntry {
             .as_ref()
             .filter(|j| !j.is_empty() && *j != "{}")
             .and_then(|json| serde_json::from_str(json).ok())
+    }
+
+    /// Returns true when the mod has at least one Vortex `fileOverrides` path.
+    pub fn has_file_overrides(&self) -> bool {
+        self.file_overrides_json
+            .as_ref()
+            .is_some_and(|j| !j.is_empty() && j != "[]")
     }
 
     /// Get the status as enum

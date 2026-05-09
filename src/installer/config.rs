@@ -25,52 +25,6 @@ impl Default for ExtractStrategy {
     }
 }
 
-/// Progress callback type for reporting download/installation progress
-pub type ProgressCallback = Arc<dyn Fn(ProgressEvent) + Send + Sync>;
-
-/// Events reported during installation for progress tracking
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields are read in the GUI (lib crate) but not by the binary crate
-pub enum ProgressEvent {
-    /// Download progress update
-    DownloadProgress {
-        name: String,
-        downloaded: u64,
-        total: u64,
-        /// Bytes per second
-        speed: f64,
-    },
-    /// A download has completed
-    DownloadComplete { name: String },
-    /// An archive has been processed (downloaded or skipped)
-    ArchiveComplete {
-        /// 1-based index of the completed archive
-        index: usize,
-        /// Total number of archives
-        total: usize,
-    },
-    /// Archives were skipped (already downloaded)
-    DownloadSkipped {
-        /// Number of archives skipped
-        count: usize,
-        /// Total size of skipped archives in bytes
-        total_size: u64,
-    },
-    /// Installation phase changed (e.g., "Downloading", "Extracting", "Installing")
-    PhaseChange { phase: String },
-    /// A directive completed
-    DirectiveComplete { index: usize, total: usize },
-    /// Status message update
-    Status { message: String },
-    /// Directive processing phase started (e.g., FromArchive, PatchedFromArchive)
-    DirectivePhaseStarted {
-        /// Type of directive being processed
-        directive_type: String,
-        /// Total directives of this type to process
-        total: usize,
-    },
-}
-
 /// Configuration for a modlist installation
 #[derive(Clone)]
 pub struct InstallConfig {
@@ -112,9 +66,6 @@ pub struct InstallConfig {
     /// Optional directory to persist patched outputs by hash for reuse
     pub patch_cache_dir: Option<PathBuf>,
 
-    /// Optional callback for progress reporting (legacy — being replaced by reporter)
-    pub progress_callback: Option<ProgressCallback>,
-
     /// Unified progress reporter (CLI or GUI implementation)
     pub reporter: Arc<dyn ProgressReporter>,
 
@@ -144,10 +95,6 @@ impl std::fmt::Debug for InstallConfig {
             .field("nxm_mode", &self.nxm_mode)
             .field("browser", &self.browser)
             .field("patch_cache_dir", &self.patch_cache_dir)
-            .field(
-                "progress_callback",
-                &self.progress_callback.as_ref().map(|_| "<callback>"),
-            )
             .field("reporter", &"<reporter>")
             .field("loverslab_email", &self.loverslab_email)
             .field("loverslab_password", &"[REDACTED]")

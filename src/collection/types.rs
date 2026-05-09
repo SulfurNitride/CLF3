@@ -191,6 +191,14 @@ pub struct CollectionMod {
     /// `<collection_root>/patches/<mod_name>/<file_path>.diff`.
     #[serde(default)]
     pub patches: Option<HashMap<String, String>>,
+
+    /// Vortex `fileOverrides`: list of relative paths this mod insists on
+    /// owning when conflicting with other mods. We surface this to MO2 by
+    /// nudging the mod above its peers in `modlist.txt` priority — Vortex's
+    /// deployment-engine semantics don't translate 1:1 to MO2's overlay
+    /// model, so this is best-effort.
+    #[serde(rename = "fileOverrides", default)]
+    pub file_overrides: Vec<String>,
 }
 
 /// Download source information for a mod.

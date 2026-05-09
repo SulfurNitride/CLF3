@@ -3266,9 +3266,9 @@ dependencies = [
 
 [[package]]
 name = "libloot"
-version = "0.28.4"
+version = "0.29.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ee174a4888ff606c296d99bf6c850d5e72523e130a56a03ec3c5d1de87eb302"
+checksum = "3cc0ff023cda5fa39c8690352ccfbb45f14c31e1022501ced49ee5b75e4d409d"
 dependencies = [
  "crc32fast",
  "esplugin",
@@ -3385,9 +3385,9 @@ dependencies = [
 
 [[package]]
 name = "loot-condition-interpreter"
-version = "5.4.0"
+version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25b56d48ce8c6249efb16d2bf91a3c959dc57eeeff906116547c0af8c86bb953"
+checksum = "658c7e8070b5d723294fed720100537640ea9fc467a2b9e15a4b58a50a2cd960"
 dependencies = [
  "crc32fast",
  "esplugin",

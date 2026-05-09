@@ -12,32 +12,31 @@
 //! Thread B (rayon):  receive events → index → resolve paths → extract → finalize
 //! ```
 
-use crate::installer::handlers::from_archive::{
-    detect_archive_type, ArchiveType as NestedArchiveType,
-};
-use crate::installer::handlers::create_bsa::{handle_create_bsa, output_bsa_valid};
-use crate::modlist::{
-    CreateBSADirective, Directive, FromArchiveDirective, ModlistDb, PatchedFromArchiveDirective,
-    TransformedTextureDirective,
-};
 use super::downloader::ArchiveEvent;
 use super::processor::{
     build_patch_basis_key, build_patch_basis_key_from_archive_hash_path, index_single_archive,
     ProcessContext,
 };
 use super::streaming::{
-    cleanup_temp_dirs, finalize_archive, process_bsa_archive,
-    process_bsa_patched_directives, process_single_archive_fused,
-    process_textures_from_bsa_streaming, process_textures_from_nested_bsas_streaming,
-    process_textures_from_temp_streaming, process_whole_file_directives, ArchiveDirective,
-    NestedTextureLookupInner, StreamingConfig, StreamingStats,
-    TextureLookupInner,
+    cleanup_temp_dirs, finalize_archive, process_bsa_archive, process_bsa_patched_directives,
+    process_single_archive_fused, process_textures_from_bsa_streaming,
+    process_textures_from_nested_bsas_streaming, process_textures_from_temp_streaming,
+    process_whole_file_directives, ArchiveDirective, NestedTextureLookupInner, StreamingConfig,
+    StreamingStats, TextureLookupInner,
+};
+use crate::installer::handlers::create_bsa::{handle_create_bsa, output_bsa_valid};
+use crate::installer::handlers::from_archive::{
+    detect_archive_type, ArchiveType as NestedArchiveType,
+};
+use crate::modlist::{
+    CreateBSADirective, Directive, FromArchiveDirective, ModlistDb, PatchedFromArchiveDirective,
+    TransformedTextureDirective,
 };
 
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -69,13 +68,16 @@ fn memory_pressure_gate(min_avail_mb: u64) -> bool {
         if !throttled {
             warn!(
                 "Memory pressure: only {}MB available (need {}MB free), waiting...",
-                available / 1024 / 1024, min_avail_mb
+                available / 1024 / 1024,
+                min_avail_mb
             );
         }
         throttled = true;
         GATE_WAITERS.fetch_add(1, Ordering::Relaxed);
         #[cfg(target_os = "linux")]
-        unsafe { libc::malloc_trim(0); }
+        unsafe {
+            libc::malloc_trim(0);
+        }
         std::thread::sleep(std::time::Duration::from_secs(1));
         GATE_WAITERS.fetch_sub(1, Ordering::Relaxed);
     }
@@ -202,7 +204,9 @@ impl ExtractionMetrics {
             NestedArchiveType::Zip => &self.zip,
             NestedArchiveType::SevenZ | NestedArchiveType::Unknown => &self.sevenz,
             NestedArchiveType::Rar => &self.rar,
-            NestedArchiveType::Bsa | NestedArchiveType::Ba2 | NestedArchiveType::Tes3Bsa => &self.bsa,
+            NestedArchiveType::Bsa | NestedArchiveType::Ba2 | NestedArchiveType::Tes3Bsa => {
+                &self.bsa
+            }
         }
     }
 
@@ -242,7 +246,10 @@ impl ExtractionMetrics {
         let workers = self.worker_count.load(Ordering::Relaxed).max(1);
 
         // Total bytes across all formats for overall rate
-        let total_bytes: u64 = formats.iter().map(|(_, b)| b.bytes.load(Ordering::Relaxed)).sum();
+        let total_bytes: u64 = formats
+            .iter()
+            .map(|(_, b)| b.bytes.load(Ordering::Relaxed))
+            .sum();
         let total_mb = total_bytes as f64 / (1024.0 * 1024.0);
 
         let mut has_data = false;
@@ -256,7 +263,8 @@ impl ExtractionMetrics {
                 if let Some(ws) = wall_secs {
                     reporter.log(&format!(
                         "Extraction: {:.1} GB in {:.0}s ({:.0} MB/s effective, {} workers)",
-                        total_mb / 1024.0, ws,
+                        total_mb / 1024.0,
+                        ws,
                         total_mb / ws,
                         workers,
                     ));
@@ -279,7 +287,11 @@ impl ExtractionMetrics {
             // Show per-thread rate and effective rate (cumulative / workers)
             let per_thread_rate = if ext_s > 0.0 { mb / ext_s } else { 0.0 };
             let effective_s = ext_s / workers as f64;
-            let effective_rate = if effective_s > 0.0 { mb / effective_s } else { 0.0 };
+            let effective_rate = if effective_s > 0.0 {
+                mb / effective_s
+            } else {
+                0.0
+            };
 
             let mut parts = vec![format!(
                 "  {:<8} {} archives, {:.1} MB — {:.0}s cpu-time ({:.0} MB/s/thread, ~{:.0} MB/s effective)",
@@ -289,7 +301,11 @@ impl ExtractionMetrics {
                 parts.push(format!(", dds: {:.1}s", dds_s));
             }
             if fin_ms > 0 {
-                let fin_rate = if fin_s > 0.0 { format!("{:.0} MB/s", mb / fin_s) } else { "-".into() };
+                let fin_rate = if fin_s > 0.0 {
+                    format!("{:.0} MB/s", mb / fin_s)
+                } else {
+                    "-".into()
+                };
                 parts.push(format!(", finalize: {:.1}s ({})", fin_s, fin_rate));
             }
             reporter.log(&parts.join(""));
@@ -297,17 +313,24 @@ impl ExtractionMetrics {
 
         // Bottleneck analysis
         if let Some(ws) = wall_secs {
-            let total_cpu_s: f64 = formats.iter()
+            let total_cpu_s: f64 = formats
+                .iter()
                 .map(|(_, b)| b.extract_ms.load(Ordering::Relaxed) as f64 / 1000.0)
                 .sum();
-            let total_fin_s: f64 = formats.iter()
+            let total_fin_s: f64 = formats
+                .iter()
                 .map(|(_, b)| b.finalize_ms.load(Ordering::Relaxed) as f64 / 1000.0)
                 .sum();
-            let total_dds_s: f64 = formats.iter()
+            let total_dds_s: f64 = formats
+                .iter()
                 .map(|(_, b)| b.dds_ms.load(Ordering::Relaxed) as f64 / 1000.0)
                 .sum();
             let available_s = ws * workers as f64;
-            let utilization = if available_s > 0.0 { total_cpu_s / available_s * 100.0 } else { 0.0 };
+            let utilization = if available_s > 0.0 {
+                total_cpu_s / available_s * 100.0
+            } else {
+                0.0
+            };
             reporter.log(&format!(
                 "  Bottleneck: decompression ({:.0}% CPU utilization, {:.0}s decompress + {:.0}s finalize + {:.0}s dds of {:.0}s available)",
                 utilization, total_cpu_s, total_fin_s, total_dds_s, available_s,
@@ -358,10 +381,7 @@ pub(crate) fn load_and_group_directives(
             if d.archive_hash_path.len() == 1 {
                 whole_file.push((id, d));
             } else if let Some(hash) = d.archive_hash_path.first() {
-                from_archive
-                    .entry(hash.clone())
-                    .or_default()
-                    .push((id, d));
+                from_archive.entry(hash.clone()).or_default().push((id, d));
             }
         }
     }
@@ -376,10 +396,7 @@ pub(crate) fn load_and_group_directives(
             }
 
             if let Some(hash) = d.archive_hash_path.first() {
-                patched
-                    .entry(hash.clone())
-                    .or_default()
-                    .push((id, d));
+                patched.entry(hash.clone()).or_default().push((id, d));
             }
         }
     }
@@ -393,10 +410,7 @@ pub(crate) fn load_and_group_directives(
                 continue;
             }
             if let Some(hash) = d.archive_hash_path.first() {
-                textures
-                    .entry(hash.clone())
-                    .or_default()
-                    .push((id, d));
+                textures.entry(hash.clone()).or_default().push((id, d));
             }
         }
     }
@@ -466,9 +480,9 @@ pub(crate) fn load_and_group_directives(
     let mut tier_patch = 0usize;
     for hash in &all_hashes {
         let has_patched = patched.contains_key(*hash);
-        let has_nested = from_archive.get(*hash).is_some_and(|ds| {
-            ds.iter().any(|(_, d)| d.archive_hash_path.len() >= 3)
-        });
+        let has_nested = from_archive
+            .get(*hash)
+            .is_some_and(|ds| ds.iter().any(|(_, d)| d.archive_hash_path.len() >= 3));
         if has_patched {
             tier_patch += 1;
         } else if has_nested {
@@ -518,11 +532,7 @@ pub(crate) struct BsaReadinessTracker {
 
 impl BsaReadinessTracker {
     /// Build tracker from CreateBSA directives and grouped extraction directives.
-    pub fn new(
-        db: &ModlistDb,
-        ctx: &ProcessContext,
-        grouped: &GroupedDirectives,
-    ) -> Result<Self> {
+    pub fn new(db: &ModlistDb, ctx: &ProcessContext, grouped: &GroupedDirectives) -> Result<Self> {
         // Parse CreateBSA directives
         let all_raw = db.get_all_pending_directives_of_type("CreateBSA")?;
         let mut bsa_directives = HashMap::new();
@@ -749,9 +759,7 @@ fn resolve_patch_basis_for_archive(
             .expect("needed_patch_basis_keys lock");
         needed.insert(key);
 
-        if let Some(raw_key) =
-            build_patch_basis_key_from_archive_hash_path(&d.archive_hash_path)
-        {
+        if let Some(raw_key) = build_patch_basis_key_from_archive_hash_path(&d.archive_hash_path) {
             needed.insert(raw_key);
         }
     }
@@ -796,7 +804,9 @@ fn prepare_archive(
     let empty_from: Vec<(i64, FromArchiveDirective)> = Vec::new();
     let empty_patched: Vec<(i64, PatchedFromArchiveDirective)> = Vec::new();
     let from_slice = from_directives.map(|v| v.as_slice()).unwrap_or(&empty_from);
-    let patched_slice = patched_directives.map(|v| v.as_slice()).unwrap_or(&empty_patched);
+    let patched_slice = patched_directives
+        .map(|v| v.as_slice())
+        .unwrap_or(&empty_patched);
 
     // No directives for this archive? Skip.
     if from_slice.is_empty() && patched_slice.is_empty() && texture_directives.is_none() {
@@ -860,18 +870,33 @@ fn extract_prepared_archive(
 ) {
     const MAX_LOGGED_FAILURES: usize = 100;
     let extract_start = std::time::Instant::now();
+    let directive_total = prepared.resolved.len();
+    let archive_progress = reporter.begin_item(&prepared.archive_name, None);
+    archive_progress.set_stage(super::progress::TaskStage::Extracting);
+    archive_progress.set_count(0, directive_total);
+    archive_progress.set_message(&format!(
+        "extracting {} ({} directives)",
+        prepared.archive_name, directive_total
+    ));
+    let mut archive_failed_total = 0usize;
 
     let archive_name_for_progress = prepared.archive_name.clone();
     let rss_before = crate::installer::current_rss_kb().unwrap_or(0);
 
     // Log to file to avoid stdout/stderr buffering issues
     if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true).append(true)
+        .create(true)
+        .append(true)
         .open("/tmp/clf3_rss.log")
     {
         use std::io::Write;
-        let _ = writeln!(f, "[RSS-START] {} : {}MB ({}directives)",
-            archive_name_for_progress, rss_before / 1024, prepared.resolved.len());
+        let _ = writeln!(
+            f,
+            "[RSS-START] {} : {}MB ({}directives)",
+            archive_name_for_progress,
+            rss_before / 1024,
+            prepared.resolved.len()
+        );
     }
 
     let archive_type =
@@ -882,33 +907,31 @@ fn extract_prepared_archive(
         NestedArchiveType::Tes3Bsa | NestedArchiveType::Bsa | NestedArchiveType::Ba2
     ) {
         // BSA/BA2 direct-read path
-        let bsa_from: Vec<(i64, FromArchiveDirective, Option<String>, Option<String>)> =
-            prepared
-                .resolved
-                .iter()
-                .filter_map(|d| match d {
-                    ArchiveDirective::FromArchive {
-                        id,
-                        directive,
-                        resolved_path,
-                        file_in_bsa,
-                    } => Some((
-                        *id,
-                        directive.clone(),
-                        resolved_path.clone(),
-                        file_in_bsa.clone(),
-                    )),
-                    _ => None,
-                })
-                .collect();
+        archive_progress.set_message(&format!("reading BSA/BA2 {}", prepared.archive_name));
+        let bsa_from: Vec<(i64, FromArchiveDirective, Option<String>, Option<String>)> = prepared
+            .resolved
+            .iter()
+            .filter_map(|d| match d {
+                ArchiveDirective::FromArchive {
+                    id,
+                    directive,
+                    resolved_path,
+                    file_in_bsa,
+                } => Some((
+                    *id,
+                    directive.clone(),
+                    resolved_path.clone(),
+                    file_in_bsa.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
 
         let bsa_patched: Vec<(i64, &PatchedFromArchiveDirective)> = prepared
             .resolved
             .iter()
             .filter_map(|d| match d {
-                ArchiveDirective::Patched {
-                    id, directive, ..
-                } => Some((*id, directive)),
+                ArchiveDirective::Patched { id, directive, .. } => Some((*id, directive)),
                 _ => None,
             })
             .collect();
@@ -953,12 +976,18 @@ fn extract_prepared_archive(
             if let Some(tx) = dds_spill_tx {
                 // Phased path: spill raw texture data for deferred processing
                 super::streaming::extract_textures_from_bsa(
-                    &prepared.archive_path, &prepared.tex_d2, tx,
+                    &prepared.archive_path,
+                    &prepared.tex_d2,
+                    tx,
                 );
             } else {
                 // Overlapped path: process inline
+                archive_progress.set_stage(super::progress::TaskStage::Transforming);
+                archive_progress.set_message(&format!("DDS {}", prepared.archive_name));
                 let (ok, fail) = process_textures_from_bsa_streaming(
-                    &prepared.archive_path, &prepared.tex_d2, ctx,
+                    &prepared.archive_path,
+                    &prepared.tex_d2,
+                    ctx,
                 );
                 written.fetch_add(ok, Ordering::Relaxed);
                 failed.fetch_add(fail, Ordering::Relaxed);
@@ -973,14 +1002,23 @@ fn extract_prepared_archive(
         written.fetch_add(arc_written.load(Ordering::Relaxed), Ordering::Relaxed);
         skipped.fetch_add(arc_skipped.load(Ordering::Relaxed), Ordering::Relaxed);
         failed.fetch_add(arc_failed.load(Ordering::Relaxed), Ordering::Relaxed);
+        archive_failed_total += arc_failed.load(Ordering::Relaxed);
 
         // BSA reads don't have separate finalization — record all time as extraction
         let archive_bytes = std::fs::metadata(&prepared.archive_path)
             .map(|m| m.len())
             .unwrap_or(0);
-        metrics.record(&archive_type, archive_bytes, extract_start.elapsed().as_millis() as u64, 0, 0);
+        metrics.record(
+            &archive_type,
+            archive_bytes,
+            extract_start.elapsed().as_millis() as u64,
+            0,
+            0,
+        );
     } else {
         // Extract via 7z/ZIP/RAR, then finalize
+        archive_progress.set_stage(super::progress::TaskStage::Extracting);
+        archive_progress.set_message(&format!("extracting {}", prepared.archive_name));
         let phase_extract_start = std::time::Instant::now();
         let result = process_single_archive_fused(
             &prepared.archive_path,
@@ -1005,6 +1043,11 @@ fn extract_prepared_archive(
                     );
                 }
                 failed.fetch_add(archive_result.failed_count, Ordering::Relaxed);
+                archive_failed_total += archive_result.failed_count;
+                archive_progress.set_count(
+                    archive_result.extracted_count + archive_result.patched_count,
+                    directive_total,
+                );
 
                 // DDS textures: spill raw data for deferred processing, or process inline
                 let phase_dds_start = std::time::Instant::now();
@@ -1012,19 +1055,27 @@ fn extract_prepared_archive(
                     // Phased path: spill raw texture data to channel for Phase 2
                     if !prepared.tex_d2.is_empty() {
                         super::streaming::extract_textures_from_temp_dir(
-                            archive_result.temp_dir.path(), &prepared.tex_d2, tx,
+                            archive_result.temp_dir.path(),
+                            &prepared.tex_d2,
+                            tx,
                         );
                     }
                     if !prepared.tex_d3.is_empty() {
                         super::streaming::extract_textures_from_nested_bsas(
-                            archive_result.temp_dir.path(), &prepared.tex_d3, tx,
+                            archive_result.temp_dir.path(),
+                            &prepared.tex_d3,
+                            tx,
                         );
                     }
                 } else {
                     // Overlapped path: process inline while temp dir exists
                     if !prepared.tex_d2.is_empty() {
+                        archive_progress.set_stage(super::progress::TaskStage::Transforming);
+                        archive_progress.set_message(&format!("DDS {}", prepared.archive_name));
                         let (ok, fail) = process_textures_from_temp_streaming(
-                            archive_result.temp_dir.path(), &prepared.tex_d2, ctx,
+                            archive_result.temp_dir.path(),
+                            &prepared.tex_d2,
+                            ctx,
                         );
                         written.fetch_add(ok, Ordering::Relaxed);
                         failed.fetch_add(fail, Ordering::Relaxed);
@@ -1034,8 +1085,13 @@ fn extract_prepared_archive(
                         }
                     }
                     if !prepared.tex_d3.is_empty() {
+                        archive_progress.set_stage(super::progress::TaskStage::Transforming);
+                        archive_progress
+                            .set_message(&format!("nested DDS {}", prepared.archive_name));
                         let (ok, fail) = process_textures_from_nested_bsas_streaming(
-                            archive_result.temp_dir.path(), &prepared.tex_d3, ctx,
+                            archive_result.temp_dir.path(),
+                            &prepared.tex_d3,
+                            ctx,
                         );
                         written.fetch_add(ok, Ordering::Relaxed);
                         failed.fetch_add(fail, Ordering::Relaxed);
@@ -1048,8 +1104,15 @@ fn extract_prepared_archive(
                 let dds_elapsed = phase_dds_start.elapsed();
 
                 let phase_fin_start = std::time::Instant::now();
-                let fin_stats =
-                    finalize_archive(archive_result, &ctx.config.output_dir, logged_failures, reporter, &ctx.dir_cache);
+                archive_progress.set_stage(super::progress::TaskStage::Finalizing);
+                archive_progress.set_message(&format!("finalizing {}", prepared.archive_name));
+                let fin_stats = finalize_archive(
+                    archive_result,
+                    &ctx.config.output_dir,
+                    logged_failures,
+                    reporter,
+                    &ctx.dir_cache,
+                );
                 written.fetch_add(fin_stats.written, Ordering::Relaxed);
                 skipped.fetch_add(fin_stats.skipped, Ordering::Relaxed);
                 if fin_stats.failed > 0 {
@@ -1059,25 +1122,47 @@ fn extract_prepared_archive(
                     );
                 }
                 failed.fetch_add(fin_stats.failed, Ordering::Relaxed);
+                archive_failed_total += fin_stats.failed;
                 let fin_elapsed = phase_fin_start.elapsed();
 
                 // Record per-phase metrics
                 let archive_bytes = std::fs::metadata(&prepared.archive_path)
                     .map(|m| m.len())
                     .unwrap_or(0);
-                let is_direct = fin_stats.written == 0 && fin_stats.failed == 0
-                    && fin_stats.skipped == 0;
+                let is_direct =
+                    fin_stats.written == 0 && fin_stats.failed == 0 && fin_stats.skipped == 0;
                 metrics.record(
                     &archive_type,
                     archive_bytes,
                     extract_elapsed.as_millis() as u64,
                     dds_elapsed.as_millis() as u64,
-                    if is_direct { 0 } else { fin_elapsed.as_millis() as u64 },
+                    if is_direct {
+                        0
+                    } else {
+                        fin_elapsed.as_millis() as u64
+                    },
                 );
                 // Determine tier based on directive types (not finalize outcome)
-                let has_patched = prepared.resolved.iter().any(|d| matches!(d, super::streaming::ArchiveDirective::Patched { .. }));
-                let has_nested = prepared.resolved.iter().any(|d| matches!(d, super::streaming::ArchiveDirective::FromArchive { file_in_bsa: Some(_), .. }));
-                let tier = if has_patched { 2u8 } else if has_nested { 1 } else { 0 };
+                let has_patched = prepared
+                    .resolved
+                    .iter()
+                    .any(|d| matches!(d, super::streaming::ArchiveDirective::Patched { .. }));
+                let has_nested = prepared.resolved.iter().any(|d| {
+                    matches!(
+                        d,
+                        super::streaming::ArchiveDirective::FromArchive {
+                            file_in_bsa: Some(_),
+                            ..
+                        }
+                    )
+                });
+                let tier = if has_patched {
+                    2u8
+                } else if has_nested {
+                    1
+                } else {
+                    0
+                };
                 metrics.record_tier(tier, archive_bytes);
             }
             Err(e) => {
@@ -1086,18 +1171,65 @@ fn extract_prepared_archive(
                     error!("FAIL: Archive {}: {:#}", prepared.archive_name, e);
                 }
                 failed.fetch_add(prepared.resolved.len(), Ordering::Relaxed);
+                archive_failed_total += prepared.resolved.len();
             }
         }
     }
 
     #[cfg(target_os = "linux")]
-    unsafe { libc::malloc_trim(0); }
+    unsafe {
+        libc::malloc_trim(0);
+    }
 
     // Update extraction status counter
     let done = extract_counter.fetch_add(1, Ordering::Relaxed) + 1;
     if let Some(ref s) = *extract_status.lock().expect("extract_status lock") {
         s.set_count(done, total_archives);
     }
+    let successful = directive_total.saturating_sub(archive_failed_total);
+    archive_progress.set_count(successful, directive_total);
+    if archive_failed_total > 0 {
+        archive_progress.finish_with_error(&format!(
+            "FAIL {} ({} failed)",
+            prepared.archive_name, archive_failed_total
+        ));
+    } else {
+        archive_progress.finish();
+    }
+}
+
+fn build_bsa_with_progress(
+    ctx: &ProcessContext,
+    directive: &CreateBSADirective,
+    reporter: &Arc<dyn super::progress::ProgressReporter>,
+) -> Result<()> {
+    let bsa_name = Path::new(&directive.to)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| directive.to.clone());
+    let task_id = super::progress::TaskId::new(format!("bsa:{}", directive.to));
+
+    reporter.task_start(super::progress::TaskStarted::new(
+        task_id.clone(),
+        super::progress::TaskKind::Bsa,
+        super::progress::TaskStage::Building,
+        bsa_name,
+        super::progress::ProgressUnit::Items,
+        Some(1),
+    ));
+
+    let result = handle_create_bsa(ctx, directive);
+    match &result {
+        Ok(()) => reporter.task_finish(task_id, super::progress::TaskOutcome::Success),
+        Err(e) => reporter.task_finish(
+            task_id,
+            super::progress::TaskOutcome::Failed {
+                error: e.to_string(),
+            },
+        ),
+    }
+
+    result
 }
 
 /// Run the pipelined processing coordinator.
@@ -1156,10 +1288,9 @@ pub(crate) fn run_processing_loop(
                     serde_json::from_str::<crate::modlist::DownloadState>(&archive.state_json)
                 {
                     let game_file = &gf.game_file;
-                    if let Some(resolved) = crate::paths::resolve_case_insensitive(
-                        &ctx.config.game_dir,
-                        game_file,
-                    ) {
+                    if let Some(resolved) =
+                        crate::paths::resolve_case_insensitive(&ctx.config.game_dir, game_file)
+                    {
                         ctx.register_archive_path(archive.hash.clone(), resolved);
                     } else if let Some(resolved) = crate::paths::resolve_case_insensitive(
                         &ctx.config.game_dir,
@@ -1280,7 +1411,9 @@ pub(crate) fn run_processing_loop(
                 if bs.is_none() {
                     let s = reporter.begin_status("BSA");
                     let total = total_bsa_tracked;
-                    if total > 0 { s.set_count(0, total); }
+                    if total > 0 {
+                        s.set_count(0, total);
+                    }
                     *bs = Some(s);
                 }
             }
@@ -1305,7 +1438,7 @@ pub(crate) fn run_processing_loop(
 
                         // Build BSA on a separate thread
                         thread_scope.spawn(move || {
-                            match handle_create_bsa(ctx, &directive) {
+                            match build_bsa_with_progress(ctx, &directive, reporter) {
                                 Ok(()) => {
                                     let done = bsa_built.fetch_add(1, Ordering::Relaxed) + 1;
                                     if let Some(ref s) = *bsa_status.lock().expect("bsa lock") {
@@ -1319,7 +1452,9 @@ pub(crate) fn run_processing_loop(
                             }
                             // Collect this thread's mimalloc heap (don't broadcast —
                             // other threads may be mid-compression on rayon)
-                            unsafe { libmimalloc_sys::mi_collect(true); }
+                            unsafe {
+                                libmimalloc_sys::mi_collect(true);
+                            }
                         });
                         bsa_tracker.built_count += 1;
                     }
@@ -1334,9 +1469,7 @@ pub(crate) fn run_processing_loop(
                     ctx.register_archive_path(hash.clone(), path.clone());
 
                     // Phase 1: Prepare (DB work — needs ModlistDb, runs on main thread)
-                    let prepared = prepare_archive(
-                        db, ctx, &hash, &name, &path, grouped,
-                    );
+                    let prepared = prepare_archive(db, ctx, &hash, &name, &path, grouped);
 
                     if let Some(prepared) = prepared {
                         // Block if system memory is too low (< 1GB free)
@@ -1401,8 +1534,7 @@ pub(crate) fn run_processing_loop(
                         .get(&hash)
                         .map(|v| v.len())
                         .unwrap_or(0);
-                    let patched_count =
-                        grouped.patched.get(&hash).map(|v| v.len()).unwrap_or(0);
+                    let patched_count = grouped.patched.get(&hash).map(|v| v.len()).unwrap_or(0);
                     failed.fetch_add(from_count + patched_count, Ordering::Relaxed);
                 }
                 ArchiveEvent::Manual { hash, name } => {
@@ -1430,7 +1562,7 @@ pub(crate) fn run_processing_loop(
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| directive.to.clone());
 
-                    match handle_create_bsa(ctx, &directive) {
+                    match build_bsa_with_progress(ctx, &directive, reporter) {
                         Ok(()) => {
                             let done = bsa_built.fetch_add(1, Ordering::Relaxed) + 1;
                             if let Some(ref s) = *bsa_status.lock().expect("bsa lock") {
@@ -1442,10 +1574,16 @@ pub(crate) fn run_processing_loop(
                             failed.fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    rayon::broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true); });
-                    unsafe { libmimalloc_sys::mi_collect(true); }
+                    rayon::broadcast(|_| unsafe {
+                        libmimalloc_sys::mi_collect(true);
+                    });
+                    unsafe {
+                        libmimalloc_sys::mi_collect(true);
+                    }
                     #[cfg(target_os = "linux")]
-                    unsafe { libc::malloc_trim(0); }
+                    unsafe {
+                        libc::malloc_trim(0);
+                    }
                     bsa_tracker.built_count += 1;
                 }
             }
@@ -1467,9 +1605,15 @@ pub(crate) fn run_processing_loop(
     extraction_metrics.stop_wall_clock();
 
     // Finish status counters
-    if let Some(ref s) = *extract_status.lock().expect("lock") { s.finish(); }
-    if let Some(ref s) = *bsa_status.lock().expect("lock") { s.finish(); }
-    if let Some(ref s) = *dds_status.lock().expect("lock") { s.finish(); }
+    if let Some(ref s) = *extract_status.lock().expect("lock") {
+        s.finish();
+    }
+    if let Some(ref s) = *bsa_status.lock().expect("lock") {
+        s.finish();
+    }
+    if let Some(ref s) = *dds_status.lock().expect("lock") {
+        s.finish();
+    }
 
     extraction_metrics.log_summary(reporter);
 
@@ -1550,11 +1694,11 @@ pub(crate) fn run_processing_loop_phased(
     // Process whole-file directives after drain so all archive paths are known
     if !grouped.whole_file.is_empty() {
         reporter.log(&format!(
-            "Copying {} whole-file directives...", grouped.whole_file.len()
+            "Copying {} whole-file directives...",
+            grouped.whole_file.len()
         ));
-        let mut wf_failed = process_whole_file_directives(
-            &grouped.whole_file, ctx, &extracted, &skipped, &failed,
-        );
+        let mut wf_failed =
+            process_whole_file_directives(&grouped.whole_file, ctx, &extracted, &skipped, &failed);
 
         // Retry failed whole-file directives up to 3 times
         for attempt in 1..=3 {
@@ -1567,12 +1711,17 @@ pub(crate) fn run_processing_loop_phased(
                 .collect();
             reporter.log(&format!(
                 "Retrying {} failed whole-file directives (attempt {}/3)...",
-                retry_directives.len(), attempt,
+                retry_directives.len(),
+                attempt,
             ));
             // Undo the failure counts for items we're retrying
             failed.fetch_sub(retry_directives.len(), Ordering::Relaxed);
             wf_failed = process_whole_file_directives(
-                &retry_directives, ctx, &extracted, &skipped, &failed,
+                &retry_directives,
+                ctx,
+                &extracted,
+                &skipped,
+                &failed,
             );
         }
     }
@@ -1588,9 +1737,18 @@ pub(crate) fn run_processing_loop_phased(
 
     // === Classify into complex vs simple ===
     let (complex, simple): (Vec<_>, Vec<_>) = all_prepared.into_iter().partition(|p| {
-        let has_patched = p.resolved.iter().any(|d| matches!(d, ArchiveDirective::Patched { .. }));
+        let has_patched = p
+            .resolved
+            .iter()
+            .any(|d| matches!(d, ArchiveDirective::Patched { .. }));
         let has_nested = p.resolved.iter().any(|d| {
-            matches!(d, ArchiveDirective::FromArchive { file_in_bsa: Some(_), .. })
+            matches!(
+                d,
+                ArchiveDirective::FromArchive {
+                    file_in_bsa: Some(_),
+                    ..
+                }
+            )
         });
         let has_dds = !p.tex_d2.is_empty() || !p.tex_d3.is_empty();
         let feeds_bsa = p.resolved.iter().any(|d| {
@@ -1605,7 +1763,9 @@ pub(crate) fn run_processing_loop_phased(
 
     reporter.log(&format!(
         "  Phased extraction: {} complex + {} simple archives ({} cores)",
-        complex.len(), simple.len(), extract_workers,
+        complex.len(),
+        simple.len(),
+        extract_workers,
     ));
 
     // Status bars
@@ -1671,7 +1831,10 @@ pub(crate) fn run_processing_loop_phased(
                 idx += 1;
             }
             let count = jobs.len();
-            collected_jobs.lock().unwrap_or_else(|e| e.into_inner()).extend(jobs);
+            collected_jobs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(jobs);
             count
         });
 
@@ -1681,7 +1844,9 @@ pub(crate) fn run_processing_loop_phased(
                 s.spawn(|_| {
                     loop {
                         let idx = cursor.fetch_add(1, Ordering::Relaxed);
-                        if idx >= complex.len() { break; }
+                        if idx >= complex.len() {
+                            break;
+                        }
 
                         // Block if system memory is too low (< 512MB free)
                         memory_pressure_gate(512);
@@ -1699,11 +1864,20 @@ pub(crate) fn run_processing_loop_phased(
                         let wrap_status = Mutex::new(Some(extract_status.clone()));
                         let wrap_dds = Mutex::new(dds_status.clone());
                         extract_prepared_archive(
-                            owned, ctx,
-                            &extracted, &written, &skipped, &failed,
-                            &logged_failures, reporter,
-                            &wrap_status, &extract_counter, total_archives,
-                            &wrap_dds, &dds_counter, texture_count,
+                            owned,
+                            ctx,
+                            &extracted,
+                            &written,
+                            &skipped,
+                            &failed,
+                            &logged_failures,
+                            reporter,
+                            &wrap_status,
+                            &extract_counter,
+                            total_archives,
+                            &wrap_dds,
+                            &dds_counter,
+                            texture_count,
                             &extraction_metrics,
                             Some(&dds_tx), // spill DDS to channel
                         );
@@ -1717,26 +1891,32 @@ pub(crate) fn run_processing_loop_phased(
         drop(dds_tx);
         let spilled_count = collector_handle.join().unwrap_or(0);
         if spilled_count > 0 {
-            reporter.log(&format!("  Collected {} DDS textures for Phase 2", spilled_count));
+            reporter.log(&format!(
+                "  Collected {} DDS textures for Phase 2",
+                spilled_count
+            ));
         }
     } else {
         drop(dds_tx);
     }
     reporter.log(&format!(
         "  Phase 1 complete in {:.1}s ({} complex archives)",
-        phase1_start.elapsed().as_secs_f64(), complex.len()
+        phase1_start.elapsed().as_secs_f64(),
+        complex.len()
     ));
 
     // === Phase 2: DDS Processing (full CPU + GPU) ===
     let phase2_start = std::time::Instant::now();
     reporter.overall_set_message("Phase 2: DDS processing...");
     {
-        let dds_jobs = std::mem::take(
-            &mut *collected_dds_jobs.lock().unwrap_or_else(|e| e.into_inner()),
-        );
+        let dds_jobs =
+            std::mem::take(&mut *collected_dds_jobs.lock().unwrap_or_else(|e| e.into_inner()));
         if !dds_jobs.is_empty() {
             let dds_total = dds_jobs.len();
-            reporter.log(&format!("  Phase 2: Processing {} DDS textures...", dds_total));
+            reporter.log(&format!(
+                "  Phase 2: Processing {} DDS textures...",
+                dds_total
+            ));
             if let Some(ref s) = dds_status {
                 s.set_count(0, dds_total);
             }
@@ -1767,7 +1947,8 @@ pub(crate) fn run_processing_loop_phased(
     reporter.overall_set_message("Phase 3: BSA building...");
     {
         let bsa_directives: Vec<(i64, CreateBSADirective)> = {
-            let raw = db.get_all_pending_directives_of_type("CreateBSA")
+            let raw = db
+                .get_all_pending_directives_of_type("CreateBSA")
                 .unwrap_or_default();
             raw.into_iter()
                 .filter_map(|(id, json)| {
@@ -1787,7 +1968,10 @@ pub(crate) fn run_processing_loop_phased(
 
         if !bsa_directives.is_empty() {
             let bsa_total = bsa_directives.len();
-            reporter.log(&format!("  Phase 3: Building {} BSA archives (2 concurrent)...", bsa_total));
+            reporter.log(&format!(
+                "  Phase 3: Building {} BSA archives (2 concurrent)...",
+                bsa_total
+            ));
             let bsa_status = reporter.begin_status("BSA");
             bsa_status.set_count(0, bsa_total);
             let bsa_built = AtomicUsize::new(0);
@@ -1798,30 +1982,36 @@ pub(crate) fn run_processing_loop_phased(
             let bsa_cursor = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..2 {
-                    s.spawn(|| {
-                        loop {
-                            let idx = bsa_cursor.fetch_add(1, Ordering::Relaxed);
-                            if idx >= bsa_total { break; }
-                            let (_id, directive) = &bsa_directives[idx];
-                            let bsa_name = std::path::Path::new(&directive.to)
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_else(|| directive.to.clone());
-                            match handle_create_bsa(ctx, directive) {
-                                Ok(()) => {
-                                    let done = bsa_built.fetch_add(1, Ordering::Relaxed) + 1;
-                                    bsa_status.set_count(done, bsa_total);
-                                }
-                                Err(e) => {
-                                    error!("Failed to build BSA {}: {:#}", bsa_name, e);
-                                    failed.fetch_add(1, Ordering::Relaxed);
-                                    bsa_built.fetch_add(1, Ordering::Relaxed);
-                                }
+                    s.spawn(|| loop {
+                        let idx = bsa_cursor.fetch_add(1, Ordering::Relaxed);
+                        if idx >= bsa_total {
+                            break;
+                        }
+                        let (_id, directive) = &bsa_directives[idx];
+                        let bsa_name = std::path::Path::new(&directive.to)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| directive.to.clone());
+                        match build_bsa_with_progress(ctx, directive, reporter) {
+                            Ok(()) => {
+                                let done = bsa_built.fetch_add(1, Ordering::Relaxed) + 1;
+                                bsa_status.set_count(done, bsa_total);
                             }
-                            rayon::broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true); });
-                            unsafe { libmimalloc_sys::mi_collect(true); }
-                            #[cfg(target_os = "linux")]
-                            unsafe { libc::malloc_trim(0); }
+                            Err(e) => {
+                                error!("Failed to build BSA {}: {:#}", bsa_name, e);
+                                failed.fetch_add(1, Ordering::Relaxed);
+                                bsa_built.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        rayon::broadcast(|_| unsafe {
+                            libmimalloc_sys::mi_collect(true);
+                        });
+                        unsafe {
+                            libmimalloc_sys::mi_collect(true);
+                        }
+                        #[cfg(target_os = "linux")]
+                        unsafe {
+                            libc::malloc_trim(0);
                         }
                     });
                 }
@@ -1852,7 +2042,9 @@ pub(crate) fn run_processing_loop_phased(
                 s.spawn(|_| {
                     loop {
                         let idx = cursor.fetch_add(1, Ordering::Relaxed);
-                        if idx >= simple.len() { break; }
+                        if idx >= simple.len() {
+                            break;
+                        }
 
                         // Block if system memory is too low (< 1GB free)
                         memory_pressure_gate(1024);
@@ -1870,11 +2062,20 @@ pub(crate) fn run_processing_loop_phased(
                         let wrap_status = Mutex::new(Some(extract_status.clone()));
                         let wrap_dds = Mutex::new(dds_status.clone());
                         extract_prepared_archive(
-                            owned, ctx,
-                            &extracted, &written, &skipped, &failed,
-                            &logged_failures, reporter,
-                            &wrap_status, &extract_counter, total_archives,
-                            &wrap_dds, &dds_counter, texture_count,
+                            owned,
+                            ctx,
+                            &extracted,
+                            &written,
+                            &skipped,
+                            &failed,
+                            &logged_failures,
+                            reporter,
+                            &wrap_status,
+                            &extract_counter,
+                            total_archives,
+                            &wrap_dds,
+                            &dds_counter,
+                            texture_count,
                             &extraction_metrics,
                             None, // simple archives have no DDS
                         );
@@ -1886,18 +2087,22 @@ pub(crate) fn run_processing_loop_phased(
     }
     reporter.log(&format!(
         "  Phase 4 complete in {:.1}s ({} simple archives)",
-        phase4_start.elapsed().as_secs_f64(), simple.len()
+        phase4_start.elapsed().as_secs_f64(),
+        simple.len()
     ));
 
     extraction_metrics.stop_wall_clock();
     extract_status.finish();
-    if let Some(ref s) = dds_status { s.finish(); }
+    if let Some(ref s) = dds_status {
+        s.finish();
+    }
 
     extraction_metrics.log_summary(reporter);
 
     reporter.log(&format!(
         "Phased pipeline complete: {} complex + {} simple archives",
-        complex.len(), simple.len()
+        complex.len(),
+        simple.len()
     ));
 
     Ok(StreamingStats {

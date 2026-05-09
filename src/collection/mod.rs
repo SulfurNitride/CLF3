@@ -29,6 +29,8 @@ pub mod gallery;
 pub mod install;
 pub mod modlist;
 pub mod patches;
+pub mod post_install;
+pub mod root_files;
 mod types;
 pub mod verify;
 

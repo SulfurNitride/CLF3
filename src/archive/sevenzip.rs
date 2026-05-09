@@ -799,6 +799,20 @@ fn extract_rar_all(archive_path: &Path, output_dir: &Path) -> Result<usize> {
                 })?;
             count += 1;
         } else {
+            // Directory entry — mkdir so empty dirs from the archive
+            // survive. FOMOD installers sometimes reference empty folders
+            // that the user populates by choice (e.g. SKSE/Plugins/ left
+            // empty for plugin-DLL variants). Skipping them here makes
+            // the FOMOD's `<folder source="...">` resolution fail.
+            let entry_name = header.entry().filename.to_string_lossy().into_owned();
+            let dir_path = output_dir.join(&entry_name);
+            if let Err(e) = fs::create_dir_all(&dir_path) {
+                tracing::warn!(
+                    "RAR mkdir for empty dir {} failed: {}",
+                    dir_path.display(),
+                    e
+                );
+            }
             archive = header
                 .skip()
                 .map_err(|e| anyhow::anyhow!("RAR skip error: {:?}", e))?;

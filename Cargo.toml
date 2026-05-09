@@ -102,7 +102,7 @@ quick-xml = "0.39"
 encoding_rs = "0.8.35"
 
 # LOOT plugin sorting (pure Rust, GPL-3 — clf3 is MIT, see TODO before shipping)
-libloot = "0.28"
+libloot = "0.29"
 
 # Bsdiff binary patches (Vortex collections use bsdiff-node = bsdiff 4.x format)
 qbsdiff = "1.4"

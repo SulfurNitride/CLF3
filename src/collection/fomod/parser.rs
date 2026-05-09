@@ -76,8 +76,25 @@ pub struct Plugin {
     pub files: Vec<InstallFile>,
     /// Flags to set if this plugin is selected.
     pub condition_flags: Vec<ConditionFlag>,
-    /// Plugin type (Optional, Required, Recommended, etc.)
+    /// Plugin type from `<typeDescriptor><type name="..."/>` (simple form).
+    /// When `dep_type_patterns` is non-empty this is treated as the fallback
+    /// only if `dep_type_default` is None.
     pub type_descriptor: PluginType,
+    /// Default type from `<typeDescriptor><dependencyType><defaultType/>`.
+    /// Used when no dep-type pattern matches.
+    pub dep_type_default: Option<PluginType>,
+    /// Conditional plugin-type patterns from
+    /// `<typeDescriptor><dependencyType><patterns>...`. Evaluated in order at
+    /// install time — first match wins.
+    pub dep_type_patterns: Vec<PluginTypePattern>,
+}
+
+/// One `<pattern>` inside `<typeDescriptor><dependencyType><patterns>`:
+/// a plugin type that takes effect when its dependencies evaluate true.
+#[derive(Debug, Clone, Default)]
+pub struct PluginTypePattern {
+    pub plugin_type: PluginType,
+    pub dependencies: Dependencies,
 }
 
 /// Plugin type descriptor.
@@ -142,8 +159,28 @@ pub struct Dependencies {
     pub operator: DependencyOperator,
     /// Flag dependencies.
     pub flags: Vec<FlagDependency>,
+    /// File-state dependencies (`<fileDependency file=".." state=".."/>`).
+    pub files: Vec<FileDependency>,
+    /// Game version dependencies. We treat these as satisfied (no game-version
+    /// info available in the install pipeline) but still record them for
+    /// debugging.
+    pub game_versions: Vec<String>,
+    /// FOMM version dependencies. Always satisfied — N/A on Linux/MO2.
+    pub fomm_versions: Vec<String>,
     /// Nested dependency groups.
     pub nested: Vec<Dependencies>,
+}
+
+/// File-state dependency: a check that another file in the deployed mod tree
+/// is in a particular state (Active/Inactive/Missing).
+#[derive(Debug, Clone, Default)]
+pub struct FileDependency {
+    /// Path being checked, relative to data root (forward-slash separators
+    /// after parse normalization).
+    pub file: String,
+    /// State the FOMOD wants. Common values: `Active`, `Inactive`, `Missing`.
+    /// Case preserved as authored; comparison is ascii-case-insensitive.
+    pub state: String,
 }
 
 /// Logical operator for combining dependencies.
@@ -182,10 +219,49 @@ pub fn parse_fomod(path: &Path) -> Result<FomodConfig> {
 }
 
 /// Helper to get unescaped attribute value (decodes &quot; &amp; etc.)
+/// Falls back to the raw byte slice as UTF-8 if quick-xml's unescape fails
+/// (e.g. malformed entity) — never panics or recurses.
 fn unescape_attr(attr: &quick_xml::events::attributes::Attribute) -> String {
     attr.unescape_value()
         .map(|s| s.to_string())
-        .unwrap_or_else(|_| unescape_attr(attr))
+        .unwrap_or_else(|_| String::from_utf8_lossy(&attr.value).into_owned())
+}
+
+/// Parse a `<flagDependency flag="X" value="Y"/>` element into a FlagDependency.
+fn parse_flag_dependency(e: &quick_xml::events::BytesStart<'_>) -> FlagDependency {
+    let mut dep = FlagDependency::default();
+    for attr in e.attributes().flatten() {
+        match attr.key.as_ref() {
+            b"flag" => dep.flag = unescape_attr(&attr),
+            b"value" => dep.value = unescape_attr(&attr),
+            _ => {}
+        }
+    }
+    dep
+}
+
+/// Parse a `<fileDependency file="path" state="Active|Inactive|Missing"/>`.
+fn parse_file_dependency(e: &quick_xml::events::BytesStart<'_>) -> FileDependency {
+    let mut dep = FileDependency::default();
+    for attr in e.attributes().flatten() {
+        match attr.key.as_ref() {
+            b"file" => dep.file = unescape_attr(&attr).replace('\\', "/"),
+            b"state" => dep.state = unescape_attr(&attr),
+            _ => {}
+        }
+    }
+    dep
+}
+
+/// Extract the `version` attribute used by `<gameDependency>` and
+/// `<fommDependency>`. Returns None when the attribute is absent.
+fn parse_version_attr(e: &quick_xml::events::BytesStart<'_>) -> Option<String> {
+    for attr in e.attributes().flatten() {
+        if attr.key.as_ref() == b"version" {
+            return Some(unescape_attr(&attr));
+        }
+    }
+    None
 }
 
 /// Parse FOMOD configuration from XML string.
@@ -207,6 +283,18 @@ pub fn parse_fomod_xml(xml: &str) -> Result<FomodConfig> {
     let mut current_group: Option<OptionGroup> = None;
     let mut current_plugin: Option<Plugin> = None;
     let mut current_pattern: Option<ConditionalPattern> = None;
+    // Set while inside `<typeDescriptor><dependencyType>...</dependencyType>`
+    // — switches the meaning of `<patterns>`/`<pattern>` from conditional
+    // installs to plugin-type-by-flag patterns.
+    let mut in_dependency_type = false;
+    let mut current_dep_type_pattern: Option<PluginTypePattern> = None;
+
+    // Dependency parse stack. Each `<dependencies>` element pushes a new
+    // Dependencies onto the stack; child `<flagDependency>` / nested
+    // `<dependencies>` mutate the top of the stack. On `</dependencies>` we
+    // pop and either splice into the parent (if stack non-empty) or assign
+    // to `current_pattern.dependencies` (when this was the outermost group).
+    let mut dep_stack: Vec<Dependencies> = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -313,47 +401,83 @@ pub fn parse_fomod_xml(xml: &str) -> Result<FomodConfig> {
                         }
                     }
                     "type" => {
-                        if let Some(ref mut plugin) = current_plugin {
+                        // In dep-type pattern context this sets the pattern's
+                        // type; in the simple `<typeDescriptor><type/>` form
+                        // it sets the plugin's static type_descriptor.
+                        if let Some(ref mut p) = current_dep_type_pattern {
                             for attr in e.attributes().flatten() {
                                 if attr.key.as_ref() == b"name" {
-                                    plugin.type_descriptor = PluginType::from_str(
-                                        &unescape_attr(&attr),
-                                    );
+                                    p.plugin_type = PluginType::from_str(&unescape_attr(&attr));
+                                }
+                            }
+                        } else if let Some(ref mut plugin) = current_plugin {
+                            if !in_dependency_type {
+                                for attr in e.attributes().flatten() {
+                                    if attr.key.as_ref() == b"name" {
+                                        plugin.type_descriptor =
+                                            PluginType::from_str(&unescape_attr(&attr));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "dependencytype" => {
+                        if current_plugin.is_some() {
+                            in_dependency_type = true;
+                        }
+                    }
+                    "defaulttype" => {
+                        if let Some(ref mut plugin) = current_plugin {
+                            if in_dependency_type {
+                                for attr in e.attributes().flatten() {
+                                    if attr.key.as_ref() == b"name" {
+                                        plugin.dep_type_default =
+                                            Some(PluginType::from_str(&unescape_attr(&attr)));
+                                    }
                                 }
                             }
                         }
                     }
                     "pattern" => {
-                        if in_conditional_installs {
+                        if in_dependency_type {
+                            current_dep_type_pattern = Some(PluginTypePattern::default());
+                        } else if in_conditional_installs {
                             current_pattern = Some(ConditionalPattern::default());
                         }
                     }
                     "dependencies" => {
-                        if let Some(ref mut pattern) = current_pattern {
-                            for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"operator" {
-                                    pattern.dependencies.operator = DependencyOperator::from_str(
-                                        &unescape_attr(&attr),
-                                    );
-                                }
+                        let mut deps = Dependencies::default();
+                        for attr in e.attributes().flatten() {
+                            if attr.key.as_ref() == b"operator" {
+                                deps.operator = DependencyOperator::from_str(
+                                    &unescape_attr(&attr),
+                                );
+                            }
+                        }
+                        dep_stack.push(deps);
+                    }
+                    "flagdependency" => {
+                        if let Some(top) = dep_stack.last_mut() {
+                            top.flags.push(parse_flag_dependency(e));
+                        }
+                    }
+                    "filedependency" => {
+                        if let Some(top) = dep_stack.last_mut() {
+                            top.files.push(parse_file_dependency(e));
+                        }
+                    }
+                    "gamedependency" => {
+                        if let Some(top) = dep_stack.last_mut() {
+                            if let Some(v) = parse_version_attr(e) {
+                                top.game_versions.push(v);
                             }
                         }
                     }
-                    "flagdependency" => {
-                        if let Some(ref mut pattern) = current_pattern {
-                            let mut flag_dep = FlagDependency::default();
-                            for attr in e.attributes().flatten() {
-                                match attr.key.as_ref() {
-                                    b"flag" => {
-                                        flag_dep.flag = unescape_attr(&attr);
-                                    }
-                                    b"value" => {
-                                        flag_dep.value = unescape_attr(&attr);
-                                    }
-                                    _ => {}
-                                }
+                    "fommdependency" => {
+                        if let Some(top) = dep_stack.last_mut() {
+                            if let Some(v) = parse_version_attr(e) {
+                                top.fomm_versions.push(v);
                             }
-                            pattern.dependencies.flags.push(flag_dep);
                         }
                     }
                     "description" => {
@@ -402,31 +526,57 @@ pub fn parse_fomod_xml(xml: &str) -> Result<FomodConfig> {
                         }
                     }
                     "type" => {
-                        if let Some(ref mut plugin) = current_plugin {
+                        if let Some(ref mut p) = current_dep_type_pattern {
                             for attr in e.attributes().flatten() {
                                 if attr.key.as_ref() == b"name" {
-                                    plugin.type_descriptor = PluginType::from_str(
-                                        &unescape_attr(&attr),
-                                    );
+                                    p.plugin_type = PluginType::from_str(&unescape_attr(&attr));
+                                }
+                            }
+                        } else if let Some(ref mut plugin) = current_plugin {
+                            if !in_dependency_type {
+                                for attr in e.attributes().flatten() {
+                                    if attr.key.as_ref() == b"name" {
+                                        plugin.type_descriptor =
+                                            PluginType::from_str(&unescape_attr(&attr));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "defaulttype" => {
+                        if let Some(ref mut plugin) = current_plugin {
+                            if in_dependency_type {
+                                for attr in e.attributes().flatten() {
+                                    if attr.key.as_ref() == b"name" {
+                                        plugin.dep_type_default =
+                                            Some(PluginType::from_str(&unescape_attr(&attr)));
+                                    }
                                 }
                             }
                         }
                     }
                     "flagdependency" => {
-                        if let Some(ref mut pattern) = current_pattern {
-                            let mut flag_dep = FlagDependency::default();
-                            for attr in e.attributes().flatten() {
-                                match attr.key.as_ref() {
-                                    b"flag" => {
-                                        flag_dep.flag = unescape_attr(&attr);
-                                    }
-                                    b"value" => {
-                                        flag_dep.value = unescape_attr(&attr);
-                                    }
-                                    _ => {}
-                                }
+                        if let Some(top) = dep_stack.last_mut() {
+                            top.flags.push(parse_flag_dependency(e));
+                        }
+                    }
+                    "filedependency" => {
+                        if let Some(top) = dep_stack.last_mut() {
+                            top.files.push(parse_file_dependency(e));
+                        }
+                    }
+                    "gamedependency" => {
+                        if let Some(top) = dep_stack.last_mut() {
+                            if let Some(v) = parse_version_attr(e) {
+                                top.game_versions.push(v);
                             }
-                            pattern.dependencies.flags.push(flag_dep);
+                        }
+                    }
+                    "fommdependency" => {
+                        if let Some(top) = dep_stack.last_mut() {
+                            if let Some(v) = parse_version_attr(e) {
+                                top.fomm_versions.push(v);
+                            }
                         }
                     }
                     _ => {}
@@ -467,8 +617,31 @@ pub fn parse_fomod_xml(xml: &str) -> Result<FomodConfig> {
                         }
                     }
                     "pattern" => {
-                        if let Some(pattern) = current_pattern.take() {
+                        if let Some(p) = current_dep_type_pattern.take() {
+                            if let Some(plugin) = current_plugin.as_mut() {
+                                plugin.dep_type_patterns.push(p);
+                            }
+                        } else if let Some(pattern) = current_pattern.take() {
                             config.conditional_installs.push(pattern);
+                        }
+                    }
+                    "dependencytype" => {
+                        in_dependency_type = false;
+                    }
+                    "dependencies" => {
+                        // Pop the matching <dependencies>. If the stack still
+                        // has a parent, splice as nested; otherwise it's the
+                        // outermost group — assign to whichever scope owns it
+                        // (dep-type pattern takes priority since it's a more
+                        // specific context than a conditional install).
+                        if let Some(popped) = dep_stack.pop() {
+                            if let Some(parent) = dep_stack.last_mut() {
+                                parent.nested.push(popped);
+                            } else if let Some(p) = current_dep_type_pattern.as_mut() {
+                                p.dependencies = popped;
+                            } else if let Some(pattern) = current_pattern.as_mut() {
+                                pattern.dependencies = popped;
+                            }
                         }
                     }
                     _ => {}
@@ -609,6 +782,118 @@ mod tests {
         assert_eq!(pattern.dependencies.flags[0].value, "true");
         assert_eq!(pattern.files.len(), 1);
         assert_eq!(pattern.files[0].source, "feature/extra.esp");
+    }
+
+    #[test]
+    fn test_parse_nested_dependencies() {
+        // OR-of-AND: install when (A=1 AND B=1) OR (C=1).
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<config>
+    <conditionalFileInstalls>
+        <patterns>
+            <pattern>
+                <dependencies operator="Or">
+                    <dependencies operator="And">
+                        <flagDependency flag="A" value="1"/>
+                        <flagDependency flag="B" value="1"/>
+                    </dependencies>
+                    <flagDependency flag="C" value="1"/>
+                </dependencies>
+                <files>
+                    <file source="x.esp"/>
+                </files>
+            </pattern>
+        </patterns>
+    </conditionalFileInstalls>
+</config>"#;
+
+        let config = parse_fomod_xml(xml).unwrap();
+        assert_eq!(config.conditional_installs.len(), 1);
+
+        let pattern = &config.conditional_installs[0];
+        let deps = &pattern.dependencies;
+        // Outer is OR with one direct flag (C) + one nested AND group.
+        assert_eq!(deps.operator, DependencyOperator::Or);
+        assert_eq!(deps.flags.len(), 1);
+        assert_eq!(deps.flags[0].flag, "C");
+        assert_eq!(deps.nested.len(), 1);
+
+        let inner = &deps.nested[0];
+        assert_eq!(inner.operator, DependencyOperator::And);
+        assert_eq!(inner.flags.len(), 2);
+        assert_eq!(inner.flags[0].flag, "A");
+        assert_eq!(inner.flags[1].flag, "B");
+    }
+
+    #[test]
+    fn test_parse_dependency_type_patterns() {
+        // Plugin's effective type = Required when flag X=1, else default Optional.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<config>
+    <installSteps>
+        <installStep name="S">
+            <optionalFileGroups>
+                <group name="G" type="SelectAny">
+                    <plugins>
+                        <plugin name="P">
+                            <description>desc</description>
+                            <typeDescriptor>
+                                <dependencyType>
+                                    <defaultType name="Optional"/>
+                                    <patterns>
+                                        <pattern>
+                                            <type name="Required"/>
+                                            <dependencies>
+                                                <flagDependency flag="X" value="1"/>
+                                            </dependencies>
+                                        </pattern>
+                                    </patterns>
+                                </dependencyType>
+                            </typeDescriptor>
+                        </plugin>
+                    </plugins>
+                </group>
+            </optionalFileGroups>
+        </installStep>
+    </installSteps>
+</config>"#;
+
+        let config = parse_fomod_xml(xml).unwrap();
+        let plugin = &config.install_steps[0].groups[0].plugins[0];
+        assert_eq!(plugin.dep_type_default, Some(PluginType::Optional));
+        assert_eq!(plugin.dep_type_patterns.len(), 1);
+        assert_eq!(plugin.dep_type_patterns[0].plugin_type, PluginType::Required);
+        assert_eq!(plugin.dep_type_patterns[0].dependencies.flags.len(), 1);
+        assert_eq!(plugin.dep_type_patterns[0].dependencies.flags[0].flag, "X");
+    }
+
+    #[test]
+    fn test_parse_file_and_version_dependencies() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<config>
+    <conditionalFileInstalls>
+        <patterns>
+            <pattern>
+                <dependencies operator="And">
+                    <fileDependency file="Skyrim.esm" state="Active"/>
+                    <gameDependency version="1.6.640.0"/>
+                    <fommDependency version="0.13.0"/>
+                </dependencies>
+                <files>
+                    <file source="patch.esp"/>
+                </files>
+            </pattern>
+        </patterns>
+    </conditionalFileInstalls>
+</config>"#;
+
+        let config = parse_fomod_xml(xml).unwrap();
+        let deps = &config.conditional_installs[0].dependencies;
+        assert_eq!(deps.files.len(), 1);
+        assert_eq!(deps.files[0].file, "Skyrim.esm");
+        assert_eq!(deps.files[0].state, "Active");
+        assert_eq!(deps.game_versions, vec!["1.6.640.0".to_string()]);
+        assert_eq!(deps.fomm_versions, vec!["0.13.0".to_string()]);
     }
 
     #[test]

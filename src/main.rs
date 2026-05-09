@@ -28,7 +28,9 @@ mod textures;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use installer::{CliReporter, ExtractStrategy, InstallConfig, Installer, ProgressReporter};
+use installer::{
+    CliReporter, ExtractStrategy, InstallConfig, Installer, ProgressMode, ProgressReporter,
+};
 
 /// CLI-facing enum for the `--extract` flag. Maps to the internal
 /// `installer::ExtractStrategy` used by the install pipeline.
@@ -48,8 +50,36 @@ impl From<ExtractStrategyArg> for ExtractStrategy {
         }
     }
 }
+
+/// CLI-facing progress rendering mode.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum ProgressModeArg {
+    /// Use full interactive progress on terminals and plain progress otherwise.
+    Auto,
+    /// Interactive progress with aggregate rows and active worker bars.
+    Full,
+    /// Line-oriented human-readable progress.
+    Plain,
+    /// Newline-delimited JSON progress events on stdout.
+    Json,
+    /// Newline-delimited JSON progress snapshots on stdout.
+    Snapshot,
+}
+
+impl From<ProgressModeArg> for ProgressMode {
+    fn from(arg: ProgressModeArg) -> Self {
+        match arg {
+            ProgressModeArg::Auto => ProgressMode::Auto,
+            ProgressModeArg::Full => ProgressMode::Full,
+            ProgressModeArg::Plain => ProgressMode::Plain,
+            ProgressModeArg::Json => ProgressMode::Json,
+            ProgressModeArg::Snapshot => ProgressMode::Snapshot,
+        }
+    }
+}
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::io::IsTerminal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 #[derive(Parser)]
@@ -136,6 +166,10 @@ enum Commands {
         ///   short and CPU-heavy work (DDS, BSA) dominates.
         #[arg(long, value_enum, default_value_t = ExtractStrategyArg::Streaming)]
         extract: ExtractStrategyArg,
+
+        /// Progress output mode.
+        #[arg(long, value_enum, default_value_t = ProgressModeArg::Auto)]
+        progress: ProgressModeArg,
     },
 
     /// Set and verify your Nexus Mods API key
@@ -190,9 +224,16 @@ enum Commands {
         #[arg(long, env = "NEXUS_API_KEY")]
         nexus_key: Option<String>,
 
-        /// Max concurrent downloads (default 4)
-        #[arg(long, default_value_t = 4)]
+        /// Max concurrent downloads (defaults to available CPU thread count).
+        /// Use 0 to keep the auto-default.
+        #[arg(long, default_value_t = 0)]
         concurrent: usize,
+
+        /// Prompt for variant picks on multi-variant mods that ship with no
+        /// FOMOD (Wind Ruler-style `No Fur/` vs `Original/`). Auto-routers
+        /// (FLM/SKSE) always run regardless.
+        #[arg(long, default_value_t = false)]
+        interactive_fix: bool,
     },
 }
 
@@ -228,9 +269,21 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .with_filter(file_filter);
 
+    let requested_progress_mode = match &cli.command {
+        Commands::Install { progress, .. } => (*progress).into(),
+        _ => ProgressMode::Auto,
+    };
+    let progress_mode = match requested_progress_mode {
+        ProgressMode::Auto if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() => {
+            ProgressMode::Full
+        }
+        ProgressMode::Auto => ProgressMode::Plain,
+        mode => mode,
+    };
+
     // Create CLI reporter for progress bars — must exist before tracing init
     // so its writer factory can route tracing output through MultiProgress.
-    let cli_reporter = CliReporter::new(16);
+    let cli_reporter = CliReporter::new(16, progress_mode);
 
     // Console layer — routes through CliReporter's MultiProgress
     let console_layer = tracing_subscriber::fmt::layer()
@@ -250,7 +303,9 @@ async fn main() -> Result<()> {
     std::panic::set_hook(Box::new(move |info| {
         let thread = std::thread::current();
         let thread_name = thread.name().unwrap_or("<unnamed>");
-        let location = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "unknown".into());
         let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
             s.to_string()
@@ -261,10 +316,17 @@ async fn main() -> Result<()> {
         };
         let msg = format!(
             "PANIC on thread '{}' at {}:\n  {}\n  backtrace: {:?}",
-            thread_name, location, payload, std::backtrace::Backtrace::force_capture()
+            thread_name,
+            location,
+            payload,
+            std::backtrace::Backtrace::force_capture()
         );
         tracing::error!("{}", msg);
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&panic_log) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&panic_log)
+        {
             use std::io::Write;
             let _ = writeln!(f, "\n[PANIC] {}", msg);
         }
@@ -280,8 +342,14 @@ async fn main() -> Result<()> {
             static HUP: AtomicBool = AtomicBool::new(false);
 
             unsafe {
-                libc::signal(libc::SIGTERM, sigterm_handler as *const () as libc::sighandler_t);
-                libc::signal(libc::SIGHUP, sighup_handler as *const () as libc::sighandler_t);
+                libc::signal(
+                    libc::SIGTERM,
+                    sigterm_handler as *const () as libc::sighandler_t,
+                );
+                libc::signal(
+                    libc::SIGHUP,
+                    sighup_handler as *const () as libc::sighandler_t,
+                );
             }
 
             extern "C" fn sigterm_handler(_: libc::c_int) {
@@ -300,7 +368,11 @@ async fn main() -> Result<()> {
                         rss / 1024
                     );
                     tracing::error!("{}", msg);
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&signal_log) {
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&signal_log)
+                    {
                         use std::io::Write;
                         let _ = writeln!(f, "\n[SIGNAL] {}", msg);
                     }
@@ -310,7 +382,11 @@ async fn main() -> Result<()> {
                 if HUP.load(Ordering::SeqCst) {
                     let msg = "Received SIGHUP — terminal closed or session ended";
                     tracing::error!("{}", msg);
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&signal_log) {
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&signal_log)
+                    {
                         use std::io::Write;
                         let _ = writeln!(f, "\n[SIGNAL] {}", msg);
                     }
@@ -396,17 +472,29 @@ async fn main() -> Result<()> {
                 println!("GPU selection set to: auto (recommended)");
             } else {
                 let idx: usize = index.parse().map_err(|_| {
-                    anyhow::anyhow!("Invalid GPU index '{}'. Use a number from list-gpu or 'auto'.", index)
+                    anyhow::anyhow!(
+                        "Invalid GPU index '{}'. Use a number from list-gpu or 'auto'.",
+                        index
+                    )
                 })?;
                 let gpus = textures::list_gpus();
-                let gpu = gpus.iter().find(|g| g.adapter_index == idx).ok_or_else(|| {
-                    anyhow::anyhow!("GPU index {} not found. Run 'clf3 list-gpu' to see available GPUs.", idx)
-                })?;
+                let gpu = gpus
+                    .iter()
+                    .find(|g| g.adapter_index == idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "GPU index {} not found. Run 'clf3 list-gpu' to see available GPUs.",
+                            idx
+                        )
+                    })?;
                 let mut settings = settings::Settings::load();
                 settings.gpu_index = Some(idx);
                 settings.gpu_name = gpu.name.clone();
                 settings.save()?;
-                println!("GPU selected: [{}] {} ({}, {})", idx, gpu.name, gpu.backend, gpu.device_type);
+                println!(
+                    "GPU selected: [{}] {} ({}, {})",
+                    idx, gpu.name, gpu.backend, gpu.device_type
+                );
             }
         }
 
@@ -417,12 +505,29 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "unknown".into());
             println!("Settings file: {}", path);
             println!();
-            println!("Nexus API key:    {}", if settings.nexus_api_key.is_empty() { "(not set)" } else { "(set)" });
-            println!("LoversLab login:  {}", if settings.loverslab_email.is_empty() { "(not set)" } else { settings.loverslab_email.as_str() });
-            println!("GPU:              {}", match settings.gpu_index {
-                Some(idx) => format!("[{}] {}", idx, settings.gpu_name),
-                None => "auto".into(),
-            });
+            println!(
+                "Nexus API key:    {}",
+                if settings.nexus_api_key.is_empty() {
+                    "(not set)"
+                } else {
+                    "(set)"
+                }
+            );
+            println!(
+                "LoversLab login:  {}",
+                if settings.loverslab_email.is_empty() {
+                    "(not set)"
+                } else {
+                    settings.loverslab_email.as_str()
+                }
+            );
+            println!(
+                "GPU:              {}",
+                match settings.gpu_index {
+                    Some(idx) => format!("[{}] {}", idx, settings.gpu_name),
+                    None => "auto".into(),
+                }
+            );
             if !settings.patch_cache_dir.is_empty() {
                 println!("Patch cache:      {}", settings.patch_cache_dir);
             }
@@ -443,6 +548,7 @@ async fn main() -> Result<()> {
             ll_email,
             ll_password,
             extract,
+            progress: _,
         } => {
             // If wabbajack_file is a URL, download it first.
             let wabbajack_file = if wabbajack_file.starts_with("http://")
@@ -454,44 +560,48 @@ async fn main() -> Result<()> {
                     .join("modlists");
                 std::fs::create_dir_all(&cache_dir)?;
 
-                // Derive filename from URL path or use a default.
-                // Wabbajack authored_files URLs look like:
-                //   .../Name.wabbajack_bbe12eee-2a70-4030-8f7a-7d7341150d7b
-                // Strip the _UUID suffix to get the real filename.
-                let filename = wabbajack_file
-                    .rsplit('/')
-                    .next()
-                    .filter(|s| !s.is_empty())
-                    .map(|s| {
-                        let decoded = urlencoded_decode(s);
-                        // If it contains ".wabbajack_", trim the UUID suffix.
-                        if let Some(idx) = decoded.find(".wabbajack_") {
-                            decoded[..idx + ".wabbajack".len()].to_string()
-                        } else if decoded.ends_with(".wabbajack") {
-                            decoded
-                        } else {
-                            format!("{}.wabbajack", decoded)
-                        }
-                    })
-                    .unwrap_or_else(|| "download.wabbajack".into());
+                let filename = wabbajack_cache_filename_from_url(&wabbajack_file);
                 let dest = cache_dir.join(&filename);
 
-                // Use cached copy if present and non-empty. The .wabbajack
-                // filename derived above includes the upstream UUID suffix,
-                // so a matching cache entry is the same file.
-                let cached = std::fs::metadata(&dest)
-                    .ok()
-                    .filter(|m| m.len() > 0);
-
-                if let Some(meta) = cached {
-                    println!(
-                        "Using cached .wabbajack file: {} ({} MiB)",
-                        dest.display(),
-                        meta.len() / (1024 * 1024)
-                    );
+                // Use cached copy only if it is non-empty and parseable. A
+                // partial/corrupt cache entry can otherwise fail much later
+                // during game auto-detection with a misleading message.
+                let cached = std::fs::metadata(&dest).ok().filter(|m| m.len() > 0);
+                let use_cached = if let Some(meta) = cached {
+                    match verify_wabbajack_file(&dest) {
+                        Ok(()) => {
+                            human_line(
+                                progress_mode,
+                                format!(
+                                    "Using cached .wabbajack file: {} ({} MiB)",
+                                    dest.display(),
+                                    meta.len() / (1024 * 1024)
+                                ),
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            human_line(
+                                progress_mode,
+                                format!(
+                                    "Cached .wabbajack file is invalid; deleting and redownloading: {} ({:#})",
+                                    dest.display(),
+                                    e
+                                ),
+                            );
+                            let _ = std::fs::remove_file(&dest);
+                            false
+                        }
+                    }
                 } else {
-                    println!("Downloading .wabbajack file from URL...");
+                    false
+                };
+
+                if !use_cached {
+                    human_line(progress_mode, "Downloading .wabbajack file from URL...");
                     let cdn = downloaders::wabbajack_cdn::WabbajackCdnDownloader::new()?;
+                    let tmp_dest = dest.with_extension("wabbajack.part");
+                    let _ = std::fs::remove_file(&tmp_dest);
                     let pb = indicatif::ProgressBar::new(0);
                     pb.set_style(
                         indicatif::ProgressStyle::default_bar()
@@ -504,7 +614,7 @@ async fn main() -> Result<()> {
                     let pb_clone = pb.clone();
                     cdn.download_with_progress(
                         &wabbajack_file,
-                        &dest,
+                        &tmp_dest,
                         0,
                         move |downloaded, total| {
                             if pb_clone.length() == Some(0) && total > 0 {
@@ -516,7 +626,16 @@ async fn main() -> Result<()> {
                     .await?;
                     pb.finish_with_message("Downloaded");
 
-                    println!("Saved to: {}", dest.display());
+                    verify_wabbajack_file(&tmp_dest).map_err(|e| {
+                        let _ = std::fs::remove_file(&tmp_dest);
+                        anyhow::anyhow!(
+                            "Downloaded .wabbajack file failed verification: {} ({:#})",
+                            tmp_dest.display(),
+                            e
+                        )
+                    })?;
+                    std::fs::rename(&tmp_dest, &dest)?;
+                    human_line(progress_mode, format!("Saved to: {}", dest.display()));
                 }
 
                 dest
@@ -529,12 +648,17 @@ async fn main() -> Result<()> {
             // Resolve API key: CLI arg > env var > saved settings
             let nexus_key = nexus_key
                 .or_else(|| {
-                    if settings.nexus_api_key.is_empty() { None }
-                    else { Some(settings.nexus_api_key.clone()) }
+                    if settings.nexus_api_key.is_empty() {
+                        None
+                    } else {
+                        Some(settings.nexus_api_key.clone())
+                    }
                 })
-                .ok_or_else(|| anyhow::anyhow!(
-                    "Nexus API key required. Set it with: clf3 set-api-key YOUR_KEY"
-                ))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Nexus API key required. Set it with: clf3 set-api-key YOUR_KEY"
+                    )
+                })?;
 
             // Resolve LL credentials: CLI arg > env var > saved settings
             let ll_email = ll_email.unwrap_or_else(|| settings.loverslab_email.clone());
@@ -548,20 +672,18 @@ async fn main() -> Result<()> {
                     // preferring installs whose game files actually match the
                     // modlist's expected hashes (Steam first, then Heroic/GOG).
                     match auto_detect_game_dir(&wabbajack_file) {
-                        Some((p, store)) => {
-                            println!(
-                                "Auto-detected game directory: {} ({})",
-                                p.display(),
-                                store
+                        Ok((p, store)) => {
+                            human_line(
+                                progress_mode,
+                                format!(
+                                    "Auto-detected game directory: {} ({})",
+                                    p.display(),
+                                    store
+                                ),
                             );
                             p
                         }
-                        None => {
-                            anyhow::bail!(
-                                "Could not auto-detect a game directory with matching files. \
-                                 Specify one with --game PATH"
-                            );
-                        }
+                        Err(e) => return Err(e),
                     }
                 }
             };
@@ -575,17 +697,26 @@ async fn main() -> Result<()> {
             let bsa_workers = bsa_workers.unwrap_or(1).max(1);
             let sevenzip_workers = sevenzip_workers.unwrap_or(thread_count).max(1);
 
-            println!("CLF3 - Wabbajack Modlist Installer");
-            println!("Concurrent downloads: {}", concurrent);
-            println!(
-                "Install workers: {} (BSA archives in parallel: {})",
-                install_workers, bsa_workers
+            human_line(progress_mode, "CLF3 - Wabbajack Modlist Installer");
+            human_line(
+                progress_mode,
+                format!("Concurrent downloads: {}", concurrent),
             );
-            println!("7z archives in parallel: {}", sevenzip_workers);
+            human_line(
+                progress_mode,
+                format!(
+                    "Install workers: {} (BSA archives in parallel: {})",
+                    install_workers, bsa_workers
+                ),
+            );
+            human_line(
+                progress_mode,
+                format!("7z archives in parallel: {}", sevenzip_workers),
+            );
             if nxm_mode {
-                println!("NXM Mode: enabled (browser-based downloads)");
+                human_line(progress_mode, "NXM Mode: enabled (browser-based downloads)");
             }
-            println!();
+            human_line(progress_mode, "");
 
             let patch_cache_dir = if settings.patch_cache_dir.is_empty() {
                 None
@@ -606,7 +737,6 @@ async fn main() -> Result<()> {
                 nxm_mode,
                 browser,
                 patch_cache_dir,
-                progress_callback: None,
                 reporter: cli_reporter.clone() as Arc<dyn ProgressReporter>,
                 loverslab_email: ll_email,
                 loverslab_password: ll_password,
@@ -733,6 +863,7 @@ async fn main() -> Result<()> {
             game,
             nexus_key,
             concurrent,
+            interactive_fix,
         } => {
             // Resolve API key: CLI flag > env > saved settings.
             let saved = settings::Settings::load();
@@ -779,11 +910,19 @@ async fn main() -> Result<()> {
                 db_path: None,
                 mods_dir: output.join("mods"),
                 downloads_dir: downloads,
-                output_dir: output,
+                output_dir: output.clone(),
                 nexus_api_key: api_key,
-                max_concurrent_downloads: concurrent.max(1),
+                max_concurrent_downloads: if concurrent == 0 {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(4)
+                } else {
+                    concurrent
+                },
                 game_path: game,
                 collection_root: None,
+                browser: None,
+                interactive_fix,
             };
 
             println!("Starting streaming collection install...");
@@ -791,13 +930,13 @@ async fn main() -> Result<()> {
 
             println!(
                 "\n=== Collection install complete ({:.1}s) ===\n\
-                 cached:     {}\n\
-                 downloaded: {}\n\
-                 extracted:  {}\n\
-                 skipped:    {} (marker matched, no work)\n\
-                 manual:     {}\n\
-                 failed:     {}\n\
-                 patches:    {} applied, {} skipped (CRC), {} missing, {} failed",
+                 cached:        {}\n\
+                 downloaded:    {}\n\
+                 extracted:     {}\n\
+                 skipped:       {} (marker matched, no work)\n\
+                 manual:        {}\n\
+                 failed (mods): {}\n\
+                 patches:       {} applied, {} skipped (CRC), {} missing, {} failed",
                 stats.elapsed_secs,
                 stats.mods_cached,
                 stats.mods_downloaded,
@@ -812,7 +951,41 @@ async fn main() -> Result<()> {
             );
 
             if stats.mods_failed > 0 || stats.mods_manual > 0 {
-                println!("\nSome mods need attention — check the log for details.");
+                // Pull the names + reasons from the install DB so the user
+                // sees exactly which mods need a closer look without grepping
+                // the log file. `mod_failed_summary` is best-effort: if the
+                // DB can't be opened (CLI sets db_path=None → defaults to
+                // <output>/collection.db, which always exists post-install),
+                // we just fall back to the generic message.
+                let db_path = output.join("collection.db");
+                if let Ok(db) = collection::CollectionDb::open(&db_path) {
+                    if let Ok(rows) = db.get_all_mods() {
+                        let mut printed_header = false;
+                        for m in &rows {
+                            match m.status.as_str() {
+                                "failed" => {
+                                    if !printed_header {
+                                        println!("\nFailed mods:");
+                                        printed_header = true;
+                                    }
+                                    let why = m.error_message.as_deref().unwrap_or("(no error message)");
+                                    println!("  ✗ {} — {}", m.name, why);
+                                }
+                                "manual" => {
+                                    if !printed_header {
+                                        println!("\nNeed manual action:");
+                                        printed_header = true;
+                                    }
+                                    let why = m.error_message.as_deref().unwrap_or("(no detail)");
+                                    println!("  ⚠ {} — {}", m.name, why);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                } else {
+                    println!("\nSome mods need attention — check the log for details.");
+                }
             }
         }
     }
@@ -834,12 +1007,20 @@ async fn main() -> Result<()> {
 ///    for Cyberpunk/Witcher3/BG3). Prefer Steam in this case.
 ///
 /// Returns `(install_path, store_label)` for display.
-fn auto_detect_game_dir(wabbajack_path: &std::path::Path) -> Option<(PathBuf, &'static str)> {
+fn auto_detect_game_dir(wabbajack_path: &std::path::Path) -> Result<(PathBuf, &'static str)> {
     use installer::game_preflight::check_game_files_from_modlist;
 
-    let modlist = modlist::parse_wabbajack_file(wabbajack_path).ok()?;
+    let modlist = modlist::parse_wabbajack_file(wabbajack_path)
+        .map_err(|e| anyhow::anyhow!("Could not inspect modlist for game auto-detection: {e:#}"))?;
 
-    let (steam_id, gog_id) = game_finder::ids_for_wabbajack_type(&modlist.game_type)?;
+    let (steam_id, gog_id) = game_finder::ids_for_wabbajack_type(&modlist.game_type)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Could not auto-detect game directory: unsupported Wabbajack game type '{}'. \
+                 Specify one with --game PATH",
+                modlist.game_type
+            )
+        })?;
 
     // Build an ordered candidate list: Steam first, then Heroic/GOG.
     let mut candidates: Vec<(PathBuf, &'static str)> = Vec::new();
@@ -857,11 +1038,17 @@ fn auto_detect_game_dir(wabbajack_path: &std::path::Path) -> Option<(PathBuf, &'
     }
 
     if candidates.is_empty() {
-        return None;
+        return Err(anyhow::anyhow!(
+            "Could not auto-detect game directory for '{}': no Steam/Heroic install candidates found. \
+             Steam app id checked: {}. Specify one with --game PATH",
+            modlist.game_type,
+            steam_id
+        ));
     }
 
     // Hash-verify each candidate against the modlist's GameFileSource entries.
     let mut first_fallback: Option<(PathBuf, &'static str)> = None;
+    let mut failures = Vec::new();
 
     for (path, store) in &candidates {
         let report = check_game_files_from_modlist(&modlist, path);
@@ -883,23 +1070,82 @@ fn auto_detect_game_dir(wabbajack_path: &std::path::Path) -> Option<(PathBuf, &'
                 store,
                 path.display()
             );
-            return Some((path.clone(), store));
+            return Ok((path.clone(), store));
         }
 
         // Preflight failed on this candidate — log and try next.
-        eprintln!(
-            "Skipping {} install at {}: {} file(s) missing, {} hash mismatch. \
-             Trying next candidate...",
+        failures.push(format!(
+            "{} candidate at {}\n{}",
             store,
             path.display(),
-            report.missing().len(),
-            report.mismatched().len()
-        );
+            report.format_summary()
+        ));
     }
 
     // All hash-gated candidates failed. Fall back to the first install that
     // had no game files to pin (if any).
-    first_fallback
+    if let Some(candidate) = first_fallback {
+        return Ok(candidate);
+    }
+
+    Err(anyhow::anyhow!(
+        "Game directory auto-detection found install candidates, but the modlist's pinned game-file hash gate rejected them.\n\n{}\n\
+         Specify the correct game directory with --game PATH, or update/rollback the game so these files match the modlist.",
+        failures.join("\n")
+    ))
+}
+
+fn verify_wabbajack_file(path: &std::path::Path) -> Result<()> {
+    modlist::parse_wabbajack_file(path).map(|_| ())
+}
+
+/// Derive a stable cache filename from a remote `.wabbajack` URL.
+///
+/// Wabbajack authored-files URLs look like:
+///   .../Name.wabbajack_bbe12eee-2a70-4030-8f7a-7d7341150d7b
+///
+/// Keep that upstream revision id in the local cache name while preserving a
+/// `.wabbajack` extension. Otherwise newer revisions of the same modlist title
+/// collide with older cached downloads.
+fn wabbajack_cache_filename_from_url(url: &str) -> String {
+    let segment = url
+        .split(['?', '#'])
+        .next()
+        .and_then(|u| u.rsplit('/').next())
+        .filter(|s| !s.is_empty());
+
+    let Some(segment) = segment else {
+        return "download.wabbajack".into();
+    };
+
+    let decoded = sanitize_cache_filename(&urlencoded_decode(segment));
+    if decoded.is_empty() {
+        return "download.wabbajack".into();
+    }
+
+    if let Some(idx) = decoded.find(".wabbajack_") {
+        let name = &decoded[..idx];
+        let revision = &decoded[idx + ".wabbajack_".len()..];
+        if name.is_empty() || revision.is_empty() {
+            "download.wabbajack".into()
+        } else {
+            format!("{name}_{revision}.wabbajack")
+        }
+    } else if decoded.ends_with(".wabbajack") {
+        decoded
+    } else {
+        format!("{decoded}.wabbajack")
+    }
+}
+
+fn sanitize_cache_filename(filename: &str) -> String {
+    filename
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '\0' => '_',
+            _ => c,
+        })
+        .collect()
 }
 
 /// Simple percent-decoding for URL filenames (e.g. %20 -> space).
@@ -918,4 +1164,38 @@ fn urlencoded_decode(s: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authored_files_cache_filename_keeps_revision_id() {
+        let filename = wabbajack_cache_filename_from_url(
+            "https://authored-files.wabbajack.org/Wasteland%20of%20Depravity.wabbajack_ff25055b-aaad-41c3-a0c0-766fbcfbda1e",
+        );
+
+        assert_eq!(
+            filename,
+            "Wasteland of Depravity_ff25055b-aaad-41c3-a0c0-766fbcfbda1e.wabbajack"
+        );
+    }
+
+    #[test]
+    fn plain_wabbajack_url_cache_filename_is_unchanged() {
+        let filename = wabbajack_cache_filename_from_url(
+            "https://example.invalid/lists/Example%20List.wabbajack?download=1",
+        );
+
+        assert_eq!(filename, "Example List.wabbajack");
+    }
+}
+
+fn human_line(progress_mode: ProgressMode, message: impl AsRef<str>) {
+    if progress_mode.is_machine_readable() {
+        eprintln!("{}", message.as_ref());
+    } else {
+        println!("{}", message.as_ref());
+    }
 }

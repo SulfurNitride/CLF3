@@ -16,6 +16,9 @@ use tracing::info;
 pub struct CollectionUrlInfo {
     pub game: String,
     pub slug: String,
+    /// Optional revision number from `?revision=N` or path suffix
+    /// `/revisions/N`. None → fetch the latest published revision.
+    pub revision: Option<i32>,
 }
 
 /// Parse a Nexus collection URL into game and slug components.
@@ -23,6 +26,8 @@ pub struct CollectionUrlInfo {
 /// Supports URLs like:
 /// - https://www.nexusmods.com/skyrimspecialedition/collections/vith5v
 /// - https://next.nexusmods.com/skyrimspecialedition/collections/vith5v
+/// - https://next.nexusmods.com/skyrimspecialedition/collections/vith5v/revisions/3
+/// - https://...?revision=3
 pub fn parse_collection_url(input: &str) -> Option<CollectionUrlInfo> {
     // Check if it looks like a URL
     if !input.contains("nexusmods.com") && !input.starts_with("http") {
@@ -36,7 +41,25 @@ pub fn parse_collection_url(input: &str) -> Option<CollectionUrlInfo> {
     let game = caps.get(1)?.as_str().to_string();
     let slug = caps.get(2)?.as_str().to_string();
 
-    Some(CollectionUrlInfo { game, slug })
+    // Path suffix `/revisions/N`.
+    let path_rev = Regex::new(r"/revisions/(\d+)")
+        .ok()
+        .and_then(|r| r.captures(input))
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse::<i32>().ok());
+
+    // Query param `?revision=N` or `&revision=N`.
+    let query_rev = Regex::new(r"[?&]revision=(\d+)")
+        .ok()
+        .and_then(|r| r.captures(input))
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse::<i32>().ok());
+
+    Some(CollectionUrlInfo {
+        game,
+        slug,
+        revision: path_rev.or(query_rev),
+    })
 }
 
 /// Check if input looks like a URL (vs a file path)
@@ -100,24 +123,37 @@ pub async fn fetch_collection(
 
     let client = reqwest::Client::new();
 
-    // Step 1: Query GraphQL for collection revision
+    // Step 1: Query GraphQL for collection revision. When the URL pinned a
+    // specific revision, ask for that one; otherwise let Nexus return the
+    // latest published.
     let graphql_url = "https://api.nexusmods.com/v2/graphql";
-    let query = serde_json::json!({
-        "query": r#"
-            query GetCollection($slug: String!) {
-                collectionRevision(slug: $slug) {
-                    revisionNumber
-                    downloadLink
-                    collection {
-                        name
+    let query = if let Some(rev) = url_info.revision {
+        serde_json::json!({
+            "query": r#"
+                query GetCollectionRevision($slug: String!, $revisionNumber: Int!) {
+                    collectionRevision(slug: $slug, revisionNumber: $revisionNumber) {
+                        revisionNumber
+                        downloadLink
+                        collection { name }
                     }
                 }
-            }
-        "#,
-        "variables": {
-            "slug": url_info.slug
-        }
-    });
+            "#,
+            "variables": { "slug": url_info.slug, "revisionNumber": rev }
+        })
+    } else {
+        serde_json::json!({
+            "query": r#"
+                query GetCollection($slug: String!) {
+                    collectionRevision(slug: $slug) {
+                        revisionNumber
+                        downloadLink
+                        collection { name }
+                    }
+                }
+            "#,
+            "variables": { "slug": url_info.slug }
+        })
+    };
 
     let response = client
         .post(graphql_url)
@@ -203,7 +239,7 @@ pub async fn fetch_collection(
 
     let archive_path = collection_dir.join(format!("{}.7z", url_info.slug));
 
-    let archive_response = client
+    let mut archive_response = client
         .get(cdn_url)
         .send()
         .await
@@ -213,15 +249,28 @@ pub async fn fetch_collection(
         bail!("Archive download failed: {}", archive_response.status());
     }
 
-    let bytes = archive_response
-        .bytes()
+    // Stream the archive to disk in chunks so a multi-MB collection doesn't
+    // sit in process RAM until we're done.
+    let mut out = tokio::fs::File::create(&archive_path)
         .await
-        .context("Failed to read archive bytes")?;
+        .with_context(|| format!("Failed to create {}", archive_path.display()))?;
+    let mut total_bytes: u64 = 0;
+    while let Some(chunk) = archive_response
+        .chunk()
+        .await
+        .context("Failed to read archive chunk")?
+    {
+        tokio::io::AsyncWriteExt::write_all(&mut out, &chunk)
+            .await
+            .context("Failed to write archive chunk")?;
+        total_bytes += chunk.len() as u64;
+    }
+    tokio::io::AsyncWriteExt::flush(&mut out)
+        .await
+        .context("Failed to flush archive")?;
+    drop(out);
 
-    std::fs::write(&archive_path, &bytes)
-        .context("Failed to write archive to disk")?;
-
-    info!("  Downloaded {} bytes", bytes.len());
+    info!("  Downloaded {} bytes", total_bytes);
 
     // Step 4: Extract collection.json from the .7z archive
     info!("  Extracting collection.json...");
