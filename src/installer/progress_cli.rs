@@ -19,6 +19,7 @@ pub struct CliReporter {
     mode: ProgressMode,
     mp: MultiProgress,
     overall: Mutex<Option<ProgressBar>>,
+    system_status: ProgressBar,
     active_header: ProgressBar,
     active: Mutex<HashMap<TaskId, TaskSnapshot>>,
     last_snapshot: Mutex<Option<Instant>>,
@@ -28,39 +29,71 @@ pub struct CliReporter {
     /// Fixed pool of reusable bars for concurrent items (downloads, archive extractions).
     pool: Vec<ProgressBar>,
     pool_available: Vec<Mutex<bool>>,
+    /// Per-slot current download speed in bytes/sec (0 when idle or extracting).
+    bar_speeds: Vec<AtomicU64>,
+}
+
+fn idle_slot_style() -> ProgressStyle {
+    ProgressStyle::default_bar()
+        .template("  [{prefix:.dim}]")
+        .unwrap()
+}
+
+fn idle_slot_prefix(index: usize) -> String {
+    format!("{:02} idle    ", index + 1)
 }
 
 impl CliReporter {
     /// Create a new CLI reporter with a bar pool of the given size.
     pub fn new(pool_size: usize, mode: ProgressMode) -> Arc<Self> {
         let mp = MultiProgress::new();
-        let idle_style = ProgressStyle::default_bar().template("").unwrap();
+        let blank_style = ProgressStyle::default_bar().template("").unwrap();
+
+        let system_status = mp.add(ProgressBar::new_spinner());
+        if mode.is_interactive() {
+            system_status.set_style(
+                ProgressStyle::default_spinner()
+                    .template("{msg}")
+                    .unwrap(),
+            );
+            system_status.set_message("System: starting...");
+        } else {
+            system_status.set_style(blank_style.clone());
+        }
 
         let active_header = mp.add(ProgressBar::new_spinner());
-        active_header.set_style(
-            ProgressStyle::default_spinner()
-                .template("{msg}")
-                .unwrap(),
-        );
         if mode.is_interactive() {
-            active_header.set_style(idle_style.clone());
+            active_header.set_style(
+                ProgressStyle::default_spinner()
+                    .template("{msg}")
+                    .unwrap(),
+            );
+            active_header.set_message("Active workers");
         } else {
-            active_header.set_style(idle_style.clone());
+            active_header.set_style(blank_style.clone());
         }
 
         let mut pool = Vec::with_capacity(pool_size);
         let mut pool_available = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
+        let mut bar_speeds = Vec::with_capacity(pool_size);
+        for i in 0..pool_size {
             let bar = mp.add(ProgressBar::new(0));
-            bar.set_style(idle_style.clone());
+            if mode.is_interactive() {
+                bar.set_style(idle_slot_style());
+                bar.set_prefix(idle_slot_prefix(i));
+            } else {
+                bar.set_style(blank_style.clone());
+            }
             pool.push(bar);
             pool_available.push(Mutex::new(true));
+            bar_speeds.push(AtomicU64::new(0));
         }
 
         let reporter = Arc::new(Self {
             mode,
             mp,
             overall: Mutex::new(None),
+            system_status,
             active_header,
             active: Mutex::new(HashMap::new()),
             last_snapshot: Mutex::new(None),
@@ -69,10 +102,14 @@ impl CliReporter {
             next_task_id: AtomicU64::new(1),
             pool,
             pool_available,
+            bar_speeds,
         });
 
         if mode == ProgressMode::Snapshot {
             Self::spawn_snapshot_ticker(&reporter);
+        }
+        if mode.is_interactive() {
+            Self::spawn_system_ticker(&reporter);
         }
 
         reporter
@@ -92,7 +129,6 @@ impl CliReporter {
             let mut guard = available.lock().expect("pool lock");
             if *guard {
                 *guard = false;
-                self.show_active_header();
                 return Some(i);
             }
         }
@@ -100,42 +136,20 @@ impl CliReporter {
     }
 
     fn release_pool_bar(&self, index: usize) {
-        let idle_style = ProgressStyle::default_bar().template("").unwrap();
-        self.pool[index].set_style(idle_style);
-        self.pool[index].set_prefix("");
-        self.pool[index].set_message("");
-        self.pool[index].set_position(0);
-        self.pool[index].set_length(0);
-        self.pool[index].disable_steady_tick();
+        let bar = &self.pool[index];
+        if self.mode.is_interactive() {
+            bar.set_style(idle_slot_style());
+            bar.set_prefix(idle_slot_prefix(index));
+        } else {
+            bar.set_style(ProgressStyle::default_bar().template("").unwrap());
+            bar.set_prefix("");
+        }
+        bar.set_message("");
+        bar.set_position(0);
+        bar.set_length(0);
+        bar.disable_steady_tick();
+        self.bar_speeds[index].store(0, Ordering::Relaxed);
         *self.pool_available[index].lock().expect("pool lock") = true;
-        self.hide_active_header_if_idle();
-    }
-
-    fn show_active_header(&self) {
-        if !self.mode.is_interactive() {
-            return;
-        }
-        self.active_header.set_style(
-            ProgressStyle::default_spinner()
-                .template("{msg}")
-                .unwrap(),
-        );
-        self.active_header.set_message("Active workers");
-    }
-
-    fn hide_active_header_if_idle(&self) {
-        if !self.mode.is_interactive() {
-            return;
-        }
-        let any_busy = self
-            .pool_available
-            .iter()
-            .any(|available| !*available.lock().expect("pool lock"));
-        if !any_busy {
-            self.active_header
-                .set_style(ProgressStyle::default_bar().template("").unwrap());
-            self.active_header.set_message("");
-        }
     }
 
     fn ensure_overall(&self) -> ProgressBar {
@@ -168,6 +182,57 @@ impl CliReporter {
                 break;
             }
             reporter.emit_snapshot();
+        });
+    }
+
+    fn spawn_system_ticker(this: &Arc<Self>) {
+        let reporter = Arc::downgrade(this);
+        let total_mem_bytes = read_total_memory_bytes();
+        std::thread::spawn(move || {
+            let mut prev_disk_write = read_disk_write_bytes();
+            let mut prev_time = Instant::now();
+            let total_mem_label = total_mem_bytes
+                .map(|t| format!(" / {}", format_bytes(t)))
+                .unwrap_or_default();
+            loop {
+                std::thread::sleep(Duration::from_millis(500));
+                let Some(reporter) = reporter.upgrade() else {
+                    break;
+                };
+                if reporter.snapshot_shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let now = Instant::now();
+                let elapsed = now.saturating_duration_since(prev_time).as_secs_f64().max(0.001);
+                prev_time = now;
+
+                let net_bps: u64 = reporter
+                    .bar_speeds
+                    .iter()
+                    .map(|a| a.load(Ordering::Relaxed))
+                    .sum();
+
+                let cur_disk_write = read_disk_write_bytes();
+                let disk_bps = match (cur_disk_write, prev_disk_write) {
+                    (Some(cur), Some(prev)) => {
+                        ((cur.saturating_sub(prev)) as f64 / elapsed) as u64
+                    }
+                    _ => 0,
+                };
+                prev_disk_write = cur_disk_write;
+
+                let rss_bytes = super::current_rss_kb().unwrap_or(0).saturating_mul(1024);
+
+                let msg = format!(
+                    "Net: {:>10}/s   Disk: {:>10}/s   RAM: {}{}",
+                    format_bytes(net_bps),
+                    format_bytes(disk_bps),
+                    format_bytes(rss_bytes),
+                    total_mem_label,
+                );
+                reporter.system_status.set_message(msg);
+            }
         });
     }
 
@@ -530,6 +595,54 @@ impl ProgressReporter for CliReporter {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn read_disk_write_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/io").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("write_bytes:") {
+            return rest.trim().parse::<u64>().ok();
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_disk_write_bytes() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn read_total_memory_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: u64 = rest.trim().split_whitespace().next()?.parse().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_total_memory_bytes() -> Option<u64> {
+    None
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut idx = 0;
+    while value >= 1024.0 && idx < UNITS.len() - 1 {
+        value /= 1024.0;
+        idx += 1;
+    }
+    if idx == 0 {
+        format!("{} {}", bytes, UNITS[0])
+    } else {
+        format!("{:.2} {}", value, UNITS[idx])
+    }
+}
+
 fn task_kind_label(kind: TaskKind) -> &'static str {
     match kind {
         TaskKind::Download => "download",
@@ -687,10 +800,12 @@ impl CliHandle {
 }
 
 impl ProgressHandle for CliHandle {
-    fn set_bytes(&self, downloaded: u64, total: u64, _speed: f64) {
+    fn set_bytes(&self, downloaded: u64, total: u64, speed: f64) {
         let bar = self.bar();
         bar.set_length(total);
         bar.set_position(downloaded);
+        self.reporter().bar_speeds[self.bar_index]
+            .store(speed.max(0.0) as u64, Ordering::Relaxed);
     }
 
     fn set_message(&self, msg: &str) {

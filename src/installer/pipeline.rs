@@ -1020,13 +1020,37 @@ fn extract_prepared_archive(
         archive_progress.set_stage(super::progress::TaskStage::Extracting);
         archive_progress.set_message(&format!("extracting {}", prepared.archive_name));
         let phase_extract_start = std::time::Instant::now();
+
+        // Live extraction counter polled by a side thread so the worker bar
+        // ticks up as files are written instead of jumping from 0 to final.
+        let live_progress = Arc::new(AtomicUsize::new(0));
+        let progress_stop = Arc::new(AtomicBool::new(false));
+        let poll_handle = {
+            let counter = Arc::clone(&live_progress);
+            let stop = Arc::clone(&progress_stop);
+            let bar: Arc<dyn super::progress::ProgressHandle> = Arc::clone(&archive_progress);
+            let total = directive_total;
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let done = counter.load(Ordering::Relaxed).min(total);
+                    bar.set_count(done, total);
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            })
+        };
+
         let result = process_single_archive_fused(
             &prepared.archive_path,
             &prepared.archive_hash,
             &prepared.resolved,
             ctx,
             &prepared.extra_paths,
+            Some(live_progress.as_ref()),
         );
+
+        progress_stop.store(true, Ordering::Relaxed);
+        let _ = poll_handle.join();
+
         let extract_elapsed = phase_extract_start.elapsed();
 
         match result {
@@ -1407,20 +1431,23 @@ pub(crate) fn run_processing_loop(
                         *ds = Some(s);
                     }
                 }
-                let mut bs = bsa_status.lock().expect("bsa_status lock");
-                if bs.is_none() {
-                    let s = reporter.begin_status("BSA");
-                    let total = total_bsa_tracked;
-                    if total > 0 {
-                        s.set_count(0, total);
+                if total_bsa_tracked > 0 {
+                    let mut bs = bsa_status.lock().expect("bsa_status lock");
+                    if bs.is_none() {
+                        let s = reporter.begin_status("BSA");
+                        s.set_count(0, total_bsa_tracked);
+                        *bs = Some(s);
                     }
-                    *bs = Some(s);
                 }
             }
         };
 
-        // Update progress bar for extraction phase
-        reporter.overall_set_total(total_archives as u64);
+        // Don't override the overall bar's total here — the streaming
+        // downloader already owns it (set to the count of archives being
+        // downloaded) and increments it as each archive completes. Setting
+        // a total based on `grouped` would either duplicate that count or
+        // collapse it to 0 when every directive is pre-skipped (the
+        // resume-after-extract case where only BSAs still need building).
         reporter.overall_set_message("Extracting archives...");
 
         // Main processing loop: receive archive events, prepare (DB work) on this thread,
@@ -1517,14 +1544,26 @@ pub(crate) fn run_processing_loop(
                             *count -= 1;
                             active_cvar.notify_one();
                         });
+                    } else {
+                        // No extraction work for this archive (all directives
+                        // pre-skipped), but BSAs may still depend on it. Signal
+                        // completion so BsaReadinessTracker can mark its
+                        // dependent BSAs as ready and start building.
+                        let _ = done_tx.send(hash.clone());
                     }
 
                     archives_processed += 1;
-                    reporter.overall_set_message(&format!(
-                        "Extracting {} ({}/{})",
-                        name, archives_processed, total_archives,
-                    ));
-                    reporter.overall_inc();
+                    if total_archives > 0 {
+                        reporter.overall_set_message(&format!(
+                            "Extracting {} ({}/{})",
+                            name, archives_processed, total_archives,
+                        ));
+                    } else {
+                        reporter.overall_set_message(&format!("Processing {}", name));
+                    }
+                    // Don't `overall_inc` here — the downloader already
+                    // increments the overall bar once per archive in
+                    // `process_archive`. Doing it again here double-counts.
                 }
                 ArchiveEvent::Failed { hash, name, error } => {
                     warn!("Archive download failed: {} ({}): {}", name, hash, error);

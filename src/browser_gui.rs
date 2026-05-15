@@ -245,7 +245,7 @@ impl BrowserApp {
             search: String::new(),
             game_filter: String::new(),
             show_nsfw: false,
-            show_unavailable: false,
+            show_unavailable: true,
             show_installed_only: false,
             installed_game_types,
             installed_game_count,
@@ -704,6 +704,25 @@ impl eframe::App for BrowserApp {
                         );
                     }
 
+                    if let Some(modlist) = &selected_modlist {
+                        if modlist.force_down {
+                            let msg = if modlist.download_url().is_some() {
+                                "Author marked this modlist DOWN. Some sources may \
+                                 fail; install may still succeed if archives are \
+                                 already in your downloads folder."
+                            } else {
+                                "Author marked this modlist DOWN and no download \
+                                 link is published. Use the local .wabbajack \
+                                 button above if you already have the file."
+                            };
+                            ui.label(
+                                egui::RichText::new(msg)
+                                    .size(11.0)
+                                    .color(egui::Color32::from_rgb(220, 140, 50)),
+                            );
+                        }
+                    }
+
                     ui.add_space(4.0);
 
                     ui.horizontal(|ui| {
@@ -967,6 +986,19 @@ impl BrowserApp {
                                         .color(egui::Color32::from_rgb(50, 180, 50)),
                                 );
                             }
+                            if modlist.force_down {
+                                ui.label(
+                                    egui::RichText::new("DOWN")
+                                        .size(11.0)
+                                        .color(egui::Color32::from_rgb(220, 140, 50)),
+                                )
+                                .on_hover_text(
+                                    "Author flagged this list as unavailable. \
+                                     Install may still work if you already have \
+                                     the .wabbajack file or all required archives \
+                                     in your downloads folder.",
+                                );
+                            }
                         });
 
                         // Author | Game.
@@ -1012,7 +1044,7 @@ impl BrowserApp {
 
                             ui.add_space(16.0);
 
-                            if modlist.is_available()
+                            if modlist.download_url().is_some()
                                 && ui
                                     .button(if is_selected {
                                         "Selected"

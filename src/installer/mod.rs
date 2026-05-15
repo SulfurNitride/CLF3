@@ -640,24 +640,40 @@ impl Installer {
             .push(("Inline Files".into(), inline_start.elapsed().as_secs_f64()));
 
         // === Phase 4: DDS Transformations ===
-        let dds_start = Instant::now();
-        self.reporter().phase_start(Phase::DdsTransform);
-        dp.texture_phase()?;
-        trim_allocator_rss("texture phase");
-        log_phase_metrics("DDS Transform", dds_start);
-        stats
-            .phase_durations
-            .push(("DDS Transform".into(), dds_start.elapsed().as_secs_f64()));
+        let dds_needs_work = dp
+            .ctx
+            .prevalidation_stats
+            .get("TransformedTexture")
+            .map(|&(_, needs_work)| needs_work)
+            .unwrap_or(0);
+        if dds_needs_work > 0 {
+            let dds_start = Instant::now();
+            self.reporter().phase_start(Phase::DdsTransform);
+            dp.texture_phase()?;
+            trim_allocator_rss("texture phase");
+            log_phase_metrics("DDS Transform", dds_start);
+            stats
+                .phase_durations
+                .push(("DDS Transform".into(), dds_start.elapsed().as_secs_f64()));
+        }
 
         // === Phase 5: BSA Building ===
-        let bsa_start = Instant::now();
-        self.reporter().phase_start(Phase::BsaBuild);
-        dp.bsa_phase()?;
-        trim_allocator_rss("bsa build phase");
-        log_phase_metrics("BSA Build", bsa_start);
-        stats
-            .phase_durations
-            .push(("BSA Build".into(), bsa_start.elapsed().as_secs_f64()));
+        let bsa_needs_work = dp
+            .ctx
+            .prevalidation_stats
+            .get("CreateBSA")
+            .map(|&(_, needs_work)| needs_work)
+            .unwrap_or(0);
+        if bsa_needs_work > 0 {
+            let bsa_start = Instant::now();
+            self.reporter().phase_start(Phase::BsaBuild);
+            dp.bsa_phase()?;
+            trim_allocator_rss("bsa build phase");
+            log_phase_metrics("BSA Build", bsa_start);
+            stats
+                .phase_durations
+                .push(("BSA Build".into(), bsa_start.elapsed().as_secs_f64()));
+        }
 
         // === Phase 6: Cleanup ===
         let cleanup_start = Instant::now();

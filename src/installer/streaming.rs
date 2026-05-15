@@ -225,6 +225,7 @@ pub(crate) fn process_single_archive_fused(
     directives: &[ArchiveDirective],
     ctx: &ProcessContext,
     extra_needed_paths: &[String],
+    live_progress: Option<&AtomicUsize>,
 ) -> Result<ArchiveResult> {
     const MAX_LOGGED_FAILURES: usize = 100;
 
@@ -271,6 +272,7 @@ pub(crate) fn process_single_archive_fused(
             &from_simple,
             ctx,
             extra_needed_paths,
+            live_progress,
         ) {
             Ok(Some(direct_result)) => {
                 // Success — return with empty staged_files (no finalize needed)
@@ -2144,6 +2146,7 @@ pub(crate) fn process_archive_direct(
     from_simple: &[(i64, &FromArchiveDirective, Option<&str>)],
     ctx: &ProcessContext,
     extra_needed_paths: &[String],
+    live_progress: Option<&AtomicUsize>,
 ) -> Result<Option<DirectExtractResult>> {
     let output_dir = &ctx.config.output_dir;
     let mut skipped_count = 0usize;
@@ -2218,6 +2221,9 @@ pub(crate) fn process_archive_direct(
                 ctx.dir_cache.ensure_parent_dirs(&target.output_path)?;
                 fs::write(&target.output_path, &data)?;
                 extracted_count.fetch_add(1, Ordering::Relaxed);
+                if let Some(p) = live_progress {
+                    p.fetch_add(1, Ordering::Relaxed);
+                }
 
                 // Record patch basis
                 if let Some(ahash) = target.archive_hash_path.first() {
