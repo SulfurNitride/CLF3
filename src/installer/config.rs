@@ -127,6 +127,16 @@ pub struct InstallConfig {
     /// Extraction scheduling strategy. Defaults to `Streaming` so large
     /// modlists overlap CPU extract work with network downloads.
     pub extract_strategy: ExtractStrategy,
+
+    /// Optional gallery `machine_name` for this modlist. When set, the
+    /// installer writes a `.clf3-install.json` manifest and updates the
+    /// settings record on success so `clf3 modlist check` can find it.
+    pub machine_name: Option<String>,
+
+    /// Optional URL the .wabbajack file was originally downloaded from.
+    /// Recorded in the post-install manifest so `clf3 modlist update` can
+    /// fall back to it when the gallery entry has moved.
+    pub wabbajack_url: Option<String>,
 }
 
 impl std::fmt::Debug for InstallConfig {

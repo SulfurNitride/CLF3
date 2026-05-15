@@ -20,7 +20,7 @@ use wgpu::{
 const GPU_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// GPU information for display/selection
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct GpuInfo {
     pub name: String,
     pub backend: String,

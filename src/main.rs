@@ -24,7 +24,7 @@ mod paths;
 mod settings;
 mod textures;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use installer::{
     CliReporter, ExtractStrategy, InstallConfig, Installer, ProgressMode, ProgressReporter,
@@ -164,6 +164,24 @@ enum Commands {
         /// Progress output mode.
         #[arg(long, value_enum, default_value_t = ProgressModeArg::Auto)]
         progress: ProgressModeArg,
+
+        /// Override the modlist gallery `machine_name` recorded with this
+        /// install. Defaults to a lookup against
+        /// `Settings::browser_list_paths` keyed by the output directory.
+        #[arg(long)]
+        machine_name: Option<String>,
+
+        /// Write the final InstallStats (downloads, directives, failures,
+        /// manual-download list) as JSON to this path. Useful for external
+        /// tooling driving CLF3.
+        #[arg(long)]
+        report_json: Option<PathBuf>,
+    },
+
+    /// Modlist update management (check for / apply gallery updates).
+    Modlist {
+        #[command(subcommand)]
+        action: ModlistAction,
     },
 
     /// Set and verify your Nexus Mods API key
@@ -181,7 +199,11 @@ enum Commands {
     },
 
     /// List available GPUs for texture encoding
-    ListGpu,
+    ListGpu {
+        /// Emit the GPU list as JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Select a GPU for texture encoding (use list-gpu to see indices)
     SelectGpu {
@@ -232,6 +254,46 @@ enum FluorineAction {
     Enable {
         /// `true` or `false`. Persisted in settings.
         value: bool,
+    },
+
+    /// Make sure Fluorine is available on disk (downloading the latest
+    /// release if not), and print where it lives. No registration step is
+    /// performed — useful as a "primer" for launcher tooling.
+    Ensure {
+        /// Emit `{"binary": "...", "source": "..."}` as JSON instead of the
+        /// human-readable line.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModlistAction {
+    /// Check installed modlists against the gallery for newer versions.
+    ///
+    /// With no name, scans every install CLF3 knows about. With `--name`,
+    /// reports only that modlist. The name accepts gallery `machine_name`
+    /// values or partial-name queries (resolved like the GUI search bar).
+    Check {
+        /// Only check this modlist. Accepts a full or partial name.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Emit the report as JSON instead of a human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Re-install a modlist against the latest gallery version. Reuses the
+    /// install + downloads directories recorded in `.clf3-install.json`.
+    Update {
+        /// Full or partial modlist name. Partial names use the same
+        /// matching rules as the gallery search bar.
+        name: String,
+
+        /// Skip the version-diff confirmation prompt.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -450,9 +512,11 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::ListGpu => {
+        Commands::ListGpu { json } => {
             let gpus = textures::list_gpus();
-            if gpus.is_empty() {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&gpus)?);
+            } else if gpus.is_empty() {
                 println!("No GPUs detected.");
             } else {
                 println!("Available GPUs:");
@@ -556,81 +620,23 @@ async fn main() -> Result<()> {
             ll_password,
             extract,
             progress: _,
+            machine_name,
+            report_json,
         } => {
-            // If wabbajack_file is a URL, download it first.
-            let wabbajack_file = if wabbajack_file.starts_with("http://")
+            // Remember the original CLI argument as a URL if it was one — it
+            // ends up recorded in `.clf3-install.json` so `modlist update`
+            // can fall back to it later.
+            let original_wabbajack_url = if wabbajack_file.starts_with("http://")
                 || wabbajack_file.starts_with("https://")
             {
-                let cache_dir = dirs::cache_dir()
-                    .unwrap_or_else(|| PathBuf::from("/tmp"))
-                    .join("clf3")
-                    .join("modlists");
-                std::fs::create_dir_all(&cache_dir)?;
+                Some(wabbajack_file.clone())
+            } else {
+                None
+            };
 
-                // Derive filename from URL path or use a default.
-                // Wabbajack authored_files URLs look like:
-                //   .../Name.wabbajack_bbe12eee-2a70-4030-8f7a-7d7341150d7b
-                // Strip the _UUID suffix to get the real filename.
-                let filename = wabbajack_file
-                    .rsplit('/')
-                    .next()
-                    .filter(|s| !s.is_empty())
-                    .map(|s| {
-                        let decoded = urlencoded_decode(s);
-                        // If it contains ".wabbajack_", trim the UUID suffix.
-                        if let Some(idx) = decoded.find(".wabbajack_") {
-                            decoded[..idx + ".wabbajack".len()].to_string()
-                        } else if decoded.ends_with(".wabbajack") {
-                            decoded
-                        } else {
-                            format!("{}.wabbajack", decoded)
-                        }
-                    })
-                    .unwrap_or_else(|| "download.wabbajack".into());
-                let dest = cache_dir.join(&filename);
-
-                // Use cached copy if present and non-empty. The .wabbajack
-                // filename derived above includes the upstream UUID suffix,
-                // so a matching cache entry is the same file.
-                let cached = std::fs::metadata(&dest).ok().filter(|m| m.len() > 0);
-
-                if let Some(meta) = cached {
-                    println!(
-                        "Using cached .wabbajack file: {} ({} MiB)",
-                        dest.display(),
-                        meta.len() / (1024 * 1024)
-                    );
-                } else {
-                    println!("Downloading .wabbajack file from URL...");
-                    let cdn = downloaders::wabbajack_cdn::WabbajackCdnDownloader::new()?;
-                    let pb = indicatif::ProgressBar::new(0);
-                    pb.set_style(
-                        indicatif::ProgressStyle::default_bar()
-                            .template("{msg} [{bar:40}] {bytes}/{total_bytes}")
-                            .expect("valid template")
-                            .progress_chars("=> "),
-                    );
-                    pb.set_message("Downloading");
-
-                    let pb_clone = pb.clone();
-                    cdn.download_with_progress(
-                        &wabbajack_file,
-                        &dest,
-                        0,
-                        move |downloaded, total| {
-                            if pb_clone.length() == Some(0) && total > 0 {
-                                pb_clone.set_length(total);
-                            }
-                            pb_clone.set_position(downloaded);
-                        },
-                    )
-                    .await?;
-                    pb.finish_with_message("Downloaded");
-
-                    println!("Saved to: {}", dest.display());
-                }
-
-                dest
+            // If wabbajack_file is a URL, download it first.
+            let wabbajack_file = if original_wabbajack_url.is_some() {
+                fetch_wabbajack_from_url(&wabbajack_file).await?
             } else {
                 PathBuf::from(&wabbajack_file)
             };
@@ -705,6 +711,16 @@ async fn main() -> Result<()> {
                 Some(PathBuf::from(&settings.patch_cache_dir))
             };
 
+            // Best-effort machine_name resolution. Explicit `--machine-name`
+            // wins. Otherwise fall back to a unique entry in
+            // `Settings::browser_list_paths` whose install_dir matches
+            // `output` — the GUI populates this when the user picks paths
+            // from the gallery, so most "from gallery" installs land here.
+            let resolved_machine_name = machine_name
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| derive_machine_name_from_settings(&settings, &output));
+
             let install_dir_for_fluorine = output.clone();
 
             let config = InstallConfig {
@@ -725,6 +741,8 @@ async fn main() -> Result<()> {
                 loverslab_email: ll_email,
                 loverslab_password: ll_password,
                 extract_strategy: extract.into(),
+                machine_name: resolved_machine_name,
+                wabbajack_url: original_wabbajack_url,
             };
 
             let mut installer = Installer::new(config)?;
@@ -801,6 +819,19 @@ async fn main() -> Result<()> {
                     ));
                 }
             }
+
+            // Optional structured report for external tooling.
+            if let Some(report_path) = report_json {
+                let content = serde_json::to_string_pretty(&stats)
+                    .context("Failed to serialize InstallStats")?;
+                std::fs::write(&report_path, content)
+                    .with_context(|| format!("Failed to write report to {}", report_path.display()))?;
+                reporter.log(&format!("Wrote install report to {}", report_path.display()));
+            }
+        }
+
+        Commands::Modlist { action } => {
+            run_modlist_action(action).await?;
         }
 
         Commands::Info { wabbajack_file } => {
@@ -954,6 +985,363 @@ async fn run_fluorine_action(action: FluorineAction) -> Result<()> {
                 if value { "enabled" } else { "disabled" }
             );
         }
+
+        FluorineAction::Ensure { json } => {
+            let install = ensure_fluorine_available().await?;
+            if json {
+                let payload = serde_json::json!({
+                    "binary": install.binary.display().to_string(),
+                    "source": install.source,
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else {
+                println!(
+                    "Fluorine ready: {} (via {})",
+                    install.binary.display(),
+                    install.source
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Detect Fluorine; if missing, download the latest release. Returns the
+/// resolved install. Unlike `ensure_fluorine_and_register`, this does NOT
+/// touch Fluorine's QSettings file — useful as a "primer" called by external
+/// launchers that just want the binary path.
+async fn ensure_fluorine_available() -> Result<fluorine::FluorineInstall> {
+    let settings = settings::Settings::load();
+    let override_path = if settings.fluorine_path.is_empty() {
+        None
+    } else {
+        Some(settings.fluorine_path.as_str())
+    };
+
+    if let Some(install) = fluorine::detect(override_path) {
+        return Ok(install);
+    }
+    tracing::info!("Fluorine not detected — downloading the latest release");
+    fluorine::download_latest(None).await?;
+    fluorine::detect(override_path)
+        .ok_or_else(|| anyhow::anyhow!("Downloaded Fluorine but could not detect the binary"))
+}
+
+/// Download a .wabbajack file from a URL into the CLF3 cache, returning the
+/// resolved local path. Reuses the existing cache file if present.
+async fn fetch_wabbajack_from_url(url: &str) -> Result<PathBuf> {
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("clf3")
+        .join("modlists");
+    std::fs::create_dir_all(&cache_dir)?;
+
+    // Derive filename from URL path or use a default. Wabbajack authored_files
+    // URLs look like ".../Name.wabbajack_<uuid>" — trim the _UUID suffix.
+    let filename = url
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let decoded = urlencoded_decode(s);
+            if let Some(idx) = decoded.find(".wabbajack_") {
+                decoded[..idx + ".wabbajack".len()].to_string()
+            } else if decoded.ends_with(".wabbajack") {
+                decoded
+            } else {
+                format!("{}.wabbajack", decoded)
+            }
+        })
+        .unwrap_or_else(|| "download.wabbajack".into());
+    let dest = cache_dir.join(&filename);
+
+    let cached = std::fs::metadata(&dest).ok().filter(|m| m.len() > 0);
+    if let Some(meta) = cached {
+        println!(
+            "Using cached .wabbajack file: {} ({} MiB)",
+            dest.display(),
+            meta.len() / (1024 * 1024)
+        );
+    } else {
+        println!("Downloading .wabbajack file from URL...");
+        let cdn = downloaders::wabbajack_cdn::WabbajackCdnDownloader::new()?;
+        let pb = indicatif::ProgressBar::new(0);
+        pb.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("{msg} [{bar:40}] {bytes}/{total_bytes}")
+                .expect("valid template")
+                .progress_chars("=> "),
+        );
+        pb.set_message("Downloading");
+
+        let pb_clone = pb.clone();
+        cdn.download_with_progress(url, &dest, 0, move |downloaded, total| {
+            if pb_clone.length() == Some(0) && total > 0 {
+                pb_clone.set_length(total);
+            }
+            pb_clone.set_position(downloaded);
+        })
+        .await?;
+        pb.finish_with_message("Downloaded");
+
+        println!("Saved to: {}", dest.display());
+    }
+
+    Ok(dest)
+}
+
+/// Best-effort lookup: did the user pick this `output` directory from the
+/// gallery? If exactly one `browser_list_paths` entry has the same
+/// canonicalized install_dir, return its machine_name.
+fn derive_machine_name_from_settings(
+    settings: &settings::Settings,
+    output: &std::path::Path,
+) -> Option<String> {
+    let canonical = output
+        .canonicalize()
+        .unwrap_or_else(|_| output.to_path_buf());
+    let mut matches: Vec<&String> = Vec::new();
+    for (machine_name, paths) in &settings.browser_list_paths {
+        if paths.install_dir.is_empty() {
+            continue;
+        }
+        let candidate = std::path::Path::new(&paths.install_dir);
+        let canon_candidate = candidate
+            .canonicalize()
+            .unwrap_or_else(|_| candidate.to_path_buf());
+        if canon_candidate == canonical {
+            matches.push(machine_name);
+        }
+    }
+    if matches.len() == 1 {
+        Some(matches[0].clone())
+    } else {
+        None
+    }
+}
+
+/// Top-level dispatcher for `clf3 modlist <action>`.
+async fn run_modlist_action(action: ModlistAction) -> Result<()> {
+    match action {
+        ModlistAction::Check { name, json } => run_modlist_check(name, json).await,
+        ModlistAction::Update { name, yes } => run_modlist_update(name, yes).await,
+    }
+}
+
+/// `clf3 modlist check`: report which installs have a newer gallery version.
+async fn run_modlist_check(name: Option<String>, json: bool) -> Result<()> {
+    let settings = settings::Settings::load();
+    let installs = modlist::update::discover_installs(&settings);
+
+    let mut browser = modlist::ModlistBrowser::new()?;
+    browser
+        .fetch_modlists()
+        .await
+        .context("Failed to fetch modlist gallery")?;
+    let gallery = browser.modlists();
+
+    let filtered: Vec<modlist::update::InstallRecord> = match &name {
+        Some(q) => {
+            let machine_name = modlist::update::resolve_query(q, gallery, &installs)?;
+            installs
+                .iter()
+                .filter(|i| i.machine_name == machine_name)
+                .cloned()
+                .collect()
+        }
+        None => installs.clone(),
+    };
+
+    if filtered.is_empty() {
+        if let Some(q) = &name {
+            anyhow::bail!(
+                "No tracked install for '{}'. Try `clf3 install <wabbajack> ...` first.",
+                q
+            );
+        }
+    }
+
+    let reports = modlist::update::build_update_reports(&filtered, gallery);
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&reports)?);
+    } else {
+        print!("{}", modlist::update::format_table(&reports));
+    }
+    Ok(())
+}
+
+/// `clf3 modlist update <name>`: re-install the modlist against the latest
+/// gallery version, reusing the original install and downloads directories.
+async fn run_modlist_update(name: String, yes: bool) -> Result<()> {
+    let settings = settings::Settings::load();
+    let installs = modlist::update::discover_installs(&settings);
+
+    let mut browser = modlist::ModlistBrowser::new()?;
+    browser
+        .fetch_modlists()
+        .await
+        .context("Failed to fetch modlist gallery")?;
+    let gallery = browser.modlists();
+
+    let machine_name = modlist::update::resolve_query(&name, gallery, &installs)?;
+    let record = installs
+        .iter()
+        .find(|r| r.machine_name == machine_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Modlist '{}' resolves to '{}' but is not tracked by CLF3. \
+                 Run `clf3 install` once to register it.",
+                name,
+                machine_name
+            )
+        })?;
+    let metadata = gallery
+        .iter()
+        .find(|m| m.machine_name == machine_name)
+        .ok_or_else(|| anyhow::anyhow!("Modlist '{}' is not in the gallery", machine_name))?;
+
+    let install_dir = record
+        .install_dir
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("No install directory recorded for '{}'", machine_name))?;
+    let downloads_dir = record
+        .downloads_dir
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("No downloads directory recorded for '{}'", machine_name))?;
+
+    if !install_dir.exists() {
+        anyhow::bail!(
+            "Install directory does not exist: {} (was the drive unmounted?)",
+            install_dir.display()
+        );
+    }
+
+    let cmp = modlist::install_manifest::compare_versions(&record.installed_version, &metadata.version);
+    println!(
+        "Modlist:  {} ({})",
+        if metadata.title.is_empty() {
+            machine_name.as_str()
+        } else {
+            metadata.title.as_str()
+        },
+        machine_name
+    );
+    println!(
+        "Installed: {}",
+        if record.installed_version.is_empty() {
+            "<unknown>"
+        } else {
+            record.installed_version.as_str()
+        }
+    );
+    println!("Latest:    {}", metadata.version);
+    println!("Verdict:   {:?}", cmp);
+    println!("Install dir:    {}", install_dir.display());
+    println!("Downloads dir:  {}", downloads_dir.display());
+    println!();
+
+    if matches!(cmp, modlist::VersionCmp::Equal | modlist::VersionCmp::Older) {
+        println!(
+            "Nothing to do — installed version {} is at or ahead of gallery {}.",
+            record.installed_version, metadata.version
+        );
+        if !yes {
+            return Ok(());
+        }
+        println!("(--yes given — re-running anyway.)");
+    }
+
+    if !yes {
+        println!(
+            "Proceed to re-run the installer against {}? Re-run with --yes to skip this prompt.",
+            install_dir.display()
+        );
+        anyhow::bail!("Update aborted (confirmation required — pass --yes to proceed)");
+    }
+
+    let download_url = metadata
+        .download_url()
+        .ok_or_else(|| anyhow::anyhow!("Gallery entry for '{}' has no download URL", machine_name))?
+        .to_string();
+    println!("Fetching latest .wabbajack from {} ...", download_url);
+    let wabbajack_path = fetch_wabbajack_from_url(&download_url).await?;
+
+    // Resolve API keys + game dir like the normal install path.
+    let nexus_key = if settings.nexus_api_key.is_empty() {
+        std::env::var("NEXUS_API_KEY").ok()
+    } else {
+        Some(settings.nexus_api_key.clone())
+    }
+    .ok_or_else(|| {
+        anyhow::anyhow!("Nexus API key required. Set it with: clf3 set-api-key YOUR_KEY")
+    })?;
+
+    let game_dir = match auto_detect_game_dir(&wabbajack_path) {
+        Some((p, store)) => {
+            println!("Auto-detected game directory: {} ({})", p.display(), store);
+            p
+        }
+        None => anyhow::bail!(
+            "Could not auto-detect a game directory with matching files. \
+             Run `clf3 install <wabbajack> ...` directly with --game to override."
+        ),
+    };
+
+    let thread_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
+    let cli_reporter = CliReporter::new(16, ProgressMode::Plain);
+
+    let patch_cache_dir = if settings.patch_cache_dir.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(&settings.patch_cache_dir))
+    };
+
+    let config = InstallConfig {
+        wabbajack_path,
+        output_dir: install_dir.clone(),
+        downloads_dir: downloads_dir.clone(),
+        game_dir,
+        nexus_api_key: nexus_key,
+        max_concurrent_downloads: thread_count,
+        max_install_workers: thread_count,
+        max_parallel_bsa_archives: 1,
+        max_parallel_7z_archives: thread_count,
+        nxm_mode: false,
+        browser: "xdg-open".into(),
+        patch_cache_dir,
+        progress_callback: None,
+        reporter: cli_reporter.clone() as Arc<dyn ProgressReporter>,
+        loverslab_email: settings.loverslab_email.clone(),
+        loverslab_password: settings.loverslab_password.clone(),
+        extract_strategy: installer::ExtractStrategy::Streaming,
+        machine_name: Some(machine_name.clone()),
+        wabbajack_url: Some(download_url),
+    };
+
+    let mut installer = Installer::new(config)?;
+    let stats = installer.run_pipelined().await?;
+
+    let installation_succeeded = stats.archives_manual == 0
+        && stats.archives_failed == 0
+        && stats.directives_failed == 0;
+
+    if installation_succeeded {
+        println!(
+            "\nUpdate complete: '{}' is now at version {}.",
+            machine_name, metadata.version
+        );
+    } else {
+        anyhow::bail!(
+            "Update incomplete ({} manual, {} failed, {} directive failures). \
+             Existing manifest left untouched — re-run after fixing issues.",
+            stats.archives_manual,
+            stats.archives_failed,
+            stats.directives_failed
+        );
     }
     Ok(())
 }

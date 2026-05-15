@@ -7,11 +7,17 @@
 
 pub mod browser;
 mod db;
+pub mod install_manifest;
 mod types;
+pub mod update;
 
 #[allow(unused_imports)] // Used by lib crate (GUI)
 pub use browser::*;
 pub use db::*;
+#[allow(unused_imports)] // Several items are public surface; not all used in the binary.
+pub use install_manifest::{
+    compare_versions, InstallManifest, VersionCmp, CURRENT_SCHEMA_VERSION, MANIFEST_FILENAME,
+};
 pub use types::*;
 
 use anyhow::{Context, Result};

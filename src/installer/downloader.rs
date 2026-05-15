@@ -130,7 +130,7 @@ pub struct DownloadStats {
 }
 
 /// Information about a manual download needed
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ManualDownloadInfo {
     pub name: String,
     pub url: String,
@@ -139,7 +139,7 @@ pub struct ManualDownloadInfo {
 }
 
 /// Information about a failed download
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FailedDownloadInfo {
     pub name: String,
     pub url: String,

@@ -230,7 +230,7 @@ fn trim_allocator_rss(_reason: &str) {
 }
 
 /// Installation statistics
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct InstallStats {
     pub archives_downloaded: usize,
     pub archives_skipped: usize,
@@ -689,8 +689,66 @@ impl Installer {
             self.reporter().log("Installation complete!");
         }
 
+        // Drop a `.clf3-install.json` manifest into the output dir so
+        // `clf3 modlist check` / `clf3 modlist update` can find this install
+        // later. Only do this on clean success — a half-broken install
+        // shouldn't claim to be a tracked install.
+        let install_succeeded = stats.archives_manual == 0
+            && stats.archives_failed == 0
+            && stats.directives_failed == 0;
+        if install_succeeded {
+            if let Err(e) = self.write_post_install_manifest() {
+                warn!("Failed to write install manifest: {:#}", e);
+            }
+        }
+
         log_install_summary(&stats, total_start, &self.config.reporter);
 
         Ok(stats)
+    }
+
+    /// Persist `.clf3-install.json` next to the install + mirror it into
+    /// settings. Pulls the modlist `name` and `installed_version` from the
+    /// state DB metadata populated during import.
+    fn write_post_install_manifest(&self) -> Result<()> {
+        let name = self.db.get_metadata("name")?.unwrap_or_default();
+        let version = self.db.get_metadata("version")?.unwrap_or_default();
+        let machine_name = self.config.machine_name.clone().unwrap_or_default();
+
+        let manifest = crate::modlist::InstallManifest::new(
+            machine_name.clone(),
+            name.clone(),
+            version.clone(),
+            self.config.wabbajack_url.clone(),
+            self.config.downloads_dir.clone(),
+            self.config.output_dir.clone(),
+        );
+        manifest.save_to(&self.config.output_dir)?;
+        info!(
+            "Wrote install manifest: {}",
+            crate::modlist::InstallManifest::path_in(&self.config.output_dir).display()
+        );
+
+        // Settings record is only keyed when we have a machine_name. Without
+        // one we still have the on-disk manifest; the discovery walk reads it
+        // via the browser_list_paths mapping or scans known install dirs.
+        if !machine_name.is_empty() {
+            let mut settings = crate::settings::Settings::load();
+            settings.installed_modlists.insert(
+                machine_name.clone(),
+                crate::settings::InstalledModlistRecord {
+                    name,
+                    installed_version: version,
+                    wabbajack_url: self.config.wabbajack_url.clone(),
+                    installed_at: manifest.installed_at.clone(),
+                    downloads_dir: self.config.downloads_dir.to_string_lossy().to_string(),
+                    install_dir: self.config.output_dir.to_string_lossy().to_string(),
+                },
+            );
+            if let Err(e) = settings.save() {
+                warn!("Failed to persist install record to settings: {:#}", e);
+            }
+        }
+        Ok(())
     }
 }

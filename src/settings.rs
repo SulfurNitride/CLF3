@@ -20,6 +20,36 @@ pub struct BrowserListPaths {
     pub install_dir: String,
 }
 
+/// Mirror of `.clf3-install.json` in settings, keyed by `machine_name`. Lets
+/// `clf3 modlist check` find installs that aren't currently mounted (i.e.
+/// when the install dir is on removable storage or temporarily unavailable).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InstalledModlistRecord {
+    /// Modlist title as taken from the .wabbajack header.
+    #[serde(default)]
+    pub name: String,
+
+    /// Version string the modlist self-reports at install time.
+    #[serde(default)]
+    pub installed_version: String,
+
+    /// Original URL the .wabbajack was downloaded from (None for local-file).
+    #[serde(default)]
+    pub wabbajack_url: Option<String>,
+
+    /// RFC3339 timestamp of when the install finished.
+    #[serde(default)]
+    pub installed_at: String,
+
+    /// Where downloaded archives live — needed to re-run the installer.
+    #[serde(default)]
+    pub downloads_dir: String,
+
+    /// The install directory itself.
+    #[serde(default)]
+    pub install_dir: String,
+}
+
 /// User settings for CLF3
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
@@ -94,6 +124,12 @@ pub struct Settings {
     /// Per-modlist install path choices keyed by machine name.
     #[serde(default)]
     pub browser_list_paths: HashMap<String, BrowserListPaths>,
+
+    /// Records of successful installs keyed by machine_name. Mirrors the
+    /// per-install `.clf3-install.json` so we can find installs whose dir
+    /// isn't currently accessible (e.g. external drive unplugged).
+    #[serde(default)]
+    pub installed_modlists: HashMap<String, InstalledModlistRecord>,
 
     /// When set, finished installs are registered as portable instances in
     /// Fluorine Manager. If Fluorine isn't installed on disk, the integration
@@ -221,6 +257,7 @@ mod tests {
             browser_show_installed_only: false,
             browser_last_selected_modlist: None,
             browser_list_paths: HashMap::new(),
+            installed_modlists: HashMap::new(),
             add_to_fluorine: false,
             fluorine_path: String::new(),
         };
