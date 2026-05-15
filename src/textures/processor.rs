@@ -318,7 +318,11 @@ fn build_bc7_mip_images(
 
             let dynamic = DynamicImage::ImageRgba8(current_image);
             current_image = dynamic
-                .resize_exact(next_width, next_height, image::imageops::FilterType::Lanczos3)
+                .resize_exact(
+                    next_width,
+                    next_height,
+                    image::imageops::FilterType::Lanczos3,
+                )
                 .into_rgba8();
 
             mip_width = next_width;
@@ -459,13 +463,14 @@ fn encode_prepared_bc7_cpu(texture: &PreparedBc7Texture) -> Result<ProcessedText
             .context("CPU BC7 encode failed")?;
         mip_data.push(encoded.data.to_vec());
     }
-    create_bc7_dds_with_mips(mip_data, texture.target_width, texture.target_height)
-        .map(|data| ProcessedTexture {
+    create_bc7_dds_with_mips(mip_data, texture.target_width, texture.target_height).map(|data| {
+        ProcessedTexture {
             data,
             width: texture.target_width,
             height: texture.target_height,
             format: OutputFormat::BC7,
-        })
+        }
+    })
 }
 
 /// Process a DDS texture: decode, resize, re-encode
@@ -682,7 +687,10 @@ fn encode_bc6h_gpu(
     let images = scratch.images();
     let mip_count = images.len() as u32;
 
-    debug!("GPU BC6H encoding {}x{} with {} mip levels", base_width, base_height, mip_count);
+    debug!(
+        "GPU BC6H encoding {}x{} with {} mip levels",
+        base_width, base_height, mip_count
+    );
 
     let mut all_bc6h_data: Vec<Vec<u8>> = Vec::with_capacity(mip_count as usize);
 
@@ -708,7 +716,8 @@ fn encode_bc6h_gpu(
                     let src_idx = ((sy * w + sx) * 8) as usize;
                     let dst_idx = ((y * encode_w + x) * 8) as usize;
                     if src_idx + 8 <= pixel_data.len() {
-                        padded[dst_idx..dst_idx + 8].copy_from_slice(&pixel_data[src_idx..src_idx + 8]);
+                        padded[dst_idx..dst_idx + 8]
+                            .copy_from_slice(&pixel_data[src_idx..src_idx + 8]);
                     }
                 }
             }
@@ -844,7 +853,12 @@ pub fn process_texture_batch(
         let mut used_gpu = false;
         if let Some(encoder_arc) = get_gpu_encoder() {
             // If device was previously lost, try to re-initialize before giving up
-            if encoder_arc.lock().ok().and_then(|g| g.as_ref().map(|e| e.is_device_lost())).unwrap_or(false) {
+            if encoder_arc
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|e| e.is_device_lost()))
+                .unwrap_or(false)
+            {
                 try_reinit_gpu();
             }
             if let Ok(mut guard) = encoder_arc.lock() {
@@ -858,7 +872,10 @@ pub fn process_texture_batch(
             }
         }
         if !used_gpu {
-            warn!("No GPU available, falling back to CPU for {} BC7 textures", bc7_jobs.len());
+            warn!(
+                "No GPU available, falling back to CPU for {} BC7 textures",
+                bc7_jobs.len()
+            );
             let cpu_results = process_batch_cpu(bc7_jobs, &completed);
             results.extend(cpu_results);
         }
@@ -896,10 +913,8 @@ fn process_bc7_batch_gpu(
     let budget = encoder.batch_budget_bytes();
 
     // Phase 1: Prepare all textures on CPU in parallel (decode + resize + generate mips)
-    let prepared: Vec<Result<PreparedBc7Texture>> = jobs
-        .par_iter()
-        .map(prepare_bc7_texture)
-        .collect();
+    let prepared: Vec<Result<PreparedBc7Texture>> =
+        jobs.par_iter().map(prepare_bc7_texture).collect();
 
     // Separate successful preparations from failures
     let mut good: Vec<PreparedBc7Texture> = Vec::new();
@@ -933,7 +948,10 @@ fn process_bc7_batch_gpu(
 
             // If device was lost during this batch, try to re-initialize
             if encoder.is_device_lost() {
-                warn!("GPU device lost during batch, {} textures remain", pending.len() + 1);
+                warn!(
+                    "GPU device lost during batch, {} textures remain",
+                    pending.len() + 1
+                );
                 // CPU fallback for remaining textures (including current one)
                 let cpu_result = encode_prepared_bc7_cpu(&texture);
                 completed.fetch_add(1, Ordering::Relaxed);
@@ -979,7 +997,12 @@ fn flush_gpu_batch(
                 warn!("Failed to queue BC7 mip: {}", e);
             }
         }
-        job_meta.push((texture.id.clone(), texture.target_width, texture.target_height, mip_count));
+        job_meta.push((
+            texture.id.clone(),
+            texture.target_width,
+            texture.target_height,
+            mip_count,
+        ));
     }
 
     match encoder.flush_batch(batch) {
@@ -1002,7 +1025,11 @@ fn flush_gpu_batch(
             }
         }
         Err(e) => {
-            warn!("GPU batch failed: {}, falling back to CPU for {} textures", e, textures.len());
+            warn!(
+                "GPU batch failed: {}, falling back to CPU for {} textures",
+                e,
+                textures.len()
+            );
             // Fall back to CPU encoding for each texture using the prepared mip data
             for texture in textures.iter() {
                 let cpu_result = encode_prepared_bc7_cpu(texture);
@@ -1266,7 +1293,11 @@ mod tests {
             }
 
             // Extract source DDS from RAR archive
-            eprintln!("Extracting {} from {}...", case.label, archive_path.file_name().unwrap().to_string_lossy());
+            eprintln!(
+                "Extracting {} from {}...",
+                case.label,
+                archive_path.file_name().unwrap().to_string_lossy()
+            );
             let extract_start = Instant::now();
 
             let source_data: Vec<u8> = match crate::archive::sevenzip::extract_file_case_insensitive(
@@ -1274,7 +1305,11 @@ mod tests {
                 case.path_in_archive,
             ) {
                 Ok(data) => {
-                    eprintln!("  Extracted {} bytes in {:.1}s", data.len(), extract_start.elapsed().as_secs_f64());
+                    eprintln!(
+                        "  Extracted {} bytes in {:.1}s",
+                        data.len(),
+                        extract_start.elapsed().as_secs_f64()
+                    );
                     data
                 }
                 Err(e) => {
@@ -1292,17 +1327,31 @@ mod tests {
             let current_w = meta.width as u32;
             let current_h = meta.height as u32;
             let decompressed = if meta.format.is_compressed() {
-                scratch.decompress(DXGI_FORMAT::DXGI_FORMAT_R16G16B16A16_FLOAT).unwrap()
+                scratch
+                    .decompress(DXGI_FORMAT::DXGI_FORMAT_R16G16B16A16_FLOAT)
+                    .unwrap()
             } else {
                 scratch
             };
             let resized = if current_w != case.width || current_h != case.height {
-                decompressed.resize(case.width as usize, case.height as usize, TEX_FILTER_FLAGS::TEX_FILTER_DEFAULT).unwrap()
+                decompressed
+                    .resize(
+                        case.width as usize,
+                        case.height as usize,
+                        TEX_FILTER_FLAGS::TEX_FILTER_DEFAULT,
+                    )
+                    .unwrap()
             } else {
                 decompressed
             };
-            let with_mips = resized.generate_mip_maps(TEX_FILTER_FLAGS::TEX_FILTER_DEFAULT, 0).unwrap_or(resized);
-            eprintln!("    Done in {:.2}s, {} mip levels", step1.elapsed().as_secs_f64(), with_mips.images().len());
+            let with_mips = resized
+                .generate_mip_maps(TEX_FILTER_FLAGS::TEX_FILTER_DEFAULT, 0)
+                .unwrap_or(resized);
+            eprintln!(
+                "    Done in {:.2}s, {} mip levels",
+                step1.elapsed().as_secs_f64(),
+                with_mips.images().len()
+            );
 
             // Try GPU encoding directly
             eprintln!("  Step 2: GPU BC6H encoding...");
@@ -1315,7 +1364,11 @@ mod tests {
                         Some(enc) => {
                             match encode_bc6h_gpu(enc, &with_mips, case.width, case.height) {
                                 Ok(dds_data) => {
-                                    eprintln!("    GPU OK: {} bytes in {:.2}s", dds_data.len(), step2.elapsed().as_secs_f64());
+                                    eprintln!(
+                                        "    GPU OK: {} bytes in {:.2}s",
+                                        dds_data.len(),
+                                        step2.elapsed().as_secs_f64()
+                                    );
                                 }
                                 Err(e) => {
                                     eprintln!("    GPU FAIL: {:#}", e);
@@ -1329,6 +1382,10 @@ mod tests {
             }
         }
 
-        eprintln!("\nTotal: {:.2}s for {} BC6H textures", overall_start.elapsed().as_secs_f64(), cases.len());
+        eprintln!(
+            "\nTotal: {:.2}s for {} BC6H textures",
+            overall_start.elapsed().as_secs_f64(),
+            cases.len()
+        );
     }
 }

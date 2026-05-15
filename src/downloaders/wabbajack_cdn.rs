@@ -233,7 +233,10 @@ impl WabbajackCdnDownloader {
                             .write(true)
                             .open(&output_path_clone)
                             .with_context(|| {
-                                format!("Failed to open {} for writing", output_path_clone.display())
+                                format!(
+                                    "Failed to open {} for writing",
+                                    output_path_clone.display()
+                                )
                             })?;
                         file.write_all_at(&bytes_clone, part_offset)?;
                         Ok::<(), anyhow::Error>(())

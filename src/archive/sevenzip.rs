@@ -32,9 +32,9 @@ use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read};
-use std::path::{Path, PathBuf};
-use unicode_normalization::UnicodeNormalization;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use unicode_normalization::UnicodeNormalization;
 
 /// Run a Command and capture output, using spawn() instead of output().
 ///
@@ -53,7 +53,6 @@ fn spawn_output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
 
 /// Windows file attribute flag for reparse points (symlinks, junctions).
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-
 
 /// Archive type detected by magic bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,12 +137,15 @@ pub fn list_archive(archive_path: &Path) -> Result<Vec<ArchiveEntry>> {
     let archive_type = detect_archive_type(archive_path).unwrap_or(ArchiveType::Unknown);
 
     match archive_type {
-        ArchiveType::Zip => list_zip(archive_path)
-            .or_else(|_| list_archive_7z_binary(archive_path)),
-        ArchiveType::SevenZ => list_7z_native(archive_path)
-            .or_else(|_| list_archive_7z_binary(archive_path)),
-        ArchiveType::Rar => list_rar(archive_path)
-            .or_else(|_| list_archive_7z_binary(archive_path)),
+        ArchiveType::Zip => {
+            list_zip(archive_path).or_else(|_| list_archive_7z_binary(archive_path))
+        }
+        ArchiveType::SevenZ => {
+            list_7z_native(archive_path).or_else(|_| list_archive_7z_binary(archive_path))
+        }
+        ArchiveType::Rar => {
+            list_rar(archive_path).or_else(|_| list_archive_7z_binary(archive_path))
+        }
         _ => list_archive_7z_binary(archive_path),
     }
 }
@@ -184,11 +186,7 @@ pub fn extract_file_case_insensitive(archive_path: &Path, file_path: &str) -> Re
 }
 
 /// Extract multiple files from an archive.
-pub fn extract_files(
-    archive_path: &Path,
-    files: &[&str],
-    output_dir: &Path,
-) -> Result<()> {
+pub fn extract_files(archive_path: &Path, files: &[&str], output_dir: &Path) -> Result<()> {
     if files.is_empty() {
         return Ok(());
     }
@@ -240,15 +238,21 @@ pub fn extract_files_case_insensitive(
     }
 
     if !not_found.is_empty() {
-        let archive_name = archive_path.file_name()
-            .unwrap_or_default().to_string_lossy();
+        let archive_name = archive_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
         tracing::warn!(
             "[selective-miss] {} of {} files not found in '{}', extracting {} found. Missing: {:?}",
             not_found.len(),
             files.len(),
             archive_name,
             resolved.len(),
-            if not_found.len() <= 5 { &not_found[..] } else { &not_found[..5] },
+            if not_found.len() <= 5 {
+                &not_found[..]
+            } else {
+                &not_found[..5]
+            },
         );
     }
 
@@ -269,17 +273,21 @@ pub fn extract_all(archive_path: &Path, output_dir: &Path) -> Result<usize> {
     let archive_type = detect_archive_type(archive_path).unwrap_or(ArchiveType::Unknown);
 
     match archive_type {
-        ArchiveType::Zip => extract_zip_all(archive_path, output_dir)
-            .or_else(|e| {
-                tracing::warn!("Native ZIP extraction failed, falling back to 7z binary: {}", e);
-                extract_all_7z_binary(archive_path, output_dir)
-            }),
+        ArchiveType::Zip => extract_zip_all(archive_path, output_dir).or_else(|e| {
+            tracing::warn!(
+                "Native ZIP extraction failed, falling back to 7z binary: {}",
+                e
+            );
+            extract_all_7z_binary(archive_path, output_dir)
+        }),
         ArchiveType::SevenZ => extract_all_7z_binary(archive_path, output_dir),
-        ArchiveType::Rar => extract_rar_all(archive_path, output_dir)
-            .or_else(|e| {
-                tracing::warn!("Native RAR extraction failed, falling back to 7z binary: {}", e);
-                extract_all_7z_binary(archive_path, output_dir)
-            }),
+        ArchiveType::Rar => extract_rar_all(archive_path, output_dir).or_else(|e| {
+            tracing::warn!(
+                "Native RAR extraction failed, falling back to 7z binary: {}",
+                e
+            );
+            extract_all_7z_binary(archive_path, output_dir)
+        }),
         _ => extract_all_7z_binary(archive_path, output_dir),
     }
 }
@@ -344,7 +352,6 @@ fn extract_zip_callback<F>(
 where
     F: Fn(&str, Vec<u8>) -> Result<()> + Send + Sync,
 {
-
     let file = File::open(archive_path)?;
     let reader = BufReader::new(file);
     let mut archive = zip::ZipArchive::new(reader)?;
@@ -401,15 +408,13 @@ where
         let entry_path = normalize_path(&original_name);
 
         if header.entry().is_file() && wanted.contains(&entry_path) {
-            let (data, next) = header
-                .read()
-                .map_err(|e| {
-                    if e.code == unrar::error::Code::EReference {
-                        anyhow::anyhow!("RAR5 reference record - callback unavailable")
-                    } else {
-                        anyhow::anyhow!("RAR read error: {:?}", e)
-                    }
-                })?;
+            let (data, next) = header.read().map_err(|e| {
+                if e.code == unrar::error::Code::EReference {
+                    anyhow::anyhow!("RAR5 reference record - callback unavailable")
+                } else {
+                    anyhow::anyhow!("RAR read error: {:?}", e)
+                }
+            })?;
             callback(&original_name, data)?;
             count += 1;
             archive = next;
@@ -753,16 +758,14 @@ fn extract_rar_files(archive_path: &Path, files: &[&str], output_dir: &Path) -> 
         let entry_path = normalize_path(&header.entry().filename.to_string_lossy());
 
         if header.entry().is_file() && target_set.contains(&entry_path) {
-            archive = header
-                .extract_with_base(output_dir)
-                .map_err(|e| {
-                    // Check for RAR5 reference record errors
-                    if e.code == unrar::error::Code::EReference {
-                        anyhow::anyhow!("RAR5 reference record - falling back to 7z binary")
-                    } else {
-                        anyhow::anyhow!("RAR extract error: {:?}", e)
-                    }
-                })?;
+            archive = header.extract_with_base(output_dir).map_err(|e| {
+                // Check for RAR5 reference record errors
+                if e.code == unrar::error::Code::EReference {
+                    anyhow::anyhow!("RAR5 reference record - falling back to 7z binary")
+                } else {
+                    anyhow::anyhow!("RAR extract error: {:?}", e)
+                }
+            })?;
         } else {
             archive = header
                 .skip()
@@ -788,17 +791,27 @@ fn extract_rar_all(archive_path: &Path, output_dir: &Path) -> Result<usize> {
         .map_err(|e| anyhow::anyhow!("RAR read_header error: {:?}", e))?
     {
         if header.entry().is_file() {
-            archive = header
-                .extract_with_base(output_dir)
-                .map_err(|e| {
-                    if e.code == unrar::error::Code::EReference {
-                        anyhow::anyhow!("RAR5 reference record - falling back to 7z binary")
-                    } else {
-                        anyhow::anyhow!("RAR extract error: {:?}", e)
-                    }
-                })?;
+            archive = header.extract_with_base(output_dir).map_err(|e| {
+                if e.code == unrar::error::Code::EReference {
+                    anyhow::anyhow!("RAR5 reference record - falling back to 7z binary")
+                } else {
+                    anyhow::anyhow!("RAR extract error: {:?}", e)
+                }
+            })?;
             count += 1;
         } else {
+            let entry_path = Path::new(&header.entry().filename);
+            if entry_path
+                .components()
+                .all(|c| matches!(c, Component::Normal(_)))
+            {
+                fs::create_dir_all(output_dir.join(entry_path)).with_context(|| {
+                    format!(
+                        "Failed to create RAR directory {}",
+                        output_dir.join(entry_path).display()
+                    )
+                })?;
+            }
             archive = header
                 .skip()
                 .map_err(|e| anyhow::anyhow!("RAR skip error: {:?}", e))?;
@@ -897,19 +910,19 @@ fn extract_file_7z_binary(archive_path: &Path, file_path: &str) -> Result<Vec<u8
 }
 
 /// Extract specific files using 7z binary.
-fn extract_files_7z_binary(
-    archive_path: &Path,
-    files: &[&str],
-    output_dir: &Path,
-) -> Result<()> {
+fn extract_files_7z_binary(archive_path: &Path, files: &[&str], output_dir: &Path) -> Result<()> {
     if files.is_empty() {
         return Ok(());
     }
 
-    let archive_size_mb = fs::metadata(archive_path).map(|m| m.len() / (1024 * 1024)).unwrap_or(0);
+    let archive_size_mb = fs::metadata(archive_path)
+        .map(|m| m.len() / (1024 * 1024))
+        .unwrap_or(0);
     tracing::info!(
         "[7z-selective] {} ({} MB, {} files)",
-        archive_path.display(), archive_size_mb, files.len()
+        archive_path.display(),
+        archive_size_mb,
+        files.len()
     );
 
     let sz_path = get_7z_path()?;
@@ -939,7 +952,11 @@ fn extract_files_7z_binary(
 
         if !reparse_paths.is_empty() {
             let mut retry = Command::new(&sz_path);
-            retry.arg("x").arg("-y").arg("-aoa").arg("-scsUTF-8")
+            retry
+                .arg("x")
+                .arg("-y")
+                .arg("-aoa")
+                .arg("-scsUTF-8")
                 .arg("-mmt=1")
                 .arg(format!("-o{}", output_dir.display()));
 
@@ -984,23 +1001,26 @@ fn extract_files_7z_binary(
 }
 
 /// Extract all files using 7z binary.
-fn extract_all_7z_binary(
-    archive_path: &Path,
-    output_dir: &Path,
-) -> Result<usize> {
+fn extract_all_7z_binary(archive_path: &Path, output_dir: &Path) -> Result<usize> {
     let sz_path = get_7z_path()?;
     fs::create_dir_all(output_dir)?;
 
-    let archive_size_mb = fs::metadata(archive_path).map(|m| m.len() / (1024 * 1024)).unwrap_or(0);
+    let archive_size_mb = fs::metadata(archive_path)
+        .map(|m| m.len() / (1024 * 1024))
+        .unwrap_or(0);
     tracing::info!(
         "[7z-full] {} ({} MB)",
-        archive_path.display(), archive_size_mb
+        archive_path.display(),
+        archive_size_mb
     );
 
     let mmt_arg = "-mmt=1";
 
     let mut cmd = Command::new(&sz_path);
-    cmd.arg("x").arg("-y").arg("-aoa").arg("-scsUTF-8")
+    cmd.arg("x")
+        .arg("-y")
+        .arg("-aoa")
+        .arg("-scsUTF-8")
         .arg(mmt_arg);
 
     cmd.arg(format!("-o{}", output_dir.display()))
@@ -1016,7 +1036,11 @@ fn extract_all_7z_binary(
 
         if !reparse_paths.is_empty() {
             let mut retry = Command::new(&sz_path);
-            retry.arg("x").arg("-y").arg("-aoa").arg("-scsUTF-8")
+            retry
+                .arg("x")
+                .arg("-y")
+                .arg("-aoa")
+                .arg("-scsUTF-8")
                 .arg(mmt_arg);
 
             retry.arg(format!("-o{}", output_dir.display()));
@@ -1220,7 +1244,12 @@ fn list_archive_innoextract(archive_path: &Path) -> Result<Vec<ArchiveEntry>> {
             .arg("rename-all")
             .arg(archive_path),
     )
-    .with_context(|| format!("Failed to run innoextract list on {}", archive_path.display()))?;
+    .with_context(|| {
+        format!(
+            "Failed to run innoextract list on {}",
+            archive_path.display()
+        )
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1249,7 +1278,11 @@ fn extract_all_innoextract(archive_path: &Path, output_dir: &Path) -> Result<usi
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("innoextract extract failed for {}: {}", archive_path.display(), stderr);
+        bail!(
+            "innoextract extract failed for {}: {}",
+            archive_path.display(),
+            stderr
+        );
     }
 
     let count = walkdir::WalkDir::new(output_dir)
@@ -1597,7 +1630,10 @@ Listing "Example"
 
         let count = extract_all(&zip_path, &output_dir)?;
         assert_eq!(count, 1);
-        assert_eq!(fs::read_to_string(output_dir.join("hello.txt"))?, "dispatch test");
+        assert_eq!(
+            fs::read_to_string(output_dir.join("hello.txt"))?,
+            "dispatch test"
+        );
 
         Ok(())
     }

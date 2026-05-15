@@ -13,6 +13,7 @@ mod archive;
 mod browser_gui;
 mod bsa;
 mod downloaders;
+mod fluorine;
 mod game_finder;
 mod hash;
 mod installer;
@@ -25,7 +26,9 @@ mod textures;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use installer::{CliReporter, ExtractStrategy, InstallConfig, Installer, ProgressReporter};
+use installer::{
+    CliReporter, ExtractStrategy, InstallConfig, Installer, ProgressMode, ProgressReporter,
+};
 
 /// CLI-facing enum for the `--extract` flag. Maps to the internal
 /// `installer::ExtractStrategy` used by the install pipeline.
@@ -45,6 +48,28 @@ impl From<ExtractStrategyArg> for ExtractStrategy {
         }
     }
 }
+
+/// CLI-facing progress rendering mode.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum ProgressModeArg {
+    /// Use full progress on terminals and plain lines otherwise.
+    Auto,
+    /// Interactive progress with system status and active worker slots.
+    Full,
+    /// Line-oriented human-readable progress.
+    Plain,
+}
+
+impl From<ProgressModeArg> for ProgressMode {
+    fn from(arg: ProgressModeArg) -> Self {
+        match arg {
+            ProgressModeArg::Auto => ProgressMode::Auto,
+            ProgressModeArg::Full => ProgressMode::Full,
+            ProgressModeArg::Plain => ProgressMode::Plain,
+        }
+    }
+}
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
@@ -57,8 +82,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
     about = "Wabbajack modlist installer - burns through modlists like CLF3 burns through concrete"
 )]
 struct Cli {
+    /// When omitted (e.g. double-click from a file manager), the browser
+    /// GUI opens. Pass `clf3 help` to see all subcommands.
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 
     /// Enable verbose logging (use RUST_LOG=debug for more detail)
     #[arg(short, long, global = true)]
@@ -133,6 +160,10 @@ enum Commands {
         ///   short and CPU-heavy work (DDS, BSA) dominates.
         #[arg(long, value_enum, default_value_t = ExtractStrategyArg::Streaming)]
         extract: ExtractStrategyArg,
+
+        /// Progress output mode.
+        #[arg(long, value_enum, default_value_t = ProgressModeArg::Auto)]
+        progress: ProgressModeArg,
     },
 
     /// Set and verify your Nexus Mods API key
@@ -165,6 +196,42 @@ enum Commands {
     Info {
         /// Path to the .wabbajack file
         wabbajack_file: PathBuf,
+    },
+
+    /// Fluorine Manager integration (auto-register finished installs).
+    Fluorine {
+        #[command(subcommand)]
+        action: FluorineAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum FluorineAction {
+    /// Show whether Fluorine is detected and where.
+    Status,
+
+    /// Download the latest Fluorine release and extract it to
+    /// ~/.local/share/fluorine-manager (or `--dest` if given).
+    Install {
+        /// Override the install destination directory.
+        #[arg(long)]
+        dest: Option<PathBuf>,
+    },
+
+    /// Register an existing install directory as a Fluorine portable instance.
+    Register {
+        /// Path to the modlist install directory (must contain ModOrganizer.ini).
+        install_dir: PathBuf,
+
+        /// Also set this as the current instance Fluorine opens by default.
+        #[arg(long)]
+        make_current: bool,
+    },
+
+    /// Toggle whether successful installs are auto-registered with Fluorine.
+    Enable {
+        /// `true` or `false`. Persisted in settings.
+        value: bool,
     },
 }
 
@@ -200,9 +267,30 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .with_filter(file_filter);
 
+    // Default to opening the browser when invoked with no subcommand — makes
+    // double-click from a desktop / file manager Just Work.
+    let command = cli.command.unwrap_or(Commands::Browser);
+
+    let requested_progress_mode = match &command {
+        Commands::Install { progress, .. } => (*progress).into(),
+        // Other commands (Browser, SetApiKey, ListGpu, Config, Info, Fluorine…)
+        // never spawn the worker pool — keep the CLI reporter silent so the
+        // "System: starting…" / "Workers" UI doesn't render on top of them.
+        _ => ProgressMode::Plain,
+    };
+    let progress_mode = match requested_progress_mode {
+        ProgressMode::Auto
+            if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() =>
+        {
+            ProgressMode::Full
+        }
+        ProgressMode::Auto => ProgressMode::Plain,
+        mode => mode,
+    };
+
     // Create CLI reporter for progress bars — must exist before tracing init
     // so its writer factory can route tracing output through MultiProgress.
-    let cli_reporter = CliReporter::new(16);
+    let cli_reporter = CliReporter::new(16, progress_mode);
 
     // Console layer — routes through CliReporter's MultiProgress
     let console_layer = tracing_subscriber::fmt::layer()
@@ -222,7 +310,9 @@ async fn main() -> Result<()> {
     std::panic::set_hook(Box::new(move |info| {
         let thread = std::thread::current();
         let thread_name = thread.name().unwrap_or("<unnamed>");
-        let location = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "unknown".into());
         let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
             s.to_string()
@@ -233,10 +323,17 @@ async fn main() -> Result<()> {
         };
         let msg = format!(
             "PANIC on thread '{}' at {}:\n  {}\n  backtrace: {:?}",
-            thread_name, location, payload, std::backtrace::Backtrace::force_capture()
+            thread_name,
+            location,
+            payload,
+            std::backtrace::Backtrace::force_capture()
         );
         tracing::error!("{}", msg);
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&panic_log) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&panic_log)
+        {
             use std::io::Write;
             let _ = writeln!(f, "\n[PANIC] {}", msg);
         }
@@ -252,8 +349,14 @@ async fn main() -> Result<()> {
             static HUP: AtomicBool = AtomicBool::new(false);
 
             unsafe {
-                libc::signal(libc::SIGTERM, sigterm_handler as *const () as libc::sighandler_t);
-                libc::signal(libc::SIGHUP, sighup_handler as *const () as libc::sighandler_t);
+                libc::signal(
+                    libc::SIGTERM,
+                    sigterm_handler as *const () as libc::sighandler_t,
+                );
+                libc::signal(
+                    libc::SIGHUP,
+                    sighup_handler as *const () as libc::sighandler_t,
+                );
             }
 
             extern "C" fn sigterm_handler(_: libc::c_int) {
@@ -272,7 +375,11 @@ async fn main() -> Result<()> {
                         rss / 1024
                     );
                     tracing::error!("{}", msg);
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&signal_log) {
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&signal_log)
+                    {
                         use std::io::Write;
                         let _ = writeln!(f, "\n[SIGNAL] {}", msg);
                     }
@@ -282,7 +389,11 @@ async fn main() -> Result<()> {
                 if HUP.load(Ordering::SeqCst) {
                     let msg = "Received SIGHUP — terminal closed or session ended";
                     tracing::error!("{}", msg);
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&signal_log) {
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&signal_log)
+                    {
                         use std::io::Write;
                         let _ = writeln!(f, "\n[SIGNAL] {}", msg);
                     }
@@ -293,7 +404,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    match cli.command {
+    match command {
         Commands::Browser => {
             if let Err(e) = browser_gui::launch_browser() {
                 eprintln!("Browser GUI error: {}", e);
@@ -368,17 +479,29 @@ async fn main() -> Result<()> {
                 println!("GPU selection set to: auto (recommended)");
             } else {
                 let idx: usize = index.parse().map_err(|_| {
-                    anyhow::anyhow!("Invalid GPU index '{}'. Use a number from list-gpu or 'auto'.", index)
+                    anyhow::anyhow!(
+                        "Invalid GPU index '{}'. Use a number from list-gpu or 'auto'.",
+                        index
+                    )
                 })?;
                 let gpus = textures::list_gpus();
-                let gpu = gpus.iter().find(|g| g.adapter_index == idx).ok_or_else(|| {
-                    anyhow::anyhow!("GPU index {} not found. Run 'clf3 list-gpu' to see available GPUs.", idx)
-                })?;
+                let gpu = gpus
+                    .iter()
+                    .find(|g| g.adapter_index == idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "GPU index {} not found. Run 'clf3 list-gpu' to see available GPUs.",
+                            idx
+                        )
+                    })?;
                 let mut settings = settings::Settings::load();
                 settings.gpu_index = Some(idx);
                 settings.gpu_name = gpu.name.clone();
                 settings.save()?;
-                println!("GPU selected: [{}] {} ({}, {})", idx, gpu.name, gpu.backend, gpu.device_type);
+                println!(
+                    "GPU selected: [{}] {} ({}, {})",
+                    idx, gpu.name, gpu.backend, gpu.device_type
+                );
             }
         }
 
@@ -389,12 +512,29 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "unknown".into());
             println!("Settings file: {}", path);
             println!();
-            println!("Nexus API key:    {}", if settings.nexus_api_key.is_empty() { "(not set)" } else { "(set)" });
-            println!("LoversLab login:  {}", if settings.loverslab_email.is_empty() { "(not set)" } else { settings.loverslab_email.as_str() });
-            println!("GPU:              {}", match settings.gpu_index {
-                Some(idx) => format!("[{}] {}", idx, settings.gpu_name),
-                None => "auto".into(),
-            });
+            println!(
+                "Nexus API key:    {}",
+                if settings.nexus_api_key.is_empty() {
+                    "(not set)"
+                } else {
+                    "(set)"
+                }
+            );
+            println!(
+                "LoversLab login:  {}",
+                if settings.loverslab_email.is_empty() {
+                    "(not set)"
+                } else {
+                    settings.loverslab_email.as_str()
+                }
+            );
+            println!(
+                "GPU:              {}",
+                match settings.gpu_index {
+                    Some(idx) => format!("[{}] {}", idx, settings.gpu_name),
+                    None => "auto".into(),
+                }
+            );
             if !settings.patch_cache_dir.is_empty() {
                 println!("Patch cache:      {}", settings.patch_cache_dir);
             }
@@ -415,6 +555,7 @@ async fn main() -> Result<()> {
             ll_email,
             ll_password,
             extract,
+            progress: _,
         } => {
             // If wabbajack_file is a URL, download it first.
             let wabbajack_file = if wabbajack_file.starts_with("http://")
@@ -451,9 +592,7 @@ async fn main() -> Result<()> {
                 // Use cached copy if present and non-empty. The .wabbajack
                 // filename derived above includes the upstream UUID suffix,
                 // so a matching cache entry is the same file.
-                let cached = std::fs::metadata(&dest)
-                    .ok()
-                    .filter(|m| m.len() > 0);
+                let cached = std::fs::metadata(&dest).ok().filter(|m| m.len() > 0);
 
                 if let Some(meta) = cached {
                     println!(
@@ -501,12 +640,17 @@ async fn main() -> Result<()> {
             // Resolve API key: CLI arg > env var > saved settings
             let nexus_key = nexus_key
                 .or_else(|| {
-                    if settings.nexus_api_key.is_empty() { None }
-                    else { Some(settings.nexus_api_key.clone()) }
+                    if settings.nexus_api_key.is_empty() {
+                        None
+                    } else {
+                        Some(settings.nexus_api_key.clone())
+                    }
                 })
-                .ok_or_else(|| anyhow::anyhow!(
-                    "Nexus API key required. Set it with: clf3 set-api-key YOUR_KEY"
-                ))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Nexus API key required. Set it with: clf3 set-api-key YOUR_KEY"
+                    )
+                })?;
 
             // Resolve LL credentials: CLI arg > env var > saved settings
             let ll_email = ll_email.unwrap_or_else(|| settings.loverslab_email.clone());
@@ -521,11 +665,7 @@ async fn main() -> Result<()> {
                     // modlist's expected hashes (Steam first, then Heroic/GOG).
                     match auto_detect_game_dir(&wabbajack_file) {
                         Some((p, store)) => {
-                            println!(
-                                "Auto-detected game directory: {} ({})",
-                                p.display(),
-                                store
-                            );
+                            println!("Auto-detected game directory: {} ({})", p.display(), store);
                             p
                         }
                         None => {
@@ -564,6 +704,8 @@ async fn main() -> Result<()> {
             } else {
                 Some(PathBuf::from(&settings.patch_cache_dir))
             };
+
+            let install_dir_for_fluorine = output.clone();
 
             let config = InstallConfig {
                 wabbajack_path: wabbajack_file,
@@ -635,12 +777,29 @@ async fn main() -> Result<()> {
                 }
             }
 
+            let installation_succeeded = stats.archives_manual == 0
+                && stats.archives_failed == 0
+                && stats.directives_failed == 0;
+
             if stats.archives_manual > 0 || stats.archives_failed > 0 {
                 reporter.log("\nSome archives need manual download. Fix issues and run again.");
             } else if stats.directives_failed > 0 {
                 reporter.log("\nSome directives failed. Check the log file for details.");
             } else {
                 reporter.log("\nInstallation complete!");
+            }
+
+            // Fluorine auto-registration. Only runs on a clean install so we
+            // don't add half-broken instances to the user's Fluorine sidebar.
+            if installation_succeeded && settings.add_to_fluorine {
+                if let Err(e) = ensure_fluorine_and_register(&settings, &install_dir_for_fluorine).await {
+                    reporter.log(&format!("\nFluorine integration failed: {}", e));
+                } else {
+                    reporter.log(&format!(
+                        "\nRegistered '{}' as a Fluorine portable instance.",
+                        install_dir_for_fluorine.display()
+                    ));
+                }
             }
         }
 
@@ -697,8 +856,105 @@ async fn main() -> Result<()> {
                 println!("{:>8}  {}", count, source);
             }
         }
+
+        Commands::Fluorine { action } => {
+            run_fluorine_action(action).await?;
+        }
     }
 
+    Ok(())
+}
+
+/// Make sure a Fluorine install is available, downloading the latest release
+/// if not, then register `install_dir` as a portable instance.
+async fn ensure_fluorine_and_register(
+    settings: &settings::Settings,
+    install_dir: &std::path::Path,
+) -> Result<()> {
+    let override_path = if settings.fluorine_path.is_empty() {
+        None
+    } else {
+        Some(settings.fluorine_path.as_str())
+    };
+
+    if fluorine::detect(override_path).is_none() {
+        tracing::info!("Fluorine not detected — downloading the latest release");
+        fluorine::download_latest(None).await?;
+    }
+
+    fluorine::register_portable_instance(install_dir, false)?;
+    Ok(())
+}
+
+async fn run_fluorine_action(action: FluorineAction) -> Result<()> {
+    match action {
+        FluorineAction::Status => {
+            let settings = settings::Settings::load();
+            let override_path = if settings.fluorine_path.is_empty() {
+                None
+            } else {
+                Some(settings.fluorine_path.as_str())
+            };
+
+            println!(
+                "Auto-register installs: {}",
+                if settings.add_to_fluorine {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            match fluorine::detect(override_path) {
+                Some(install) => println!(
+                    "Detected:               {} (via {})",
+                    install.binary.display(),
+                    install.source
+                ),
+                None => println!(
+                    "Detected:               (none — run `clf3 fluorine install` to fetch \
+                     the latest release)"
+                ),
+            }
+        }
+
+        FluorineAction::Install { dest } => {
+            println!("Downloading latest Fluorine release...");
+            let path = fluorine::download_latest(dest).await?;
+            println!("Installed Fluorine to: {}", path.display());
+        }
+
+        FluorineAction::Register {
+            install_dir,
+            make_current,
+        } => {
+            if !install_dir.exists() {
+                anyhow::bail!("Install directory does not exist: {}", install_dir.display());
+            }
+            let ini = install_dir.join("ModOrganizer.ini");
+            if !ini.exists() {
+                eprintln!(
+                    "Warning: {} has no ModOrganizer.ini — Fluorine may not show it",
+                    install_dir.display()
+                );
+            }
+            fluorine::register_portable_instance(&install_dir, make_current)?;
+            println!(
+                "Registered {} as a Fluorine portable instance{}",
+                install_dir.display(),
+                if make_current { " (current)" } else { "" }
+            );
+        }
+
+        FluorineAction::Enable { value } => {
+            let mut settings = settings::Settings::load();
+            settings.add_to_fluorine = value;
+            settings.save()?;
+            println!(
+                "Fluorine auto-register: {}",
+                if value { "enabled" } else { "disabled" }
+            );
+        }
+    }
     Ok(())
 }
 

@@ -17,8 +17,8 @@ use super::config::{InstallConfig, ProgressEvent};
 use super::progress::{ProgressHandle, ProgressReporter};
 
 use anyhow::{bail, Context, Result};
-use rayon::prelude::*;
 use futures::stream::{self, StreamExt};
+use rayon::prelude::*;
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
@@ -31,9 +31,14 @@ use tracing::{debug, info, warn};
 
 /// Build set of BSA temp_ids whose output already has a valid sidecar.
 /// Used to skip downloading archives only needed for BSAs that are already built.
-fn build_valid_bsa_set(db: &ModlistDb, config: &InstallConfig) -> std::collections::HashSet<String> {
+fn build_valid_bsa_set(
+    db: &ModlistDb,
+    config: &InstallConfig,
+) -> std::collections::HashSet<String> {
     let mut valid = std::collections::HashSet::new();
-    let bsa_directives = db.get_all_pending_directives_of_type("CreateBSA").unwrap_or_default();
+    let bsa_directives = db
+        .get_all_pending_directives_of_type("CreateBSA")
+        .unwrap_or_default();
     for (_id, json) in bsa_directives {
         if let Ok(crate::modlist::Directive::CreateBSA(d)) = serde_json::from_str(&json) {
             let output_path = crate::paths::join_windows_path(&config.output_dir, &d.to);
@@ -205,7 +210,10 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
     // Smart check: scan output directory to find what's missing
     reporter.log("Scanning output directory for existing files...");
     let existing_outputs = scan_existing_outputs(&config.output_dir)?;
-    reporter.log(&format!("Found {} existing output files", existing_outputs.len()));
+    reporter.log(&format!(
+        "Found {} existing output files",
+        existing_outputs.len()
+    ));
 
     // Build set of BSA temp_ids whose output is already valid (sidecar matches).
     // Directives writing into TEMP_BSA_FILES/{temp_id} can be skipped.
@@ -320,6 +328,9 @@ Copied files with different names will not be reused. Examples: {}",
         reporter.log(&format!("Verifying {} existing archives...", verify_total));
         reporter.overall_set_total(verify_total as u64);
         reporter.overall_set_message("Verifying archives...");
+        let verify_status = reporter.begin_status("Verify");
+        verify_status.set_count(0, verify_total);
+        let verify_counter = AtomicUsize::new(0);
 
         // Kick off readahead on all archives — tells the kernel to start loading
         // files into the page cache in the background. By the time the hash loop
@@ -345,9 +356,12 @@ Copied files with different names will not be reused. Examples: {}",
                 reporter.overall_set_message(&format!("Verifying {}...", truncate_name(&name, 40)));
                 let result = verify_file_hash_detailed(output_path, &archive.hash);
                 reporter.overall_inc();
+                let done = verify_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                verify_status.set_count(done, verify_total);
                 result
             })
             .collect();
+        verify_status.finish();
 
         // Process results sequentially (DB writes, file deletes, bookkeeping)
         for ((archive, output_path), result) in
@@ -361,17 +375,18 @@ Copied files with different names will not be reused. Examples: {}",
                         output_path.to_string_lossy().as_ref(),
                     )?;
                     if let Err(e) = super::sidecar::write_archive_hash(output_path, &archive.hash) {
-                        tracing::debug!("Failed to write archive sidecar for {}: {}", output_path.display(), e);
+                        tracing::debug!(
+                            "Failed to write archive sidecar for {}: {}",
+                            output_path.display(),
+                            e
+                        );
                     }
                     already_downloaded += 1;
                     already_downloaded_size += archive.size as u64;
                 }
                 Ok((false, actual_hash)) => {
                     // Hash mismatch - corrupted, delete and re-download
-                    reporter.log(&format!(
-                        "  Corrupted (hash mismatch): {}",
-                        archive.name
-                    ));
+                    reporter.log(&format!("  Corrupted (hash mismatch): {}", archive.name));
                     warn!(
                         "Rejecting local archive '{}' due to hash mismatch (expected={}, actual={})",
                         output_path.display(),
@@ -390,10 +405,7 @@ Copied files with different names will not be reused. Examples: {}",
                 }
                 Err(e) => {
                     // Error reading file - treat as corrupted
-                    reporter.log(&format!(
-                        "  Verify error for {}: {}",
-                        archive.name, e
-                    ));
+                    reporter.log(&format!("  Verify error for {}: {}", archive.name, e));
                     if let Err(e) = fs::remove_file(output_path) {
                         warn!(
                             "Failed to remove unreadable file {}: {}",
@@ -408,9 +420,7 @@ Copied files with different names will not be reused. Examples: {}",
         }
         reporter.log(&format!(
             "  Verified {} archives ({} valid, {} corrupted)",
-            verify_total,
-            already_downloaded,
-            corrupted_count
+            verify_total, already_downloaded, corrupted_count
         ));
     }
 
@@ -447,7 +457,10 @@ Copied files with different names will not be reused. Examples: {}",
         });
     }
 
-    reporter.log(&format!("Need to download {} archives", need_download.len()));
+    reporter.log(&format!(
+        "Need to download {} archives",
+        need_download.len()
+    ));
 
     // Route to NXM mode if enabled
     if config.nxm_mode {
@@ -639,10 +652,7 @@ pub enum ArchiveEvent {
         error: String,
     },
     /// Archive requires manual download — not a hard failure but blocks this archive.
-    Manual {
-        hash: String,
-        name: String,
-    },
+    Manual { hash: String, name: String },
 }
 
 /// Download archives with per-archive completion events.
@@ -661,7 +671,10 @@ pub async fn download_archives_streaming(
     // Smart check: scan output directory to find what's missing
     reporter.log("Scanning output directory for existing files...");
     let existing_outputs = scan_existing_outputs(&config.output_dir)?;
-    reporter.log(&format!("Found {} existing output files", existing_outputs.len()));
+    reporter.log(&format!(
+        "Found {} existing output files",
+        existing_outputs.len()
+    ));
 
     // Build set of BSA temp_ids whose output is already valid (sidecar matches)
     let valid_bsa_temp_ids = build_valid_bsa_set(db, config);
@@ -715,10 +728,7 @@ pub async fn download_archives_streaming(
         if output_path.exists() && fs::metadata(&output_path).is_ok() {
             // Fast path: sidecar cache says hash+size+mtime match
             if super::sidecar::archive_hash_valid(&output_path, &archive.hash) {
-                db.mark_archive_downloaded(
-                    &archive.hash,
-                    output_path.to_string_lossy().as_ref(),
-                )?;
+                db.mark_archive_downloaded(&archive.hash, output_path.to_string_lossy().as_ref())?;
                 already_downloaded += 1;
                 already_downloaded_size += archive.size as u64;
                 sidecar_verified.push((archive, output_path));
@@ -758,6 +768,9 @@ pub async fn download_archives_streaming(
         reporter.log(&format!("Verifying {} existing archives...", verify_total));
         reporter.overall_set_total(verify_total as u64);
         reporter.overall_set_message("Verifying archives...");
+        let verify_status = reporter.begin_status("Verify");
+        verify_status.set_count(0, verify_total);
+        let verify_counter = AtomicUsize::new(0);
 
         // Readahead: tell kernel to start loading archive files into page cache
         #[cfg(target_os = "linux")]
@@ -780,22 +793,28 @@ pub async fn download_archives_streaming(
                 reporter.overall_set_message(&format!("Verifying {}...", truncate_name(&name, 40)));
                 let result = verify_file_hash_detailed(output_path, &archive.hash);
                 reporter.overall_inc();
+                let done = verify_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                verify_status.set_count(done, verify_total);
                 result
             })
             .collect();
+        verify_status.finish();
 
         let mut verified_archives: Vec<(ArchiveInfo, PathBuf)> = Vec::new();
-        for ((archive, output_path), result) in
-            archives_to_verify.into_iter().zip(verify_results)
-        {
+        for ((archive, output_path), result) in archives_to_verify.into_iter().zip(verify_results) {
             match result {
                 Ok((true, _)) => {
                     db.mark_archive_downloaded(
                         &archive.hash,
                         output_path.to_string_lossy().as_ref(),
                     )?;
-                    if let Err(e) = super::sidecar::write_archive_hash(&output_path, &archive.hash) {
-                        tracing::debug!("Failed to write archive sidecar for {}: {}", output_path.display(), e);
+                    if let Err(e) = super::sidecar::write_archive_hash(&output_path, &archive.hash)
+                    {
+                        tracing::debug!(
+                            "Failed to write archive sidecar for {}: {}",
+                            output_path.display(),
+                            e
+                        );
                     }
                     already_downloaded += 1;
                     already_downloaded_size += archive.size as u64;
@@ -856,7 +875,10 @@ pub async fn download_archives_streaming(
         });
     }
 
-    reporter.log(&format!("Need to download {} archives", need_download.len()));
+    reporter.log(&format!(
+        "Need to download {} archives",
+        need_download.len()
+    ));
 
     // Route to NXM mode if enabled — falls back to non-streaming (events after batch)
     if config.nxm_mode {
@@ -1038,7 +1060,8 @@ async fn process_archive(
         Err(e) => {
             ctx.failed.fetch_add(1, Ordering::Relaxed);
             ctx.reporter.overall_inc();
-            ctx.reporter.log(&format!("FAIL {} - parse error: {}", archive.name, e));
+            ctx.reporter
+                .log(&format!("FAIL {} - parse error: {}", archive.name, e));
             return (DownloadResult::Failed, None);
         }
     };
@@ -1073,10 +1096,7 @@ async fn process_archive(
             ctx.reporter.overall_inc();
             let error_msg = root_cause(&e);
             let full_error = format!("{:#}", e);
-            warn!(
-                "Download failed for {}: {}",
-                archive.name, full_error
-            );
+            warn!("Download failed for {}: {}", archive.name, full_error);
             handle.finish_with_error(&format!(
                 "FAIL [{}] {} - {}",
                 source,
@@ -1236,11 +1256,7 @@ fn extract_moddb_mirror_url(html: &str) -> Option<String> {
     Some(moddb_abs_url(capture.get(1)?.as_str()))
 }
 
-async fn fetch_moddb_html(
-    client: &HttpClient,
-    url: &str,
-    referer: Option<&str>,
-) -> Result<String> {
+async fn fetch_moddb_html(client: &HttpClient, url: &str, referer: Option<&str>) -> Result<String> {
     let mut request = client
         .inner()
         .get(url)
@@ -1261,7 +1277,11 @@ async fn fetch_moddb_html(
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        bail!("ModDB page error {}: {}", status.as_u16(), root_cause_text(&body));
+        bail!(
+            "ModDB page error {}: {}",
+            status.as_u16(),
+            root_cause_text(&body)
+        );
     }
     response
         .text()
@@ -1288,12 +1308,8 @@ async fn resolve_moddb_download_url(client: &HttpClient, source_url: &str) -> Re
         source_url.clone()
     } else {
         let page_html = fetch_moddb_html(client, &source_url, None).await?;
-        extract_moddb_start_url(&page_html).with_context(|| {
-            format!(
-                "Could not find ModDB start link on page: {}",
-                source_url
-            )
-        })?
+        extract_moddb_start_url(&page_html)
+            .with_context(|| format!("Could not find ModDB start link on page: {}", source_url))?
     };
 
     let start_html = fetch_moddb_html(client, &start_url, Some(&source_url)).await?;
@@ -1426,7 +1442,6 @@ async fn download_via_proxy(
         &proxy_url,
         output_path,
         Some(expected_size),
-
         callback,
     )
     .await?;
@@ -1625,10 +1640,7 @@ async fn download_archive(
 
                     // Try Wabbajack proxy
                     handle.set_bytes(0, expected_size, 0.0);
-                    handle.set_message(&format!(
-                        "{} (proxy)",
-                        truncate_name(&archive.name, 30)
-                    ));
+                    handle.set_message(&format!("{} (proxy)", truncate_name(&archive.name, 30)));
                     let _ = std::fs::remove_file(output_path);
 
                     info!(
@@ -1652,42 +1664,25 @@ async fn download_archive(
                             return Ok(None);
                         }
                         Err(proxy_err) => {
-                            debug!(
-                                "Proxy failed for {}: {}",
-                                archive.name, proxy_err
-                            );
+                            debug!("Proxy failed for {}: {}", archive.name, proxy_err);
                         }
                     }
 
                     // Try Wabbajack mirror (CDN by hash)
                     handle.set_bytes(0, expected_size, 0.0);
-                    handle.set_message(&format!(
-                        "{} (mirror)",
-                        truncate_name(&archive.name, 30)
-                    ));
+                    handle.set_message(&format!("{} (mirror)", truncate_name(&archive.name, 30)));
                     let _ = std::fs::remove_file(output_path);
 
-                    info!(
-                        "Proxy failed for {}, trying Wabbajack mirror",
-                        archive.name
-                    );
-                    match download_from_mirror(
-                        &ctx.cdn,
-                        &archive.hash,
-                        output_path,
-                        expected_size,
-                    )
-                    .await
+                    info!("Proxy failed for {}, trying Wabbajack mirror", archive.name);
+                    match download_from_mirror(&ctx.cdn, &archive.hash, output_path, expected_size)
+                        .await
                     {
                         Ok(()) => {
                             info!("Mirror download succeeded for {}", archive.name);
                             return Ok(None);
                         }
                         Err(mirror_err) => {
-                            debug!(
-                                "Mirror failed for {}: {}",
-                                archive.name, mirror_err
-                            );
+                            debug!("Mirror failed for {}: {}", archive.name, mirror_err);
                         }
                     }
                 }
@@ -1847,10 +1842,7 @@ async fn download_archive_inner(
                 }
                 Err(_) => {
                     // GDrive failed (likely quota exceeded) — report for manual download
-                    let url = format!(
-                        "https://drive.google.com/file/d/{}/view",
-                        gd_state.id
-                    );
+                    let url = format!("https://drive.google.com/file/d/{}/view", gd_state.id);
                     bail!(
                         "GDrive download failed (likely quota exceeded, download manually): {}",
                         url
@@ -1893,11 +1885,8 @@ async fn download_archive_inner(
             info!("Mega download for {} - trying native API", archive.name);
             handle.set_message(&format!("Mega: {}", truncate_name(&archive.name, 30)));
 
-            match crate::downloaders::mega_native::download_mega_file(
-                &mega_state.url,
-                output_path,
-            )
-            .await
+            match crate::downloaders::mega_native::download_mega_file(&mega_state.url, output_path)
+                .await
             {
                 Ok(()) => {
                     info!("Mega native download succeeded for {}", archive.name);
@@ -1956,15 +1945,22 @@ async fn download_archive_inner(
             } else if is_loverslab_url(&manual_state.url) {
                 if let Some(ll) = &ctx.loverslab {
                     // Show waiting status while queued for LL semaphore
-                    handle.set_message(&format!("LL (queued): {}", truncate_name(&archive.name, 30)));
+                    handle.set_message(&format!(
+                        "LL (queued): {}",
+                        truncate_name(&archive.name, 30)
+                    ));
 
                     // Acquire semaphore to enforce sequential LL downloads
-                    let _permit = ctx.ll_semaphore.acquire().await
+                    let _permit = ctx
+                        .ll_semaphore
+                        .acquire()
+                        .await
                         .map_err(|_| anyhow::anyhow!("LoversLab semaphore closed"))?;
 
                     handle.set_message(&format!("LL: {}", truncate_name(&archive.name, 35)));
 
-                    let result = ll.download(&manual_state.url, &archive.name, output_path)
+                    let result = ll
+                        .download(&manual_state.url, &archive.name, output_path)
                         .await;
 
                     match result {
@@ -2013,9 +2009,13 @@ async fn download_archive_inner(
                 }
             } else if is_mediafire_url(&manual_state.url) {
                 // MediaFire: resolve direct download URL from page
-                let url = ctx.mediafire.get_download_url(&manual_state.url)
+                let url = ctx
+                    .mediafire
+                    .get_download_url(&manual_state.url)
                     .await
-                    .with_context(|| format!("Failed to resolve MediaFire URL: {}", manual_state.url))?;
+                    .with_context(|| {
+                        format!("Failed to resolve MediaFire URL: {}", manual_state.url)
+                    })?;
                 info!("Resolved MediaFire URL for {}: {}", archive.name, url);
                 download_file_with_callback(
                     &ctx.http,
@@ -2027,7 +2027,10 @@ async fn download_archive_inner(
                 .await?;
                 Ok(((), None))
             } else if is_mega_url(&manual_state.url) {
-                info!("Mega manual download for {} - trying native API", archive.name);
+                info!(
+                    "Mega manual download for {} - trying native API",
+                    archive.name
+                );
                 handle.set_message(&format!("Mega: {}", truncate_name(&archive.name, 30)));
 
                 match crate::downloaders::mega_native::download_mega_file(
@@ -2107,7 +2110,10 @@ fn copy_game_file(
     let mut source_path: Option<PathBuf> = None;
     for (base, relative) in [
         (&config.game_dir, game_file_path.as_str()),
-        (&config.game_dir, &format!("Data/{}", game_file_path) as &str),
+        (
+            &config.game_dir,
+            &format!("Data/{}", game_file_path) as &str,
+        ),
     ] {
         if let Some(resolved) = crate::paths::resolve_case_insensitive(base, relative) {
             if resolved.exists() {
@@ -2220,8 +2226,14 @@ async fn download_archives_nxm(
         }
     }
 
-    reporter.log(&format!("Nexus downloads (NXM mode): {}", nexus_pending.len()));
-    reporter.log(&format!("Other downloads (direct):   {}", other_pending.len()));
+    reporter.log(&format!(
+        "Nexus downloads (NXM mode): {}",
+        nexus_pending.len()
+    ));
+    reporter.log(&format!(
+        "Other downloads (direct):   {}",
+        other_pending.len()
+    ));
 
     // First, handle non-Nexus downloads with direct API
     let mut stats = DownloadStats::default();

@@ -264,7 +264,11 @@ pub async fn download_file_with_callback(
 
         let progress = Arc::new(DownloadProgress::new(offset));
         let progress_clone = progress.clone();
-        let content_length = if total_size > 0 { Some(total_size) } else { None };
+        let content_length = if total_size > 0 {
+            Some(total_size)
+        } else {
+            None
+        };
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
         let stall_detector = tokio::spawn(async move {

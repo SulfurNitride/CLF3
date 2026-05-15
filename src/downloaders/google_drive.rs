@@ -34,10 +34,7 @@ impl GoogleDriveDownloader {
     pub async fn get_download_url(&self, file_id: &str, expected_size: u64) -> Result<String> {
         // Step 1: Hit the old-style URL to get the confirmation/quota page
         // This returns a form with a unique UUID that we need
-        let initial_url = format!(
-            "https://drive.google.com/uc?id={}&export=download",
-            file_id
-        );
+        let initial_url = format!("https://drive.google.com/uc?id={}&export=download", file_id);
 
         debug!("Fetching Google Drive confirmation page: {}", initial_url);
 
@@ -140,7 +137,9 @@ impl GoogleDriveDownloader {
         if meta.len() != expected_size {
             // If we got a tiny file, it's likely an error page
             if meta.len() < 10000 {
-                let content = tokio::fs::read_to_string(output_path).await.unwrap_or_default();
+                let content = tokio::fs::read_to_string(output_path)
+                    .await
+                    .unwrap_or_default();
                 let _ = tokio::fs::remove_file(output_path).await;
                 if content.contains("Quota") || content.contains("Too many") {
                     bail!("Google Drive error: Too many users have viewed or downloaded this file recently");
@@ -162,7 +161,6 @@ impl GoogleDriveDownloader {
         Ok(())
     }
 }
-
 
 /// Parse Google Drive confirmation page to extract download URL
 ///
@@ -335,7 +333,11 @@ mod tests {
             "URL should contain uuid: {}",
             url
         );
-        assert!(url.contains("confirm=t"), "URL should contain confirm=t: {}", url);
+        assert!(
+            url.contains("confirm=t"),
+            "URL should contain confirm=t: {}",
+            url
+        );
     }
 
     /// Live test: resolve GDrive download URL for High Poly Head

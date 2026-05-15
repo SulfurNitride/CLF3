@@ -60,8 +60,7 @@ pub fn handle_patched_from_archive(
         apply_and_stream(basis, delta, &mut writer, &patch_name)?
     } else if directive.archive_hash_path.len() == 2 {
         let path_in_archive = &directive.archive_hash_path[1];
-        let source_data = if let Some(cached) = ctx.get_cached_file(archive_hash, path_in_archive)
-        {
+        let source_data = if let Some(cached) = ctx.get_cached_file(archive_hash, path_in_archive) {
             cached
         } else {
             extract_from_archive_with_temp(

@@ -83,9 +83,9 @@ pub async fn download_mega_file(mega_url: &str, output_path: &Path) -> Result<()
         .context("Failed to fetch Mega file info")?;
 
     let file_node = if let Some(handle) = file_handle_override.as_deref() {
-        nodes.get_node_by_handle(handle).with_context(|| {
-            format!("File handle {} not found in Mega folder listing", handle)
-        })?
+        nodes
+            .get_node_by_handle(handle)
+            .with_context(|| format!("File handle {} not found in Mega folder listing", handle))?
     } else {
         nodes
             .roots()
@@ -226,4 +226,3 @@ mod tests {
         );
     }
 }
-

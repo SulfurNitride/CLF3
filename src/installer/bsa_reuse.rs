@@ -129,9 +129,8 @@ pub fn pre_extract_reusable_bsa_files(
             if let Some(old_hash) = old_manifest.get(&normalized_internal) {
                 if old_hash == new_hash {
                     // File unchanged — can extract from existing BSA
-                    let staging_path = staging_dir.join(
-                        bsa_internal.replace('/', std::path::MAIN_SEPARATOR_STR),
-                    );
+                    let staging_path =
+                        staging_dir.join(bsa_internal.replace('/', std::path::MAIN_SEPARATOR_STR));
                     reusable.push((normalized_internal, staging_path, *size));
                     continue;
                 }

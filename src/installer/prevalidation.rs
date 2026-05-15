@@ -79,10 +79,7 @@ impl PreValidationResult {
         }
 
         if !self.extra_files.is_empty() {
-            reporter.log(&format!(
-                "Extra files to clean: {}",
-                self.extra_files.len()
-            ));
+            reporter.log(&format!("Extra files to clean: {}", self.extra_files.len()));
         }
     }
 }
@@ -169,12 +166,7 @@ pub fn run_prevalidation(
         let stats = type_stats.entry(d.directive_type.clone()).or_default();
         stats.total += 1;
 
-        let is_valid = check_directive_valid(
-            d,
-            existing_files,
-            output_dir,
-            &valid_bsa_temp_ids,
-        );
+        let is_valid = check_directive_valid(d, existing_files, output_dir, &valid_bsa_temp_ids);
 
         if is_valid {
             stats.already_valid += 1;

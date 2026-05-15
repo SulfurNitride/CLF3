@@ -342,8 +342,9 @@ impl Ba2Builder {
                     format!("Failed to read staged file: {}", entry.disk_path.display())
                 })?;
 
-                let file = Ba2File::read(Copied(&data), &read_options)
-                    .with_context(|| format!("Failed to parse DDS texture: {}", entry.archive_path))?;
+                let file = Ba2File::read(Copied(&data), &read_options).with_context(|| {
+                    format!("Failed to parse DDS texture: {}", entry.archive_path)
+                })?;
 
                 let key: ArchiveKey = entry.archive_path.as_bytes().into();
                 Ok((key, file))

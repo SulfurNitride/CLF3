@@ -31,8 +31,7 @@ use crate::installer::handlers::from_archive::{
     detect_archive_type, ArchiveType as NestedArchiveType,
 };
 use crate::modlist::{
-    FromArchiveDirective, PatchedFromArchiveDirective,
-    TransformedTextureDirective,
+    FromArchiveDirective, PatchedFromArchiveDirective, TransformedTextureDirective,
 };
 use crate::paths;
 
@@ -61,6 +60,8 @@ pub(crate) struct StagedFile {
     pub(crate) output_path: PathBuf,
     /// Expected file size for verification
     pub(crate) expected_size: u64,
+    /// Expected xxh64 base64 hash.
+    pub(crate) expected_hash: String,
     /// Directive ID for error reporting
     pub(crate) directive_id: i64,
 }
@@ -114,7 +115,6 @@ pub(crate) struct FinalizeStats {
     pub(crate) failed: usize,
 }
 
-
 /// A DDS texture job sent from extraction threads to the DDS handler thread.
 /// During extraction, `data` holds the raw bytes. The collector thread spills
 /// them to temp files on disk so they don't accumulate in RAM.
@@ -142,7 +142,6 @@ impl SpilledDdsJob {
         fs::read(&self.data_path)
     }
 }
-
 
 /// Configuration for fused extraction/patch scheduling.
 #[derive(Debug, Clone, Default)]
@@ -195,17 +194,22 @@ pub fn get_large_archive_threshold() -> u64 {
 }
 
 /// Clean up leftover temp directories from previous interrupted runs.
-pub fn cleanup_temp_dirs(downloads_dir: &std::path::Path, reporter: &Arc<dyn ProgressReporter>) -> usize {
+pub fn cleanup_temp_dirs(
+    downloads_dir: &std::path::Path,
+    reporter: &Arc<dyn ProgressReporter>,
+) -> usize {
     let mut cleaned = 0;
     if let Ok(entries) = fs::read_dir(downloads_dir) {
         for entry in entries.filter_map(|e| e.ok()) {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             // tempfile creates dirs like .tmpXXXXXX
-            if name_str.starts_with(".tmp") && entry.path().is_dir()
-                && fs::remove_dir_all(entry.path()).is_ok() {
-                    cleaned += 1;
-                }
+            if name_str.starts_with(".tmp")
+                && entry.path().is_dir()
+                && fs::remove_dir_all(entry.path()).is_ok()
+            {
+                cleaned += 1;
+            }
         }
     }
     if cleaned > 0 {
@@ -223,6 +227,7 @@ pub(crate) fn process_single_archive_fused(
     directives: &[ArchiveDirective],
     ctx: &ProcessContext,
     extra_needed_paths: &[String],
+    live_progress: Option<&AtomicUsize>,
 ) -> Result<ArchiveResult> {
     const MAX_LOGGED_FAILURES: usize = 100;
 
@@ -231,8 +236,7 @@ pub(crate) fn process_single_archive_fused(
     // Separate directive types
     let mut from_simple: Vec<(i64, &FromArchiveDirective, Option<&str>)> = Vec::new();
     let mut from_nested: Vec<(i64, &FromArchiveDirective, Option<&str>, &str)> = Vec::new();
-    let mut patched_directives: Vec<(i64, &PatchedFromArchiveDirective, Option<&str>)> =
-        Vec::new();
+    let mut patched_directives: Vec<(i64, &PatchedFromArchiveDirective, Option<&str>)> = Vec::new();
 
     for d in directives {
         match d {
@@ -269,6 +273,7 @@ pub(crate) fn process_single_archive_fused(
             &from_simple,
             ctx,
             extra_needed_paths,
+            live_progress,
         ) {
             Ok(Some(direct_result)) => {
                 // Success — return with empty staged_files (no finalize needed)
@@ -285,11 +290,18 @@ pub(crate) fn process_single_archive_fused(
             }
             Ok(None) => {
                 // Archive format doesn't support callback — fall through to temp dir path
-                debug!("Direct extraction unavailable for {}, using temp dir", archive_path.display());
+                debug!(
+                    "Direct extraction unavailable for {}, using temp dir",
+                    archive_path.display()
+                );
             }
             Err(e) => {
                 // Callback extraction failed — fall through to temp dir path
-                warn!("Direct extraction failed for {}: {:#}, falling back to temp dir", archive_path.display(), e);
+                warn!(
+                    "Direct extraction failed for {}: {:#}, falling back to temp dir",
+                    archive_path.display(),
+                    e
+                );
             }
         }
     }
@@ -297,8 +309,7 @@ pub(crate) fn process_single_archive_fused(
     let temp_dir = tempfile::tempdir_in(output_dir)?;
 
     // Filter patched directives: check cache and existing outputs first
-    let mut patched_to_process: Vec<(i64, &PatchedFromArchiveDirective, Option<&str>)> =
-        Vec::new();
+    let mut patched_to_process: Vec<(i64, &PatchedFromArchiveDirective, Option<&str>)> = Vec::new();
     let mut patched_skipped = 0usize;
     let mut patched_cache_completed = 0usize;
 
@@ -330,8 +341,7 @@ pub(crate) fn process_single_archive_fused(
     let mut needs_extraction: Vec<(i64, &PatchedFromArchiveDirective)> = Vec::new();
 
     for (id, directive, _) in &patched_to_process {
-        let basis_key =
-            build_patch_basis_key_from_archive_hash_path(&directive.archive_hash_path);
+        let basis_key = build_patch_basis_key_from_archive_hash_path(&directive.archive_hash_path);
         if let Some(key) = basis_key.as_deref() {
             if let Some(local_path) =
                 ctx.resolve_verified_patch_basis_path(key, Some(&directive.from_hash))
@@ -372,8 +382,7 @@ pub(crate) fn process_single_archive_fused(
 
     // For patched directives, include their source paths (unless served by local basis)
     for (_, directive, resolved_path) in &patched_to_process {
-        let basis_key =
-            build_patch_basis_key_from_archive_hash_path(&directive.archive_hash_path);
+        let basis_key = build_patch_basis_key_from_archive_hash_path(&directive.archive_hash_path);
         if basis_key
             .as_deref()
             .is_some_and(|k| verified_local_basis.contains_key(k))
@@ -399,8 +408,7 @@ pub(crate) fn process_single_archive_fused(
     }
 
     // Detect archive type for extraction strategy
-    let archive_type =
-        detect_archive_type(archive_path).unwrap_or(NestedArchiveType::Unknown);
+    let archive_type = detect_archive_type(archive_path).unwrap_or(NestedArchiveType::Unknown);
     let is_bsa = matches!(
         archive_type,
         NestedArchiveType::Tes3Bsa | NestedArchiveType::Bsa | NestedArchiveType::Ba2
@@ -420,7 +428,10 @@ pub(crate) fn process_single_archive_fused(
                     .map(|(_, d, _)| d.patch_id.to_string())
                     .collect();
                 preload_patch_blobs_by_name(&wabbajack_path, &patch_names).unwrap_or_else(|e| {
-                    debug!("Patch preload failed (falling back to shared reader): {}", e);
+                    debug!(
+                        "Patch preload failed (falling back to shared reader): {}",
+                        e
+                    );
                     HashMap::new()
                 })
             } else {
@@ -433,11 +444,7 @@ pub(crate) fn process_single_archive_fused(
             // BSA/BA2: extract each needed file individually (preserving path structure)
             extract_bsa_files_to_temp(archive_path, &needed_paths, &extract_dir);
         } else if !needed_paths.is_empty() {
-            if let Err(e) = extract_archive_to_temp(
-                archive_path,
-                &needed_paths,
-                &extract_dir,
-            ) {
+            if let Err(e) = extract_archive_to_temp(archive_path, &needed_paths, &extract_dir) {
                 error!("FAIL: Cannot extract {}: {}", archive_path.display(), e);
             }
         }
@@ -546,7 +553,11 @@ pub(crate) fn process_single_archive_fused(
             } else {
                 // Non-BSA container: use generic archive extraction.
                 let wanted_files: Vec<String> = wanted.iter().cloned().collect();
-                match sevenzip::extract_files_case_insensitive(bsa_disk_path, &wanted_files, &tmp_path) {
+                match sevenzip::extract_files_case_insensitive(
+                    bsa_disk_path,
+                    &wanted_files,
+                    &tmp_path,
+                ) {
                     Ok(_) => {
                         // Scan extracted files and register them
                         for (file_in_bsa, combined_normalized) in needed_files {
@@ -578,7 +589,10 @@ pub(crate) fn process_single_archive_fused(
             }
 
             // Merge extracted entries into the main map
-            for (key, path) in extracted_entries.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            for (key, path) in extracted_entries
+                .into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+            {
                 extracted_map.insert(key, path);
             }
 
@@ -612,12 +626,8 @@ pub(crate) fn process_single_archive_fused(
 
     // === Process nested BSA directives FIRST (before anything can rename BSA files) ===
     if !from_nested.is_empty() {
-        let (nested_staged, nested_bsa_temp_dirs) = process_nested_bsa_directives_staged(
-            &from_nested,
-            &extracted_map,
-            ctx,
-            output_dir,
-        );
+        let (nested_staged, nested_bsa_temp_dirs) =
+            process_nested_bsa_directives_staged(&from_nested, &extracted_map, ctx, output_dir);
         nested_temp_dirs.extend(nested_bsa_temp_dirs);
         for result in nested_staged {
             match result {
@@ -672,6 +682,7 @@ pub(crate) fn process_single_archive_fused(
             temp_path: src_path,
             output_path: final_output_path,
             expected_size: directive.size,
+            expected_hash: directive.hash.clone(),
             directive_id: *id,
         });
         extracted_count += 1;
@@ -758,8 +769,7 @@ fn resolve_patch_source(
     extracted_map: &HashMap<String, PathBuf>,
     archive_path: &Path,
 ) -> Result<PathBuf> {
-    let basis_key =
-        build_patch_basis_key_from_archive_hash_path(&directive.archive_hash_path);
+    let basis_key = build_patch_basis_key_from_archive_hash_path(&directive.archive_hash_path);
 
     if let Some(key) = basis_key.as_deref() {
         if let Some(path) = verified_local_basis.get(key) {
@@ -798,13 +808,16 @@ fn resolve_patch_source(
         }
         // Also try just the inner file path (in case it was extracted differently)
         let inner_normalized = normalize_archive_lookup_path(file_in_bsa);
-        return extracted_map.get(&inner_normalized).cloned().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Source not found in BSA/BA2: {} / {}",
-                bsa_path,
-                file_in_bsa
-            )
-        });
+        return extracted_map
+            .get(&inner_normalized)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Source not found in BSA/BA2: {} / {}",
+                    bsa_path,
+                    file_in_bsa
+                )
+            });
     }
 
     anyhow::bail!("Invalid archive_hash_path")
@@ -823,9 +836,8 @@ fn extract_bsa_files_to_temp(archive_path: &Path, needed_paths: &[String], temp_
         if let Some(parent) = temp_file.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        fs::write(&temp_file, &data).map_err(|e| {
-            anyhow::anyhow!("BSA extract write error for {}: {}", path, e)
-        })
+        fs::write(&temp_file, &data)
+            .map_err(|e| anyhow::anyhow!("BSA extract write error for {}: {}", path, e))
     }) {
         error!(
             "FAIL: BSA batch extraction error for {}: {}",
@@ -948,15 +960,39 @@ pub(crate) fn finalize_archive(
         };
 
         if src_size != sf.expected_size {
-            let count = logged_failures.fetch_add(1, Ordering::Relaxed);
-            if count < MAX_LOGGED_FAILURES {
-                error!(
-                    "FAIL [{}]: size mismatch: expected {} got {}",
-                    sf.directive_id, sf.expected_size, src_size
-                );
+            match crate::hash::compute_file_hash(&sf.temp_path) {
+                Ok(actual_hash) if actual_hash == sf.expected_hash => {
+                    warn!(
+                        "Size mismatch but hash OK for [{}] {}: manifest size {} vs actual {} - accepting",
+                        sf.directive_id,
+                        sf.output_path.display(),
+                        sf.expected_size,
+                        src_size
+                    );
+                }
+                Ok(actual_hash) => {
+                    let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                    if count < MAX_LOGGED_FAILURES {
+                        error!(
+                            "FAIL [{}]: size+hash mismatch: expected {}/{} got {}/{}",
+                            sf.directive_id, sf.expected_size, sf.expected_hash, src_size, actual_hash
+                        );
+                    }
+                    failed_atomic.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Err(e) => {
+                    let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                    if count < MAX_LOGGED_FAILURES {
+                        error!(
+                            "FAIL [{}]: size mismatch and hash compute failed: expected {} got {}: {}",
+                            sf.directive_id, sf.expected_size, src_size, e
+                        );
+                    }
+                    failed_atomic.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
             }
-            failed_atomic.fetch_add(1, Ordering::Relaxed);
-            return;
         }
 
         let _ = fs::remove_file(&sf.output_path);
@@ -1054,27 +1090,34 @@ fn process_nested_bsa_directives_staged(
     let results = std::sync::Mutex::new(Vec::new());
 
     for (archive_path_in_outer, directives) in by_archive {
-        let archive_disk_path = match find_archive_in_extracted_map(extracted_map, &archive_path_in_outer) {
-            Some(p) => p.clone(),
-            None => {
-                for (id, _, _) in &directives {
-                    results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!(
-                        "FAIL [{}]: Nested archive not found: {}",
-                        id, archive_path_in_outer
-                    )));
+        let archive_disk_path =
+            match find_archive_in_extracted_map(extracted_map, &archive_path_in_outer) {
+                Some(p) => p.clone(),
+                None => {
+                    for (id, _, _) in &directives {
+                        results
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(Err(format!(
+                                "FAIL [{}]: Nested archive not found: {}",
+                                id, archive_path_in_outer
+                            )));
+                    }
+                    continue;
                 }
-                continue;
-            }
-        };
+            };
 
         let archive_type = match detect_archive_type(&archive_disk_path) {
             Ok(t) => t,
             Err(e) => {
                 for (id, _, _) in &directives {
-                    results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!(
-                        "FAIL [{}]: Cannot detect archive type for {}: {}",
-                        id, archive_path_in_outer, e
-                    )));
+                    results
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(Err(format!(
+                            "FAIL [{}]: Cannot detect archive type for {}: {}",
+                            id, archive_path_in_outer, e
+                        )));
                 }
                 continue;
             }
@@ -1106,8 +1149,7 @@ fn process_nested_bsa_directives_staged(
                     );
                     match batch_result {
                         Ok(_) => {
-                            let nested_map =
-                                build_extracted_file_map(nested_tmp_dir.path());
+                            let nested_map = build_extracted_file_map(nested_tmp_dir.path());
 
                             // Process each directive
                             for (id, directive, file_in_archive) in &directives {
@@ -1116,10 +1158,12 @@ fn process_nested_bsa_directives_staged(
                                 let extracted_path = match nested_map.get(&normalized_file) {
                                     Some(p) => p,
                                     None => {
-                                        results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!(
-                                            "FAIL [{}]: Nested file not found: {}",
-                                            id, file_in_archive
-                                        )));
+                                        results.lock().unwrap_or_else(|e| e.into_inner()).push(
+                                            Err(format!(
+                                                "FAIL [{}]: Nested file not found: {}",
+                                                id, file_in_archive
+                                            )),
+                                        );
                                         continue;
                                     }
                                 };
@@ -1127,19 +1171,23 @@ fn process_nested_bsa_directives_staged(
                                 let src_size = match fs::metadata(extracted_path) {
                                     Ok(meta) => meta.len(),
                                     Err(e) => {
-                                        results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!(
-                                            "FAIL [{}]: Nested metadata error: {}",
-                                            id, e
-                                        )));
+                                        results.lock().unwrap_or_else(|e| e.into_inner()).push(
+                                            Err(format!(
+                                                "FAIL [{}]: Nested metadata error: {}",
+                                                id, e
+                                            )),
+                                        );
                                         continue;
                                     }
                                 };
 
                                 if src_size != directive.size {
-                                    results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!(
-                                        "FAIL [{}]: Size mismatch: expected {} got {}",
-                                        id, directive.size, src_size
-                                    )));
+                                    results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(
+                                        format!(
+                                            "FAIL [{}]: Size mismatch: expected {} got {}",
+                                            id, directive.size, src_size
+                                        ),
+                                    ));
                                     continue;
                                 }
 
@@ -1162,12 +1210,15 @@ fn process_nested_bsa_directives_staged(
                                     );
                                 }
 
-                                results.lock().unwrap_or_else(|e| e.into_inner()).push(Ok(StagedFile {
-                                    temp_path: extracted_path.clone(),
-                                    output_path: final_path,
-                                    expected_size: directive.size,
-                                    directive_id: *id,
-                                }));
+                                results.lock().unwrap_or_else(|e| e.into_inner()).push(Ok(
+                                    StagedFile {
+                                        temp_path: extracted_path.clone(),
+                                        output_path: final_path,
+                                        expected_size: directive.size,
+                                        expected_hash: directive.hash.clone(),
+                                        directive_id: *id,
+                                    },
+                                ));
                             }
 
                             // Keep temp dir alive until finalize_archive copies files out
@@ -1185,10 +1236,13 @@ fn process_nested_bsa_directives_staged(
                 }
                 Err(e) => {
                     for (id, _, _) in &directives {
-                        results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!(
-                            "FAIL [{}]: Cannot create temp dir for nested extraction: {}",
-                            id, e
-                        )));
+                        results
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(Err(format!(
+                                "FAIL [{}]: Cannot create temp dir for nested extraction: {}",
+                                id, e
+                            )));
                     }
                 }
             }
@@ -1203,10 +1257,11 @@ fn process_nested_bsa_directives_staged(
         for (id, directive, file_in_archive) in &directives {
             let normalized = file_in_archive.replace('\\', "/").to_lowercase();
             wanted_paths.insert(normalized.clone());
-            path_to_directives
-                .entry(normalized)
-                .or_default()
-                .push((*id, *directive, *file_in_archive));
+            path_to_directives.entry(normalized).or_default().push((
+                *id,
+                *directive,
+                *file_in_archive,
+            ));
         }
 
         if let Err(e) = bsa::extract_archive_batch(
@@ -1220,24 +1275,41 @@ fn process_nested_bsa_directives_staged(
 
                 for &(id, directive, file_in_archive) in directive_list {
                     if data.len() as u64 != directive.size {
-                        results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!(
-                            "FAIL [{}]: Size mismatch: expected {} got {}",
-                            id, directive.size, data.len()
-                        )));
-                        continue;
+                        let actual_hash = crate::hash::compute_bytes_hash(&data);
+                        if actual_hash != directive.hash {
+                            results
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(Err(format!(
+                                    "FAIL [{}]: Size+hash mismatch: expected {}/{} got {}/{}",
+                                    id,
+                                    directive.size,
+                                    directive.hash,
+                                    data.len(),
+                                    actual_hash
+                                )));
+                            continue;
+                        }
+                        warn!(
+                            "Size mismatch but hash OK for [{}] {}: manifest size {} vs actual {} - accepting",
+                            id, directive.to, directive.size, data.len()
+                        );
                     }
 
                     let out_path = paths::join_windows_path(output_dir, &directive.to);
                     if let Err(_e) = ctx.dir_cache.ensure_parent_dirs(&out_path) {
-                        results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!(
-                            "FAIL [{}]: Cannot create parent dirs",
-                            id
-                        )));
+                        results
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(Err(format!("FAIL [{}]: Cannot create parent dirs", id)));
                         continue;
                     }
 
                     if let Err(e) = fs::write(&out_path, &data) {
-                        results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!("FAIL [{}]: write error: {}", id, e)));
+                        results
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(Err(format!("FAIL [{}]: write error: {}", id, e)));
                         continue;
                     }
 
@@ -1255,27 +1327,37 @@ fn process_nested_bsa_directives_staged(
                         );
                     }
 
-                    results.lock().unwrap_or_else(|e| e.into_inner()).push(Ok(StagedFile {
-                        temp_path: out_path.clone(),
-                        output_path: out_path,
-                        expected_size: directive.size,
-                        directive_id: id,
-                    }));
+                    results
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(Ok(StagedFile {
+                            temp_path: out_path.clone(),
+                            output_path: out_path,
+                            expected_size: directive.size,
+                            expected_hash: directive.hash.clone(),
+                            directive_id: id,
+                        }));
                 }
                 Ok(())
             },
         ) {
             // Batch extraction failed entirely — report for all directives
             for (id, _, _) in &directives {
-                results.lock().unwrap_or_else(|e| e.into_inner()).push(Err(format!(
-                    "FAIL [{}]: Nested BSA batch extract error from {:?}: {}",
-                    id, archive_type, e
-                )));
+                results
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(Err(format!(
+                        "FAIL [{}]: Nested BSA batch extract error from {:?}: {}",
+                        id, archive_type, e
+                    )));
             }
         }
     }
 
-    (results.into_inner().unwrap_or_else(|e| e.into_inner()), kept_temp_dirs)
+    (
+        results.into_inner().unwrap_or_else(|e| e.into_inner()),
+        kept_temp_dirs,
+    )
 }
 
 fn normalize_archive_lookup_path(path: &str) -> String {
@@ -1341,78 +1423,98 @@ pub(crate) fn process_whole_file_directives(
 ) -> Vec<usize> {
     let failed_indices: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
-    directives.par_iter().enumerate().for_each(|(idx, (id, directive))| {
-        let archive_hash = &directive.archive_hash_path[0];
+    directives
+        .par_iter()
+        .enumerate()
+        .for_each(|(idx, (id, directive))| {
+            let archive_hash = &directive.archive_hash_path[0];
 
-        let normalized_to = paths::normalize_for_lookup(&directive.to);
-        if let Some(&existing_size) = ctx.existing_files.get(&normalized_to) {
-            if existing_size == directive.size {
-                skipped.fetch_add(1, Ordering::Relaxed);
-                return;
+            let normalized_to = paths::normalize_for_lookup(&directive.to);
+            if let Some(&existing_size) = ctx.existing_files.get(&normalized_to) {
+                if existing_size == directive.size {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
             }
-        }
 
-        let archive_path = match ctx.get_archive_path(archive_hash) {
-            Some(p) => p,
-            None => {
-                error!(
-                    "FAIL [{}]: whole-file archive not found (hash={}): {}",
-                    id, archive_hash, directive.to
-                );
+            let archive_path = match ctx.get_archive_path(archive_hash) {
+                Some(p) => p,
+                None => {
+                    error!(
+                        "FAIL [{}]: whole-file archive not found (hash={}): {}",
+                        id, archive_hash, directive.to
+                    );
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    failed_indices
+                        .lock()
+                        .expect("failed_indices lock")
+                        .push(idx);
+                    return;
+                }
+            };
+
+            let archive_size = match fs::metadata(&archive_path) {
+                Ok(m) => m.len(),
+                Err(e) => {
+                    error!(
+                        "FAIL [{}]: whole-file archive unreadable: {}: {}",
+                        id,
+                        archive_path.display(),
+                        e
+                    );
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    failed_indices
+                        .lock()
+                        .expect("failed_indices lock")
+                        .push(idx);
+                    return;
+                }
+            };
+
+            if archive_size != directive.size {
                 failed.fetch_add(1, Ordering::Relaxed);
-                failed_indices.lock().expect("failed_indices lock").push(idx);
-                return;
-            }
-        };
-
-        let archive_size = match fs::metadata(&archive_path) {
-            Ok(m) => m.len(),
-            Err(e) => {
+                failed_indices
+                    .lock()
+                    .expect("failed_indices lock")
+                    .push(idx);
                 error!(
-                    "FAIL [{}]: whole-file archive unreadable: {}: {}",
-                    id, archive_path.display(), e
+                    "FAIL [{}]: whole-file size mismatch {} vs {}",
+                    id, archive_size, directive.size
                 );
-                failed.fetch_add(1, Ordering::Relaxed);
-                failed_indices.lock().expect("failed_indices lock").push(idx);
                 return;
             }
-        };
 
-        if archive_size != directive.size {
-            failed.fetch_add(1, Ordering::Relaxed);
-            failed_indices.lock().expect("failed_indices lock").push(idx);
-            error!(
-                "FAIL [{}]: whole-file size mismatch {} vs {}",
-                id, archive_size, directive.size
+            let output_path = paths::join_windows_path(&ctx.config.output_dir, &directive.to);
+            if let Err(e) = ctx.dir_cache.ensure_parent_dirs(&output_path) {
+                failed.fetch_add(1, Ordering::Relaxed);
+                failed_indices
+                    .lock()
+                    .expect("failed_indices lock")
+                    .push(idx);
+                error!("FAIL [{}]: cannot create parent dirs: {}", id, e);
+                return;
+            }
+
+            if let Err(e) = fs::copy(&archive_path, &output_path) {
+                failed.fetch_add(1, Ordering::Relaxed);
+                failed_indices
+                    .lock()
+                    .expect("failed_indices lock")
+                    .push(idx);
+                error!("FAIL [{}]: copy failed: {}", id, e);
+                return;
+            }
+            let basis_key = build_patch_basis_key(archive_hash, None, None);
+            ctx.record_patch_basis_candidate_path_dual(
+                &basis_key,
+                &directive.archive_hash_path,
+                &archive_path,
+                &output_path,
+                directive.size,
             );
-            return;
-        }
 
-        let output_path = paths::join_windows_path(&ctx.config.output_dir, &directive.to);
-        if let Err(e) = ctx.dir_cache.ensure_parent_dirs(&output_path) {
-            failed.fetch_add(1, Ordering::Relaxed);
-            failed_indices.lock().expect("failed_indices lock").push(idx);
-            error!("FAIL [{}]: cannot create parent dirs: {}", id, e);
-            return;
-        }
-
-        if let Err(e) = fs::copy(&archive_path, &output_path) {
-            failed.fetch_add(1, Ordering::Relaxed);
-            failed_indices.lock().expect("failed_indices lock").push(idx);
-            error!("FAIL [{}]: copy failed: {}", id, e);
-            return;
-        }
-        let basis_key = build_patch_basis_key(archive_hash, None, None);
-        ctx.record_patch_basis_candidate_path_dual(
-            &basis_key,
-            &directive.archive_hash_path,
-            &archive_path,
-            &output_path,
-            directive.size,
-        );
-
-        extracted.fetch_add(1, Ordering::Relaxed);
-    });
+            extracted.fetch_add(1, Ordering::Relaxed);
+        });
 
     failed_indices.into_inner().expect("failed_indices lock")
 }
@@ -1460,12 +1562,11 @@ pub(crate) fn extract_textures_from_temp_dir(
 
     for (normalized_path, directives) in tex_lookup {
         // Try to find the file in the temp dir
-        let found = file_map.get(normalized_path)
-            .or_else(|| {
-                // Also try backslash variant
-                let bs = normalized_path.replace('/', "\\");
-                file_map.get(&bs)
-            });
+        let found = file_map.get(normalized_path).or_else(|| {
+            // Also try backslash variant
+            let bs = normalized_path.replace('/', "\\");
+            file_map.get(&bs)
+        });
 
         if let Some(file_path) = found {
             if let Ok(data) = fs::read(file_path) {
@@ -1495,11 +1596,10 @@ pub(crate) fn extract_textures_from_nested_bsas(
 
     for (bsa_name, tex_lookup) in nested_lookup {
         // Find the nested BSA file in the extracted temp dir
-        let bsa_path = file_map.get(bsa_name)
-            .or_else(|| {
-                let bs = bsa_name.replace('/', "\\");
-                file_map.get(&bs)
-            });
+        let bsa_path = file_map.get(bsa_name).or_else(|| {
+            let bs = bsa_name.replace('/', "\\");
+            file_map.get(&bs)
+        });
 
         let Some(bsa_disk_path) = bsa_path else {
             debug!("Nested BSA not found in temp dir: {}", bsa_name);
@@ -1562,11 +1662,14 @@ pub(crate) fn process_textures_from_bsa_streaming(
             let i = idx.fetch_add(1, Ordering::Relaxed);
             let data_path = spill_dir.path().join(format!("tex_{}.tmp", i));
             fs::write(&data_path, &data)?;
-            spilled.lock().unwrap_or_else(|e| e.into_inner()).push(SpilledDdsJob {
-                id: *id,
-                directive: directive.clone(),
-                data_path,
-            });
+            spilled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(SpilledDdsJob {
+                    id: *id,
+                    directive: directive.clone(),
+                    data_path,
+                });
         }
         Ok(())
     });
@@ -1589,7 +1692,8 @@ pub(crate) fn process_textures_from_temp_streaming(
     let mut idx = 0u64;
 
     for (normalized_path, directives) in tex_lookup {
-        let found = file_map.get(normalized_path)
+        let found = file_map
+            .get(normalized_path)
             .or_else(|| file_map.get(&normalized_path.replace('/', "\\")));
         let Some(file_path) = found else { continue };
 
@@ -1597,7 +1701,10 @@ pub(crate) fn process_textures_from_temp_streaming(
             // Symlink or copy the source to spill dir (avoids reading into memory now)
             let data_path = spill_dir.path().join(format!("tex_{}.tmp", idx));
             if std::os::unix::fs::symlink(file_path, &data_path).is_err()
-                && fs::copy(file_path, &data_path).is_err() { continue; }
+                && fs::copy(file_path, &data_path).is_err()
+            {
+                continue;
+            }
             spilled.push(SpilledDdsJob {
                 id: *id,
                 directive: directive.clone(),
@@ -1625,7 +1732,8 @@ pub(crate) fn process_textures_from_nested_bsas_streaming(
     let idx = AtomicUsize::new(0);
 
     for (bsa_name, tex_lookup) in nested_lookup {
-        let bsa_path = file_map.get(bsa_name)
+        let bsa_path = file_map
+            .get(bsa_name)
             .or_else(|| file_map.get(&bsa_name.replace('/', "\\")));
         let Some(bsa_disk_path) = bsa_path else {
             debug!("Nested BSA not found in temp dir: {}", bsa_name);
@@ -1633,7 +1741,9 @@ pub(crate) fn process_textures_from_nested_bsas_streaming(
         };
 
         let wanted: HashSet<String> = tex_lookup.keys().cloned().collect();
-        if wanted.is_empty() { continue; }
+        if wanted.is_empty() {
+            continue;
+        }
 
         let spill_path = spill_dir.path().to_path_buf();
         let spilled_ref = std::sync::Mutex::new(Vec::new());
@@ -1647,11 +1757,14 @@ pub(crate) fn process_textures_from_nested_bsas_streaming(
                 let i = idx.fetch_add(1, Ordering::Relaxed);
                 let data_path = spill_path.join(format!("tex_{}.tmp", i));
                 fs::write(&data_path, &data)?;
-                spilled_ref.lock().unwrap_or_else(|e| e.into_inner()).push(SpilledDdsJob {
-                    id: *id,
-                    directive: directive.clone(),
-                    data_path,
-                });
+                spilled_ref
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(SpilledDdsJob {
+                        id: *id,
+                        directive: directive.clone(),
+                        data_path,
+                    });
             }
             Ok(())
         });
@@ -1671,22 +1784,28 @@ fn process_spilled_dds_batched(jobs: Vec<SpilledDdsJob>, ctx: &ProcessContext) -
 
     use crate::installer::handlers::texture::is_fallback_mode;
     use crate::installer::sidecar;
-    use crate::textures::{process_texture_batch, process_texture_with_fallback, OutputFormat, TextureJob};
+    use crate::textures::{
+        process_texture_batch, process_texture_with_fallback, OutputFormat, TextureJob,
+    };
 
     // Pre-filter: skip jobs whose output already has a valid sidecar
     let mut skipped = 0usize;
-    let jobs: Vec<SpilledDdsJob> = jobs.into_iter().filter(|job| {
-        let out = paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
-        if sidecar::sidecar_valid(&out, &job.directive.hash) {
-            ctx.textures_processed_during_install
-                .lock().unwrap_or_else(|e| e.into_inner())
-                .insert(job.id);
-            skipped += 1;
-            false
-        } else {
-            true
-        }
-    }).collect();
+    let jobs: Vec<SpilledDdsJob> = jobs
+        .into_iter()
+        .filter(|job| {
+            let out = paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
+            if sidecar::sidecar_valid(&out, &job.directive.hash) {
+                ctx.textures_processed_during_install
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(job.id);
+                skipped += 1;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
 
     let mut ok_count = skipped;
     let mut fail_count = 0usize;
@@ -1710,19 +1829,17 @@ fn process_spilled_dds_batched(jobs: Vec<SpilledDdsJob>, ctx: &ProcessContext) -
             for chunk in format_jobs.chunks(DDS_BATCH_SIZE) {
                 let tex_jobs: Vec<TextureJob> = chunk
                     .iter()
-                    .filter_map(|j| {
-                        match j.read_data() {
-                            Ok(data) => Some(TextureJob {
-                                data,
-                                width: j.directive.image_state.width,
-                                height: j.directive.image_state.height,
-                                format: OutputFormat::BC7,
-                                id: Some(format!("{}", j.id)),
-                            }),
-                            Err(e) => {
-                                warn!("DDS spill read failed for {}: {:#}", j.id, e);
-                                None
-                            }
+                    .filter_map(|j| match j.read_data() {
+                        Ok(data) => Some(TextureJob {
+                            data,
+                            width: j.directive.image_state.width,
+                            height: j.directive.image_state.height,
+                            format: OutputFormat::BC7,
+                            id: Some(format!("{}", j.id)),
+                        }),
+                        Err(e) => {
+                            warn!("DDS spill read failed for {}: {:#}", j.id, e);
+                            None
                         }
                     })
                     .collect();
@@ -1732,14 +1849,17 @@ fn process_spilled_dds_batched(jobs: Vec<SpilledDdsJob>, ctx: &ProcessContext) -
                 for (job, (_job_id, result)) in chunk.iter().zip(results.into_iter()) {
                     match result {
                         Ok(processed) => {
-                            let out = paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
+                            let out =
+                                paths::join_windows_path(&ctx.config.output_dir, &job.directive.to);
                             let mut written = ctx.dir_cache.ensure_parent_dirs(&out).is_ok()
                                 && fs::write(&out, &processed.data).is_ok();
                             // Retry up to 3 times for transient filesystem errors
                             // Use force_ensure_parent_dirs to bypass DirCache stale entries
                             if !written {
                                 for attempt in 1..=3u64 {
-                                    std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
+                                    std::thread::sleep(std::time::Duration::from_millis(
+                                        100 * attempt,
+                                    ));
                                     if ctx.dir_cache.force_ensure_parent_dirs(&out).is_ok()
                                         && fs::write(&out, &processed.data).is_ok()
                                     {
@@ -1759,7 +1879,8 @@ fn process_spilled_dds_batched(jobs: Vec<SpilledDdsJob>, ctx: &ProcessContext) -
                                 }
                                 ok_count += 1;
                                 ctx.textures_processed_during_install
-                                    .lock().unwrap_or_else(|e| e.into_inner())
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
                                     .insert(job.id);
                             } else {
                                 fail_count += 1;
@@ -1798,7 +1919,9 @@ fn process_spilled_dds_batched(jobs: Vec<SpilledDdsJob>, ctx: &ProcessContext) -
                             {
                                 warn!(
                                     "DDS {} write for {} succeeded on retry {}",
-                                    fmt.name(), job.directive.to, attempt
+                                    fmt.name(),
+                                    job.directive.to,
+                                    attempt
                                 );
                                 succeeded = true;
                                 break;
@@ -1807,7 +1930,8 @@ fn process_spilled_dds_batched(jobs: Vec<SpilledDdsJob>, ctx: &ProcessContext) -
                         if !succeeded {
                             anyhow::bail!(
                                 "write failed after 3 retries for {}: {}",
-                                job.directive.to, first_err
+                                job.directive.to,
+                                first_err
                             );
                         }
                     }
@@ -1820,12 +1944,19 @@ fn process_spilled_dds_batched(jobs: Vec<SpilledDdsJob>, ctx: &ProcessContext) -
                     Ok(()) => {
                         ok_count += 1;
                         ctx.textures_processed_during_install
-                            .lock().unwrap_or_else(|e| e.into_inner())
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
                             .insert(job.id);
                     }
                     Err(e) => {
                         fail_count += 1;
-                        warn!("DDS {} fail [{}]: {} — {}", fmt.name(), job.id, job.directive.to, e);
+                        warn!(
+                            "DDS {} fail [{}]: {} — {}",
+                            fmt.name(),
+                            job.id,
+                            job.directive.to,
+                            e
+                        );
                     }
                 }
             }
@@ -1872,12 +2003,10 @@ pub(crate) fn collect_textures_from_temp_dir(
     let mut jobs = Vec::new();
 
     for (normalized_path, directives) in tex_lookup {
-        let found = file_map
-            .get(normalized_path)
-            .or_else(|| {
-                let bs = normalized_path.replace('/', "\\");
-                file_map.get(&bs)
-            });
+        let found = file_map.get(normalized_path).or_else(|| {
+            let bs = normalized_path.replace('/', "\\");
+            file_map.get(&bs)
+        });
 
         if let Some(file_path) = found {
             if let Ok(data) = fs::read(file_path) {
@@ -1904,12 +2033,10 @@ pub(crate) fn collect_textures_from_nested_bsas(
     let mut jobs = Vec::new();
 
     for (bsa_name, tex_lookup) in nested_lookup {
-        let bsa_path = file_map
-            .get(bsa_name)
-            .or_else(|| {
-                let bs = bsa_name.replace('/', "\\");
-                file_map.get(&bs)
-            });
+        let bsa_path = file_map.get(bsa_name).or_else(|| {
+            let bs = bsa_name.replace('/', "\\");
+            file_map.get(&bs)
+        });
 
         let Some(bsa_disk_path) = bsa_path else {
             debug!("Nested BSA not found in temp dir: {}", bsa_name);
@@ -1926,11 +2053,14 @@ pub(crate) fn collect_textures_from_nested_bsas(
             let lookup = path.replace('\\', "/").to_lowercase();
             if let Some(directives) = tex_lookup.get(&lookup) {
                 for (id, directive) in directives {
-                    nested_jobs.lock().unwrap_or_else(|e| e.into_inner()).push(DdsJob {
-                        id: *id,
-                        directive: directive.clone(),
-                        data: data.clone(),
-                    });
+                    nested_jobs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(DdsJob {
+                            id: *id,
+                            directive: directive.clone(),
+                            data: data.clone(),
+                        });
                 }
             }
             Ok(())
@@ -1950,7 +2080,9 @@ pub(crate) fn process_dds_jobs_inline(jobs: Vec<DdsJob>, ctx: &ProcessContext) -
     }
 
     use crate::installer::handlers::texture::is_fallback_mode;
-    use crate::textures::{process_texture_batch, process_texture_with_fallback, OutputFormat, TextureJob};
+    use crate::textures::{
+        process_texture_batch, process_texture_with_fallback, OutputFormat, TextureJob,
+    };
 
     let ok_count = AtomicUsize::new(0);
     let fail_count = AtomicUsize::new(0);
@@ -2053,7 +2185,10 @@ pub(crate) fn process_dds_jobs_inline(jobs: Vec<DdsJob>, ctx: &ProcessContext) -
         }
     }
 
-    (ok_count.load(Ordering::Relaxed), fail_count.load(Ordering::Relaxed))
+    (
+        ok_count.load(Ordering::Relaxed),
+        fail_count.load(Ordering::Relaxed),
+    )
 }
 
 /// Result of direct (callback-based) extraction — no temp dir, no finalize needed.
@@ -2068,6 +2203,7 @@ struct DirectiveTarget {
     id: i64,
     output_path: PathBuf,
     expected_size: u64,
+    expected_hash: String,
     archive_hash_path: Vec<String>,
 }
 
@@ -2090,6 +2226,7 @@ fn build_directive_lookup(
             id: *id,
             output_path,
             expected_size: directive.size,
+            expected_hash: directive.hash.clone(),
             archive_hash_path: directive.archive_hash_path.clone(),
         });
     }
@@ -2110,6 +2247,7 @@ pub(crate) fn process_archive_direct(
     from_simple: &[(i64, &FromArchiveDirective, Option<&str>)],
     ctx: &ProcessContext,
     extra_needed_paths: &[String],
+    live_progress: Option<&AtomicUsize>,
 ) -> Result<Option<DirectExtractResult>> {
     let output_dir = &ctx.config.output_dir;
     let mut skipped_count = 0usize;
@@ -2159,20 +2297,37 @@ pub(crate) fn process_archive_direct(
 
         if let Some(targets) = directive_lookup.get(&normalized) {
             for target in targets.iter() {
-                // Verify size
+                // Verify size. If the manifest size is stale, accept a matching xxh64.
                 if data.len() as u64 != target.expected_size {
-                    error!(
-                        "FAIL [{}]: size mismatch: expected {} got {}",
-                        target.id, target.expected_size, data.len()
+                    let actual_hash = crate::hash::compute_bytes_hash(&data);
+                    if actual_hash != target.expected_hash {
+                        error!(
+                            "FAIL [{}]: size+hash mismatch: expected {}/{} got {}/{}",
+                            target.id,
+                            target.expected_size,
+                            target.expected_hash,
+                            data.len(),
+                            actual_hash
+                        );
+                        failed_count.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    warn!(
+                        "Size mismatch but hash OK for [{}] {}: manifest size {} vs actual {} - accepting",
+                        target.id,
+                        target.output_path.display(),
+                        target.expected_size,
+                        data.len()
                     );
-                    failed_count.fetch_add(1, Ordering::Relaxed);
-                    continue;
                 }
 
                 // Write directly to final output
                 ctx.dir_cache.ensure_parent_dirs(&target.output_path)?;
                 fs::write(&target.output_path, &data)?;
                 extracted_count.fetch_add(1, Ordering::Relaxed);
+                if let Some(p) = live_progress {
+                    p.fetch_add(1, Ordering::Relaxed);
+                }
 
                 // Record patch basis
                 if let Some(ahash) = target.archive_hash_path.first() {
@@ -2251,10 +2406,7 @@ pub(crate) fn process_bsa_archive(
 
         let normalized = file_path_in_bsa.replace('\\', "/").to_lowercase();
         wanted_paths.insert(normalized.clone());
-        path_to_directives
-            .entry(normalized)
-            .or_default()
-            .push(item);
+        path_to_directives.entry(normalized).or_default().push(item);
     }
 
     // Extract all files in parallel via batch callback
@@ -2267,21 +2419,37 @@ pub(crate) fn process_bsa_archive(
 
         for &(id, ref directive, _, _) in directive_list {
             if data.len() as u64 != directive.size {
-                let count = logged_failures.fetch_add(1, Ordering::Relaxed);
-                if count < MAX_LOGGED_FAILURES {
-                    error!(
-                        "FAIL [{}]: BSA size mismatch: expected {} got {}",
-                        id, directive.size, data.len()
-                    );
+                let actual_hash = crate::hash::compute_bytes_hash(&data);
+                if actual_hash != directive.hash {
+                    let count = logged_failures.fetch_add(1, Ordering::Relaxed);
+                    if count < MAX_LOGGED_FAILURES {
+                        error!(
+                            "FAIL [{}]: BSA size+hash mismatch: expected {}/{} got {}/{}",
+                            id,
+                            directive.size,
+                            directive.hash,
+                            data.len(),
+                            actual_hash
+                        );
+                    }
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
-                failed.fetch_add(1, Ordering::Relaxed);
-                continue;
+                warn!(
+                    "BSA size mismatch but hash OK for [{}] {}: manifest size {} vs actual {} - accepting",
+                    id, directive.to, directive.size, data.len()
+                );
             }
 
             let out_path = paths::join_windows_path(output_dir, &directive.to);
             if let Err(e) = ctx.dir_cache.ensure_parent_dirs(&out_path) {
                 failed.fetch_add(1, Ordering::Relaxed);
-                error!("FAIL [{}]: cannot create dirs for {}: {}", id, out_path.display(), e);
+                error!(
+                    "FAIL [{}]: cannot create dirs for {}: {}",
+                    id,
+                    out_path.display(),
+                    e
+                );
                 continue;
             }
 
@@ -2297,8 +2465,7 @@ pub(crate) fn process_bsa_archive(
                     .get(1)
                     .map(|s| s.as_str())
                     .unwrap_or("");
-                let basis_key =
-                    build_patch_basis_key(archive_hash, Some(file_path_in_bsa), None);
+                let basis_key = build_patch_basis_key(archive_hash, Some(file_path_in_bsa), None);
                 ctx.record_patch_basis_candidate_bytes_dual(
                     &basis_key,
                     &directive.archive_hash_path,
@@ -2369,10 +2536,7 @@ pub(crate) fn process_bsa_patched_directives(
         };
         let normalized = file_path_in_bsa.replace('\\', "/").to_lowercase();
         wanted_paths.insert(normalized.clone());
-        path_to_directives
-            .entry(normalized)
-            .or_default()
-            .push(item);
+        path_to_directives.entry(normalized).or_default().push(item);
     }
 
     // Read basis files from BSA in one batch, apply patches inline
@@ -2432,8 +2596,7 @@ pub(crate) fn process_bsa_patched_directives(
                             .get(1)
                             .map(|s| s.as_str())
                             .unwrap_or("");
-                        let basis_key =
-                            build_patch_basis_key(ahash, Some(file_in), None);
+                        let basis_key = build_patch_basis_key(ahash, Some(file_in), None);
                         ctx.record_patch_basis_candidate_bytes_dual(
                             &basis_key,
                             &directive.archive_hash_path,
@@ -2528,10 +2691,7 @@ fn find_file_case_insensitive(base: &Path, normalized_rel: &str) -> Option<PathB
 /// This is shared between the streaming and pipelined install flows.
 /// Successfully processed textures are recorded in `ctx.textures_processed_during_install`
 /// so that the subsequent `texture_phase()` can skip them.
-pub(crate) fn process_spilled_dds_jobs(
-    dds_jobs: Vec<SpilledDdsJob>,
-    ctx: &ProcessContext,
-) {
+pub(crate) fn process_spilled_dds_jobs(dds_jobs: Vec<SpilledDdsJob>, ctx: &ProcessContext) {
     process_spilled_dds_jobs_with_progress(dds_jobs, ctx, None, None)
 }
 
@@ -2593,26 +2753,27 @@ pub(crate) fn process_spilled_dds_jobs_with_progress(
 
         if fmt == OutputFormat::BC7 {
             // BC7: GPU batch encode in chunks of 64 to bound memory
-            ctx.config.reporter.log(&format!("  BC7: {} textures (GPU+CPU pipeline)...", jobs.len()));
+            ctx.config.reporter.log(&format!(
+                "  BC7: {} textures (GPU+CPU pipeline)...",
+                jobs.len()
+            ));
             const BC7_BATCH: usize = 64;
 
             for chunk in jobs.chunks(BC7_BATCH) {
                 let tex_jobs: Vec<TextureJob> = chunk
                     .iter()
-                    .filter_map(|j| {
-                        match j.read_data() {
-                            Ok(data) => Some(TextureJob {
-                                data,
-                                width: j.directive.image_state.width,
-                                height: j.directive.image_state.height,
-                                format: OutputFormat::BC7,
-                                id: Some(format!("{}", j.id)),
-                            }),
-                            Err(e) => {
-                                warn!("DDS spill read failed for texture {}: {:#}", j.id, e);
-                                dds_fail.fetch_add(1, Ordering::Relaxed);
-                                None
-                            }
+                    .filter_map(|j| match j.read_data() {
+                        Ok(data) => Some(TextureJob {
+                            data,
+                            width: j.directive.image_state.width,
+                            height: j.directive.image_state.height,
+                            format: OutputFormat::BC7,
+                            id: Some(format!("{}", j.id)),
+                        }),
+                        Err(e) => {
+                            warn!("DDS spill read failed for texture {}: {:#}", j.id, e);
+                            dds_fail.fetch_add(1, Ordering::Relaxed);
+                            None
                         }
                     })
                     .collect();
@@ -2630,7 +2791,9 @@ pub(crate) fn process_spilled_dds_jobs_with_progress(
                             // Use force_ensure_parent_dirs to bypass DirCache stale entries
                             if !written {
                                 for attempt in 1..=3u64 {
-                                    std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
+                                    std::thread::sleep(std::time::Duration::from_millis(
+                                        100 * attempt,
+                                    ));
                                     if ctx.dir_cache.force_ensure_parent_dirs(&out).is_ok()
                                         && fs::write(&out, &processed.data).is_ok()
                                     {
@@ -2671,7 +2834,11 @@ pub(crate) fn process_spilled_dds_jobs_with_progress(
             }
         } else {
             // Non-BC7: full CPU parallelism
-            ctx.config.reporter.log(&format!("  {}: {} textures (CPU parallel)...", fmt.name(), jobs.len()));
+            ctx.config.reporter.log(&format!(
+                "  {}: {} textures (CPU parallel)...",
+                fmt.name(),
+                jobs.len()
+            ));
 
             jobs.par_iter().for_each(|job| {
                 let result: anyhow::Result<()> = (|| {
@@ -2695,7 +2862,9 @@ pub(crate) fn process_spilled_dds_jobs_with_progress(
                             {
                                 warn!(
                                     "DDS {} write for {} succeeded on retry {}",
-                                    fmt.name(), job.directive.to, attempt
+                                    fmt.name(),
+                                    job.directive.to,
+                                    attempt
                                 );
                                 succeeded = true;
                                 break;
@@ -2704,7 +2873,8 @@ pub(crate) fn process_spilled_dds_jobs_with_progress(
                         if !succeeded {
                             anyhow::bail!(
                                 "write failed after 3 retries for {}: {}",
-                                job.directive.to, first_err
+                                job.directive.to,
+                                first_err
                             );
                         }
                     }
@@ -2727,7 +2897,13 @@ pub(crate) fn process_spilled_dds_jobs_with_progress(
                     }
                     Err(e) => {
                         dds_fail.fetch_add(1, Ordering::Relaxed);
-                        warn!("DDS {} fail [{}]: {} — {}", fmt.name(), job.id, job.directive.to, e);
+                        warn!(
+                            "DDS {} fail [{}]: {} — {}",
+                            fmt.name(),
+                            job.id,
+                            job.directive.to,
+                            e
+                        );
                     }
                 }
             });
@@ -2736,7 +2912,10 @@ pub(crate) fn process_spilled_dds_jobs_with_progress(
 
     let ok = dds_ok.load(Ordering::Relaxed);
     let fail = dds_fail.load(Ordering::Relaxed);
-    ctx.config.reporter.log(&format!("DDS processing complete: {} OK, {} failed", ok, fail));
+    ctx.config.reporter.log(&format!(
+        "DDS processing complete: {} OK, {} failed",
+        ok, fail
+    ));
 }
 
 #[cfg(test)]
@@ -2761,5 +2940,4 @@ mod tests {
         let second = get_large_archive_threshold();
         assert_eq!(first, second, "Threshold should be cached and consistent");
     }
-
 }

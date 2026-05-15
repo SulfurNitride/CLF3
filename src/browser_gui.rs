@@ -1,18 +1,25 @@
 //! egui-based modlist browser GUI.
 //!
-//! Launched via `clf3 browser`. Shows a scrollable grid of modlist cards with
-//! lazy-loaded thumbnail images, search/filter controls, and generates a CLI
-//! install command for the user to copy-paste.
+//! Launched via `clf3 browser`. Shows a scrollable list of modlist cards with
+//! lazy-loaded thumbnail images, search/filter controls, and a Settings tab
+//! for managing API keys, GPU selection, and default directories.
 
+use crate::downloaders::{LoversLabDownloader, NexusDownloader};
 use crate::game_finder::{detect_all_games, find_by_gog_id, find_by_steam_id, Launcher};
 use crate::modlist::browser::{ModlistBrowser, ModlistMetadata};
+use crate::settings::{BrowserListPaths, Settings};
+use crate::textures::{list_gpus, GpuInfo};
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 /// How many images to fetch concurrently during background loading.
 const IMAGE_BATCH_SIZE: usize = 12;
+
+/// How many downloaded images to decode/upload on the UI thread per frame.
+const IMAGE_CONVERSIONS_PER_FRAME: usize = 2;
 
 /// List row thumbnail size.
 const THUMB_WIDTH: f32 = 200.0;
@@ -62,6 +69,23 @@ struct SharedState {
     fetch_error: Option<String>,
 }
 
+/// Top-level navigation between the modlist browser and the settings editor.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    #[default]
+    Browser,
+    Settings,
+}
+
+/// Async credential-validation status for the Settings tab.
+#[derive(Clone)]
+enum ValidationStatus {
+    Idle,
+    InProgress,
+    Ok(String),
+    Err(String),
+}
+
 struct BrowserApp {
     shared: Arc<Mutex<SharedState>>,
     /// Search query string.
@@ -105,6 +129,28 @@ struct BrowserApp {
     image_cache_dir: PathBuf,
     /// Whether background image loading has been kicked off.
     image_load_started: bool,
+
+    // --- Tab + Settings state ---
+    /// Which top-level tab is showing.
+    current_tab: Tab,
+    /// Editable settings, loaded from disk at startup.
+    settings: Settings,
+    /// Async status for "Save & Verify Nexus key".
+    nexus_status: Arc<Mutex<ValidationStatus>>,
+    /// Async status for "Save & Verify LoversLab login".
+    ll_status: Arc<Mutex<ValidationStatus>>,
+    /// Whether to render the Nexus key in plain text.
+    show_nexus_key: bool,
+    /// Whether to render the LL email + password in plain text.
+    show_ll_credentials: bool,
+    /// Lazily populated on first Settings tab visit — wgpu enumeration is slow.
+    available_gpus: Option<Vec<GpuInfo>>,
+    /// One-shot message shown after saving (ok flag, text).
+    settings_save_message: Option<(bool, String)>,
+    /// Status message shown next to the Run button after spawning a terminal.
+    run_status: Option<(bool, String)>,
+    /// Whether we've tried to restore the last browser selection after metadata loaded.
+    selection_restore_attempted: bool,
 }
 
 impl Drop for BrowserApp {
@@ -145,6 +191,12 @@ impl BrowserApp {
             }
         }
 
+        // Load saved settings and pre-fill the install panel's directory
+        // fields with the user's defaults (if any).
+        let settings = Settings::load();
+        let downloads_dir = settings.default_downloads_dir.clone();
+        let install_dir = settings.default_install_dir.clone();
+
         Self {
             shared: Arc::new(Mutex::new(SharedState {
                 modlists: Vec::new(),
@@ -154,23 +206,31 @@ impl BrowserApp {
                 fetch_error: None,
             })),
             search: String::new(),
-            game_filter: String::new(),
-            show_nsfw: false,
-            show_unavailable: false,
-            show_installed_only: false,
+            game_filter: settings.browser_game_filter.clone(),
+            show_nsfw: settings.browser_show_nsfw,
+            show_unavailable: settings.browser_show_unavailable,
+            show_installed_only: settings.browser_show_installed_only,
             installed_game_types,
             installed_game_count,
             selected: None,
             local_wabbajack: None,
-            downloads_dir: String::new(),
-            install_dir: String::new(),
+            downloads_dir,
+            install_dir,
             generated_command: None,
             fetch_started: false,
-            rt: Some(
-                tokio::runtime::Runtime::new().expect("Failed to create tokio runtime"),
-            ),
+            rt: Some(tokio::runtime::Runtime::new().expect("Failed to create tokio runtime")),
             image_cache_dir,
             image_load_started: false,
+            current_tab: Tab::Browser,
+            settings,
+            nexus_status: Arc::new(Mutex::new(ValidationStatus::Idle)),
+            ll_status: Arc::new(Mutex::new(ValidationStatus::Idle)),
+            show_nexus_key: false,
+            show_ll_credentials: false,
+            available_gpus: None,
+            settings_save_message: None,
+            run_status: None,
+            selection_restore_attempted: false,
         }
     }
 
@@ -297,16 +357,14 @@ impl BrowserApp {
 
                         // Download.
                         match client.get(&url).send().await {
-                            Ok(resp) if resp.status().is_success() => {
-                                match resp.bytes().await {
-                                    Ok(bytes) if !bytes.is_empty() => {
-                                        let _ = std::fs::write(&cached_path, &bytes);
-                                        (key, Ok(bytes.to_vec()))
-                                    }
-                                    Ok(_) => (key, Err("Empty response".to_string())),
-                                    Err(e) => (key, Err(e.to_string())),
+                            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                                Ok(bytes) if !bytes.is_empty() => {
+                                    let _ = std::fs::write(&cached_path, &bytes);
+                                    (key, Ok(bytes.to_vec()))
                                 }
-                            }
+                                Ok(_) => (key, Err("Empty response".to_string())),
+                                Err(e) => (key, Err(e.to_string())),
+                            },
                             Ok(resp) => (key, Err(format!("HTTP {}", resp.status()))),
                             Err(e) => (key, Err(e.to_string())),
                         }
@@ -424,6 +482,55 @@ impl BrowserApp {
         self.build_install_command(&path.display().to_string())
     }
 
+    fn selected_list_key(&self) -> Option<String> {
+        self.selected.clone()
+    }
+
+    fn apply_paths_for_list(&mut self, key: &str) {
+        if let Some(paths) = self.settings.browser_list_paths.get(key) {
+            self.downloads_dir = paths.downloads_dir.clone();
+            self.install_dir = paths.install_dir.clone();
+        } else {
+            self.downloads_dir = self.settings.default_downloads_dir.clone();
+            self.install_dir = self.settings.default_install_dir.clone();
+        }
+    }
+
+    fn remember_current_list_paths(&mut self) {
+        let Some(key) = self.selected_list_key() else {
+            return;
+        };
+
+        self.settings.browser_list_paths.insert(
+            key,
+            BrowserListPaths {
+                downloads_dir: self.downloads_dir.clone(),
+                install_dir: self.install_dir.clone(),
+            },
+        );
+        let _ = self.settings.save();
+    }
+
+    fn remember_browser_state(&mut self) {
+        self.settings.browser_game_filter = self.game_filter.clone();
+        self.settings.browser_show_nsfw = self.show_nsfw;
+        self.settings.browser_show_unavailable = self.show_unavailable;
+        self.settings.browser_show_installed_only = self.show_installed_only;
+        self.settings.browser_last_selected_modlist = self.selected.clone();
+        let _ = self.settings.save();
+    }
+
+    fn select_modlist(&mut self, name: String) {
+        self.remember_current_list_paths();
+        self.selected = Some(name.clone());
+        self.local_wabbajack = None;
+        self.generated_command = None;
+        self.run_status = None;
+        self.apply_paths_for_list(&name);
+        self.settings.browser_last_selected_modlist = Some(name);
+        let _ = self.settings.save();
+    }
+
     /// Shared command builder — both modlist-URL and local-path callers
     /// produce the same `clf3 install <src> <downloads> <install>` shape.
     fn build_install_command(&self, source: &str) -> Option<String> {
@@ -437,6 +544,23 @@ impl BrowserApp {
             "\"{}\" install \"{}\" \"{}\" \"{}\"",
             exe, source, self.downloads_dir, self.install_dir
         ))
+    }
+
+    /// Build the install command as a list of args (exe + args) for direct
+    /// spawning, alongside the display string. Returns `None` when the user
+    /// hasn't supplied both directories yet.
+    fn build_install_args(&self, source: &str) -> Option<(PathBuf, Vec<String>)> {
+        if self.downloads_dir.is_empty() || self.install_dir.is_empty() {
+            return None;
+        }
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("clf3"));
+        let args = vec![
+            "install".into(),
+            source.into(),
+            self.downloads_dir.clone(),
+            self.install_dir.clone(),
+        ];
+        Some((exe, args))
     }
 }
 
@@ -454,8 +578,126 @@ impl eframe::App for BrowserApp {
             }
         }
 
-        // Top panel: search and filters.
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+        // Convert a small number of downloaded images to GPU textures each
+        // frame. Decoding every ready image in one pass makes the browser feel
+        // frozen on launch when many thumbnails arrive together.
+        let images_to_convert: Vec<(String, Vec<u8>)> = {
+            let mut state = self.shared.lock().expect("lock shared state");
+            let keys_to_convert: Vec<String> = state
+                .images
+                .iter()
+                .filter_map(|(k, v)| {
+                    if matches!(v, ImageState::Downloaded(_)) {
+                        Some(k.clone())
+                    } else {
+                        None
+                    }
+                })
+                .take(IMAGE_CONVERSIONS_PER_FRAME)
+                .collect();
+
+            keys_to_convert
+                .into_iter()
+                .filter_map(|key| match state.images.remove(&key) {
+                    Some(ImageState::Downloaded(bytes)) => Some((key, bytes)),
+                    other => {
+                        if let Some(state_value) = other {
+                            state.images.insert(key, state_value);
+                        }
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        for (key, bytes) in images_to_convert {
+            let converted = match image::load_from_memory(&bytes) {
+                Ok(img) => {
+                    let rgba = img.to_rgba8();
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    let pixels = rgba.into_raw();
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                    ImageState::Texture(ctx.load_texture(
+                        &key,
+                        color_image,
+                        egui::TextureOptions::LINEAR,
+                    ))
+                }
+                Err(_) => ImageState::Failed,
+            };
+
+            let mut state = self.shared.lock().expect("lock shared state");
+            state.images.insert(key, converted);
+            if state
+                .images
+                .values()
+                .any(|v| matches!(v, ImageState::Downloaded(_)))
+            {
+                ctx.request_repaint();
+            }
+        }
+
+        // Top tab bar — always visible.
+        egui::TopBottomPanel::top("tab_bar").show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.current_tab, Tab::Browser, "Modlist Browser");
+                ui.selectable_value(&mut self.current_tab, Tab::Settings, "Settings");
+            });
+            ui.add_space(2.0);
+        });
+
+        match self.current_tab {
+            Tab::Browser => self.render_browser_tab(ctx),
+            Tab::Settings => self.render_settings_tab(ctx),
+        }
+
+        if !self.selection_restore_attempted {
+            let last = self.settings.browser_last_selected_modlist.clone();
+            if let Some(name) = last {
+                let exists = {
+                    let state = self.shared.lock().expect("lock shared state");
+                    state.fetch_done && state.modlists.iter().any(|m| m.machine_name == name)
+                };
+                if exists {
+                    self.select_modlist(name);
+                    self.selection_restore_attempted = true;
+                } else {
+                    let fetch_done = {
+                        let state = self.shared.lock().expect("lock shared state");
+                        state.fetch_done
+                    };
+                    if fetch_done {
+                        self.selection_restore_attempted = true;
+                    }
+                }
+            } else {
+                self.selection_restore_attempted = true;
+            }
+        }
+
+        // Check for pending card selection (set by render_card via ctx memory).
+        let pending: Option<String> =
+            ctx.memory_mut(|mem| mem.data.get_temp(egui::Id::new("pending_selection")));
+        if let Some(name) = pending {
+            ctx.memory_mut(|mem| {
+                mem.data
+                    .remove::<String>(egui::Id::new("pending_selection"));
+            });
+            self.select_modlist(name);
+        }
+    }
+}
+
+impl BrowserApp {
+    /// Top panel: search bar + filters + open-file button.
+    fn render_browser_filters(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("browser_filters").show(ctx, |ui| {
+            let old_game_filter = self.game_filter.clone();
+            let old_show_nsfw = self.show_nsfw;
+            let old_show_unavailable = self.show_unavailable;
+            let old_show_installed_only = self.show_installed_only;
+
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.label("Search:");
@@ -527,6 +769,9 @@ impl eframe::App for BrowserApp {
                     !self.installed_game_types.is_empty(),
                     egui::Checkbox::new(&mut self.show_installed_only, installed_label),
                 );
+                if self.installed_game_types.is_empty() {
+                    self.show_installed_only = false;
+                }
 
                 ui.separator();
 
@@ -537,178 +782,247 @@ impl eframe::App for BrowserApp {
                         .add_filter("Wabbajack modlist", &["wabbajack"])
                         .pick_file()
                     {
+                        self.remember_current_list_paths();
                         self.local_wabbajack = Some(path);
                         // Picking a local file clears any network selection so
                         // the bottom panel doesn't show two competing titles.
                         self.selected = None;
                         self.generated_command = None;
+                        self.settings.browser_last_selected_modlist = None;
+                        let _ = self.settings.save();
                     }
                 }
             });
             ui.add_space(4.0);
+
+            if self.game_filter != old_game_filter
+                || self.show_nsfw != old_show_nsfw
+                || self.show_unavailable != old_show_unavailable
+                || self.show_installed_only != old_show_installed_only
+            {
+                self.remember_browser_state();
+            }
         });
+    }
 
-        // Bottom panel: selected modlist details + command generation.
-        // Shows for either a modlist picked from the grid OR a local
-        // .wabbajack file opened via the top-panel button.
-        if self.selected.is_some() || self.local_wabbajack.is_some() {
-            egui::TopBottomPanel::bottom("bottom_panel")
-                .min_height(120.0)
-                .show(ctx, |ui| {
-                    ui.add_space(8.0);
-
-                    // Resolve the selected modlist once (needed if we're in
-                    // modlist-selection mode).
-                    let selected_modlist = self.selected.as_ref().and_then(|name| {
-                        let state = self.shared.lock().expect("lock shared state");
-                        state
-                            .modlists
-                            .iter()
-                            .find(|m| &m.machine_name == name)
-                            .cloned()
-                    });
-
-                    // Header row — title/author/game or local filename
-                    ui.horizontal(|ui| {
-                        if let Some(modlist) = &selected_modlist {
-                            ui.heading(&modlist.title);
-                            ui.label(format!("by {}", modlist.author));
-                            ui.label(format!("({})", Self::format_game_name(&modlist.game)));
-                        } else if let Some(path) = &self.local_wabbajack {
-                            let filename = path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| path.display().to_string());
-                            ui.heading(filename);
-                            ui.label("Local .wabbajack file");
-                        }
-
-                        if ui.button("X Close").clicked() {
-                            self.selected = None;
-                            self.local_wabbajack = None;
-                            self.generated_command = None;
-                        }
-                    });
-
-                    if let Some(path) = &self.local_wabbajack {
-                        ui.label(
-                            egui::RichText::new(path.display().to_string())
-                                .size(11.0)
-                                .color(egui::Color32::from_gray(160)),
-                        );
-                    }
-
-                    ui.add_space(4.0);
-
-                    ui.horizontal(|ui| {
-                        ui.label("Downloads dir:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.downloads_dir)
-                                .desired_width(300.0),
-                        );
-                        if ui.button("Browse...").clicked() {
-                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                self.downloads_dir = path.display().to_string();
-                            }
-                        }
-
-                        ui.separator();
-
-                        ui.label("Install dir:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.install_dir)
-                                .desired_width(300.0),
-                        );
-                        if ui.button("Browse...").clicked() {
-                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                self.install_dir = path.display().to_string();
-                            }
-                        }
-                    });
-
-                    ui.add_space(4.0);
-
-                    // Build the install command from whichever source is set.
-                    // Local file takes precedence over an online selection
-                    // because picking a file clears `selected`.
-                    let generated = if let Some(path) = self.local_wabbajack.clone() {
-                        self.generate_command_for_local(&path)
-                    } else if let Some(modlist) = &selected_modlist {
-                        self.generate_command(modlist)
-                    } else {
-                        None
-                    };
-                    if let Some(cmd) = generated {
-                        self.generated_command = Some(cmd);
-                    }
-
-                    if let Some(ref cmd) = self.generated_command {
-                        ui.horizontal(|ui| {
-                            ui.label("Command:");
-                            let response = ui.add(
-                                egui::TextEdit::singleline(&mut cmd.clone())
-                                    .desired_width(ui.available_width() - 80.0)
-                                    .font(egui::TextStyle::Monospace),
-                            );
-                            if ui.button("Copy").clicked() {
-                                ui.ctx().copy_text(cmd.clone());
-                            }
-                            // Select all on click for easy manual copy.
-                            if response.clicked() {
-                                ui.ctx().copy_text(cmd.clone());
-                            }
-                        });
-                    } else if !self.downloads_dir.is_empty() || !self.install_dir.is_empty() {
-                        ui.label("Fill in both directories to generate the install command.");
-                    } else {
-                        ui.label(
-                            "Enter your downloads and install directories to generate the command.",
-                        );
-                    }
-
-                    ui.add_space(4.0);
-                });
+    /// Bottom panel: directory inputs + generated command + Run/Copy buttons.
+    /// Only rendered when a modlist or local file is selected.
+    fn render_install_panel(&mut self, ctx: &egui::Context) {
+        if self.selected.is_none() && self.local_wabbajack.is_none() {
+            return;
         }
 
-        // Convert any Downloaded images to GPU textures.
-        {
-            let mut state = self.shared.lock().expect("lock shared state");
-            let keys_to_convert: Vec<String> = state
-                .images
-                .iter()
-                .filter_map(|(k, v)| {
-                    if matches!(v, ImageState::Downloaded(_)) {
-                        Some(k.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+        egui::TopBottomPanel::bottom("install_panel")
+            .min_height(120.0)
+            .show(ctx, |ui| {
+                ui.add_space(8.0);
 
-            for key in keys_to_convert {
-                if let Some(ImageState::Downloaded(bytes)) = state.images.remove(&key) {
-                    match image::load_from_memory(&bytes) {
-                        Ok(img) => {
-                            let rgba = img.to_rgba8();
-                            let size = [rgba.width() as usize, rgba.height() as usize];
-                            let pixels = rgba.into_raw();
-                            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-                            let texture = ctx.load_texture(
-                                &key,
-                                color_image,
-                                egui::TextureOptions::LINEAR,
-                            );
-                            state.images.insert(key, ImageState::Texture(texture));
-                        }
-                        Err(_) => {
-                            state.images.insert(key, ImageState::Failed);
-                        }
+                // Resolve the selected modlist once (needed if we're in
+                // modlist-selection mode).
+                let selected_modlist = self.selected.as_ref().and_then(|name| {
+                    let state = self.shared.lock().expect("lock shared state");
+                    state
+                        .modlists
+                        .iter()
+                        .find(|m| &m.machine_name == name)
+                        .cloned()
+                });
+
+                // Header row — title/author/game or local filename
+                ui.horizontal(|ui| {
+                    if let Some(modlist) = &selected_modlist {
+                        ui.heading(&modlist.title);
+                        ui.label(format!("by {}", modlist.author));
+                        ui.label(format!("({})", Self::format_game_name(&modlist.game)));
+                    } else if let Some(path) = &self.local_wabbajack {
+                        let filename = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string());
+                        ui.heading(filename);
+                        ui.label("Local .wabbajack file");
+                    }
+
+                    if ui.button("X Close").clicked() {
+                        self.remember_current_list_paths();
+                        self.selected = None;
+                        self.local_wabbajack = None;
+                        self.generated_command = None;
+                        self.run_status = None;
+                        self.settings.browser_last_selected_modlist = None;
+                        let _ = self.settings.save();
+                    }
+                });
+
+                if let Some(path) = &self.local_wabbajack {
+                    ui.label(
+                        egui::RichText::new(path.display().to_string())
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(160)),
+                    );
+                }
+
+                if let Some(modlist) = &selected_modlist {
+                    if modlist.force_down {
+                        let msg = if modlist.download_url().is_some() {
+                            "Author marked this modlist DOWN. Some sources may \
+                             fail; install may still succeed if archives are \
+                             already in your downloads folder."
+                        } else {
+                            "Author marked this modlist DOWN and no download \
+                             link is published. Use the local .wabbajack \
+                             button above if you already have the file."
+                        };
+                        ui.label(
+                            egui::RichText::new(msg)
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(220, 140, 50)),
+                        );
                     }
                 }
-            }
-        }
 
-        // Central panel: modlist grid.
+                ui.add_space(4.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Downloads dir:");
+                    let downloads_response = ui.add(
+                        egui::TextEdit::singleline(&mut self.downloads_dir).desired_width(300.0),
+                    );
+                    let mut paths_changed = downloads_response.changed();
+                    if ui.button("Browse...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            self.downloads_dir = path.display().to_string();
+                            paths_changed = true;
+                        }
+                    }
+
+                    ui.separator();
+
+                    ui.label("Install dir:");
+                    let install_response = ui.add(
+                        egui::TextEdit::singleline(&mut self.install_dir).desired_width(300.0),
+                    );
+                    paths_changed |= install_response.changed();
+                    if ui.button("Browse...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            self.install_dir = path.display().to_string();
+                            paths_changed = true;
+                        }
+                    }
+
+                    if paths_changed {
+                        self.generated_command = None;
+                        self.remember_current_list_paths();
+                    }
+                });
+
+                ui.add_space(4.0);
+
+                // Build the install command from whichever source is set.
+                // Local file takes precedence over an online selection
+                // because picking a file clears `selected`.
+                let (display_cmd, spawn_args) = if let Some(path) = self.local_wabbajack.clone() {
+                    let source = path.display().to_string();
+                    (
+                        self.generate_command_for_local(&path),
+                        self.build_install_args(&source),
+                    )
+                } else if let Some(modlist) = &selected_modlist {
+                    let source_owned = modlist.download_url().map(|s| s.to_string());
+                    let display = source_owned
+                        .as_ref()
+                        .and_then(|_| self.generate_command(modlist));
+                    let args = source_owned
+                        .as_ref()
+                        .and_then(|s| self.build_install_args(s));
+                    (display, args)
+                } else {
+                    (None, None)
+                };
+
+                if let Some(cmd) = display_cmd {
+                    self.generated_command = Some(cmd);
+                }
+
+                if let Some(ref cmd) = self.generated_command.clone() {
+                    ui.horizontal(|ui| {
+                        ui.label("Command:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut cmd.clone())
+                                .desired_width(ui.available_width() - 220.0)
+                                .font(egui::TextStyle::Monospace),
+                        );
+
+                        let run_clicked = ui
+                            .add_enabled(spawn_args.is_some(), egui::Button::new("Run"))
+                            .on_hover_text(
+                                "Launches the install in a new terminal window and closes \
+                                 the browser. Falls back to the parent terminal if no \
+                                 graphical terminal emulator is found.",
+                            )
+                            .clicked();
+
+                        if ui.button("Copy").clicked() {
+                            ui.ctx().copy_text(cmd.clone());
+                            self.run_status = Some((true, "Copied to clipboard.".into()));
+                        }
+
+                        if run_clicked {
+                            if let Some((exe, args)) = spawn_args {
+                                match launch_install(&exe, &args) {
+                                    Ok(LaunchOutcome::Terminal(name)) => {
+                                        // Window will be closed once we exit
+                                        // this UI scope; tell egui to do so.
+                                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                        self.run_status = Some((
+                                            true,
+                                            format!("Launched in {} — closing browser.", name),
+                                        ));
+                                    }
+                                    Ok(LaunchOutcome::Inline) => {
+                                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                        self.run_status = Some((
+                                            true,
+                                            "No graphical terminal found — install spawned \
+                                             inline; output goes to the terminal that \
+                                             launched the browser."
+                                                .into(),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        self.run_status =
+                                            Some((false, format!("Run failed: {}", e)));
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    if let Some((ok, ref msg)) = self.run_status {
+                        let color = if ok {
+                            egui::Color32::from_rgb(50, 180, 50)
+                        } else {
+                            egui::Color32::RED
+                        };
+                        ui.colored_label(color, msg);
+                    }
+                } else if !self.downloads_dir.is_empty() || !self.install_dir.is_empty() {
+                    ui.label("Fill in both directories to generate the install command.");
+                } else {
+                    ui.label(
+                        "Enter your downloads and install directories to generate the command.",
+                    );
+                }
+
+                ui.add_space(4.0);
+            });
+    }
+
+    /// Browser tab: filters + install panel + modlist grid.
+    fn render_browser_tab(&mut self, ctx: &egui::Context) {
+        self.render_browser_filters(ctx);
+        self.render_install_panel(ctx);
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let fetch_done = {
                 let state = self.shared.lock().expect("lock shared state");
@@ -739,18 +1053,458 @@ impl eframe::App for BrowserApp {
                     }
                 });
         });
+    }
 
-        // Check for pending card selection (set by render_card via ctx memory).
-        let pending: Option<String> = ctx.memory_mut(|mem| {
-            mem.data.get_temp(egui::Id::new("pending_selection"))
-        });
-        if let Some(name) = pending {
-            ctx.memory_mut(|mem| {
-                mem.data
-                    .remove::<String>(egui::Id::new("pending_selection"));
+    /// Settings tab: editable form for credentials, GPU, default directories.
+    fn render_settings_tab(&mut self, ctx: &egui::Context) {
+        // Lazy-load GPU list on first visit — wgpu enumeration can take 1-2s.
+        if self.available_gpus.is_none() {
+            self.available_gpus = Some(list_gpus());
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.heading("Settings");
+                ui.label(
+                    egui::RichText::new(
+                        Settings::settings_path()
+                            .map(|p| format!("Stored in: {}", p.display()))
+                            .unwrap_or_else(|_| "Stored in: <unknown>".into()),
+                    )
+                    .size(11.0)
+                    .color(egui::Color32::from_gray(140)),
+                );
+                ui.add_space(12.0);
+
+                // --- Fluorine integration (single toggle at the top) ---
+                let prev_add_to_fluorine = self.settings.add_to_fluorine;
+                let cb = ui.checkbox(
+                    &mut self.settings.add_to_fluorine,
+                    "Add finished installs to Fluorine",
+                );
+                cb.on_hover_text(
+                    "After a successful install, register the install directory as a \
+                     portable instance in Fluorine Manager. If Fluorine isn't installed, \
+                     CLF3 will download the latest release from GitHub automatically.",
+                );
+                if self.settings.add_to_fluorine != prev_add_to_fluorine {
+                    let _ = self.settings.save();
+                }
+
+                ui.add_space(12.0);
+
+                // --- Default Directories ---
+                ui.group(|ui| {
+                    ui.heading("Default Directories");
+                    ui.label(
+                        egui::RichText::new(
+                            "Pre-fill the install panel each time you launch the browser.",
+                        )
+                        .size(11.0)
+                        .color(egui::Color32::from_gray(160)),
+                    );
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label("Downloads:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.default_downloads_dir)
+                                .desired_width(400.0),
+                        );
+                        if ui.button("Browse...").clicked() {
+                            if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                                self.settings.default_downloads_dir = p.display().to_string();
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Install:    ");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.default_install_dir)
+                                .desired_width(400.0),
+                        );
+                        if ui.button("Browse...").clicked() {
+                            if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                                self.settings.default_install_dir = p.display().to_string();
+                            }
+                        }
+                    });
+
+                    ui.add_space(4.0);
+                    if ui.button("Save default directories").clicked() {
+                        // Mirror into the live install panel so the user sees
+                        // their saved defaults immediately on the Browser tab.
+                        self.downloads_dir = self.settings.default_downloads_dir.clone();
+                        self.install_dir = self.settings.default_install_dir.clone();
+                        self.do_save_settings("Default directories saved.");
+                    }
+                });
+
+                ui.add_space(12.0);
+
+                // --- Nexus Mods API Key ---
+                ui.group(|ui| {
+                    ui.heading("Nexus Mods");
+                    ui.label(
+                        egui::RichText::new(
+                            "API key from https://www.nexusmods.com/users/myaccount?tab=api",
+                        )
+                        .size(11.0)
+                        .color(egui::Color32::from_gray(160)),
+                    );
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label("API key:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.nexus_api_key)
+                                .password(!self.show_nexus_key)
+                                .desired_width(400.0),
+                        );
+                        ui.checkbox(&mut self.show_nexus_key, "Show");
+                    });
+
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save & Verify").clicked() {
+                            self.verify_and_save_nexus(ctx);
+                        }
+                        render_validation_status(ui, &self.nexus_status);
+                    });
+                });
+
+                ui.add_space(12.0);
+
+                // --- LoversLab login ---
+                ui.group(|ui| {
+                    ui.heading("LoversLab");
+                    ui.label(
+                        egui::RichText::new(
+                            "Used to log in for automated downloads of LL-hosted files.",
+                        )
+                        .size(11.0)
+                        .color(egui::Color32::from_gray(160)),
+                    );
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label("Email/username:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.loverslab_email)
+                                .password(!self.show_ll_credentials)
+                                .desired_width(360.0),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Password:      ");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.loverslab_password)
+                                .password(!self.show_ll_credentials)
+                                .desired_width(360.0),
+                        );
+                        ui.checkbox(&mut self.show_ll_credentials, "Show");
+                    });
+
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save & Verify").clicked() {
+                            self.verify_and_save_ll(ctx);
+                        }
+                        render_validation_status(ui, &self.ll_status);
+                    });
+                });
+
+                ui.add_space(12.0);
+
+                // --- GPU selection ---
+                ui.group(|ui| {
+                    ui.heading("GPU (texture encoding)");
+                    ui.label(
+                        egui::RichText::new(
+                            "Used for BC7/BC6H DDS encoding during install. Auto picks \
+                             the first discrete GPU.",
+                        )
+                        .size(11.0)
+                        .color(egui::Color32::from_gray(160)),
+                    );
+                    ui.add_space(4.0);
+
+                    let gpus = self.available_gpus.clone().unwrap_or_default();
+                    let current_text = match self.settings.gpu_index {
+                        None => "auto (recommended)".to_string(),
+                        Some(idx) => format!(
+                            "[{}] {}",
+                            idx,
+                            if self.settings.gpu_name.is_empty() {
+                                "<unknown>"
+                            } else {
+                                self.settings.gpu_name.as_str()
+                            }
+                        ),
+                    };
+                    egui::ComboBox::from_id_salt("gpu_select")
+                        .selected_text(current_text)
+                        .width(500.0)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(
+                                    self.settings.gpu_index.is_none(),
+                                    "auto (recommended)",
+                                )
+                                .clicked()
+                            {
+                                self.settings.gpu_index = None;
+                                self.settings.gpu_name = String::new();
+                            }
+                            for gpu in &gpus {
+                                let label = format!(
+                                    "[{}] {} ({}, {})",
+                                    gpu.adapter_index, gpu.name, gpu.backend, gpu.device_type
+                                );
+                                let selected = self.settings.gpu_index == Some(gpu.adapter_index);
+                                if ui.selectable_label(selected, &label).clicked() {
+                                    self.settings.gpu_index = Some(gpu.adapter_index);
+                                    self.settings.gpu_name = gpu.name.clone();
+                                }
+                            }
+                        });
+
+                    ui.add_space(4.0);
+                    if ui.button("Save GPU selection").clicked() {
+                        self.do_save_settings("GPU selection saved.");
+                    }
+                });
+
+                ui.add_space(12.0);
+
+                // --- Patch cache (optional) ---
+                ui.group(|ui| {
+                    ui.heading("Patch cache (optional)");
+                    ui.label(
+                        egui::RichText::new(
+                            "Persistent directory for octodiff patched files \
+                             across runs. Leave blank to disable.",
+                        )
+                        .size(11.0)
+                        .color(egui::Color32::from_gray(160)),
+                    );
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.patch_cache_dir)
+                                .desired_width(400.0),
+                        );
+                        if ui.button("Browse...").clicked() {
+                            if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                                self.settings.patch_cache_dir = p.display().to_string();
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+                    if ui.button("Save patch cache dir").clicked() {
+                        self.do_save_settings("Patch cache directory saved.");
+                    }
+                });
+
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save all settings").clicked() {
+                        self.do_save_settings("All settings saved.");
+                    }
+                    if let Some((ok, ref msg)) = self.settings_save_message {
+                        let color = if ok {
+                            egui::Color32::from_rgb(50, 180, 50)
+                        } else {
+                            egui::Color32::RED
+                        };
+                        ui.colored_label(color, msg);
+                    }
+                });
+                ui.add_space(12.0);
             });
-            self.selected = Some(name);
-            self.generated_command = None;
+        });
+    }
+
+    /// Persist the current `self.settings` to disk and record a status message.
+    fn do_save_settings(&mut self, success_msg: &str) {
+        match self.settings.save() {
+            Ok(_) => self.settings_save_message = Some((true, success_msg.into())),
+            Err(e) => self.settings_save_message = Some((false, format!("Save failed: {}", e))),
+        }
+    }
+
+    /// Validate the Nexus API key against the live API, then save settings on
+    /// success. The status field is updated from the background task and
+    /// triggers a repaint when done.
+    fn verify_and_save_nexus(&mut self, ctx: &egui::Context) {
+        let key = self.settings.nexus_api_key.clone();
+        if key.is_empty() {
+            *self.nexus_status.lock().unwrap() = ValidationStatus::Err("API key is empty".into());
+            return;
+        }
+        *self.nexus_status.lock().unwrap() = ValidationStatus::InProgress;
+
+        let status = Arc::clone(&self.nexus_status);
+        let settings_snapshot = self.settings.clone();
+        let ctx = ctx.clone();
+        self.rt().spawn(async move {
+            let result = match NexusDownloader::new(&key) {
+                Ok(nx) => nx.validate().await,
+                Err(e) => Err(e),
+            };
+            let mut s = status.lock().unwrap();
+            match result {
+                Ok(info) => match settings_snapshot.save() {
+                    Ok(_) => {
+                        *s = ValidationStatus::Ok(format!(
+                            "Verified as {} (Premium: {})",
+                            info.name,
+                            if info.is_premium { "yes" } else { "no" }
+                        ));
+                    }
+                    Err(e) => {
+                        *s = ValidationStatus::Err(format!("Verified but save failed: {}", e));
+                    }
+                },
+                Err(e) => *s = ValidationStatus::Err(format!("{}", e)),
+            }
+            drop(s);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Validate LoversLab credentials by attempting a login, then save settings
+    /// on success.
+    fn verify_and_save_ll(&mut self, ctx: &egui::Context) {
+        let email = self.settings.loverslab_email.clone();
+        let password = self.settings.loverslab_password.clone();
+        if email.is_empty() || password.is_empty() {
+            *self.ll_status.lock().unwrap() =
+                ValidationStatus::Err("Email and password are required".into());
+            return;
+        }
+        *self.ll_status.lock().unwrap() = ValidationStatus::InProgress;
+
+        let status = Arc::clone(&self.ll_status);
+        let settings_snapshot = self.settings.clone();
+        let ctx = ctx.clone();
+        self.rt().spawn(async move {
+            let result = LoversLabDownloader::login(&email, &password).await;
+            let mut s = status.lock().unwrap();
+            match result {
+                Ok(_) => match settings_snapshot.save() {
+                    Ok(_) => *s = ValidationStatus::Ok("Verified and saved.".into()),
+                    Err(e) => {
+                        *s = ValidationStatus::Err(format!("Verified but save failed: {}", e));
+                    }
+                },
+                Err(e) => *s = ValidationStatus::Err(format!("{}", e)),
+            }
+            drop(s);
+            ctx.request_repaint();
+        });
+    }
+}
+
+/// Outcome of trying to run the install command.
+enum LaunchOutcome {
+    /// Spawned into a graphical terminal emulator (binary name).
+    Terminal(&'static str),
+    /// No graphical terminal found — spawned inline with inherited stdio.
+    Inline,
+}
+
+/// Linux terminal emulators we know how to invoke, in preference order.
+/// Each entry is `(binary, args_before_command)`.
+const TERMINAL_CANDIDATES: &[(&str, &[&str])] = &[
+    ("kitty", &[]),
+    ("konsole", &["-e"]),
+    ("alacritty", &["-e"]),
+    ("wezterm", &["start", "--"]),
+    ("gnome-terminal", &["--"]),
+    ("foot", &[]),
+    ("tilix", &["-e"]),
+    ("xfce4-terminal", &["-e"]),
+    ("xterm", &["-e"]),
+];
+
+/// Spawn the install command in a new terminal window (preferred) or inline
+/// (fallback). Returns which path was taken.
+fn launch_install(exe: &Path, args: &[String]) -> Result<LaunchOutcome, String> {
+    // Build a single bash invocation that runs the install and pauses for
+    // input afterwards so the user can read the final output.
+    let mut quoted = shell_single_quote(&exe.display().to_string());
+    for a in args {
+        quoted.push(' ');
+        quoted.push_str(&shell_single_quote(a));
+    }
+    let bash_script = format!(
+        "{} ; echo ; echo \"Installation finished. Press Enter to close.\" ; read",
+        quoted
+    );
+
+    for (binary, prefix) in TERMINAL_CANDIDATES {
+        if which::which(binary).is_err() {
+            continue;
+        }
+        let mut cmd = Command::new(binary);
+        cmd.args(*prefix);
+        cmd.args(["bash", "-c", &bash_script]);
+        // Detach stdio so the new window owns its own TTY.
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        match cmd.spawn() {
+            Ok(_) => return Ok(LaunchOutcome::Terminal(binary)),
+            Err(_) => continue,
+        }
+    }
+
+    // Inline fallback — spawn the install directly with inherited stdio so
+    // its output goes to whatever terminal launched the browser.
+    Command::new(exe)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map(|_| LaunchOutcome::Inline)
+        .map_err(|e| format!("spawning {}: {}", exe.display(), e))
+}
+
+/// Wrap a string in single quotes for safe shell embedding.
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            // Close quote, escape the apostrophe, reopen.
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Render an inline indicator showing the current state of an async
+/// validation task.
+fn render_validation_status(ui: &mut egui::Ui, status: &Arc<Mutex<ValidationStatus>>) {
+    let snapshot = status.lock().unwrap().clone();
+    match snapshot {
+        ValidationStatus::Idle => {}
+        ValidationStatus::InProgress => {
+            ui.spinner();
+            ui.label("Verifying...");
+        }
+        ValidationStatus::Ok(msg) => {
+            ui.colored_label(egui::Color32::from_rgb(50, 180, 50), msg);
+        }
+        ValidationStatus::Err(msg) => {
+            ui.colored_label(egui::Color32::RED, msg);
         }
     }
 }
@@ -795,8 +1549,7 @@ impl BrowserApp {
                         )
                     };
 
-                    let (_, thumb_rect) =
-                        ui.allocate_space(egui::vec2(THUMB_WIDTH, THUMB_HEIGHT));
+                    let (_, thumb_rect) = ui.allocate_space(egui::vec2(THUMB_WIDTH, THUMB_HEIGHT));
 
                     if let Some(tex) = texture {
                         let img = egui::Image::new(&tex)
@@ -804,19 +1557,13 @@ impl BrowserApp {
                             .corner_radius(4);
                         ui.put(thumb_rect, img);
                     } else if is_loading {
-                        ui.painter().rect_filled(
-                            thumb_rect,
-                            4,
-                            egui::Color32::from_gray(45),
-                        );
+                        ui.painter()
+                            .rect_filled(thumb_rect, 4, egui::Color32::from_gray(45));
                         ui.put(thumb_rect, egui::Spinner::new());
                     } else {
                         // Failed.
-                        ui.painter().rect_filled(
-                            thumb_rect,
-                            4,
-                            egui::Color32::from_gray(35),
-                        );
+                        ui.painter()
+                            .rect_filled(thumb_rect, 4, egui::Color32::from_gray(35));
                         ui.painter().text(
                             thumb_rect.center(),
                             egui::Align2::CENTER_CENTER,
@@ -832,11 +1579,7 @@ impl BrowserApp {
                     ui.vertical(|ui| {
                         // Title row with badges.
                         ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(&modlist.title)
-                                    .strong()
-                                    .size(16.0),
-                            );
+                            ui.label(egui::RichText::new(&modlist.title).strong().size(16.0));
                             if modlist.nsfw {
                                 ui.label(
                                     egui::RichText::new("NSFW")
@@ -849,6 +1592,19 @@ impl BrowserApp {
                                     egui::RichText::new("Official")
                                         .size(11.0)
                                         .color(egui::Color32::from_rgb(50, 180, 50)),
+                                );
+                            }
+                            if modlist.force_down {
+                                ui.label(
+                                    egui::RichText::new("DOWN")
+                                        .size(11.0)
+                                        .color(egui::Color32::from_rgb(220, 140, 50)),
+                                )
+                                .on_hover_text(
+                                    "Author flagged this list as unavailable. \
+                                     Install may still work if you already have \
+                                     the .wabbajack file or all required archives \
+                                     in your downloads folder.",
                                 );
                             }
                         });
@@ -868,8 +1624,7 @@ impl BrowserApp {
 
                         // Description.
                         let desc = if modlist.description.chars().count() > 200 {
-                            let truncated: String =
-                                modlist.description.chars().take(200).collect();
+                            let truncated: String = modlist.description.chars().take(200).collect();
                             format!("{}...", truncated)
                         } else {
                             modlist.description.clone()
@@ -896,13 +1651,9 @@ impl BrowserApp {
 
                             ui.add_space(16.0);
 
-                            if modlist.is_available()
+                            if modlist.download_url().is_some()
                                 && ui
-                                    .button(if is_selected {
-                                        "Selected"
-                                    } else {
-                                        "Select"
-                                    })
+                                    .button(if is_selected { "Selected" } else { "Select" })
                                     .clicked()
                             {
                                 ui.ctx().memory_mut(|mem| {

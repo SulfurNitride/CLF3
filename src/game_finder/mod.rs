@@ -29,8 +29,8 @@ use std::path::PathBuf;
 
 pub use heroic::detect_heroic_games;
 pub use known_games::{
-    find_by_gog_id, find_by_name, find_by_steam_id, find_by_wabbajack_type,
-    ids_for_wabbajack_type, KnownGame, KNOWN_GAMES,
+    find_by_gog_id, find_by_name, find_by_steam_id, find_by_wabbajack_type, ids_for_wabbajack_type,
+    KnownGame, KNOWN_GAMES,
 };
 pub use proton::{find_steam_path, find_steam_protons, SteamProton};
 pub use steam::{

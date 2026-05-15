@@ -7,7 +7,18 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+
+/// Browser install path choices saved per Wabbajack list.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BrowserListPaths {
+    #[serde(default)]
+    pub downloads_dir: String,
+
+    #[serde(default)]
+    pub install_dir: String,
+}
 
 /// User settings for CLF3
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -59,6 +70,42 @@ pub struct Settings {
     /// LoversLab password for automated downloads
     #[serde(default)]
     pub loverslab_password: String,
+
+    /// Last selected browser game filter.
+    #[serde(default)]
+    pub browser_game_filter: String,
+
+    /// Last state of the browser NSFW filter.
+    #[serde(default)]
+    pub browser_show_nsfw: bool,
+
+    /// Last state of the browser unavailable-list filter.
+    #[serde(default)]
+    pub browser_show_unavailable: bool,
+
+    /// Last state of the browser installed-only filter.
+    #[serde(default)]
+    pub browser_show_installed_only: bool,
+
+    /// Last selected online modlist machine name.
+    #[serde(default)]
+    pub browser_last_selected_modlist: Option<String>,
+
+    /// Per-modlist install path choices keyed by machine name.
+    #[serde(default)]
+    pub browser_list_paths: HashMap<String, BrowserListPaths>,
+
+    /// When set, finished installs are registered as portable instances in
+    /// Fluorine Manager. If Fluorine isn't installed on disk, the integration
+    /// downloads the latest release automatically.
+    #[serde(default)]
+    pub add_to_fluorine: bool,
+
+    /// Optional override for the Fluorine install directory. When empty, the
+    /// integration auto-detects (PATH + common locations) and falls back to
+    /// ~/.local/share/fluorine-manager for auto-downloads.
+    #[serde(default)]
+    pub fluorine_path: String,
 }
 
 impl Settings {
@@ -168,6 +215,14 @@ mod tests {
             patch_cache_dir: "/home/user/.cache/clf3/patches".into(),
             loverslab_email: String::new(),
             loverslab_password: String::new(),
+            browser_game_filter: String::new(),
+            browser_show_nsfw: false,
+            browser_show_unavailable: false,
+            browser_show_installed_only: false,
+            browser_last_selected_modlist: None,
+            browser_list_paths: HashMap::new(),
+            add_to_fluorine: false,
+            fluorine_path: String::new(),
         };
 
         let json = serde_json::to_string(&settings).unwrap();

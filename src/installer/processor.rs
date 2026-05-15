@@ -206,11 +206,10 @@ fn list_archive_files_rust(archive_path: &Path) -> Result<Vec<ArchiveFileEntry>>
     let archive_type = detect_archive_type(archive_path)?;
 
     match archive_type {
-        ArchiveType::Zip => list_zip_files(archive_path)
-            .or_else(|e| {
-                tracing::warn!("ZIP crate listing failed, falling back to 7z: {}", e);
-                list_7z_files(archive_path)
-            }),
+        ArchiveType::Zip => list_zip_files(archive_path).or_else(|e| {
+            tracing::warn!("ZIP crate listing failed, falling back to 7z: {}", e);
+            list_7z_files(archive_path)
+        }),
         ArchiveType::SevenZ => list_7z_files(archive_path),
         ArchiveType::Rar => list_rar_files(archive_path),
         ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2 => {
@@ -367,10 +366,9 @@ fn index_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
                     {
                         // Look in game directory with case-insensitive path resolution
                         let game_file = &gf.game_file;
-                        if let Some(resolved) = crate::paths::resolve_case_insensitive(
-                            &ctx.config.game_dir,
-                            game_file,
-                        ) {
+                        if let Some(resolved) =
+                            crate::paths::resolve_case_insensitive(&ctx.config.game_dir, game_file)
+                        {
                             resolved
                         } else if let Some(resolved) = crate::paths::resolve_case_insensitive(
                             &ctx.config.game_dir,
@@ -493,7 +491,6 @@ pub struct ProcessStats {
     pub failed: usize,
 }
 
-
 /// Persistent SQLite-backed store for patch basis entries.
 ///
 /// Stores `basis_key -> (local_path, size, quick_hash)` scoped per modlist.
@@ -599,9 +596,8 @@ impl PatchBasisStore {
 
         // Delete stale entries
         if !stale_keys.is_empty() {
-            let mut del = conn.prepare(
-                "DELETE FROM patch_basis WHERE modlist_name = ?1 AND basis_key = ?2",
-            )?;
+            let mut del =
+                conn.prepare("DELETE FROM patch_basis WHERE modlist_name = ?1 AND basis_key = ?2")?;
             for key in &stale_keys {
                 let _ = del.execute(params![&self.modlist_name, key]);
             }
@@ -692,12 +688,13 @@ impl<'a> ProcessContext<'a> {
                     serde_json::from_str::<crate::modlist::DownloadState>(&archive.state_json)
                 {
                     let game_file = &gf.game_file;
-                    if let Some(resolved) = crate::paths::resolve_case_insensitive(
-                        &config.game_dir, game_file,
-                    ) {
+                    if let Some(resolved) =
+                        crate::paths::resolve_case_insensitive(&config.game_dir, game_file)
+                    {
                         archive_paths.insert(archive.hash.clone(), resolved);
                     } else if let Some(resolved) = crate::paths::resolve_case_insensitive(
-                        &config.game_dir, &format!("Data/{}", game_file),
+                        &config.game_dir,
+                        &format!("Data/{}", game_file),
                     ) {
                         archive_paths.insert(archive.hash.clone(), resolved);
                     } else {
@@ -707,7 +704,8 @@ impl<'a> ProcessContext<'a> {
                         } else {
                             warn!(
                                 "GameFileSource '{}' not found in game dir ({}) or downloads dir",
-                                game_file, config.game_dir.display()
+                                game_file,
+                                config.game_dir.display()
                             );
                         }
                     }
@@ -1191,10 +1189,18 @@ pub fn cleanup_bsa_temp_dirs(config: &InstallConfig) -> Result<()> {
     // 1. Clean up TEMP_BSA_FILES staging directory
     let staging_root = config.output_dir.join("TEMP_BSA_FILES");
     if staging_root.exists() {
-        config.reporter.log("Cleaning up orphaned BSA staging directories...");
+        config
+            .reporter
+            .log("Cleaning up orphaned BSA staging directories...");
         match std::fs::remove_dir_all(&staging_root) {
-            Ok(()) => config.reporter.log(&format!("  Removed: {}", staging_root.display())),
-            Err(e) => config.reporter.log(&format!("  WARN: Failed to remove {}: {}", staging_root.display(), e)),
+            Ok(()) => config
+                .reporter
+                .log(&format!("  Removed: {}", staging_root.display())),
+            Err(e) => config.reporter.log(&format!(
+                "  WARN: Failed to remove {}: {}",
+                staging_root.display(),
+                e
+            )),
         }
     }
 
@@ -1203,8 +1209,14 @@ pub fn cleanup_bsa_temp_dirs(config: &InstallConfig) -> Result<()> {
     if working_dir.exists() {
         config.reporter.log("Cleaning up BSA working cache...");
         match std::fs::remove_dir_all(&working_dir) {
-            Ok(()) => config.reporter.log(&format!("  Removed: {}", working_dir.display())),
-            Err(e) => config.reporter.log(&format!("  WARN: Failed to remove {}: {}", working_dir.display(), e)),
+            Ok(()) => config
+                .reporter
+                .log(&format!("  Removed: {}", working_dir.display())),
+            Err(e) => config.reporter.log(&format!(
+                "  WARN: Failed to remove {}: {}",
+                working_dir.display(),
+                e
+            )),
         }
     }
 
@@ -1262,7 +1274,8 @@ impl<'a> DirectiveProcessor<'a> {
     /// Record failures from a phase
     fn record_phase_failures(&self, phase: &str, count: usize) {
         if count > 0 {
-            self.reporter.log(&format!("WARNING: {} phase had {} failures", phase, count));
+            self.reporter
+                .log(&format!("WARNING: {} phase had {} failures", phase, count));
             self.phase_failures
                 .lock()
                 .expect("phase_failures lock poisoned")
@@ -1369,7 +1382,8 @@ impl<'a> DirectiveProcessor<'a> {
             return Ok(());
         }
 
-        self.reporter.overall_set_total((inline_count + remapped_count) as u64);
+        self.reporter
+            .overall_set_total((inline_count + remapped_count) as u64);
 
         // InlineFile
         let failed_before = self.failed.load(Ordering::Relaxed);
@@ -1411,12 +1425,15 @@ impl<'a> DirectiveProcessor<'a> {
 
     /// DDS Transform phase: TransformedTexture
     pub fn texture_phase(&self) -> Result<()> {
-        let texture_count = self.ctx.prevalidation_stats
+        let texture_count = self
+            .ctx
+            .prevalidation_stats
             .get("TransformedTexture")
             .map(|&(total, needs_work)| if needs_work > 0 { total } else { 0 })
             .unwrap_or_else(|| self.get_type_count("TransformedTexture").unwrap_or(0));
 
-        self.reporter.phase_start(super::progress::Phase::DdsTransform);
+        self.reporter
+            .phase_start(super::progress::Phase::DdsTransform);
         self.reporter.overall_set_total(texture_count as u64);
 
         let failed_before = self.failed.load(Ordering::Relaxed);
@@ -1440,7 +1457,9 @@ impl<'a> DirectiveProcessor<'a> {
 
     /// BSA Build phase: CreateBSA
     pub fn bsa_phase(&self) -> Result<()> {
-        let bsa_count = self.ctx.prevalidation_stats
+        let bsa_count = self
+            .ctx
+            .prevalidation_stats
             .get("CreateBSA")
             .map(|&(total, needs_work)| if needs_work > 0 { total } else { 0 })
             .unwrap_or_else(|| self.get_type_count("CreateBSA").unwrap_or(0));
@@ -1504,7 +1523,8 @@ impl<'a> DirectiveProcessor<'a> {
         if !phase_failures.is_empty() {
             self.reporter.log("\n=== FAILURE SUMMARY ===");
             for (phase, count) in phase_failures.iter() {
-                self.reporter.log(&format!("  {}: {} failures", phase, count));
+                self.reporter
+                    .log(&format!("  {}: {} failures", phase, count));
             }
             self.reporter.log("=======================\n");
         }
@@ -1524,9 +1544,10 @@ fn cleanup_extra_files(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
         .map(|p| paths::normalize_for_lookup(p))
         .collect();
 
-    ctx.config
-        .reporter
-        .log(&format!("Expected {} files in output directory", expected_set.len()));
+    ctx.config.reporter.log(&format!(
+        "Expected {} files in output directory",
+        expected_set.len()
+    ));
 
     // Walk the output directory
     let output_dir = &ctx.config.output_dir;
@@ -1564,7 +1585,12 @@ fn cleanup_extra_files(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
 
         if entry.file_type().is_file() {
             // Never delete sidecar hash cache or manifest files
-            if entry.path().extension().map(|e| e == "clf3hash" || e == "clf3manifest").unwrap_or(false) {
+            if entry
+                .path()
+                .extension()
+                .map(|e| e == "clf3hash" || e == "clf3manifest")
+                .unwrap_or(false)
+            {
                 continue;
             }
 
@@ -1585,7 +1611,9 @@ fn cleanup_extra_files(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
             deleted_bytes += meta.len();
         }
         if let Err(e) = fs::remove_file(path) {
-            ctx.config.reporter.log(&format!("WARN: Failed to delete {}: {}", path.display(), e));
+            ctx.config
+                .reporter
+                .log(&format!("WARN: Failed to delete {}: {}", path.display(), e));
         } else {
             deleted_files += 1;
         }
@@ -1692,12 +1720,20 @@ pub(crate) fn apply_patch_to_temp(
 
     // Stream to temp output file
     ctx.dir_cache.ensure_parent_dirs(temp_output_path)?;
-    let output_file = File::create(temp_output_path)
-        .with_context(|| format!("Failed to create temp output: {}", temp_output_path.display()))?;
+    let output_file = File::create(temp_output_path).with_context(|| {
+        format!(
+            "Failed to create temp output: {}",
+            temp_output_path.display()
+        )
+    })?;
     let mut writer = BufWriter::with_capacity(65536, output_file);
 
-    let written = std::io::copy(&mut reader, &mut writer)
-        .with_context(|| format!("Failed to write patched file: {}", temp_output_path.display()))?;
+    let written = std::io::copy(&mut reader, &mut writer).with_context(|| {
+        format!(
+            "Failed to write patched file: {}",
+            temp_output_path.display()
+        )
+    })?;
 
     if written != expected_size {
         let _ = fs::remove_file(temp_output_path);
@@ -1753,15 +1789,19 @@ fn extract_to_temp_disk(archive_path: &Path, needed_paths: &[&str], temp_dir: &P
                     .with_context(|| format!("Failed to extract: {}", archive_path.display()))
             } else {
                 let needed: Vec<String> = needed_paths.iter().map(|p| (*p).to_string()).collect();
-                crate::archive::sevenzip::extract_files_case_insensitive(archive_path, &needed, temp_dir)
-                    .map(|_| ())
-                    .with_context(|| {
-                        format!(
-                            "Failed to selectively extract {} files from {}",
-                            needed_paths.len(),
-                            archive_path.display()
-                        )
-                    })
+                crate::archive::sevenzip::extract_files_case_insensitive(
+                    archive_path,
+                    &needed,
+                    temp_dir,
+                )
+                .map(|_| ())
+                .with_context(|| {
+                    format!(
+                        "Failed to selectively extract {} files from {}",
+                        needed_paths.len(),
+                        archive_path.display()
+                    )
+                })
             }
         }
         _ => Ok(()),
@@ -1821,7 +1861,10 @@ fn read_single_file_from_archive(
             bsa::extract_archive_file(archive_path, file_path)
         }
         _ => {
-            anyhow::bail!("Cannot read individual files from archive type {:?}", archive_type)
+            anyhow::bail!(
+                "Cannot read individual files from archive type {:?}",
+                archive_type
+            )
         }
     }
 }
@@ -1853,8 +1896,10 @@ fn process_transformed_texture(
     ));
 
     // Filter out textures already processed during install phase (DDS handler thread)
-    let already_done = ctx.textures_processed_during_install
-        .lock().expect("textures_processed lock")
+    let already_done = ctx
+        .textures_processed_during_install
+        .lock()
+        .expect("textures_processed lock")
         .clone();
     let pre_done = already_done.len();
 
@@ -1883,7 +1928,10 @@ fn process_transformed_texture(
     }
 
     if pre_done > 0 {
-        reporter.log(&format!("{} textures already processed during install phase", pre_done));
+        reporter.log(&format!(
+            "{} textures already processed during install phase",
+            pre_done
+        ));
     }
 
     if parse_failures > 0 {
@@ -1907,7 +1955,9 @@ fn process_transformed_texture(
         }
     }
 
-    use crate::textures::{OutputFormat, TextureJob, process_texture_batch, process_texture_with_fallback};
+    use crate::textures::{
+        process_texture_batch, process_texture_with_fallback, OutputFormat, TextureJob,
+    };
 
     let total_archives = by_archive.len();
     let total_directives: usize = by_archive.values().map(|v| v.len()).sum();
@@ -1941,144 +1991,170 @@ fn process_transformed_texture(
     let archives_vec: Vec<_> = by_archive.into_iter().collect();
 
     // Extract archives in parallel — each archive writes needed textures to staging dir
-    archives_vec.par_iter().for_each(|(archive_hash, directives)| {
-        let archive_path = match ctx.get_archive_path(archive_hash) {
-            Some(p) => p.clone(),
-            None => {
-                for (_, directive) in directives {
-                    if output_dds_valid(ctx, &directive.to, &directive.hash)
-                        || directive.to.contains("TEMP_BSA_FILES")
-                    {
-                        stage_skipped.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        error!(
-                            "FAIL: texture archive not found (hash={}): {}",
-                            archive_hash, directive.to
-                        );
-                        stage_failed.fetch_add(1, Ordering::Relaxed);
+    archives_vec
+        .par_iter()
+        .for_each(|(archive_hash, directives)| {
+            let archive_path = match ctx.get_archive_path(archive_hash) {
+                Some(p) => p.clone(),
+                None => {
+                    for (_, directive) in directives {
+                        if output_dds_valid(ctx, &directive.to, &directive.hash)
+                            || directive.to.contains("TEMP_BSA_FILES")
+                        {
+                            stage_skipped.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            error!(
+                                "FAIL: texture archive not found (hash={}): {}",
+                                archive_hash, directive.to
+                            );
+                            stage_failed.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
+                    reporter.overall_inc();
+                    return;
                 }
+            };
+
+            // Filter to directives that actually need processing
+            let to_process: Vec<_> = directives
+                .iter()
+                .filter(|(_, d)| !output_dds_valid(ctx, &d.to, &d.hash))
+                .collect();
+
+            let skip_count = directives.len() - to_process.len();
+            stage_skipped.fetch_add(skip_count, Ordering::Relaxed);
+
+            if to_process.is_empty() {
                 reporter.overall_inc();
                 return;
             }
-        };
 
-        // Filter to directives that actually need processing
-        let to_process: Vec<_> = directives
-            .iter()
-            .filter(|(_, d)| !output_dds_valid(ctx, &d.to, &d.hash))
-            .collect();
+            let archive_name = archive_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let archive_type = detect_archive_type(&archive_path).unwrap_or(ArchiveType::Unknown);
 
-        let skip_count = directives.len() - to_process.len();
-        stage_skipped.fetch_add(skip_count, Ordering::Relaxed);
-
-        if to_process.is_empty() {
-            reporter.overall_inc();
-            return;
-        }
-
-        let archive_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-        let archive_type = detect_archive_type(&archive_path).unwrap_or(ArchiveType::Unknown);
-
-        // For 7z/RAR: extract entire archive to temp dir, then copy needed files to staging
-        let temp_extract = if matches!(archive_type, ArchiveType::SevenZ | ArchiveType::Rar | ArchiveType::Unknown) {
-            let mut needed_paths = Vec::new();
-            let mut seen_paths = HashSet::new();
-            for (_, d) in &to_process {
-                if let Some(path) = d.archive_hash_path.get(1) {
-                    let normalized = paths::normalize_for_lookup(path);
-                    if seen_paths.insert(normalized) {
-                        needed_paths.push(path.as_str());
-                    }
-                }
-            }
-            match tempfile::tempdir_in(&ctx.config.output_dir) {
-                Ok(td) => {
-                    if let Err(e) = extract_to_temp_disk(&archive_path, &needed_paths, td.path()) {
-                        reporter.log(&format!("WARN: Failed to extract {}: {}", archive_name, e));
-                    }
-                    Some(td)
-                }
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-
-        // Handle nested BSAs: extract BSA files to temp
-        let mut nested_bsa_temps: HashMap<String, tempfile::NamedTempFile> = HashMap::new();
-        {
-            let mut needed_bsas: HashMap<String, HashSet<String>> = HashMap::new();
-            for (_, d) in &to_process {
-                if d.archive_hash_path.len() >= 3 {
-                    needed_bsas.entry(d.archive_hash_path[1].clone()).or_default()
-                        .insert(d.archive_hash_path[2].clone());
-                }
-            }
-            for bsa_path in needed_bsas.keys() {
-                let bsa_data = if let Some(ref td) = temp_extract {
-                    find_file_in_temp_dir(td.path(), bsa_path)
-                        .and_then(|p| fs::read(&p).ok())
-                } else {
-                    read_single_file_from_archive(&archive_path, archive_type, bsa_path).ok()
-                };
-                if let Some(data) = bsa_data {
-                    let suffix = if bsa_path.to_lowercase().ends_with(".ba2") { ".ba2" } else { ".bsa" };
-                    if let Ok(temp_bsa) = tempfile::Builder::new()
-                        .prefix(".clf3_bsa_").suffix(suffix)
-                        .tempfile_in(&ctx.config.output_dir)
-                    {
-                        if fs::write(temp_bsa.path(), &data).is_ok() {
-                            nested_bsa_temps.insert(bsa_path.clone(), temp_bsa);
+            // For 7z/RAR: extract entire archive to temp dir, then copy needed files to staging
+            let temp_extract = if matches!(
+                archive_type,
+                ArchiveType::SevenZ | ArchiveType::Rar | ArchiveType::Unknown
+            ) {
+                let mut needed_paths = Vec::new();
+                let mut seen_paths = HashSet::new();
+                for (_, d) in &to_process {
+                    if let Some(path) = d.archive_hash_path.get(1) {
+                        let normalized = paths::normalize_for_lookup(path);
+                        if seen_paths.insert(normalized) {
+                            needed_paths.push(path.as_str());
                         }
                     }
                 }
-            }
-        }
-
-        // Stage each texture source file to disk
-        for (id, directive) in &to_process {
-            let source_data = if directive.archive_hash_path.len() == 2 {
-                let path = &directive.archive_hash_path[1];
-                if let Some(ref td) = temp_extract {
-                    find_file_in_temp_dir(td.path(), path)
-                        .and_then(|p| fs::read(&p).ok())
-                } else {
-                    read_single_file_from_archive(&archive_path, archive_type, path).ok()
+                match tempfile::tempdir_in(&ctx.config.output_dir) {
+                    Ok(td) => {
+                        if let Err(e) =
+                            extract_to_temp_disk(&archive_path, &needed_paths, td.path())
+                        {
+                            reporter
+                                .log(&format!("WARN: Failed to extract {}: {}", archive_name, e));
+                        }
+                        Some(td)
+                    }
+                    Err(_) => None,
                 }
-            } else if directive.archive_hash_path.len() >= 3 {
-                let bsa_path = &directive.archive_hash_path[1];
-                let file_in_bsa = &directive.archive_hash_path[2];
-                nested_bsa_temps.get(bsa_path)
-                    .and_then(|tb| bsa::extract_archive_file(tb.path(), file_in_bsa).ok())
             } else {
                 None
             };
 
-            if let Some(data) = source_data {
-                let staged_path = staging_dir.path().join(format!("{}.dds", id));
-                if fs::write(&staged_path, &data).is_ok() {
-                    staged_textures.lock().expect("staged_textures").push(StagedTexture {
-                        id: *id,
-                        directive: directive.clone(),
-                        staged_path,
-                    });
+            // Handle nested BSAs: extract BSA files to temp
+            let mut nested_bsa_temps: HashMap<String, tempfile::NamedTempFile> = HashMap::new();
+            {
+                let mut needed_bsas: HashMap<String, HashSet<String>> = HashMap::new();
+                for (_, d) in &to_process {
+                    if d.archive_hash_path.len() >= 3 {
+                        needed_bsas
+                            .entry(d.archive_hash_path[1].clone())
+                            .or_default()
+                            .insert(d.archive_hash_path[2].clone());
+                    }
+                }
+                for bsa_path in needed_bsas.keys() {
+                    let bsa_data = if let Some(ref td) = temp_extract {
+                        find_file_in_temp_dir(td.path(), bsa_path).and_then(|p| fs::read(&p).ok())
+                    } else {
+                        read_single_file_from_archive(&archive_path, archive_type, bsa_path).ok()
+                    };
+                    if let Some(data) = bsa_data {
+                        let suffix = if bsa_path.to_lowercase().ends_with(".ba2") {
+                            ".ba2"
+                        } else {
+                            ".bsa"
+                        };
+                        if let Ok(temp_bsa) = tempfile::Builder::new()
+                            .prefix(".clf3_bsa_")
+                            .suffix(suffix)
+                            .tempfile_in(&ctx.config.output_dir)
+                        {
+                            if fs::write(temp_bsa.path(), &data).is_ok() {
+                                nested_bsa_temps.insert(bsa_path.clone(), temp_bsa);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Stage each texture source file to disk
+            for (id, directive) in &to_process {
+                let source_data = if directive.archive_hash_path.len() == 2 {
+                    let path = &directive.archive_hash_path[1];
+                    if let Some(ref td) = temp_extract {
+                        find_file_in_temp_dir(td.path(), path).and_then(|p| fs::read(&p).ok())
+                    } else {
+                        read_single_file_from_archive(&archive_path, archive_type, path).ok()
+                    }
+                } else if directive.archive_hash_path.len() >= 3 {
+                    let bsa_path = &directive.archive_hash_path[1];
+                    let file_in_bsa = &directive.archive_hash_path[2];
+                    nested_bsa_temps
+                        .get(bsa_path)
+                        .and_then(|tb| bsa::extract_archive_file(tb.path(), file_in_bsa).ok())
                 } else {
-                    error!("FAIL [{}]: failed to write staged texture: {}", id, directive.to);
+                    None
+                };
+
+                if let Some(data) = source_data {
+                    let staged_path = staging_dir.path().join(format!("{}.dds", id));
+                    if fs::write(&staged_path, &data).is_ok() {
+                        staged_textures
+                            .lock()
+                            .expect("staged_textures")
+                            .push(StagedTexture {
+                                id: *id,
+                                directive: directive.clone(),
+                                staged_path,
+                            });
+                    } else {
+                        error!(
+                            "FAIL [{}]: failed to write staged texture: {}",
+                            id, directive.to
+                        );
+                        stage_failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    error!(
+                        "FAIL [{}]: failed to read texture source from archive (path depth {}): {}",
+                        id,
+                        directive.archive_hash_path.len(),
+                        directive.to
+                    );
                     stage_failed.fetch_add(1, Ordering::Relaxed);
                 }
-            } else {
-                error!(
-                    "FAIL [{}]: failed to read texture source from archive (path depth {}): {}",
-                    id, directive.archive_hash_path.len(), directive.to
-                );
-                stage_failed.fetch_add(1, Ordering::Relaxed);
             }
-        }
 
-        reporter.overall_inc();
-        // temp_extract dropped here — archive temp dir cleaned up
-    });
+            reporter.overall_inc();
+            // temp_extract dropped here — archive temp dir cleaned up
+        });
 
     let mut staged = staged_textures.into_inner().expect("staged_textures");
     let total_staged = staged.len();
@@ -2097,8 +2173,12 @@ fn process_transformed_texture(
     reporter.overall_set_total(total_directives as u64);
     reporter.overall_set_message("Processing textures...");
 
-    for _ in 0..total_skipped { reporter.overall_inc(); }
-    for _ in 0..total_failed_stage { reporter.overall_inc(); }
+    for _ in 0..total_skipped {
+        reporter.overall_inc();
+    }
+    for _ in 0..total_failed_stage {
+        reporter.overall_inc();
+    }
 
     let failure_tracker = failure_tracker.clone();
     let reporter = reporter.clone();
@@ -2111,9 +2191,13 @@ fn process_transformed_texture(
     }
 
     // Print format breakdown
-    let mut format_summary: Vec<_> = by_format.iter().map(|(f, j)| (f.clone(), j.len())).collect();
+    let mut format_summary: Vec<_> = by_format
+        .iter()
+        .map(|(f, j)| (f.clone(), j.len()))
+        .collect();
     format_summary.sort_by(|a, b| b.1.cmp(&a.1));
-    let summary_str = format_summary.iter()
+    let summary_str = format_summary
+        .iter()
         .map(|(f, n)| format!("{}: {}", f, n))
         .collect::<Vec<_>>()
         .join(", ");
@@ -2124,8 +2208,12 @@ fn process_transformed_texture(
 
     // Process each format group
     for (fmt_str, jobs) in &by_format {
-        let fmt = OutputFormat::parse(fmt_str)
-            .unwrap_or(if handlers::texture::is_fallback_mode() { OutputFormat::BC1 } else { OutputFormat::BC7 });
+        let fmt =
+            OutputFormat::parse(fmt_str).unwrap_or(if handlers::texture::is_fallback_mode() {
+                OutputFormat::BC1
+            } else {
+                OutputFormat::BC7
+            });
 
         if fmt == OutputFormat::BC7 {
             // BC7: parallel CPU prep → GPU batch encode
@@ -2137,13 +2225,16 @@ fn process_transformed_texture(
             for (i, st) in jobs.iter().enumerate() {
                 match fs::read(&st.staged_path) {
                     Ok(data) => {
-                        indexed_jobs.push((i, TextureJob {
-                            data,
-                            width: st.directive.image_state.width,
-                            height: st.directive.image_state.height,
-                            format: OutputFormat::BC7,
-                            id: Some(format!("{}", st.id)),
-                        }));
+                        indexed_jobs.push((
+                            i,
+                            TextureJob {
+                                data,
+                                width: st.directive.image_state.width,
+                                height: st.directive.image_state.height,
+                                format: OutputFormat::BC7,
+                                id: Some(format!("{}", st.id)),
+                            },
+                        ));
                     }
                     Err(e) => {
                         failed.fetch_add(1, Ordering::Relaxed);
@@ -2166,14 +2257,18 @@ fn process_transformed_texture(
                 match result {
                     Ok(processed) => {
                         let output_path = ctx.resolve_output_path(&st.directive.to);
-                        if let Err(e) = ctx.dir_cache.ensure_parent_dirs(&output_path)
+                        if let Err(e) = ctx
+                            .dir_cache
+                            .ensure_parent_dirs(&output_path)
                             .and_then(|_| fs::write(&output_path, &processed.data))
                         {
                             // Retry up to 3 times — transient ENOENT on slow/external filesystems
                             // Use force_ensure_parent_dirs to bypass DirCache (it cached Ok from the first attempt)
                             let mut retry_ok = false;
                             for attempt in 1..=3 {
-                                std::thread::sleep(std::time::Duration::from_millis(100 * attempt as u64));
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    100 * attempt as u64,
+                                ));
                                 if ctx.dir_cache.force_ensure_parent_dirs(&output_path).is_ok()
                                     && fs::write(&output_path, &processed.data).is_ok()
                                 {
@@ -2212,14 +2307,21 @@ fn process_transformed_texture(
             }
         } else {
             // Non-BC7: full CPU parallelism (all cores, like Radium)
-            reporter.overall_set_message(&format!("{}: {} textures (CPU parallel)...", fmt.name(), jobs.len()));
+            reporter.overall_set_message(&format!(
+                "{}: {} textures (CPU parallel)...",
+                fmt.name(),
+                jobs.len()
+            ));
 
             jobs.par_iter().for_each(|st| {
                 let result: Result<()> = (|| {
                     let data = fs::read(&st.staged_path)
                         .with_context(|| format!("Failed to read staged texture {}", st.id))?;
                     let (processed, _) = process_texture_with_fallback(
-                        &data, st.directive.image_state.width, st.directive.image_state.height, fmt,
+                        &data,
+                        st.directive.image_state.width,
+                        st.directive.image_state.height,
+                        fmt,
                     )?;
                     let output_path = ctx.resolve_output_path(&st.directive.to);
                     ctx.dir_cache.ensure_parent_dirs(&output_path)?;
@@ -2228,7 +2330,9 @@ fn process_transformed_texture(
                         // Use force_ensure_parent_dirs to bypass DirCache stale entries
                         let mut succeeded = false;
                         for attempt in 1..=3 {
-                            std::thread::sleep(std::time::Duration::from_millis(100 * attempt as u64));
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                100 * attempt as u64,
+                            ));
                             if ctx.dir_cache.force_ensure_parent_dirs(&output_path).is_ok()
                                 && fs::write(&output_path, &processed.data).is_ok()
                             {
@@ -2243,21 +2347,25 @@ fn process_transformed_texture(
                         if !succeeded {
                             anyhow::bail!(
                                 "write failed after 3 retries for {}: {}",
-                                st.directive.to, first_err
+                                st.directive.to,
+                                first_err
                             );
                         }
                     }
                     Ok(())
                 })();
                 match result {
-                    Ok(()) => { completed.fetch_add(1, Ordering::Relaxed); }
+                    Ok(()) => {
+                        completed.fetch_add(1, Ordering::Relaxed);
+                    }
                     Err(e) => {
                         failed.fetch_add(1, Ordering::Relaxed);
                         error!(
                             "FAIL [{}] {} texture: {} — {:#}",
                             st.id, fmt_str, st.directive.to, e
                         );
-                        failure_tracker.record_failure("texture", &format!("{}: {}", st.directive.to, e));
+                        failure_tracker
+                            .record_failure("texture", &format!("{}: {}", st.directive.to, e));
                     }
                 }
                 reporter.overall_inc();
@@ -2327,7 +2435,9 @@ fn process_create_bsa(
             s.spawn(|| {
                 loop {
                     let idx = cursor.fetch_add(1, Ordering::Relaxed);
-                    if idx >= bsa_total { break; }
+                    if idx >= bsa_total {
+                        break;
+                    }
                     let (id, directive) = &directives[idx];
 
                     if ctx.skip_set.contains(id) || handlers::output_bsa_valid(ctx, directive) {
@@ -2369,10 +2479,16 @@ fn process_create_bsa(
                 }
 
                 // Reclaim rayon thread-local mimalloc heaps when this worker finishes.
-                rayon::broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true); });
-                unsafe { libmimalloc_sys::mi_collect(true); }
+                rayon::broadcast(|_| unsafe {
+                    libmimalloc_sys::mi_collect(true);
+                });
+                unsafe {
+                    libmimalloc_sys::mi_collect(true);
+                }
                 #[cfg(target_os = "linux")]
-                unsafe { libc::malloc_trim(0); }
+                unsafe {
+                    libc::malloc_trim(0);
+                }
             });
         }
     });
@@ -2628,10 +2744,7 @@ mod tests {
 
     #[test]
     fn test_build_patch_basis_key_from_archive_hash_path() {
-        let parts = vec![
-            "abc123".to_string(),
-            "Data\\Textures\\test.dds".to_string(),
-        ];
+        let parts = vec!["abc123".to_string(), "Data\\Textures\\test.dds".to_string()];
         let key = build_patch_basis_key_from_archive_hash_path(&parts).unwrap();
         assert_eq!(key, "abc123|data/textures/test.dds");
 

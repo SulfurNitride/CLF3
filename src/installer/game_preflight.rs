@@ -75,7 +75,12 @@ impl PreflightReport {
     pub fn mismatched(&self) -> Vec<&GameFileCheck> {
         self.checks
             .iter()
-            .filter(|c| matches!(c.status, CheckStatus::Mismatch(_) | CheckStatus::ReadError(_)))
+            .filter(|c| {
+                matches!(
+                    c.status,
+                    CheckStatus::Mismatch(_) | CheckStatus::ReadError(_)
+                )
+            })
             .collect()
     }
 
@@ -191,9 +196,8 @@ fn verify(game_files: &[GameFileSourceState], game_dir: &Path) -> PreflightRepor
             // Try the path as written, then under Data/ which is where most
             // Bethesda GameFileSource entries actually live (they encode `.esm`
             // without a leading `Data\\` sometimes, sometimes with).
-            let resolved = resolve_case_insensitive(game_dir, &file).or_else(|| {
-                resolve_case_insensitive(game_dir, &format!("Data/{}", file))
-            });
+            let resolved = resolve_case_insensitive(game_dir, &file)
+                .or_else(|| resolve_case_insensitive(game_dir, &format!("Data/{}", file)));
 
             let status = match resolved {
                 None => CheckStatus::Missing,
@@ -206,7 +210,9 @@ fn verify(game_files: &[GameFileSourceState], game_dir: &Path) -> PreflightRepor
                         tracing::warn!(
                             "Game file '{}' hash differs from expected ({} vs {}) but \
                              is on known-alternate-variant list — accepting",
-                            file, h, expected_hash
+                            file,
+                            h,
+                            expected_hash
                         );
                         CheckStatus::Ok
                     }

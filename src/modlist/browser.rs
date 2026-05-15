@@ -271,7 +271,7 @@ impl ModlistBrowser {
 
         self.modlists
             .iter()
-            .filter(move |m| m.is_available() && m.matches_query(&query) && m.matches_game(&game))
+            .filter(move |m| m.matches_query(&query) && m.matches_game(&game))
     }
 
     pub fn modlists(&self) -> &[ModlistMetadata] {

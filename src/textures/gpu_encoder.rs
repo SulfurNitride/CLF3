@@ -5,8 +5,8 @@
 
 use anyhow::{Context, Result};
 use block_compression::{BC6HSettings, BC7Settings, CompressionVariant, GpuBlockCompressor};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use wgpu::{
@@ -155,8 +155,7 @@ impl GpuEncoder {
             wgpu::DeviceType::Cpu => 0.04,
             _ => 0.10,
         };
-        let batch_budget_bytes =
-            ((binding_cap as f64) * utilization) as u64;
+        let batch_budget_bytes = ((binding_cap as f64) * utilization) as u64;
         let batch_budget_bytes = batch_budget_bytes.clamp(64 * 1024 * 1024, 1024 * 1024 * 1024);
 
         info!(
@@ -221,11 +220,17 @@ impl GpuEncoder {
     }
 
     /// Wait for a mapped buffer result with timeout.
-    fn recv_map_result(&self, rx: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>) -> Result<()> {
+    fn recv_map_result(
+        &self,
+        rx: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    ) -> Result<()> {
         match rx.recv_timeout(GPU_POLL_TIMEOUT) {
             Ok(map_result) => map_result.context("Failed to map buffer"),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                error!("GPU buffer map timed out after {}s, marking device as lost", GPU_POLL_TIMEOUT.as_secs());
+                error!(
+                    "GPU buffer map timed out after {}s, marking device as lost",
+                    GPU_POLL_TIMEOUT.as_secs()
+                );
                 self.device_lost.store(true, Ordering::Relaxed);
                 anyhow::bail!("GPU buffer map timed out");
             }

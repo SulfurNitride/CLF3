@@ -8,8 +8,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use tracing::{debug, info};
 
-const DOWNLOAD_ENDPOINT: &str =
-    "https://cloud-api.yandex.net/v1/disk/public/resources/download";
+const DOWNLOAD_ENDPOINT: &str = "https://cloud-api.yandex.net/v1/disk/public/resources/download";
 const LIST_ENDPOINT: &str = "https://cloud-api.yandex.net/v1/disk/public/resources";
 
 pub struct YandexDownloader {
@@ -77,9 +76,8 @@ impl YandexDownloader {
             return Ok(href);
         }
 
-        let name = expected_name.context(
-            "Yandex bare resolve failed and no expected_name provided to search folder",
-        )?;
+        let name = expected_name
+            .context("Yandex bare resolve failed and no expected_name provided to search folder")?;
 
         // Folder share — list contents, find matching file path.
         let path = self
@@ -116,10 +114,7 @@ impl YandexDownloader {
         let expected_lower = expected_name.to_lowercase();
 
         let root = self.list_folder(public_url, None).await?;
-        let root_items = root
-            .embedded
-            .map(|e| e.items)
-            .unwrap_or_default();
+        let root_items = root.embedded.map(|e| e.items).unwrap_or_default();
 
         // First pass — root items.
         if let Some(item) = root_items
@@ -157,11 +152,7 @@ impl YandexDownloader {
         );
     }
 
-    async fn list_folder(
-        &self,
-        public_url: &str,
-        path: Option<&str>,
-    ) -> Result<ListResponse> {
+    async fn list_folder(&self, public_url: &str, path: Option<&str>) -> Result<ListResponse> {
         let mut request_url = format!(
             "{}?public_key={}&limit=200",
             LIST_ENDPOINT,
@@ -189,9 +180,8 @@ impl YandexDownloader {
             bail!("Yandex list returned {}: {}", status, body_text);
         }
 
-        let parsed: ListResponse = serde_json::from_str(&body_text).with_context(|| {
-            format!("Failed to parse Yandex list response: {}", body_text)
-        })?;
+        let parsed: ListResponse = serde_json::from_str(&body_text)
+            .with_context(|| format!("Failed to parse Yandex list response: {}", body_text))?;
         Ok(parsed)
     }
 
@@ -291,7 +281,11 @@ mod tests {
             )
             .await
             .expect("Yandex resolve failed");
-        assert!(url.starts_with("https://"), "Expected https URL, got: {}", url);
+        assert!(
+            url.starts_with("https://"),
+            "Expected https URL, got: {}",
+            url
+        );
         println!("Resolved URL: {}", url);
     }
 }

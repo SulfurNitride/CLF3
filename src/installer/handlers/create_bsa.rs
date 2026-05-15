@@ -188,7 +188,11 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
 
     // Write sidecar hash cache so re-runs can skip this BSA
     if let Err(e) = sidecar::write_sidecar(&output_path, &directive.hash) {
-        tracing::warn!("Failed to write BSA sidecar for {}: {}", output_path.display(), e);
+        tracing::warn!(
+            "Failed to write BSA sidecar for {}: {}",
+            output_path.display(),
+            e
+        );
     }
 
     // Write per-file manifest for partial reuse on future updates.
@@ -196,9 +200,9 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
     let manifest_entries: Vec<(String, String)> = files
         .par_iter()
         .filter_map(|(archive_path, disk_path)| {
-            crate::hash::compute_file_hash(disk_path).ok().map(|h| {
-                (sidecar::normalize_manifest_path(archive_path), h)
-            })
+            crate::hash::compute_file_hash(disk_path)
+                .ok()
+                .map(|h| (sidecar::normalize_manifest_path(archive_path), h))
         })
         .collect();
 

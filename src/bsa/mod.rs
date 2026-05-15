@@ -174,9 +174,7 @@ where
     F: Fn(&str, Vec<u8>) -> Result<()> + Send + Sync,
 {
     match detect_format(archive_path) {
-        Some(ArchiveFormat::Ba2) => {
-            extract_ba2_batch_parallel(archive_path, wanted, callback)
-        }
+        Some(ArchiveFormat::Ba2) => extract_ba2_batch_parallel(archive_path, wanted, callback),
         Some(ArchiveFormat::Bsa) => {
             // TES4 BSA: wanted-set batch path (matches standalone BSA/BA2 tool behavior).
             extract_batch_streaming(archive_path, wanted, callback)

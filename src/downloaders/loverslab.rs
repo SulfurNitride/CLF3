@@ -16,8 +16,7 @@ use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
 
 const BASE_URL: &str = "https://www.loverslab.com";
-const USER_AGENT: &str =
-    "Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0";
+const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0";
 
 /// A logged-in LoversLab session that can download files.
 pub struct LoversLabDownloader {
@@ -72,7 +71,10 @@ impl LoversLabDownloader {
         let csrf_key = extract_csrf_key(&login_page)
             .context("Could not find csrfKey on LoversLab login page")?;
 
-        debug!("Got LoversLab csrfKey: {}...", &csrf_key[..8.min(csrf_key.len())]);
+        debug!(
+            "Got LoversLab csrfKey: {}...",
+            &csrf_key[..8.min(csrf_key.len())]
+        );
 
         // Step 2: POST login form
         let params = [
@@ -95,9 +97,7 @@ impl LoversLabDownloader {
 
         // A successful login redirects (302/303) back to the homepage.
         // If we get the login form again with an error, login failed.
-        if body.contains("Your account has been locked")
-            || body.contains("You have been banned")
-        {
+        if body.contains("Your account has been locked") || body.contains("You have been banned") {
             bail!("LoversLab account is locked or banned");
         }
 
@@ -151,10 +151,7 @@ impl LoversLabDownloader {
         // Ensure the URL has ?do=download so we get the file list page
         let download_page_url = ensure_download_url(page_url);
 
-        info!(
-            "Fetching LoversLab download page: {}",
-            download_page_url
-        );
+        info!("Fetching LoversLab download page: {}", download_page_url);
 
         // Use no-redirect client to capture Location headers (Mega redirects have #key in fragment)
         let initial_resp = self
@@ -256,7 +253,8 @@ impl LoversLabDownloader {
                 );
                 bail!(
                     "Could not find csrfKey on LL download page (page title: '{}', {} bytes)",
-                    title, page_len
+                    title,
+                    page_len
                 );
             }
         };
@@ -283,14 +281,13 @@ impl LoversLabDownloader {
         );
 
         // Match the expected filename against the available files
-        let matched = match_filename(expected_name, &entries)
-            .with_context(|| {
-                let available: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-                format!(
-                    "Could not match '{}' against available files: {:?}",
-                    expected_name, available
-                )
-            })?;
+        let matched = match_filename(expected_name, &entries).with_context(|| {
+            let available: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+            format!(
+                "Could not match '{}' against available files: {:?}",
+                expected_name, available
+            )
+        })?;
 
         info!(
             "Matched '{}' -> '{}' ({})",
@@ -321,10 +318,7 @@ impl LoversLabDownloader {
     }
 
     /// Stream an HTTP response body to a file, verifying Content-Length.
-    async fn stream_response_to_file(
-        resp: reqwest::Response,
-        output_path: &Path,
-    ) -> Result<()> {
+    async fn stream_response_to_file(resp: reqwest::Response, output_path: &Path) -> Result<()> {
         use futures::StreamExt;
 
         let expected_len = resp.content_length();
@@ -362,11 +356,7 @@ impl LoversLabDownloader {
             }
         }
 
-        info!(
-            "Downloaded {} ({} bytes)",
-            output_path.display(),
-            written
-        );
+        info!("Downloaded {} ({} bytes)", output_path.display(), written);
 
         Ok(())
     }
@@ -451,8 +441,8 @@ fn extract_csrf_key(html: &str) -> Option<String> {
 /// - `<a href='...?do=download&r=ID&confirm=1&t=1&csrfKey=...' data-action="download">`
 fn parse_file_list(html: &str, _csrf_key: &str) -> Result<Vec<FileEntry>> {
     let document = Html::parse_document(html);
-    let item_selector = Selector::parse("li.ipsDataItem")
-        .map_err(|e| anyhow::anyhow!("Bad selector: {:?}", e))?;
+    let item_selector =
+        Selector::parse("li.ipsDataItem").map_err(|e| anyhow::anyhow!("Bad selector: {:?}", e))?;
     let title_selector = Selector::parse("h4.ipsDataItem_title span")
         .map_err(|e| anyhow::anyhow!("Bad selector: {:?}", e))?;
     let link_selector = Selector::parse("a[data-action='download']")
@@ -553,9 +543,7 @@ fn match_filename<'a>(expected: &str, entries: &'a [FileEntry]) -> Option<&'a Fi
     let expected_clean = strip_duplicate_suffix(&expected_lower);
 
     // Normalize whitespace for comparison (collapse multiple spaces into one)
-    let normalize_ws = |s: &str| -> String {
-        s.split_whitespace().collect::<Vec<_>>().join(" ")
-    };
+    let normalize_ws = |s: &str| -> String { s.split_whitespace().collect::<Vec<_>>().join(" ") };
     let expected_norm = normalize_ws(&expected_clean);
 
     // 1. Exact match (with whitespace normalization)
@@ -631,9 +619,7 @@ fn extract_mega_url(html: &str) -> Option<String> {
     if let Some(start) = html.find("https://mega.nz/") {
         let rest = &html[start..];
         // Find the end of the URL (quote, space, or angle bracket)
-        let end = rest
-            .find(['"', '\'', ' ', '<', '>'])
-            .unwrap_or(rest.len());
+        let end = rest.find(['"', '\'', ' ', '<', '>']).unwrap_or(rest.len());
         let url = &rest[..end];
         if url.len() > 20 {
             return Some(url.to_string());
@@ -642,9 +628,7 @@ fn extract_mega_url(html: &str) -> Option<String> {
     // Also check for old-style mega.nz/#! links
     if let Some(start) = html.find("https://mega.nz/#!") {
         let rest = &html[start..];
-        let end = rest
-            .find(['"', '\'', ' ', '<', '>'])
-            .unwrap_or(rest.len());
+        let end = rest.find(['"', '\'', ' ', '<', '>']).unwrap_or(rest.len());
         let url = &rest[..end];
         if url.len() > 20 {
             return Some(url.to_string());
@@ -656,8 +640,8 @@ fn extract_mega_url(html: &str) -> Option<String> {
 /// Parse forum post attachments (ipsAttachLink elements).
 fn parse_forum_attachments(html: &str) -> Result<Vec<FileEntry>> {
     let document = Html::parse_document(html);
-    let selector = Selector::parse("a.ipsAttachLink")
-        .map_err(|e| anyhow::anyhow!("Bad selector: {:?}", e))?;
+    let selector =
+        Selector::parse("a.ipsAttachLink").map_err(|e| anyhow::anyhow!("Bad selector: {:?}", e))?;
 
     let mut entries = Vec::new();
 
@@ -703,7 +687,9 @@ mod tests {
         assert!(is_loverslab_url(
             "https://loverslab.com/files/file/5878-devious-devices-se/"
         ));
-        assert!(!is_loverslab_url("https://www.nexusmods.com/skyrim/mods/123"));
+        assert!(!is_loverslab_url(
+            "https://www.nexusmods.com/skyrim/mods/123"
+        ));
     }
 
     #[test]
@@ -745,10 +731,7 @@ mod tests {
             strip_duplicate_suffix("co more creatures 1.8.2 (with hostile creatures) (1).rar"),
             "co more creatures 1.8.2 (with hostile creatures).rar"
         );
-        assert_eq!(
-            strip_duplicate_suffix("file (2).7z"),
-            "file.7z"
-        );
+        assert_eq!(strip_duplicate_suffix("file (2).7z"), "file.7z");
         // Don't strip non-numeric parens
         assert_eq!(
             strip_duplicate_suffix("file (with stuff).7z"),
@@ -862,9 +845,16 @@ mod tests {
             crate::hash::verify_file_hash_detailed(&output, expected_hash).unwrap();
         println!(
             "ES DDI Patch.7z: {} bytes, hash={} expected={} match={}",
-            meta.len(), actual, expected_hash, matches
+            meta.len(),
+            actual,
+            expected_hash,
+            matches
         );
-        assert!(matches, "Hash mismatch: got {} expected {}", actual, expected_hash);
+        assert!(
+            matches,
+            "Hash mismatch: got {} expected {}",
+            actual, expected_hash
+        );
 
         let _ = std::fs::remove_file(&output);
     }
@@ -903,11 +893,17 @@ mod tests {
             crate::hash::verify_file_hash_detailed(&output, expected_hash).unwrap();
         println!(
             "CO Hostile Creatures: {} bytes, hash={} expected={} match={}",
-            meta.len(), actual, expected_hash, matches
+            meta.len(),
+            actual,
+            expected_hash,
+            matches
         );
-        assert!(matches, "Hash mismatch: got {} expected {}", actual, expected_hash);
+        assert!(
+            matches,
+            "Hash mismatch: got {} expected {}",
+            actual, expected_hash
+        );
 
         let _ = std::fs::remove_file(&output);
     }
-
 }

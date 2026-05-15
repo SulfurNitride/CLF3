@@ -6,6 +6,17 @@
 use std::fmt;
 use std::sync::Arc;
 
+/// CLI progress rendering mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressMode {
+    /// Use interactive progress on terminals and plain lines otherwise.
+    Auto,
+    /// Interactive progress bars and worker slots.
+    Full,
+    /// Line-oriented human-readable progress.
+    Plain,
+}
+
 /// Phases of installation, reported to the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {

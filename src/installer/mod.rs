@@ -26,11 +26,11 @@ pub mod streaming;
 
 #[allow(unused_imports)] // ProgressCallback/ProgressEvent used by lib crate (GUI)
 pub use config::{ExtractStrategy, InstallConfig, ProgressCallback, ProgressEvent};
-#[allow(unused_imports)] // NullReporter used by lib crate (GUI)
-pub use progress::{NullReporter, Phase, ProgressHandle, ProgressReporter};
-pub use progress_cli::CliReporter;
 #[allow(unused_imports)] // Used by lib crate (GUI)
 pub use config_cache::{ConfigCache, ModlistConfig};
+#[allow(unused_imports)] // NullReporter used by lib crate (GUI)
+pub use progress::{NullReporter, Phase, ProgressHandle, ProgressMode, ProgressReporter};
+pub use progress_cli::CliReporter;
 
 use crate::modlist::{import_wabbajack_to_db, ModlistDb};
 use anyhow::{bail, Context, Result};
@@ -129,7 +129,10 @@ fn log_install_summary(
     let total_min = total_secs / 60.0;
 
     reporter.log("--- Performance Summary ---");
-    reporter.log(&format!("Total time: {:.1}m ({:.0}s)", total_min, total_secs));
+    reporter.log(&format!(
+        "Total time: {:.1}m ({:.0}s)",
+        total_min, total_secs
+    ));
 
     for (phase, duration) in &stats.phase_durations {
         if *duration >= 0.1 {
@@ -137,7 +140,8 @@ fn log_install_summary(
         }
     }
 
-    let total_directives = stats.directives_completed + stats.directives_skipped + stats.directives_failed;
+    let total_directives =
+        stats.directives_completed + stats.directives_skipped + stats.directives_failed;
     if total_directives > 0 && total_secs > 0.0 {
         reporter.log(&format!(
             "Directives: {} completed, {} skipped, {} failed ({:.0}/s)",
@@ -150,7 +154,9 @@ fn log_install_summary(
 
     if stats.archives_downloaded > 0 {
         // Find the download+extract phase duration
-        let extract_secs = stats.phase_durations.iter()
+        let extract_secs = stats
+            .phase_durations
+            .iter()
             .find(|(name, _)| name.contains("Download") || name.contains("Pipelined"))
             .map(|(_, d)| *d)
             .unwrap_or(total_secs);
@@ -201,16 +207,26 @@ fn trim_allocator_rss(reason: &str) {
     // - mi_collect: mimalloc (Rust allocations via #[global_allocator])
     // - malloc_trim: glibc (C library allocations: SQLite, libcurl, etc.)
     // Broadcast to all rayon threads so their thread-local mimalloc heaps get collected too.
-    rayon::broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true); });
-    unsafe { libmimalloc_sys::mi_collect(true); }
-    unsafe { libc::malloc_trim(0); }
+    rayon::broadcast(|_| unsafe {
+        libmimalloc_sys::mi_collect(true);
+    });
+    unsafe {
+        libmimalloc_sys::mi_collect(true);
+    }
+    unsafe {
+        libc::malloc_trim(0);
+    }
     info!("allocator collect after {}", reason);
 }
 
 #[cfg(not(target_os = "linux"))]
 fn trim_allocator_rss(_reason: &str) {
-    rayon::broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true); });
-    unsafe { libmimalloc_sys::mi_collect(true); }
+    rayon::broadcast(|_| unsafe {
+        libmimalloc_sys::mi_collect(true);
+    });
+    unsafe {
+        libmimalloc_sys::mi_collect(true);
+    }
 }
 
 /// Installation statistics
@@ -258,13 +274,17 @@ impl Installer {
         })?;
 
         // Parse wabbajack and import to database
-        config.reporter.log(&format!("Parsing: {}", config.wabbajack_path.display()));
+        config
+            .reporter
+            .log(&format!("Parsing: {}", config.wabbajack_path.display()));
         let db = import_wabbajack_to_db(&config.wabbajack_path, &config.db_path())?;
 
         // Show modlist info
         if let (Some(name), Some(version)) = (db.get_metadata("name")?, db.get_metadata("version")?)
         {
-            config.reporter.log(&format!("Modlist: {} v{}", name, version));
+            config
+                .reporter
+                .log(&format!("Modlist: {} v{}", name, version));
         }
 
         let stats = db.get_directive_stats()?;
@@ -357,10 +377,10 @@ impl Installer {
                     }
                 }
                 Err(e) => {
-                    errors.lock().expect("errors mutex").push((
-                        archive.name.clone(),
-                        format!("Cannot read file: {}", e),
-                    ));
+                    errors
+                        .lock()
+                        .expect("errors mutex")
+                        .push((archive.name.clone(), format!("Cannot read file: {}", e)));
                 }
             }
 
@@ -391,7 +411,10 @@ impl Installer {
         // === Phase 1: Game Check ===
         let game_check_start = Instant::now();
         self.reporter().phase_start(Phase::GameCheck);
-        self.reporter().log(&format!("Game directory: {}", self.config.game_dir.display()));
+        self.reporter().log(&format!(
+            "Game directory: {}",
+            self.config.game_dir.display()
+        ));
         if !self.config.game_dir.exists() {
             bail!(
                 "Game directory does not exist: {}",
@@ -405,8 +428,7 @@ impl Installer {
         // authored, missing DLC, wrong store variant (Steam vs GOG), etc.
         //
         // Runs parallel via rayon; typical cost <2s for Bethesda modlists.
-        let preflight =
-            game_preflight::check_game_files_from_db(&self.db, &self.config.game_dir)?;
+        let preflight = game_preflight::check_game_files_from_db(&self.db, &self.config.game_dir)?;
         if preflight.total == 0 {
             self.reporter()
                 .log("No game files required by this modlist — skipping hash preflight");
@@ -414,10 +436,8 @@ impl Installer {
             self.reporter()
                 .log(&format!("Verifying {} game files...", preflight.total));
             if preflight.all_ok() {
-                self.reporter().log(&format!(
-                    "All {} game files verified",
-                    preflight.total
-                ));
+                self.reporter()
+                    .log(&format!("All {} game files verified", preflight.total));
             } else {
                 // Dump per-file diagnostics so user knows which files are bad.
                 for line in preflight.format_summary().lines() {
@@ -456,7 +476,11 @@ impl Installer {
 
         // Pre-load and group all directives by archive hash (no index needed yet)
         let grouped = pipeline::load_and_group_directives(&self.db, &dp.ctx)?;
-        let total_from = grouped.from_archive.values().map(|v| v.len()).sum::<usize>();
+        let total_from = grouped
+            .from_archive
+            .values()
+            .map(|v| v.len())
+            .sum::<usize>();
         let total_patched = grouped.patched.values().map(|v| v.len()).sum::<usize>();
         let total_textures = grouped.textures.values().map(|v| v.len()).sum::<usize>();
         let total_whole = grouped.whole_file.len();
@@ -537,9 +561,8 @@ impl Installer {
         // CLI flag.
         let streaming_stats = match self.config.extract_strategy {
             ExtractStrategy::Streaming => {
-                self.reporter().log(
-                    "Using streaming extraction (download and extract run concurrently)",
-                );
+                self.reporter()
+                    .log("Using streaming extraction (download and extract run concurrently)");
                 pipeline::run_processing_loop(
                     &self.db,
                     &dp.ctx,
@@ -592,7 +615,9 @@ impl Installer {
         }
         let pipeline_secs = pipeline_start.elapsed().as_secs_f64();
         log_phase_metrics("Pipelined Download+Extract", pipeline_start);
-        stats.phase_durations.push(("Download+Extract".into(), pipeline_secs));
+        stats
+            .phase_durations
+            .push(("Download+Extract".into(), pipeline_secs));
 
         // === Phase 3: InlineFile + RemappedInlineFile ===
         let inline_start = Instant::now();
@@ -600,23 +625,45 @@ impl Installer {
         dp.inline_phase()?;
         trim_allocator_rss("inline files");
         log_phase_metrics("Inline Files", inline_start);
-        stats.phase_durations.push(("Inline Files".into(), inline_start.elapsed().as_secs_f64()));
+        stats
+            .phase_durations
+            .push(("Inline Files".into(), inline_start.elapsed().as_secs_f64()));
 
         // === Phase 4: DDS Transformations ===
-        let dds_start = Instant::now();
-        self.reporter().phase_start(Phase::DdsTransform);
-        dp.texture_phase()?;
-        trim_allocator_rss("texture phase");
-        log_phase_metrics("DDS Transform", dds_start);
-        stats.phase_durations.push(("DDS Transform".into(), dds_start.elapsed().as_secs_f64()));
+        let dds_needs_work = dp
+            .ctx
+            .prevalidation_stats
+            .get("TransformedTexture")
+            .map(|&(_, needs_work)| needs_work)
+            .unwrap_or(0);
+        if dds_needs_work > 0 {
+            let dds_start = Instant::now();
+            self.reporter().phase_start(Phase::DdsTransform);
+            dp.texture_phase()?;
+            trim_allocator_rss("texture phase");
+            log_phase_metrics("DDS Transform", dds_start);
+            stats
+                .phase_durations
+                .push(("DDS Transform".into(), dds_start.elapsed().as_secs_f64()));
+        }
 
         // === Phase 5: BSA Building ===
-        let bsa_start = Instant::now();
-        self.reporter().phase_start(Phase::BsaBuild);
-        dp.bsa_phase()?;
-        trim_allocator_rss("bsa build phase");
-        log_phase_metrics("BSA Build", bsa_start);
-        stats.phase_durations.push(("BSA Build".into(), bsa_start.elapsed().as_secs_f64()));
+        let bsa_needs_work = dp
+            .ctx
+            .prevalidation_stats
+            .get("CreateBSA")
+            .map(|&(_, needs_work)| needs_work)
+            .unwrap_or(0);
+        if bsa_needs_work > 0 {
+            let bsa_start = Instant::now();
+            self.reporter().phase_start(Phase::BsaBuild);
+            dp.bsa_phase()?;
+            trim_allocator_rss("bsa build phase");
+            log_phase_metrics("BSA Build", bsa_start);
+            stats
+                .phase_durations
+                .push(("BSA Build".into(), bsa_start.elapsed().as_secs_f64()));
+        }
 
         // === Phase 6: Cleanup ===
         let cleanup_start = Instant::now();
@@ -624,7 +671,9 @@ impl Installer {
         dp.cleanup_phase()?;
         trim_allocator_rss("cleanup phase");
         log_phase_metrics("Cleanup", cleanup_start);
-        stats.phase_durations.push(("Cleanup".into(), cleanup_start.elapsed().as_secs_f64()));
+        stats
+            .phase_durations
+            .push(("Cleanup".into(), cleanup_start.elapsed().as_secs_f64()));
 
         let process_stats = dp.finish();
         stats.directives_completed += process_stats.completed;

@@ -166,7 +166,11 @@ pub fn handle_transformed_texture(
 
     // Write sidecar hash cache so re-runs can skip this texture
     if let Err(e) = crate::installer::sidecar::write_sidecar(&output_path, &directive.hash) {
-        tracing::warn!("Failed to write DDS sidecar for {}: {}", output_path.display(), e);
+        tracing::warn!(
+            "Failed to write DDS sidecar for {}: {}",
+            output_path.display(),
+            e
+        );
     }
 
     Ok(())

@@ -75,7 +75,12 @@ pub fn write_sidecar(output_path: &Path, directive_hash: &str) -> std::io::Resul
     let actual_size = fs::metadata(output_path)?.len();
     let sp = sidecar_path(output_path);
     let content = format!("hash={}\nsize={}\n", directive_hash, actual_size);
-    tracing::info!("Writing sidecar: {} (hash={}, size={})", sp.display(), directive_hash, actual_size);
+    tracing::info!(
+        "Writing sidecar: {} (hash={}, size={})",
+        sp.display(),
+        directive_hash,
+        actual_size
+    );
     fs::write(&sp, content)
 }
 
@@ -183,10 +188,7 @@ pub fn normalize_manifest_path(path: &str) -> String {
 ///
 /// Each entry is `(normalized_bsa_path, xxhash64_base64)`.
 /// Format: one `path=hash` pair per line, sorted for determinism.
-pub fn write_manifest(
-    output_path: &Path,
-    entries: &[(String, String)],
-) -> std::io::Result<()> {
+pub fn write_manifest(output_path: &Path, entries: &[(String, String)]) -> std::io::Result<()> {
     let mp = manifest_path(output_path);
 
     let mut sorted: Vec<_> = entries.iter().collect();

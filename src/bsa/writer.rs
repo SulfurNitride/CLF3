@@ -27,12 +27,8 @@ impl FileEntry {
     /// Read file from disk and create a BSA file, optionally compressing it.
     /// Peak memory per call = 1 file's worth of data.
     fn into_bsa_file(self, version: Version, should_compress: bool) -> Result<BsaFile<'static>> {
-        let data = fs::read(&self.disk_path).with_context(|| {
-            format!(
-                "Failed to read staged file: {}",
-                self.disk_path.display()
-            )
-        })?;
+        let data = fs::read(&self.disk_path)
+            .with_context(|| format!("Failed to read staged file: {}", self.disk_path.display()))?;
         let uncompressed = BsaFile::from_decompressed(data.into_boxed_slice());
 
         if should_compress {
@@ -176,11 +172,13 @@ impl BsaBuilder {
             .files
             .into_iter()
             .flat_map(|(dir_path, files)| {
-                files.into_iter().map(move |(file_name, disk_path)| FileEntry {
-                    dir_path: dir_path.clone(),
-                    file_name,
-                    disk_path,
-                })
+                files
+                    .into_iter()
+                    .map(move |(file_name, disk_path)| FileEntry {
+                        dir_path: dir_path.clone(),
+                        file_name,
+                        disk_path,
+                    })
             })
             .collect();
 

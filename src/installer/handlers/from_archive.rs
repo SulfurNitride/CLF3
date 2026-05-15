@@ -110,8 +110,13 @@ pub fn handle_from_archive(ctx: &ProcessContext, directive: &FromArchiveDirectiv
                 meta.len()
             );
         }
-        reflink_copy::reflink_or_copy(&archive_path, &output_path)
-            .with_context(|| format!("Failed to copy {} -> {}", archive_path.display(), output_path.display()))?;
+        reflink_copy::reflink_or_copy(&archive_path, &output_path).with_context(|| {
+            format!(
+                "Failed to copy {} -> {}",
+                archive_path.display(),
+                output_path.display()
+            )
+        })?;
         return Ok(());
     }
 
