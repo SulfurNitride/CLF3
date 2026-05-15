@@ -544,7 +544,7 @@ pub(crate) fn process_single_archive_fused(
                     );
                 }
             } else {
-                // Non-BSA container (e.g. .fomod which is a ZIP): use generic archive extraction
+                // Non-BSA container: use generic archive extraction.
                 let wanted_files: Vec<String> = wanted.iter().cloned().collect();
                 match sevenzip::extract_files_case_insensitive(bsa_disk_path, &wanted_files, &tmp_path) {
                     Ok(_) => {

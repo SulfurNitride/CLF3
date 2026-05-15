@@ -10,7 +10,7 @@ If you want to support the things I put out, I do have a [Ko-Fi](https://ko-fi.c
 
 ---------------------------------------------------
 
-Modlist installer for Linux. Installs Wabbajack modlists and Nexus Collections without needing Windows.
+Modlist installer for Linux. Installs Wabbajack modlists without needing Windows.
 
 Named after Chlorine Trifluoride - burns through modlists like ClF3 burns through concrete.
 

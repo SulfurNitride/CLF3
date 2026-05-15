@@ -97,10 +97,6 @@ memmap2 = "0.9"
 reflink-copy = "0.1.28"
 which = "8.0"
 
-# Collection support (FOMOD/XML parsing)
-quick-xml = "0.39"
-encoding_rs = "0.8.35"
-
 # Hashing
 md5 = "0.7"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
