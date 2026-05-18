@@ -123,24 +123,30 @@ impl PreflightReport {
 }
 
 /// Files that ship in known-different bytes across editions or stores but
-/// behave identically at runtime — accept a hash mismatch rather than failing
-/// preflight. Match is case-insensitive against the basename of the modlist's
-/// `game_file` path. Mirrors `is_curios` in `downloader.rs` so preflight and
-/// download accept the same set.
+/// behave identically at runtime — accept a size/hash mismatch rather than
+/// failing. Match is case-insensitive against the basename of the modlist's
+/// `game_file` path / archive name. Both preflight and the GameFile copy
+/// step consult this list, so we accept the same set everywhere.
 ///
 /// Add new entries here when modlist authors hit known alt-variant pain.
 const ALT_VARIANT_FILE_BASENAMES: &[&str] = &[
-    // Skyrim SE Curios Creation Club content — Steam vs Bethesda.net builds
-    // ship different bytes but the same content. Wabbajack's downloader has
-    // accepted this since forever.
+    // Skyrim SE Curios Creation Club — Steam vs Bethesda.net builds ship
+    // different bytes but the same runtime content. Wabbajack has accepted
+    // this since forever.
     "ccbgssse037-curios.esl",
     "ccbgssse037-curios.bsa",
+    // Fallout 4 Creation Club — same alt-variant pattern (Steam-Pipe-pushed
+    // CC files re-stamped at distribution time so size + hash drift while
+    // the gameplay payload is identical). Confirmed against modlists that
+    // bake these in (e.g. Fallen World).
+    "ccotmfo4001-remnants.esl",
+    "ccbgsfo4046-tescan.esl",
 ];
 
-/// Returns true if the given modlist `game_file` path matches a known alternate
-/// variant. Hash mismatches on these files are warned-and-accepted instead of
-/// failed.
-fn has_known_alt_variant(game_file: &str) -> bool {
+/// Returns true if the given modlist `game_file` path (or archive name) is on
+/// the known alt-variant list. Hash *and* size mismatches on these files are
+/// warned-and-accepted instead of failed.
+pub fn has_known_alt_variant(game_file: &str) -> bool {
     let basename = game_file
         .rsplit(['\\', '/'])
         .next()

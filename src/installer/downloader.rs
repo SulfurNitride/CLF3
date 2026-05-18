@@ -1548,18 +1548,21 @@ async fn download_archive(
                     truncate_name(&archive.name, 30)
                 ));
 
-                // ccbgssse037-curios has Steam vs Bethesda variants with different
-                // hashes but identical content — accept if size matches
-                let is_curios = archive.name.to_lowercase().contains("ccbgssse037-curios");
+                // Known Creation Club alt-variants (Curios, FO4 CC files) ship
+                // different bytes between stores/patch revisions while staying
+                // runtime-equivalent. Single source of truth lives in
+                // `game_preflight::has_known_alt_variant`.
+                let is_alt_variant =
+                    crate::installer::game_preflight::has_known_alt_variant(&archive.name);
 
                 match verify_file_hash(output_path, &archive.hash) {
                     Ok(true) => {
                         // Hash matches - success!
                     }
-                    Ok(false) if is_curios => {
-                        // Curios Steam/Bethesda variant — accept it
+                    Ok(false) if is_alt_variant => {
+                        // CC alt-variant (Steam vs Bethesda / patch drift) — accept it
                         warn!(
-                            "{} has different hash (Steam/Bethesda variant) — accepting",
+                            "{} has different hash (known CC alt-variant) — accepting",
                             archive.name
                         );
                     }
@@ -2156,13 +2159,25 @@ fn copy_game_file(
         )
     })?;
 
-    // Verify size
+    // Verify size — but tolerate the curated alt-variant set (Steam vs
+    // Bethesda Creation Club builds drift by a handful of metadata bytes
+    // while staying runtime-equivalent; see `ALT_VARIANT_FILE_BASENAMES`).
     if bytes_copied != archive.size as u64 {
-        bail!(
-            "Size mismatch copying game file: expected {}, got {}",
-            archive.size,
-            bytes_copied
-        );
+        if crate::installer::game_preflight::has_known_alt_variant(game_file_path)
+            || crate::installer::game_preflight::has_known_alt_variant(&archive.name)
+        {
+            warn!(
+                "Game file {} size differs (expected {}, got {}) but is on the \
+                 known alt-variant list — accepting",
+                game_file_path, archive.size, bytes_copied
+            );
+        } else {
+            bail!(
+                "Size mismatch copying game file: expected {}, got {}",
+                archive.size,
+                bytes_copied
+            );
+        }
     }
 
     Ok(())
