@@ -21,6 +21,7 @@ mod modlist;
 mod nxm_handler;
 mod octodiff;
 mod paths;
+mod self_update;
 mod settings;
 mod textures;
 
@@ -224,6 +225,25 @@ enum Commands {
     Fluorine {
         #[command(subcommand)]
         action: FluorineAction,
+    },
+
+    /// Self-update: check GitHub for a newer clf3 release and replace the
+    /// running binary in place. Atomic on Linux — the kernel keeps the old
+    /// inode mapped so the running invocation isn't disrupted.
+    SelfUpdate {
+        /// Only check; don't download or replace anything. Exits 0 if up to
+        /// date, 1 if an update is available.
+        #[arg(long)]
+        check: bool,
+
+        /// Skip the version-diff confirmation and apply.
+        #[arg(long, short)]
+        yes: bool,
+
+        /// Re-download and replace even when versions match (or are
+        /// unparseable). Useful for recovering from a broken install.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -464,6 +484,20 @@ async fn main() -> Result<()> {
                 }
             }
         });
+    }
+
+    // Best-effort startup check for a newer clf3 release. Skips itself for
+    // the `SelfUpdate` subcommand (to avoid double-querying GitHub) and runs
+    // with a short timeout so the network never blocks normal commands.
+    // Result is cached in `~/.config/clf3/update_cache.json` for 24h.
+    if !matches!(command, Commands::SelfUpdate { .. }) {
+        // Don't `await` directly — race it against a short timeout so an
+        // unreachable api.github.com doesn't visibly delay every invocation.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self_update::startup_check_with_notice(),
+        )
+        .await;
     }
 
     match command {
@@ -891,8 +925,82 @@ async fn main() -> Result<()> {
         Commands::Fluorine { action } => {
             run_fluorine_action(action).await?;
         }
+
+        Commands::SelfUpdate { check, yes, force } => {
+            run_self_update(check, yes, force).await?;
+        }
     }
 
+    Ok(())
+}
+
+/// `clf3 self-update` handler. Implements the three modes — check-only,
+/// interactive (default), and `--yes`/`--force` non-interactive apply.
+async fn run_self_update(check: bool, yes: bool, force: bool) -> Result<()> {
+    let release = self_update::fetch_latest_release()
+        .await
+        .context("Failed to query GitHub for the latest CLF3 release")?;
+    let remote_version = release.version().to_string();
+    let verdict = self_update::compare_to_running(&remote_version);
+
+    let local = self_update::current_version();
+    println!("Running version: {}", local);
+    println!("Latest release:  {} ({})", remote_version, release.name);
+    println!("Verdict:         {:?}", verdict);
+
+    if check {
+        if verdict.update_available() {
+            println!(
+                "\nUpdate available. Run `clf3 self-update --yes` to apply."
+            );
+            std::process::exit(1);
+        } else {
+            println!("\nUp to date.");
+            return Ok(());
+        }
+    }
+
+    let should_apply = force
+        || matches!(verdict, self_update::UpdateVerdict::Newer)
+        || (yes
+            && matches!(
+                verdict,
+                self_update::UpdateVerdict::Equal | self_update::UpdateVerdict::Ahead
+            ));
+
+    if !should_apply {
+        match verdict {
+            self_update::UpdateVerdict::Equal | self_update::UpdateVerdict::Ahead => {
+                println!("\nNothing to do. Pass --force to re-download anyway.");
+                return Ok(());
+            }
+            self_update::UpdateVerdict::Unknown => {
+                anyhow::bail!(
+                    "Remote tag '{}' isn't comparable to running version '{}'. \
+                     Pass --force to overwrite anyway.",
+                    remote_version,
+                    local
+                );
+            }
+            self_update::UpdateVerdict::Newer => unreachable!(),
+        }
+    }
+
+    if !yes && !force {
+        println!(
+            "\nReady to download and replace the running clf3 binary. \
+             Re-run with --yes to apply."
+        );
+        anyhow::bail!("Self-update aborted (confirmation required — pass --yes to proceed)");
+    }
+
+    let outcome = self_update::run_update(force).await?;
+    if outcome.replaced {
+        println!("\nclf3 updated to {}.", outcome.version);
+        println!("Restart any running clf3 invocations to pick up the new binary.");
+    } else {
+        println!("\nNo replacement needed — already on {}.", outcome.version);
+    }
     Ok(())
 }
 
@@ -1329,6 +1437,36 @@ async fn run_modlist_update(name: String, yes: bool) -> Result<()> {
         && stats.archives_failed == 0
         && stats.directives_failed == 0;
 
+    // Mirror the fresh-install summary so the terminal — not just the log
+    // file — shows *why* an update failed (which archive, which URL, which
+    // error). Without this, the bail! below only carries counts.
+    if !stats.manual_downloads.is_empty() {
+        println!(
+            "\n=== Manual Downloads Needed ({}) ===",
+            stats.manual_downloads.len()
+        );
+        for (i, md) in stats.manual_downloads.iter().enumerate() {
+            println!("{}. {}", i + 1, md.name);
+            println!("   URL: {}", md.url);
+            println!("   Size: {} bytes", md.expected_size);
+            if let Some(ref prompt) = md.prompt {
+                println!("   Note: {}", prompt);
+            }
+        }
+    }
+
+    if !stats.failed_downloads.is_empty() {
+        println!(
+            "\n=== Failed Downloads ({}) ===",
+            stats.failed_downloads.len()
+        );
+        for (i, fd) in stats.failed_downloads.iter().enumerate() {
+            println!("{}. {}", i + 1, fd.name);
+            println!("   URL: {}", fd.url);
+            println!("   Error: {}", fd.error);
+        }
+    }
+
     if installation_succeeded {
         println!(
             "\nUpdate complete: '{}' is now at version {}.",
@@ -1365,24 +1503,59 @@ fn auto_detect_game_dir(wabbajack_path: &std::path::Path) -> Option<(PathBuf, &'
 
     let modlist = modlist::parse_wabbajack_file(wabbajack_path).ok()?;
 
-    let (steam_id, gog_id) = game_finder::ids_for_wabbajack_type(&modlist.game_type)?;
-
-    // Build an ordered candidate list: Steam first, then Heroic/GOG.
-    let mut candidates: Vec<(PathBuf, &'static str)> = Vec::new();
-
-    if let Some(p) = game_finder::find_game_install_path(steam_id) {
-        candidates.push((p, "Steam"));
+    // Collect every KnownGame entry that maps to this Wabbajack game_type —
+    // canonical + store variants (e.g. Fallout 3 + Fallout 3 GOTY share the
+    // Bethesda registry path but have distinct Steam app IDs).
+    let variants = game_finder::variants_for_wabbajack_type(&modlist.game_type);
+    if variants.is_empty() {
+        tracing::warn!(
+            "Unknown Wabbajack game_type='{}'; can't auto-detect a game directory.",
+            modlist.game_type
+        );
+        return None;
     }
 
-    if let Some(gog_app_id) = gog_id {
-        for g in game_finder::detect_heroic_games() {
-            if g.app_id == gog_app_id {
-                candidates.push((g.install_path.clone(), "Heroic/GOG"));
+    // Build an ordered candidate list: every Steam variant first (canonical
+    // app ID before GOTY/store reissues), then every Heroic/GOG variant.
+    let mut candidates: Vec<(PathBuf, &'static str)> = Vec::new();
+    let mut tried_steam_ids: Vec<&'static str> = Vec::new();
+    let mut tried_gog_ids: Vec<&'static str> = Vec::new();
+
+    for g in &variants {
+        tried_steam_ids.push(g.steam_app_id);
+        if let Some(p) = game_finder::find_game_install_path(g.steam_app_id) {
+            // Distinguish the canonical Steam entry from a store variant in
+            // the log so the user can tell which appmanifest matched.
+            let label: &'static str = if g.wabbajack_type.is_some() {
+                "Steam"
+            } else {
+                "Steam (variant)"
+            };
+            candidates.push((p, label));
+        }
+    }
+
+    let heroic_games = game_finder::detect_heroic_games();
+    for g in &variants {
+        if let Some(gog_app_id) = g.gog_app_id {
+            tried_gog_ids.push(gog_app_id);
+            for hg in &heroic_games {
+                if hg.app_id == gog_app_id {
+                    candidates.push((hg.install_path.clone(), "Heroic/GOG"));
+                }
             }
         }
     }
 
     if candidates.is_empty() {
+        tracing::warn!(
+            "No installed game directory found for game_type='{}' \
+             (tried Steam IDs {:?}, GOG IDs {:?}). \
+             Install the game via Steam/Heroic or pass --game PATH.",
+            modlist.game_type,
+            tried_steam_ids,
+            tried_gog_ids
+        );
         return None;
     }
 
@@ -1404,6 +1577,11 @@ fn auto_detect_game_dir(wabbajack_path: &std::path::Path) -> Option<(PathBuf, &'
         }
 
         if report.all_ok() {
+            tracing::info!(
+                "Game file preflight passed on {} candidate: {}",
+                store,
+                path.display()
+            );
             println!(
                 "Game file preflight passed on {} candidate: {}",
                 store,
@@ -1412,14 +1590,38 @@ fn auto_detect_game_dir(wabbajack_path: &std::path::Path) -> Option<(PathBuf, &'
             return Some((path.clone(), store));
         }
 
-        // Preflight failed on this candidate — log and try next.
-        eprintln!(
-            "Skipping {} install at {}: {} file(s) missing, {} hash mismatch. \
-             Trying next candidate...",
+        // Preflight failed on this candidate. Log the per-file detail so the
+        // log file shows what's actually wrong (missing files vs. hash drift
+        // from a game update) — counts alone aren't actionable.
+        tracing::warn!(
+            "Skipping {} install at {} — preflight failed ({} missing, {} mismatch of {})",
             store,
             path.display(),
             report.missing().len(),
-            report.mismatched().len()
+            report.mismatched().len(),
+            report.total
+        );
+        for line in report.format_summary().lines() {
+            tracing::warn!("{}", line);
+        }
+        eprintln!(
+            "Skipping {} install at {}: {} file(s) missing, {} hash mismatch (of {}). \
+             Per-file detail logged. Trying next candidate...",
+            store,
+            path.display(),
+            report.missing().len(),
+            report.mismatched().len(),
+            report.total
+        );
+    }
+
+    if first_fallback.is_none() {
+        tracing::warn!(
+            "All candidate game directories failed the game-file preflight for \
+             modlist '{}' (game_type='{}'). The game is likely on the wrong version \
+             or has files removed — restore vanilla and re-run, or pass --game PATH.",
+            modlist.name,
+            modlist.game_type
         );
     }
 

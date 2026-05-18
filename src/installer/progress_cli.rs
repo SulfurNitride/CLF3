@@ -22,42 +22,40 @@ pub struct CliReporter {
     /// Per-slot current download speed in bytes/sec (0 when idle or extracting).
     bar_speeds: Arc<Vec<AtomicU64>>,
     ticker_shutdown: Arc<AtomicBool>,
+    /// `true` while we're in a phase that benefits from the live system status
+    /// bar + worker pool (Downloading / Installing / DdsTransform / BsaBuild).
+    /// Toggled on `phase_start`; non-active phases (GameCheck, Cleanup) keep
+    /// the status line hidden so it doesn't render across the whole pipeline.
+    status_visible: AtomicBool,
 }
 
 impl CliReporter {
     /// Create a new CLI reporter with a bar pool of the given size.
+    ///
+    /// In Full mode the system status / worker header / pool bars start
+    /// *hidden* (blank-styled) and only become visible once `phase_start`
+    /// reports an active phase (Downloading / Installing / DdsTransform /
+    /// BsaBuild). This avoids the status line stomping over Game Check /
+    /// Cleanup output where there's no meaningful network/disk activity to
+    /// display.
     pub fn new(pool_size: usize, mode: ProgressMode) -> Arc<Self> {
         let mp = MultiProgress::new();
         let blank_style = blank_style();
-        let idle_style = idle_slot_style();
 
+        // Start blank in both modes; Full-mode bars get their real style
+        // applied on the first active `phase_start`.
         let system_status = mp.add(ProgressBar::new_spinner());
-        if mode == ProgressMode::Full {
-            system_status.set_style(ProgressStyle::default_spinner().template("{msg}").unwrap());
-            system_status.set_message("System: starting...");
-        } else {
-            system_status.set_style(blank_style.clone());
-        }
+        system_status.set_style(blank_style.clone());
 
         let active_header = mp.add(ProgressBar::new_spinner());
-        if mode == ProgressMode::Full {
-            active_header.set_style(ProgressStyle::default_bar().template("{msg}").unwrap());
-            active_header.set_message(format!("{}", style("Workers").bold().cyan()));
-        } else {
-            active_header.set_style(blank_style.clone());
-        }
+        active_header.set_style(blank_style.clone());
 
         let mut pool = Vec::with_capacity(pool_size);
         let mut pool_available = Vec::with_capacity(pool_size);
         let mut bar_speeds = Vec::with_capacity(pool_size);
-        for index in 0..pool_size {
+        for _ in 0..pool_size {
             let bar = mp.add(ProgressBar::new(0));
-            if mode == ProgressMode::Full {
-                bar.set_style(idle_style.clone());
-                bar.set_prefix(worker_slot_prefix(index));
-            } else {
-                bar.set_style(blank_style.clone());
-            }
+            bar.set_style(blank_style.clone());
             pool.push(bar);
             pool_available.push(Mutex::new(true));
             bar_speeds.push(AtomicU64::new(0));
@@ -73,12 +71,79 @@ impl CliReporter {
             pool_available,
             bar_speeds: Arc::new(bar_speeds),
             ticker_shutdown: Arc::new(AtomicBool::new(false)),
+            status_visible: AtomicBool::new(false),
         });
 
         if mode == ProgressMode::Full {
             Self::spawn_system_ticker(&reporter);
         }
         reporter
+    }
+
+    /// Phases that benefit from the live system status + worker pool display.
+    /// GameCheck / Cleanup / any unknown future phase stays hidden.
+    fn phase_is_active(phase: Phase) -> bool {
+        matches!(
+            phase,
+            Phase::Downloading
+                | Phase::Validating
+                | Phase::Extracting
+                | Phase::Installing
+                | Phase::DdsTransform
+                | Phase::BsaBuild
+        )
+    }
+
+    /// Switch the persistent bars between visible (real styles) and hidden
+    /// (blank). Idempotent — repeated calls with the same state are cheap.
+    /// Only meaningful in `ProgressMode::Full`.
+    fn set_status_visible(&self, visible: bool) {
+        if self.mode != ProgressMode::Full {
+            return;
+        }
+        let was = self.status_visible.swap(visible, Ordering::Relaxed);
+        if was == visible {
+            return;
+        }
+
+        let blank = blank_style();
+        if visible {
+            self.system_status
+                .set_style(ProgressStyle::default_spinner().template("{msg}").unwrap());
+            // Drop a placeholder; the ticker thread will overwrite within 500ms.
+            self.system_status.set_message("System: starting...");
+
+            self.active_header
+                .set_style(ProgressStyle::default_bar().template("{msg}").unwrap());
+            self.active_header
+                .set_message(format!("{}", style("Workers").bold().cyan()));
+
+            let idle = idle_slot_style();
+            for (index, bar) in self.pool.iter().enumerate() {
+                // Only restyle bars that are currently idle. In-flight bars
+                // own their own style (byte/spinner template from begin_item)
+                // and re-styling them would clobber their display.
+                let idle_now = self
+                    .pool_available
+                    .get(index)
+                    .map(|m| *m.lock().expect("pool lock"))
+                    .unwrap_or(true);
+                if idle_now {
+                    bar.set_style(idle.clone());
+                    bar.set_prefix(worker_slot_prefix(index));
+                    bar.set_message("");
+                }
+            }
+        } else {
+            self.system_status.set_style(blank.clone());
+            self.system_status.set_message("");
+            self.active_header.set_style(blank.clone());
+            self.active_header.set_message("");
+            for bar in &self.pool {
+                bar.set_style(blank.clone());
+                bar.set_message("");
+            }
+        }
     }
 
     /// Get a `MakeWriter` for the tracing subscriber that routes through this reporter's
@@ -265,6 +330,12 @@ impl ProgressReporter for CliReporter {
                 pb.finish_and_clear();
             }
         }
+        // Toggle the persistent status line + worker pool to match the new
+        // phase. Active phases (Downloading / Installing / DdsTransform /
+        // BsaBuild) get the live Net/Disk/RAM display; GameCheck / Cleanup
+        // stay quiet.
+        self.set_status_visible(Self::phase_is_active(phase));
+
         let header = format!("=== {} ===", phase);
         let _ = self.mp.println(format!("{}", style(header).bold().cyan()));
     }

@@ -288,7 +288,67 @@ pub fn find_by_wabbajack_type(wj_type: &str) -> Option<&'static KnownGame> {
 
 /// Convenience: return `(steam_app_id, gog_app_id)` for a Wabbajack game_type.
 /// GOG id is `None` for games without a known GOG variant.
+///
+/// Returns only the *canonical* entry; for installs that come in store
+/// variants (Fallout 3 vs. Fallout 3 GOTY both shipped on Steam under
+/// different app IDs), use [`variants_for_wabbajack_type`] which returns
+/// every install candidate.
 pub fn ids_for_wabbajack_type(wj_type: &str) -> Option<(&'static str, Option<&'static str>)> {
     let g = find_by_wabbajack_type(wj_type)?;
     Some((g.steam_app_id, g.gog_app_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallout3_resolves_to_both_steam_variants() {
+        let v = variants_for_wabbajack_type("Fallout3");
+        let ids: Vec<&str> = v.iter().map(|g| g.steam_app_id).collect();
+        assert!(
+            ids.contains(&"22300") && ids.contains(&"22370"),
+            "expected Fallout3 lookup to include both 22300 and 22370; got {:?}",
+            ids
+        );
+        // Canonical entry first.
+        assert_eq!(v[0].steam_app_id, "22300");
+    }
+
+    #[test]
+    fn variants_handles_aliases() {
+        let v = variants_for_wabbajack_type("SkyrimSE");
+        assert!(!v.is_empty(), "alias 'SkyrimSE' should resolve");
+        assert_eq!(v[0].steam_app_id, "489830");
+    }
+
+    #[test]
+    fn unknown_type_returns_empty() {
+        assert!(variants_for_wabbajack_type("NotAGame").is_empty());
+    }
+}
+
+/// Return every known `KnownGame` entry that maps to the same Wabbajack
+/// `game_type`, ordered with the canonical entry first.
+///
+/// A store variant is recognised as `wabbajack_type: None` (i.e. Wabbajack
+/// doesn't have its own enum for it) plus a shared `registry_path` with the
+/// canonical entry — Bethesda variants use the same registry key regardless
+/// of the Steam app ID, so this catches Fallout 3 GOTY (22370) when the
+/// modlist asks for "Fallout3" (22300) and vice-versa.
+pub fn variants_for_wabbajack_type(wj_type: &str) -> Vec<&'static KnownGame> {
+    let Some(canonical) = find_by_wabbajack_type(wj_type) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(2);
+    out.push(canonical);
+    for g in KNOWN_GAMES {
+        if std::ptr::eq(g as *const _, canonical as *const _) {
+            continue;
+        }
+        if g.wabbajack_type.is_none() && g.registry_path == canonical.registry_path {
+            out.push(g);
+        }
+    }
+    out
 }

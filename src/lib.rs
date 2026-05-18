@@ -15,6 +15,7 @@ pub mod modlist;
 pub mod nxm_handler;
 pub mod octodiff;
 pub mod paths;
+pub mod self_update;
 pub mod settings;
 pub mod textures;
 pub mod ttw;
