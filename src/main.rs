@@ -1144,23 +1144,7 @@ async fn fetch_wabbajack_from_url(url: &str) -> Result<PathBuf> {
         .join("modlists");
     std::fs::create_dir_all(&cache_dir)?;
 
-    // Derive filename from URL path or use a default. Wabbajack authored_files
-    // URLs look like ".../Name.wabbajack_<uuid>" — trim the _UUID suffix.
-    let filename = url
-        .rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            let decoded = urlencoded_decode(s);
-            if let Some(idx) = decoded.find(".wabbajack_") {
-                decoded[..idx + ".wabbajack".len()].to_string()
-            } else if decoded.ends_with(".wabbajack") {
-                decoded
-            } else {
-                format!("{}.wabbajack", decoded)
-            }
-        })
-        .unwrap_or_else(|| "download.wabbajack".into());
+    let filename = cache_filename_from_wabbajack_url(url);
     let dest = cache_dir.join(&filename);
 
     let cached = std::fs::metadata(&dest).ok().filter(|m| m.len() > 0);
@@ -1196,6 +1180,28 @@ async fn fetch_wabbajack_from_url(url: &str) -> Result<PathBuf> {
     }
 
     Ok(dest)
+}
+
+/// Derive a stable cache filename from a .wabbajack URL.
+///
+/// Wabbajack authored-files URLs usually look like
+/// `Name.wabbajack_<release-uuid>`. Keep that UUID in the local cache name so
+/// two releases of the same list do not collide and cause stale reuse.
+fn cache_filename_from_wabbajack_url(url: &str) -> String {
+    url.rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let decoded = urlencoded_decode(s);
+            if let Some((name, uuid)) = decoded.split_once(".wabbajack_") {
+                format!("{}_{}.wabbajack", name, uuid)
+            } else if decoded.ends_with(".wabbajack") {
+                decoded
+            } else {
+                format!("{}.wabbajack", decoded)
+            }
+        })
+        .unwrap_or_else(|| "download.wabbajack".into())
 }
 
 /// Best-effort lookup: did the user pick this `output` directory from the
@@ -1646,4 +1652,27 @@ fn urlencoded_decode(s: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_filename_from_wabbajack_url;
+
+    #[test]
+    fn authored_file_cache_name_keeps_release_uuid() {
+        let url = "https://authored-files.wabbajack.org/Wasteland%20of%20Depravity.wabbajack_63571769-45e6-418e-a643-79d64d5ac98d";
+
+        assert_eq!(
+            cache_filename_from_wabbajack_url(url),
+            "Wasteland of Depravity_63571769-45e6-418e-a643-79d64d5ac98d.wabbajack"
+        );
+    }
+
+    #[test]
+    fn plain_wabbajack_cache_name_stays_readable() {
+        assert_eq!(
+            cache_filename_from_wabbajack_url("https://example.test/modlists/Foo%20Bar.wabbajack"),
+            "Foo Bar.wabbajack"
+        );
+    }
 }
