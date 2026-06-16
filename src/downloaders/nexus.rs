@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
-use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -94,13 +94,40 @@ pub struct NexusDownloader {
 }
 
 impl NexusDownloader {
-    /// Create a new Nexus downloader with API key
+    /// Create a new Nexus downloader with an API key (apikey header).
     pub fn new(api_key: &str) -> Result<Self> {
+        Self::build_client(Some(api_key), None)
+    }
+
+    /// Create a new Nexus downloader using an OAuth bearer token.
+    pub fn with_bearer(token: &str) -> Result<Self> {
+        Self::build_client(None, Some(token))
+    }
+
+    /// Create a downloader from config, preferring oauth_token over api_key when both are set.
+    pub fn from_config(api_key: &str, oauth_token: Option<&str>) -> Result<Self> {
+        if let Some(token) = oauth_token {
+            if !token.is_empty() {
+                return Self::build_client(None, Some(token));
+            }
+        }
+        Self::build_client(Some(api_key), None)
+    }
+
+    fn build_client(api_key: Option<&str>, oauth_token: Option<&str>) -> Result<Self> {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTH_HEADER,
-            HeaderValue::from_str(api_key).context("Invalid API key format")?,
-        );
+        if let Some(token) = oauth_token {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", token))
+                    .context("Invalid OAuth token format")?,
+            );
+        } else if let Some(key) = api_key {
+            headers.insert(
+                AUTH_HEADER,
+                HeaderValue::from_str(key).context("Invalid API key format")?,
+            );
+        }
 
         let client = Client::builder()
             .default_headers(headers)

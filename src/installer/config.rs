@@ -2,6 +2,7 @@
 //!
 //! Defines the configuration structure for modlist installation.
 
+use serde::Serialize;
 use super::progress::ProgressReporter;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,7 +30,8 @@ impl Default for ExtractStrategy {
 pub type ProgressCallback = Arc<dyn Fn(ProgressEvent) + Send + Sync>;
 
 /// Events reported during installation for progress tracking
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
 #[allow(dead_code)] // Fields are read in the GUI (lib crate) but not by the binary crate
 pub enum ProgressEvent {
     /// Download progress update
@@ -83,11 +85,14 @@ pub struct InstallConfig {
     /// Directory for downloaded archives
     pub downloads_dir: PathBuf,
 
-    /// Game installation directory (for GameFileSource)
-    pub game_dir: PathBuf,
+    /// Game installation directory (for GameFileSource); None if not available or not required
+    pub game_dir: Option<PathBuf>,
 
-    /// Nexus API key (required for download links)
+    /// Nexus API key (apikey header)
     pub nexus_api_key: String,
+
+    /// Nexus OAuth bearer token (Authorization: Bearer header); takes precedence over nexus_api_key
+    pub nexus_oauth_token: Option<String>,
 
     /// Maximum concurrent downloads
     pub max_concurrent_downloads: usize,
@@ -156,6 +161,7 @@ impl std::fmt::Debug for InstallConfig {
             .field("downloads_dir", &self.downloads_dir)
             .field("game_dir", &self.game_dir)
             .field("nexus_api_key", &"[REDACTED]")
+            .field("nexus_oauth_token", &self.nexus_oauth_token.as_ref().map(|_| "[REDACTED]"))
             .field("max_concurrent_downloads", &self.max_concurrent_downloads)
             .field("max_install_workers", &self.max_install_workers)
             .field("max_parallel_bsa_archives", &self.max_parallel_bsa_archives)
@@ -204,11 +210,13 @@ impl InstallConfig {
             return Err(ConfigError::WabbajackNotFound(self.wabbajack_path.clone()));
         }
 
-        if !self.game_dir.exists() {
-            return Err(ConfigError::GameDirNotFound(self.game_dir.clone()));
+        if let Some(ref gd) = self.game_dir {
+            if !gd.exists() {
+                return Err(ConfigError::GameDirNotFound(gd.clone()));
+            }
         }
 
-        if self.nexus_api_key.is_empty() && !self.manual_browser_mode {
+        if self.nexus_api_key.is_empty() && self.nexus_oauth_token.is_none() && !self.manual_browser_mode {
             return Err(ConfigError::MissingNexusKey);
         }
         if self.max_concurrent_downloads == 0 {

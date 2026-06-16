@@ -27,7 +27,8 @@ mod textures;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use installer::{
-    CliReporter, ExtractStrategy, InstallConfig, Installer, ProgressMode, ProgressReporter,
+    CliReporter, ExtractStrategy, InstallConfig, Installer, JackifyReporter, ProgressCallback,
+    ProgressEvent, ProgressMode, ProgressReporter,
 };
 
 /// CLI-facing enum for the `--extract` flag. Maps to the internal
@@ -117,6 +118,10 @@ enum Commands {
         #[arg(long, env = "NEXUS_API_KEY")]
         nexus_key: Option<String>,
 
+        /// Nexus Mods OAuth bearer token (takes precedence over API key)
+        #[arg(long, env = "NEXUS_OAUTH_TOKEN")]
+        nexus_oauth_token: Option<String>,
+
         /// Maximum concurrent downloads (defaults to CPU thread count)
         #[arg(short, long)]
         concurrent: Option<usize>,
@@ -184,6 +189,21 @@ enum Commands {
         /// tooling driving CLF3.
         #[arg(long)]
         report_json: Option<PathBuf>,
+
+        /// Emit structured JSON progress events to stdout (for Jackify integration).
+        /// Tracing output is redirected to stderr when this flag is set.
+        #[arg(long)]
+        jackify: bool,
+    },
+
+    /// Download a .wabbajack file from the Wabbajack CDN
+    Fetch {
+        /// CDN URL of the .wabbajack file
+        url: String,
+
+        /// Output path for the downloaded file
+        #[arg(short, long)]
+        output: PathBuf,
     },
 
     /// Modlist update management (check for / apply gallery updates).
@@ -651,6 +671,7 @@ async fn main() -> Result<()> {
             output,
             game,
             nexus_key,
+            nexus_oauth_token,
             concurrent,
             install_workers,
             bsa_workers,
@@ -665,6 +686,7 @@ async fn main() -> Result<()> {
             progress: _,
             machine_name,
             report_json,
+            jackify,
         } => {
             // Remember the original CLI argument as a URL if it was one — it
             // ends up recorded in `.clf3-install.json` so `modlist update`
@@ -706,26 +728,19 @@ async fn main() -> Result<()> {
             let ll_email = ll_email.unwrap_or_else(|| settings.loverslab_email.clone());
             let ll_password = ll_password.unwrap_or_else(|| settings.loverslab_password.clone());
 
-            // Game dir: CLI arg > auto-detect from modlist
-            let game_dir = match game {
-                Some(g) => g,
-                None => {
-                    // Try to auto-detect game path from the modlist's game type,
-                    // preferring installs whose game files actually match the
-                    // modlist's expected hashes (Steam first, then Heroic/GOG).
-                    match auto_detect_game_dir(&wabbajack_file) {
-                        Some((p, store)) => {
-                            println!("Auto-detected game directory: {} ({})", p.display(), store);
-                            p
-                        }
-                        None => {
-                            anyhow::bail!(
-                                "Could not auto-detect a game directory with matching files. \
-                                 Specify one with --game PATH"
-                            );
-                        }
+            // Game dir: CLI arg > auto-detect from modlist > None (graceful fallback)
+            let game_dir: Option<PathBuf> = match game {
+                Some(g) => Some(g),
+                None => match auto_detect_game_dir(&wabbajack_file) {
+                    Some((p, store)) => {
+                        println!("Auto-detected game directory: {} ({})", p.display(), store);
+                        Some(p)
                     }
-                }
+                    None => {
+                        println!("No game directory found - GameFileSource archives will be sourced from downloads dir");
+                        None
+                    }
+                },
             };
 
             // Default to CPU thread count
@@ -771,12 +786,29 @@ async fn main() -> Result<()> {
 
             let install_dir_for_fluorine = output.clone();
 
+            let (progress_callback, active_reporter): (
+                Option<ProgressCallback>,
+                Arc<dyn ProgressReporter>,
+            ) = if jackify {
+                let cb: ProgressCallback = Arc::new(|event: ProgressEvent| {
+                    if let Ok(json) = serde_json::to_string(&event) {
+                        println!("{}", json);
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                    }
+                });
+                let reporter = JackifyReporter::new(cb.clone()) as Arc<dyn ProgressReporter>;
+                (Some(cb), reporter)
+            } else {
+                (None, cli_reporter.clone() as Arc<dyn ProgressReporter>)
+            };
+
             let config = InstallConfig {
                 wabbajack_path: wabbajack_file,
                 output_dir: output,
                 downloads_dir: downloads,
                 game_dir,
                 nexus_api_key: nexus_key,
+                nexus_oauth_token,
                 max_concurrent_downloads: concurrent,
                 max_install_workers: install_workers,
                 max_parallel_bsa_archives: bsa_workers,
@@ -786,8 +818,8 @@ async fn main() -> Result<()> {
                 manual_watch_dir,
                 manual_max_active,
                 patch_cache_dir,
-                progress_callback: None,
-                reporter: cli_reporter.clone() as Arc<dyn ProgressReporter>,
+                progress_callback,
+                reporter: active_reporter,
                 loverslab_email: ll_email,
                 loverslab_password: ll_password,
                 extract_strategy: extract.into(),
@@ -950,6 +982,33 @@ async fn main() -> Result<()> {
 
         Commands::SelfUpdate { check, yes, force } => {
             run_self_update(check, yes, force).await?;
+        }
+
+        Commands::Fetch { url, output } => {
+            use downloaders::wabbajack_cdn::WabbajackCdnDownloader;
+            use std::sync::atomic::{AtomicU64, Ordering};
+
+            println!("Fetching: {}", url);
+            println!("Output:   {}", output.display());
+
+            let downloader = WabbajackCdnDownloader::new()?;
+            let last_reported = Arc::new(AtomicU64::new(0));
+
+            downloader
+                .download_with_progress(&url, &output, 0, move |downloaded, total| {
+                    if total == 0 {
+                        return;
+                    }
+                    let pct = downloaded * 100 / total;
+                    let last = last_reported.load(Ordering::Relaxed);
+                    if pct >= last + 5 || downloaded == total {
+                        last_reported.store(pct, Ordering::Relaxed);
+                        eprintln!("{}% ({} / {} bytes)", pct, downloaded, total);
+                    }
+                })
+                .await?;
+
+            println!("Done: {}", output.display());
         }
     }
 
@@ -1415,10 +1474,10 @@ async fn run_modlist_update(name: String, yes: bool) -> Result<()> {
         anyhow::anyhow!("Nexus API key required. Set it with: clf3 set-api-key YOUR_KEY")
     })?;
 
-    let game_dir = match auto_detect_game_dir(&wabbajack_path) {
+    let game_dir: Option<PathBuf> = match auto_detect_game_dir(&wabbajack_path) {
         Some((p, store)) => {
             println!("Auto-detected game directory: {} ({})", p.display(), store);
-            p
+            Some(p)
         }
         None => anyhow::bail!(
             "Could not auto-detect a game directory with matching files. \
@@ -1444,6 +1503,7 @@ async fn run_modlist_update(name: String, yes: bool) -> Result<()> {
         downloads_dir: downloads_dir.clone(),
         game_dir,
         nexus_api_key: nexus_key,
+        nexus_oauth_token: None,
         max_concurrent_downloads: thread_count,
         max_install_workers: thread_count,
         max_parallel_bsa_archives: 1,

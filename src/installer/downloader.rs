@@ -766,6 +766,38 @@ pub async fn download_archives_streaming(
     let mut sidecar_verified: Vec<(ArchiveInfo, PathBuf)> = Vec::new();
 
     for archive in archives_to_check {
+        // GameFileSource archives: resolve directly from game dir, skip download.
+        if archive.state_json.contains("GameFileSourceDownloader") {
+            if let Some(ref gd) = config.game_dir {
+                if let Ok(crate::modlist::DownloadState::GameFileSource(gf)) =
+                    serde_json::from_str::<crate::modlist::DownloadState>(&archive.state_json)
+                {
+                    let game_file = &gf.game_file;
+                    let resolved = crate::paths::resolve_case_insensitive(gd, game_file)
+                        .or_else(|| {
+                            crate::paths::resolve_case_insensitive(
+                                gd,
+                                &format!("Data/{}", game_file),
+                            )
+                        });
+                    if let Some(path) = resolved {
+                        db.mark_archive_downloaded(
+                            &archive.hash,
+                            path.to_string_lossy().as_ref(),
+                        )?;
+                        already_downloaded += 1;
+                        already_downloaded_size += archive.size as u64;
+                        let _ = tx.send(ArchiveEvent::Ready {
+                            hash: archive.hash.clone(),
+                            name: archive.name.clone(),
+                            path: path.clone(),
+                        });
+                        continue;
+                    }
+                }
+            }
+        }
+
         let output_path = config.downloads_dir.join(&archive.name);
         if output_path.exists() && fs::metadata(&output_path).is_ok() {
             // Fast path: sidecar cache says hash+size+mtime match
@@ -2253,17 +2285,13 @@ fn copy_game_file(
 
     // Check game directory and downloads directory
     let mut source_path: Option<PathBuf> = None;
-    for (base, relative) in [
-        (&config.game_dir, game_file_path.as_str()),
-        (
-            &config.game_dir,
-            &format!("Data/{}", game_file_path) as &str,
-        ),
-    ] {
-        if let Some(resolved) = crate::paths::resolve_case_insensitive(base, relative) {
-            if resolved.exists() {
-                source_path = Some(resolved);
-                break;
+    if let Some(ref gd) = config.game_dir {
+        for relative in [game_file_path.as_str(), &format!("Data/{}", game_file_path) as &str] {
+            if let Some(resolved) = crate::paths::resolve_case_insensitive(gd, relative) {
+                if resolved.exists() {
+                    source_path = Some(resolved);
+                    break;
+                }
             }
         }
     }
@@ -2276,9 +2304,8 @@ fn copy_game_file(
 
     let source = source_path.with_context(|| {
         format!(
-            "Game file not found: {} in {} or downloads dir",
+            "Game file not found: {} in game dir or downloads dir",
             game_file_path,
-            config.game_dir.display()
         )
     })?;
 
