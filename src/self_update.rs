@@ -88,7 +88,10 @@ impl LatestRelease {
 /// Compare the running version to a remote tag.
 pub fn compare_to_running(remote: &str) -> UpdateVerdict {
     let local = current_version();
-    match (semver::Version::parse(local), semver::Version::parse(remote)) {
+    match (
+        semver::Version::parse(local),
+        semver::Version::parse(remote),
+    ) {
         (Ok(l), Ok(r)) => match r.cmp(&l) {
             std::cmp::Ordering::Greater => UpdateVerdict::Newer,
             std::cmp::Ordering::Equal => UpdateVerdict::Equal,
@@ -289,8 +292,8 @@ pub async fn run_update(force: bool) -> Result<UpdateOutcome> {
         .linux_asset()
         .ok_or_else(|| anyhow!("Release {} has no '{}' asset", release.tag_name, ASSET_NAME))?;
 
-    let current_exe = std::env::current_exe()
-        .context("Could not resolve path to running clf3 executable")?;
+    let current_exe =
+        std::env::current_exe().context("Could not resolve path to running clf3 executable")?;
     let target_dir = current_exe
         .parent()
         .ok_or_else(|| anyhow!("Running exe has no parent dir: {}", current_exe.display()))?
@@ -326,9 +329,8 @@ pub async fn run_update(force: bool) -> Result<UpdateOutcome> {
     // half-update the install.
     if let Some(seven) = staged.seven_zz {
         let final_seven = target_dir.join("7zz");
-        atomic_replace(&seven, &final_seven).with_context(|| {
-            format!("Failed to install new 7zz at {}", final_seven.display())
-        })?;
+        atomic_replace(&seven, &final_seven)
+            .with_context(|| format!("Failed to install new 7zz at {}", final_seven.display()))?;
     }
     atomic_replace(&staged.clf3, &current_exe).with_context(|| {
         format!(
@@ -360,8 +362,7 @@ struct StagedBinaries {
 }
 
 fn stage_zip_into_dir(bytes: &[u8], dir: &Path) -> Result<StagedBinaries> {
-    fs::create_dir_all(dir)
-        .with_context(|| format!("Failed to create {}", dir.display()))?;
+    fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
 
     let reader = std::io::Cursor::new(bytes);
     let mut zip = zip::ZipArchive::new(reader)
@@ -392,9 +393,8 @@ fn stage_zip_into_dir(bytes: &[u8], dir: &Path) -> Result<StagedBinaries> {
         let mut buf = Vec::with_capacity(file.size() as usize);
         file.read_to_end(&mut buf)
             .with_context(|| format!("Failed to read {} from zip", basename))?;
-        write_executable(&staged_path, &buf).with_context(|| {
-            format!("Failed to write staged {}", staged_path.display())
-        })?;
+        write_executable(&staged_path, &buf)
+            .with_context(|| format!("Failed to write staged {}", staged_path.display()))?;
 
         match target_stem {
             "clf3" => staged_clf3 = Some(staged_path),
@@ -425,13 +425,8 @@ fn write_executable(path: &Path, bytes: &[u8]) -> Result<()> {
 /// exists. The running process keeps its already-mmapped inode, so this is
 /// safe even when `dst` is the currently-executing binary.
 fn atomic_replace(src: &Path, dst: &Path) -> Result<()> {
-    fs::rename(src, dst).with_context(|| {
-        format!(
-            "Failed to rename {} → {}",
-            src.display(),
-            dst.display()
-        )
-    })?;
+    fs::rename(src, dst)
+        .with_context(|| format!("Failed to rename {} → {}", src.display(), dst.display()))?;
     Ok(())
 }
 
@@ -441,10 +436,7 @@ mod tests {
 
     #[test]
     fn equal_version_is_not_an_update() {
-        assert_eq!(
-            compare_to_running(current_version()),
-            UpdateVerdict::Equal
-        );
+        assert_eq!(compare_to_running(current_version()), UpdateVerdict::Equal);
     }
 
     #[test]

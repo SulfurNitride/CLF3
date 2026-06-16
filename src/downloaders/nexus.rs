@@ -162,10 +162,10 @@ impl NexusDownloader {
     /// Check if user has Premium status
     ///
     /// Premium users can use direct API downloads with 20,000 daily limit.
-    /// Non-premium users are limited and may need NXM browser mode.
+    /// Non-premium users are limited and may need manual browser mode.
     ///
     /// Note: If premium override is active, this returns false even if the
-    /// account is actually premium, forcing NXM browser mode.
+    /// account is actually premium, forcing manual browser mode.
     pub fn is_premium(&self) -> bool {
         if self.premium_override.load(Ordering::Relaxed) {
             return false;
@@ -176,14 +176,14 @@ impl NexusDownloader {
     /// Set premium override to force non-premium mode
     ///
     /// When `force_non_premium` is true, `is_premium()` will return false
-    /// regardless of actual account status, forcing NXM browser mode.
+    /// regardless of actual account status, forcing browser/manual mode.
     /// This is useful for users who want to use browser-based downloads
     /// even if they have a premium account.
     pub fn set_premium_override(&self, force_non_premium: bool) {
         self.premium_override
             .store(force_non_premium, Ordering::Relaxed);
         if force_non_premium {
-            info!("Premium override enabled - forcing non-premium (NXM browser) mode");
+            info!("Premium override enabled - forcing non-premium browser mode");
         } else {
             debug!("Premium override disabled - using actual account status");
         }
@@ -207,42 +207,12 @@ impl NexusDownloader {
     /// Get download URL for a file (direct API mode for Premium users)
     ///
     /// Premium users can call this directly with 20,000 daily limit.
-    /// Non-premium users may hit rate limits and should use NXM mode.
+    /// Non-premium users may hit rate limits and should use manual browser mode.
     pub async fn get_download_link(
         &self,
         game_domain: &str,
         mod_id: u64,
         file_id: u64,
-    ) -> Result<String> {
-        self.get_download_link_internal(game_domain, mod_id, file_id, None, None)
-            .await
-    }
-
-    /// Get download URL for a file with NXM key/expires (bypasses hourly limit, uses daily limit)
-    ///
-    /// The `key` and `expires` parameters come from NXM links generated when the user
-    /// clicks "Download with Manager" on the Nexus website. When these params are provided,
-    /// the request bypasses the hourly API limit and instead uses the daily download limit.
-    pub async fn get_download_link_with_nxm_key(
-        &self,
-        game_domain: &str,
-        mod_id: u64,
-        file_id: u64,
-        key: &str,
-        expires: u64,
-    ) -> Result<String> {
-        self.get_download_link_internal(game_domain, mod_id, file_id, Some(key), Some(expires))
-            .await
-    }
-
-    /// Internal method for getting download links with optional NXM key
-    async fn get_download_link_internal(
-        &self,
-        game_domain: &str,
-        mod_id: u64,
-        file_id: u64,
-        nxm_key: Option<&str>,
-        nxm_expires: Option<u64>,
     ) -> Result<String> {
         // Log current rate limit state (but don't pre-emptively fail - limits may have reset)
         {
@@ -258,20 +228,10 @@ impl NexusDownloader {
             }
         }
 
-        // Build URL with optional NXM key/expires params
-        let url = if let (Some(key), Some(expires)) = (nxm_key, nxm_expires) {
-            // NXM mode: add key/expires to bypass hourly limit
-            format!(
-                "{}/v1/games/{}/mods/{}/files/{}/download_link.json?key={}&expires={}",
-                API_BASE_URL, game_domain, mod_id, file_id, key, expires
-            )
-        } else {
-            // Standard API mode
-            format!(
-                "{}/v1/games/{}/mods/{}/files/{}/download_link.json",
-                API_BASE_URL, game_domain, mod_id, file_id
-            )
-        };
+        let url = format!(
+            "{}/v1/games/{}/mods/{}/files/{}/download_link.json",
+            API_BASE_URL, game_domain, mod_id, file_id
+        );
 
         debug!("Fetching download link from: {}", url);
 
@@ -304,7 +264,7 @@ impl NexusDownloader {
             if status.as_u16() == 429 {
                 let limits = self.rate_limits.read().unwrap();
                 bail!(
-                    "Nexus API rate limit hit (429). Hourly: {}/{}, Daily: {}/{}. Wait for reset or use NXM mode.",
+                    "Nexus API rate limit hit (429). Hourly: {}/{}, Daily: {}/{}. Wait for reset or use manual browser mode.",
                     limits.hourly_remaining,
                     limits.hourly_limit,
                     limits.daily_remaining,
@@ -318,8 +278,8 @@ impl NexusDownloader {
                 if !is_premium {
                     bail!(
                         "Nexus API forbidden (403). Your account is not Premium. \
-                        Free users need to use NXM browser mode for downloads. \
-                        Re-run with --nxm flag or get Nexus Premium for direct downloads."
+                        Free users need to use manual browser mode for Nexus downloads. \
+                        Re-run with --manual-browser-mode or get Nexus Premium for direct downloads."
                     );
                 } else {
                     // Premium user got 403 - might be deleted mod or permissions issue
@@ -351,7 +311,7 @@ impl NexusDownloader {
     /// Get the mod page URL for manual fallback
     pub fn get_mod_page_url(game_domain: &str, mod_id: u64, file_id: u64) -> String {
         format!(
-            "https://www.nexusmods.com/{}/mods/{}?tab=files&file_id={}&nmm=1",
+            "https://www.nexusmods.com/{}/mods/{}?tab=files&file_id={}",
             game_domain.to_lowercase(),
             mod_id,
             file_id

@@ -2,7 +2,7 @@
 //! Download phase coordinator
 //!
 //! Coordinates downloading all archives from various sources with parallel downloads.
-//! Supports both direct API mode (premium) and NXM browser mode (free/rate-limit bypass).
+//! Supports direct API mode (premium) and manual browser mode (non-premium).
 
 use crate::downloaders::{
     download_file_with_callback, GoogleDriveDownloader, HttpClient, LoversLabDownloader,
@@ -10,8 +10,7 @@ use crate::downloaders::{
     WabbajackCdnDownloader, YandexDownloader,
 };
 use crate::hash::{verify_file_hash, verify_file_hash_detailed};
-use crate::modlist::{ArchiveInfo, DownloadState, ModlistDb, NexusState};
-use crate::nxm_handler;
+use crate::modlist::{ArchiveInfo, DownloadState, ModlistDb};
 
 use super::config::{InstallConfig, ProgressEvent};
 use super::progress::{ProgressHandle, ProgressReporter};
@@ -384,6 +383,27 @@ Copied files with different names will not be reused. Examples: {}",
                     already_downloaded += 1;
                     already_downloaded_size += archive.size as u64;
                 }
+                Ok((false, actual_hash))
+                    if crate::installer::game_preflight::has_known_alt_variant(&archive.name) =>
+                {
+                    warn!(
+                        "{} has different hash (known CC alt-variant, expected={}, actual={}) — accepting",
+                        archive.name, archive.hash, actual_hash
+                    );
+                    db.mark_archive_downloaded(
+                        &archive.hash,
+                        output_path.to_string_lossy().as_ref(),
+                    )?;
+                    if let Err(e) = super::sidecar::write_archive_hash(output_path, &archive.hash) {
+                        tracing::debug!(
+                            "Failed to write archive sidecar for {}: {}",
+                            output_path.display(),
+                            e
+                        );
+                    }
+                    already_downloaded += 1;
+                    already_downloaded_size += archive.size as u64;
+                }
                 Ok((false, actual_hash)) => {
                     // Hash mismatch - corrupted, delete and re-download
                     reporter.log(&format!("  Corrupted (hash mismatch): {}", archive.name));
@@ -462,11 +482,33 @@ Copied files with different names will not be reused. Examples: {}",
         need_download.len()
     ));
 
-    // Route to NXM mode if enabled
-    if config.nxm_mode {
-        let mut stats = download_archives_nxm(db, config, need_download).await?;
-        stats.skipped += already_downloaded;
-        return Ok(stats);
+    if config.manual_browser_mode {
+        let (manual_pending, auto_pending) = split_manual_browser_pending(config, need_download);
+        if !manual_pending.is_empty() {
+            reporter.log(&format!(
+                "Manual browser downloads: {}; automatic downloads: {}",
+                manual_pending.len(),
+                auto_pending.len()
+            ));
+            let manual_future = super::manual_controller::download_manual_browser_archives(
+                db,
+                config,
+                manual_pending,
+                None,
+            );
+            let auto_future = async {
+                if auto_pending.is_empty() {
+                    Ok(DownloadStats::default())
+                } else {
+                    download_non_nexus_files(db, config, auto_pending).await
+                }
+            };
+            let (manual_stats, auto_stats) = tokio::try_join!(manual_future, auto_future)?;
+            let stats = merge_parallel_download_stats(auto_stats, manual_stats, already_downloaded);
+            print_download_summary(reporter.as_ref(), &stats);
+            return Ok(stats);
+        }
+        need_download = auto_pending;
     }
 
     let pending = need_download;
@@ -820,6 +862,29 @@ pub async fn download_archives_streaming(
                     already_downloaded_size += archive.size as u64;
                     verified_archives.push((archive, output_path));
                 }
+                Ok((false, actual_hash))
+                    if crate::installer::game_preflight::has_known_alt_variant(&archive.name) =>
+                {
+                    warn!(
+                        "{} has different hash (known CC alt-variant, expected={}, actual={}) — accepting",
+                        archive.name, archive.hash, actual_hash
+                    );
+                    db.mark_archive_downloaded(
+                        &archive.hash,
+                        output_path.to_string_lossy().as_ref(),
+                    )?;
+                    if let Err(e) = super::sidecar::write_archive_hash(&output_path, &archive.hash)
+                    {
+                        tracing::debug!(
+                            "Failed to write archive sidecar for {}: {}",
+                            output_path.display(),
+                            e
+                        );
+                    }
+                    already_downloaded += 1;
+                    already_downloaded_size += archive.size as u64;
+                    verified_archives.push((archive, output_path));
+                }
                 Ok((false, _)) | Err(_) => {
                     let _ = fs::remove_file(&output_path);
                     need_download.push(archive);
@@ -880,28 +945,33 @@ pub async fn download_archives_streaming(
         need_download.len()
     ));
 
-    // Route to NXM mode if enabled — falls back to non-streaming (events after batch)
-    if config.nxm_mode {
-        let mut stats = download_archives_nxm(db, config, need_download).await?;
-        stats.skipped += already_downloaded;
-        // NXM mode doesn't stream events per-archive; emit all at end
-        let all_archives = db.get_all_archives()?;
-        for a in &all_archives {
-            if a.download_status == "completed" {
-                let path = match &a.local_path {
-                    Some(p) => PathBuf::from(p),
-                    None => config.downloads_dir.join(&a.name),
-                };
-                if path.exists() {
-                    let _ = tx.send(ArchiveEvent::Ready {
-                        hash: a.hash.clone(),
-                        name: a.name.clone(),
-                        path,
-                    });
+    if config.manual_browser_mode {
+        let (manual_pending, auto_pending) = split_manual_browser_pending(config, need_download);
+        if !manual_pending.is_empty() {
+            reporter.log(&format!(
+                "Manual browser downloads: {}; automatic downloads: {}",
+                manual_pending.len(),
+                auto_pending.len()
+            ));
+            let manual_future = super::manual_controller::download_manual_browser_archives(
+                db,
+                config,
+                manual_pending,
+                Some(tx),
+            );
+            let auto_future = async {
+                if auto_pending.is_empty() {
+                    Ok(DownloadStats::default())
+                } else {
+                    download_pending_archives_streaming(db, config, tx, auto_pending).await
                 }
-            }
+            };
+            let (manual_stats, auto_stats) = tokio::try_join!(manual_future, auto_future)?;
+            let stats = merge_parallel_download_stats(auto_stats, manual_stats, already_downloaded);
+            print_download_summary(reporter.as_ref(), &stats);
+            return Ok(stats);
         }
-        return Ok(stats);
+        need_download = auto_pending;
     }
 
     let pending = need_download;
@@ -1032,6 +1102,79 @@ enum DownloadResult {
     Skipped,
     Manual,
     Failed,
+}
+
+fn split_manual_browser_pending(
+    config: &InstallConfig,
+    pending: Vec<ArchiveInfo>,
+) -> (Vec<ArchiveInfo>, Vec<ArchiveInfo>) {
+    let has_loverslab_credentials =
+        !config.loverslab_email.is_empty() && !config.loverslab_password.is_empty();
+    let mut manual = Vec::new();
+    let mut automatic = Vec::new();
+
+    for archive in pending {
+        if is_manual_browser_candidate(&archive, has_loverslab_credentials) {
+            manual.push(archive);
+        } else {
+            automatic.push(archive);
+        }
+    }
+
+    (manual, automatic)
+}
+
+fn is_manual_browser_candidate(archive: &ArchiveInfo, has_loverslab_credentials: bool) -> bool {
+    let Ok(state) = serde_json::from_str::<DownloadState>(&archive.state_json) else {
+        return false;
+    };
+    match &state {
+        DownloadState::Nexus(_) => true,
+        DownloadState::Manual(_) => {
+            check_manual(&state, archive, has_loverslab_credentials).is_some()
+        }
+        _ => false,
+    }
+}
+
+fn merge_manual_downloads(
+    mut downloads: Vec<ManualDownloadInfo>,
+    manual_browser_stats: &DownloadStats,
+) -> Vec<ManualDownloadInfo> {
+    downloads.extend(manual_browser_stats.manual_downloads.clone());
+    downloads
+}
+
+fn merge_failed_downloads(
+    mut downloads: Vec<FailedDownloadInfo>,
+    manual_browser_stats: &DownloadStats,
+) -> Vec<FailedDownloadInfo> {
+    downloads.extend(manual_browser_stats.failed_downloads.clone());
+    downloads
+}
+
+fn merge_parallel_download_stats(
+    mut automatic: DownloadStats,
+    manual_browser: DownloadStats,
+    already_downloaded: usize,
+) -> DownloadStats {
+    automatic.downloaded += manual_browser.downloaded;
+    automatic.skipped += already_downloaded + manual_browser.skipped;
+    automatic.failed += manual_browser.failed;
+    automatic.manual += manual_browser.manual;
+    automatic.failed_downloads =
+        merge_failed_downloads(automatic.failed_downloads, &manual_browser);
+    automatic.manual_downloads =
+        merge_manual_downloads(automatic.manual_downloads, &manual_browser);
+    automatic
+}
+
+fn print_download_summary(reporter: &dyn ProgressReporter, stats: &DownloadStats) {
+    reporter.log("\n=== Download Summary ===");
+    reporter.log(&format!("Downloaded: {}", stats.downloaded));
+    reporter.log(&format!("Skipped:    {}", stats.skipped));
+    reporter.log(&format!("Manual:     {}", stats.manual));
+    reporter.log(&format!("Failed:     {}", stats.failed));
 }
 
 /// Process a single archive (check, download, or mark manual)
@@ -1485,6 +1628,7 @@ async fn download_archive(
     let mut rate_limit_retries = 0u32;
     let display_name = truncate_name(&archive.name, 40);
     let expected_size = archive.size as u64;
+    let is_alt_variant = crate::installer::game_preflight::has_known_alt_variant(&archive.name);
 
     loop {
         attempt += 1;
@@ -1505,7 +1649,7 @@ async fn download_archive(
                 match std::fs::metadata(output_path) {
                     Ok(meta) => {
                         let actual_size = meta.len();
-                        if actual_size != expected_size {
+                        if actual_size != expected_size && !is_alt_variant {
                             // Size mismatch - delete and retry
                             let _ = std::fs::remove_file(output_path);
                             if attempt < MAX_RETRIES {
@@ -1525,6 +1669,11 @@ async fn download_archive(
                                     actual_size
                                 );
                             }
+                        } else if actual_size != expected_size {
+                            warn!(
+                                "{} has different size (known CC alt-variant, got {} expected {}) — accepting",
+                                archive.name, actual_size, expected_size
+                            );
                         }
                     }
                     Err(e) => {
@@ -1547,13 +1696,6 @@ async fn download_archive(
                     "{} (verifying...)",
                     truncate_name(&archive.name, 30)
                 ));
-
-                // Known Creation Club alt-variants (Curios, FO4 CC files) ship
-                // different bytes between stores/patch revisions while staying
-                // runtime-equivalent. Single source of truth lives in
-                // `game_preflight::has_known_alt_variant`.
-                let is_alt_variant =
-                    crate::installer::game_preflight::has_known_alt_variant(&archive.name);
 
                 match verify_file_hash(output_path, &archive.hash) {
                     Ok(true) => {
@@ -2183,377 +2325,93 @@ fn copy_game_file(
     Ok(())
 }
 
-// ============================================================================
-// NXM Browser Mode
-// ============================================================================
-
-/// Pending Nexus download info for NXM mode
-struct NexusPending {
-    archive: ArchiveInfo,
-    nexus_state: NexusState,
-    output_path: PathBuf,
-}
-
-/// Download archives using NXM browser mode (bypasses API rate limits)
-async fn download_archives_nxm(
+/// Download non-Nexus files directly.
+async fn download_pending_archives_streaming(
     db: &ModlistDb,
     config: &InstallConfig,
+    tx: &std::sync::mpsc::SyncSender<ArchiveEvent>,
     pending: Vec<ArchiveInfo>,
 ) -> Result<DownloadStats> {
     let reporter = &config.reporter;
+    let concurrency = config.max_concurrent_downloads;
 
-    reporter.log("\n=== NXM Browser Mode ===");
-    reporter.log("This mode opens browser tabs for Nexus downloads.");
-    reporter.log("Click 'Slow Download' or 'Download with Manager' for each file.\n");
+    reporter.overall_set_total(pending.len() as u64);
+    reporter.overall_set_message("Starting automatic downloads...");
 
-    // Separate Nexus downloads from others
-    let mut nexus_pending: Vec<NexusPending> = Vec::new();
-    let mut other_pending: Vec<ArchiveInfo> = Vec::new();
+    let total_archives = pending.len();
+    let ctx = Arc::new(build_context(config, total_archives).await?);
 
-    for archive in pending {
-        let output_path = config.downloads_dir.join(&archive.name);
-
-        // Skip if already exists with correct size
-        if output_path.exists() {
-            if let Ok(meta) = fs::metadata(&output_path) {
-                if meta.len() == archive.size as u64 {
-                    continue;
-                }
+    stream::iter(pending)
+        .map(|archive| {
+            let ctx = Arc::clone(&ctx);
+            async move {
+                let output_path = ctx.config.downloads_dir.join(&archive.name);
+                let (result, url_to_cache) = process_archive(&ctx, &archive, &output_path).await;
+                (archive, output_path, result, url_to_cache)
             }
-        }
-
-        let state: DownloadState = match serde_json::from_str(&archive.state_json) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-
-        match state {
-            DownloadState::Nexus(nexus_state) => {
-                nexus_pending.push(NexusPending {
-                    archive,
-                    nexus_state,
-                    output_path,
-                });
+        })
+        .buffer_unordered(concurrency)
+        .for_each(|(archive, output_path, result, url_to_cache)| {
+            if let Some((url, expires)) = url_to_cache {
+                let _ = db.cache_download_url(&archive.hash, &url, expires);
             }
-            _ => {
-                other_pending.push(archive);
-            }
-        }
-    }
 
-    reporter.log(&format!(
-        "Nexus downloads (NXM mode): {}",
-        nexus_pending.len()
-    ));
-    reporter.log(&format!(
-        "Other downloads (direct):   {}",
-        other_pending.len()
-    ));
-
-    // First, handle non-Nexus downloads with direct API
-    let mut stats = DownloadStats::default();
-
-    if !other_pending.is_empty() {
-        reporter.log("\n--- Downloading non-Nexus files ---");
-        // Create a temporary config with nxm_mode disabled for direct downloads
-        let mut direct_config = config.clone();
-        direct_config.nxm_mode = false;
-
-        // Process non-Nexus files directly
-        let direct_stats = download_non_nexus_files(db, &direct_config, other_pending).await?;
-        stats.downloaded += direct_stats.downloaded;
-        stats.skipped += direct_stats.skipped;
-        stats.failed += direct_stats.failed;
-        stats.manual += direct_stats.manual;
-    }
-
-    // Now handle Nexus downloads via NXM
-    if nexus_pending.is_empty() {
-        reporter.log("\nNo Nexus downloads needed in NXM mode.");
-        return Ok(stats);
-    }
-
-    reporter.log("\n--- Starting NXM server ---");
-
-    // Auto-register as nxm:// handler so browser clicks work
-    let exe = std::env::current_exe()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    if let Err(e) = nxm_handler::register_handler(&exe) {
-        warn!(
-            "Failed to register NXM handler (browser clicks may not work): {}",
-            e
-        );
-    }
-
-    // Start NXM server
-    let (mut rx, _sock_path) = nxm_handler::start_listener().await?;
-
-    // Create HTTP client for downloads
-    let http = Arc::new(HttpClient::new()?);
-    let nexus = NexusDownloader::new(&config.nexus_api_key)?;
-
-    // Build lookup map: "game:mod_id:file_id" -> pending info
-    let mut lookup: HashMap<String, NexusPending> = HashMap::new();
-    for pending in nexus_pending {
-        let domain = NexusDownloader::game_domain(&pending.nexus_state.game_name);
-        let key = format!(
-            "{}:{}:{}",
-            domain, pending.nexus_state.mod_id, pending.nexus_state.file_id
-        );
-        lookup.insert(key, pending);
-    }
-
-    let total_nexus = lookup.len();
-    reporter.log(&format!("Waiting for {} NXM links...\n", total_nexus));
-
-    // Setup progress via reporter
-    reporter.overall_set_total(total_nexus as u64);
-    reporter.overall_set_message("Waiting for browser clicks...");
-
-    // Pipelined NXM download: open ONE tab at a time, wait for user to click
-    // "Download with Manager", start the download in background, then open the
-    // next tab. Concurrent downloads capped at CPU thread count.
-    let max_concurrent_downloads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-
-    // Queue of keys still needing a tab opened
-    let mut tab_queue: Vec<String> = lookup.keys().cloned().collect();
-    let active_downloads = Arc::new(AtomicUsize::new(0));
-    let mut tab_open = false; // true when we have exactly one tab waiting for NXM click
-    let mut downloaded = 0usize;
-    let mut failed = 0usize;
-    let mut nxm_completed = 0usize; // tracks completed for progress callbacks
-
-    // Channel for background download tasks to report results: (hash, name, path, result)
-    let (result_tx, mut result_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(String, String, PathBuf, Result<()>)>();
-
-    let open_tab = |pending: &NexusPending, browser: &str| {
-        let domain = NexusDownloader::game_domain(&pending.nexus_state.game_name);
-        let url = nxm_handler::nexus_mod_url(
-            domain,
-            pending.nexus_state.mod_id,
-            pending.nexus_state.file_id,
-        );
-        let _ = std::process::Command::new(browser).arg(&url).spawn();
-    };
-
-    // Open the first tab
-    if let Some(key) = tab_queue.pop() {
-        if let Some(pending) = lookup.get(&key) {
-            open_tab(pending, &config.browser);
-            tab_open = true;
-        }
-    }
-
-    reporter.log("Click 'Download with Manager' on each Nexus page.\n");
-
-    // Main event loop: process NXM links and download completions
-    loop {
-        if lookup.is_empty() && active_downloads.load(Ordering::Relaxed) == 0 {
-            break;
-        }
-
-        tokio::select! {
-            // Handle incoming NXM links
-            nxm_result = rx.recv() => {
-                let link = match nxm_result {
-                    Some(link) => link,
-                    None => {
-                        reporter.log("NXM server closed unexpectedly");
-                        break;
-                    }
-                };
-
-                let key = link.lookup_key();
-                let Some(pending) = lookup.remove(&key) else {
-                    reporter.log(&format!("Received NXM link for unknown file: {}", key));
-                    continue;
-                };
-
-                tab_open = false;
-
-                // Open next tab immediately (user clicks while download runs)
-                if active_downloads.load(Ordering::Relaxed) < max_concurrent_downloads {
-                    if let Some(next_key) = tab_queue.pop() {
-                        if let Some(next_pending) = lookup.get(&next_key) {
-                            open_tab(next_pending, &config.browser);
-                            tab_open = true;
+            match result {
+                DownloadResult::Success | DownloadResult::Skipped => {
+                    let _ = db.mark_archive_downloaded(
+                        &archive.hash,
+                        output_path.to_string_lossy().as_ref(),
+                    );
+                    if matches!(result, DownloadResult::Success) {
+                        if let Err(e) =
+                            super::sidecar::write_archive_hash(&output_path, &archive.hash)
+                        {
+                            tracing::debug!(
+                                "Failed to write archive sidecar for {}: {}",
+                                output_path.display(),
+                                e
+                            );
                         }
                     }
-                }
-
-                // Spawn download as background task
-                let http = Arc::clone(&http);
-                let api_key = config.nexus_api_key.clone();
-                let output_path = pending.output_path.clone();
-                let archive_size = pending.archive.size as u64;
-                let archive_name = pending.archive.name.clone();
-                let archive_hash = pending.archive.hash.clone();
-                // Create a per-download progress handle via the reporter
-                let dl_handle = reporter.begin_item(&archive_name, Some(archive_size));
-                let progress_callback = make_progress_callback(
-                    archive_name.clone(),
-                    &config.progress_callback,
-                    &dl_handle,
-                );
-
-                let active = Arc::clone(&active_downloads);
-                active.fetch_add(1, Ordering::Relaxed);
-                let tx = result_tx.clone();
-
-                tokio::spawn(async move {
-                    let result = async {
-                        let api_url = link.api_url();
-                        let response = reqwest::Client::new()
-                            .get(&api_url)
-                            .header("apikey", &api_key)
-                            .send()
-                            .await
-                            .context("Failed to get download link")?;
-
-                        if !response.status().is_success() {
-                            let status = response.status();
-                            let body = response.text().await.unwrap_or_default();
-                            bail!("Nexus API error {}: {}", status, body);
-                        }
-
-                        let links: Vec<serde_json::Value> = response.json().await?;
-                        let url = links
-                            .first()
-                            .and_then(|l| l.get("URI"))
-                            .and_then(|u| u.as_str())
-                            .context("No download URL in response")?;
-
-                        download_file_with_callback(&http, url, &output_path, Some(archive_size), progress_callback.as_ref()).await?;
-                        Ok::<_, anyhow::Error>(())
-                    }.await;
-
-                    dl_handle.finish();
-                    active.fetch_sub(1, Ordering::Relaxed);
-                    // Always send result — if this line is somehow skipped (panic),
-                    // the receiver will see the channel close when the sender drops.
-                    if tx.send((archive_hash.clone(), archive_name.clone(), output_path.clone(), result)).is_err() {
-                        tracing::warn!("NXM result channel closed for {}", archive_name);
-                    }
-                });
-
-                reporter.overall_set_message(&format!(
-                    "OK:{} Fail:{} Active:{} Remaining:{}",
-                    downloaded, failed,
-                    active_downloads.load(Ordering::Relaxed),
-                    lookup.len()
-                ));
-            }
-
-            // Handle completed downloads
-            Some((hash, name, output_path, result)) = result_rx.recv() => {
-                match result {
-                    Ok(()) => {
-                        reporter.overall_set_message(&format!("Verifying {}...", truncate_name(&output_path.file_name().unwrap_or_default().to_string_lossy(), 30)));
-                        match verify_file_hash(&output_path, &hash) {
-                            Ok(true) => {
-                                downloaded += 1;
-                                db.mark_archive_downloaded(
-                                    &hash,
-                                    output_path.to_string_lossy().as_ref(),
-                                )?;
-                                if let Err(e) =
-                                    super::sidecar::write_archive_hash(&output_path, &hash)
-                                {
-                                    tracing::debug!(
-                                        "Failed to write archive sidecar for {}: {}",
-                                        output_path.display(),
-                                        e
-                                    );
-                                }
-                            }
-                            Ok(false) => {
-                                reporter.log(&format!("FAIL {} - hash mismatch", output_path.display()));
-                                let _ = fs::remove_file(&output_path);
-                                failed += 1;
-                            }
-                            Err(e) => {
-                                reporter.log(&format!("FAIL {} - verify error: {}", output_path.display(), e));
-                                let _ = fs::remove_file(&output_path);
-                                failed += 1;
-                            }
-                        }
-                        reporter.overall_inc();
-                    }
-                    Err(e) => {
-                        failed += 1;
-                        reporter.log(&format!("FAIL {} - {}", output_path.display(), e));
-                        reporter.overall_inc();
-                    }
-                }
-
-                // Report progress to GUI callback
-                nxm_completed += 1;
-                if let Some(ref callback) = config.progress_callback {
-                    callback(ProgressEvent::DownloadComplete { name });
-                    callback(ProgressEvent::ArchiveComplete {
-                        index: nxm_completed,
-                        total: total_nexus,
+                    let _ = tx.send(ArchiveEvent::Ready {
+                        hash: archive.hash.clone(),
+                        name: archive.name.clone(),
+                        path: output_path,
                     });
                 }
-
-                // A download slot freed up - open next tab if we don't have one waiting
-                if !tab_open && active_downloads.load(Ordering::Relaxed) < max_concurrent_downloads {
-                    if let Some(next_key) = tab_queue.pop() {
-                        if let Some(next_pending) = lookup.get(&next_key) {
-                            open_tab(next_pending, &config.browser);
-                            tab_open = true;
-                        }
-                    }
+                DownloadResult::Manual => {
+                    let _ = tx.send(ArchiveEvent::Manual {
+                        hash: archive.hash.clone(),
+                        name: archive.name.clone(),
+                    });
                 }
-
-                reporter.overall_set_message(&format!(
-                    "OK:{} Fail:{} Active:{} Remaining:{}",
-                    downloaded, failed,
-                    active_downloads.load(Ordering::Relaxed),
-                    lookup.len()
-                ));
-            }
-
-            // Timeout if nothing happens for 5 minutes
-            _ = tokio::time::sleep(Duration::from_secs(300)) => {
-                if tab_open || !lookup.is_empty() {
-                    reporter.log(&format!("Timeout waiting for NXM links. {} remaining.", lookup.len()));
-                    break;
+                DownloadResult::Failed => {
+                    let _ = tx.send(ArchiveEvent::Failed {
+                        hash: archive.hash.clone(),
+                        name: archive.name.clone(),
+                        error: "Download failed".to_string(),
+                    });
                 }
             }
-        }
-    }
+            futures::future::ready(())
+        })
+        .await;
 
     reporter.overall_finish();
 
-    // Add remaining as failed
-    failed += lookup.len();
-    stats.downloaded += downloaded;
-    stats.failed += failed;
+    let manual_downloads_list = ctx.manual_downloads.lock().await.clone();
+    let failed_downloads_list = ctx.failed_downloads.lock().await.clone();
 
-    // Print Nexus rate limits
-    let limits = nexus.rate_limits();
-    reporter.log(&format!(
-        "\nNexus API: {}/{} hourly, {}/{} daily",
-        limits.hourly_remaining, limits.hourly_limit, limits.daily_remaining, limits.daily_limit
-    ));
-
-    // Print summary
-    reporter.log("\n=== Download Summary ===");
-    reporter.log(&format!("Downloaded: {}", stats.downloaded));
-    reporter.log(&format!("Skipped:    {}", stats.skipped));
-    reporter.log(&format!("Manual:     {}", stats.manual));
-    reporter.log(&format!("Failed:     {}", stats.failed));
-
-    Ok(stats)
+    Ok(DownloadStats {
+        downloaded: ctx.downloaded.load(Ordering::Relaxed),
+        skipped: ctx.skipped.load(Ordering::Relaxed),
+        failed: ctx.failed.load(Ordering::Relaxed),
+        manual: manual_downloads_list.len(),
+        failed_downloads: failed_downloads_list,
+        manual_downloads: manual_downloads_list,
+    })
 }
 
-/// Download non-Nexus files directly (used in NXM mode for CDN, HTTP, etc.)
 async fn download_non_nexus_files(
     db: &ModlistDb,
     config: &InstallConfig,

@@ -540,10 +540,15 @@ impl BrowserApp {
         let exe = std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "clf3".into());
-        Some(format!(
-            "\"{}\" install \"{}\" \"{}\" \"{}\"",
-            exe, source, self.downloads_dir, self.install_dir
-        ))
+        let mut parts = vec![
+            shell_quote(&exe),
+            "install".to_string(),
+            shell_quote(source),
+            shell_quote(&self.downloads_dir),
+            shell_quote(&self.install_dir),
+        ];
+        parts.extend(self.manual_browser_display_args());
+        Some(parts.join(" "))
     }
 
     /// Build the install command as a list of args (exe + args) for direct
@@ -554,13 +559,49 @@ impl BrowserApp {
             return None;
         }
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("clf3"));
-        let args = vec![
+        let mut args = vec![
             "install".into(),
             source.into(),
             self.downloads_dir.clone(),
             self.install_dir.clone(),
         ];
+        args.extend(self.manual_browser_spawn_args());
         Some((exe, args))
+    }
+
+    fn manual_browser_spawn_args(&self) -> Vec<String> {
+        if !self.settings.browser_manual_browser_mode {
+            return Vec::new();
+        }
+        let mut args = vec!["--manual-browser-mode".to_string()];
+        if !self.settings.browser_manual_watch_dir.trim().is_empty() {
+            args.push("--manual-watch-dir".to_string());
+            args.push(self.settings.browser_manual_watch_dir.clone());
+        }
+        args.push("--manual-max-active".to_string());
+        args.push(self.manual_browser_max_active().to_string());
+        args
+    }
+
+    fn manual_browser_max_active(&self) -> usize {
+        if self.settings.browser_manual_max_active >= 8 {
+            8
+        } else {
+            4
+        }
+    }
+
+    fn manual_browser_display_args(&self) -> Vec<String> {
+        self.manual_browser_spawn_args()
+            .into_iter()
+            .map(|arg| {
+                if arg.starts_with("--") {
+                    arg
+                } else {
+                    shell_quote(&arg)
+                }
+            })
+            .collect()
     }
 }
 
@@ -1142,6 +1183,62 @@ impl BrowserApp {
 
                 ui.add_space(12.0);
 
+                // --- Browser download mode ---
+                ui.group(|ui| {
+                    ui.heading("Manual Browser Downloads");
+                    ui.label(
+                        egui::RichText::new(
+                            "Use the local controller for non-premium Nexus downloads.",
+                        )
+                        .size(11.0)
+                        .color(egui::Color32::from_gray(160)),
+                    );
+                    ui.add_space(4.0);
+
+                    let before_enabled = self.settings.browser_manual_browser_mode;
+                    ui.checkbox(
+                        &mut self.settings.browser_manual_browser_mode,
+                        "Use manual browser mode by default",
+                    );
+                    if self.settings.browser_manual_browser_mode != before_enabled {
+                        self.generated_command = None;
+                        let _ = self.settings.save();
+                    }
+
+                    ui.horizontal(|ui| {
+                        ui.label("Watch folder:");
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.browser_manual_watch_dir)
+                                .desired_width(400.0),
+                        );
+                        if response.changed() {
+                            self.generated_command = None;
+                        }
+                        if ui.button("Browse...").clicked() {
+                            if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                                self.settings.browser_manual_watch_dir = p.display().to_string();
+                                self.generated_command = None;
+                            }
+                        }
+                    });
+
+                    let mut use_eight_downloads = self.manual_browser_max_active() == 8;
+                    let response = ui.checkbox(&mut use_eight_downloads, "Use 8 active downloads");
+                    if response.changed() {
+                        self.settings.browser_manual_max_active =
+                            if use_eight_downloads { 8 } else { 4 };
+                        self.generated_command = None;
+                        let _ = self.settings.save();
+                    }
+
+                    ui.add_space(4.0);
+                    if ui.button("Save manual browser settings").clicked() {
+                        self.do_save_settings("Manual browser settings saved.");
+                    }
+                });
+
+                ui.add_space(12.0);
+
                 // --- Nexus Mods API Key ---
                 ui.group(|ui| {
                     ui.heading("Nexus Mods");
@@ -1405,6 +1502,20 @@ impl BrowserApp {
             drop(s);
             ctx.request_repaint();
         });
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '-' | '_' | ':' | '='))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
 }
 

@@ -18,7 +18,6 @@ mod game_finder;
 mod hash;
 mod installer;
 mod modlist;
-mod nxm_handler;
 mod octodiff;
 mod paths;
 mod self_update;
@@ -134,13 +133,21 @@ enum Commands {
         #[arg(long)]
         sevenzip_workers: Option<usize>,
 
-        /// Use NXM browser mode instead of direct API (avoids rate limits)
+        /// Use a local browser controller and watch a download folder for non-premium Nexus files
         #[arg(long)]
-        nxm_mode: bool,
+        manual_browser_mode: bool,
 
         /// Browser command to open Nexus pages (default: xdg-open)
         #[arg(long, default_value = "xdg-open")]
         browser: String,
+
+        /// Folder to watch for browser downloads in --manual-browser-mode
+        #[arg(long)]
+        manual_watch_dir: Option<PathBuf>,
+
+        /// Maximum browser-opened manual downloads in --manual-browser-mode
+        #[arg(long)]
+        manual_max_active: Option<usize>,
 
         /// LoversLab email (overrides saved setting)
         #[arg(long, env = "LOVERSLAB_EMAIL")]
@@ -648,8 +655,10 @@ async fn main() -> Result<()> {
             install_workers,
             bsa_workers,
             sevenzip_workers,
-            nxm_mode,
+            manual_browser_mode,
             browser,
+            manual_watch_dir,
+            manual_max_active,
             ll_email,
             ll_password,
             extract,
@@ -686,6 +695,7 @@ async fn main() -> Result<()> {
                         Some(settings.nexus_api_key.clone())
                     }
                 })
+                .or_else(|| manual_browser_mode.then(String::new))
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "Nexus API key required. Set it with: clf3 set-api-key YOUR_KEY"
@@ -726,6 +736,7 @@ async fn main() -> Result<()> {
             let install_workers = install_workers.unwrap_or(thread_count).max(1);
             let bsa_workers = bsa_workers.unwrap_or(1).max(1);
             let sevenzip_workers = sevenzip_workers.unwrap_or(thread_count).max(1);
+            let manual_max_active = manual_max_active.unwrap_or(4).max(1);
 
             println!("CLF3 - Wabbajack Modlist Installer");
             println!("Concurrent downloads: {}", concurrent);
@@ -734,8 +745,11 @@ async fn main() -> Result<()> {
                 install_workers, bsa_workers
             );
             println!("7z archives in parallel: {}", sevenzip_workers);
-            if nxm_mode {
-                println!("NXM Mode: enabled (browser-based downloads)");
+            if manual_browser_mode {
+                println!(
+                    "Manual browser mode: enabled (watching browser downloads, max active: {})",
+                    manual_max_active
+                );
             }
             println!();
 
@@ -767,8 +781,10 @@ async fn main() -> Result<()> {
                 max_install_workers: install_workers,
                 max_parallel_bsa_archives: bsa_workers,
                 max_parallel_7z_archives: sevenzip_workers,
-                nxm_mode,
+                manual_browser_mode,
                 browser,
+                manual_watch_dir,
+                manual_max_active,
                 patch_cache_dir,
                 progress_callback: None,
                 reporter: cli_reporter.clone() as Arc<dyn ProgressReporter>,
@@ -844,7 +860,9 @@ async fn main() -> Result<()> {
             // Fluorine auto-registration. Only runs on a clean install so we
             // don't add half-broken instances to the user's Fluorine sidebar.
             if installation_succeeded && settings.add_to_fluorine {
-                if let Err(e) = ensure_fluorine_and_register(&settings, &install_dir_for_fluorine).await {
+                if let Err(e) =
+                    ensure_fluorine_and_register(&settings, &install_dir_for_fluorine).await
+                {
                     reporter.log(&format!("\nFluorine integration failed: {}", e));
                 } else {
                     reporter.log(&format!(
@@ -858,9 +876,13 @@ async fn main() -> Result<()> {
             if let Some(report_path) = report_json {
                 let content = serde_json::to_string_pretty(&stats)
                     .context("Failed to serialize InstallStats")?;
-                std::fs::write(&report_path, content)
-                    .with_context(|| format!("Failed to write report to {}", report_path.display()))?;
-                reporter.log(&format!("Wrote install report to {}", report_path.display()));
+                std::fs::write(&report_path, content).with_context(|| {
+                    format!("Failed to write report to {}", report_path.display())
+                })?;
+                reporter.log(&format!(
+                    "Wrote install report to {}",
+                    report_path.display()
+                ));
             }
         }
 
@@ -950,9 +972,7 @@ async fn run_self_update(check: bool, yes: bool, force: bool) -> Result<()> {
 
     if check {
         if verdict.update_available() {
-            println!(
-                "\nUpdate available. Run `clf3 self-update --yes` to apply."
-            );
+            println!("\nUpdate available. Run `clf3 self-update --yes` to apply.");
             std::process::exit(1);
         } else {
             println!("\nUp to date.");
@@ -1067,7 +1087,10 @@ async fn run_fluorine_action(action: FluorineAction) -> Result<()> {
             make_current,
         } => {
             if !install_dir.exists() {
-                anyhow::bail!("Install directory does not exist: {}", install_dir.display());
+                anyhow::bail!(
+                    "Install directory does not exist: {}",
+                    install_dir.display()
+                );
             }
             let ini = install_dir.join("ModOrganizer.ini");
             if !ini.exists() {
@@ -1331,7 +1354,8 @@ async fn run_modlist_update(name: String, yes: bool) -> Result<()> {
         );
     }
 
-    let cmp = modlist::install_manifest::compare_versions(&record.installed_version, &metadata.version);
+    let cmp =
+        modlist::install_manifest::compare_versions(&record.installed_version, &metadata.version);
     println!(
         "Modlist:  {} ({})",
         if metadata.title.is_empty() {
@@ -1424,8 +1448,10 @@ async fn run_modlist_update(name: String, yes: bool) -> Result<()> {
         max_install_workers: thread_count,
         max_parallel_bsa_archives: 1,
         max_parallel_7z_archives: thread_count,
-        nxm_mode: false,
+        manual_browser_mode: false,
         browser: "xdg-open".into(),
+        manual_watch_dir: None,
+        manual_max_active: 4,
         patch_cache_dir,
         progress_callback: None,
         reporter: cli_reporter.clone() as Arc<dyn ProgressReporter>,
@@ -1439,9 +1465,8 @@ async fn run_modlist_update(name: String, yes: bool) -> Result<()> {
     let mut installer = Installer::new(config)?;
     let stats = installer.run_pipelined().await?;
 
-    let installation_succeeded = stats.archives_manual == 0
-        && stats.archives_failed == 0
-        && stats.directives_failed == 0;
+    let installation_succeeded =
+        stats.archives_manual == 0 && stats.archives_failed == 0 && stats.directives_failed == 0;
 
     // Mirror the fresh-install summary so the terminal — not just the log
     // file — shows *why* an update failed (which archive, which URL, which

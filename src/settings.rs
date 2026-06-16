@@ -121,6 +121,20 @@ pub struct Settings {
     #[serde(default)]
     pub browser_last_selected_modlist: Option<String>,
 
+    /// Browser GUI default: run installs with the manual browser controller.
+    #[serde(default)]
+    pub browser_manual_browser_mode: bool,
+
+    /// Browser GUI default: folder watched for browser downloads in manual mode.
+    /// Empty means the installer uses the OS Downloads directory.
+    #[serde(default)]
+    pub browser_manual_watch_dir: String,
+
+    /// Browser GUI default: maximum active manual downloads. Zero is treated
+    /// as the standard non-premium default of 4.
+    #[serde(default)]
+    pub browser_manual_max_active: usize,
+
     /// Per-modlist install path choices keyed by machine name.
     #[serde(default)]
     pub browser_list_paths: HashMap<String, BrowserListPaths>,
@@ -256,6 +270,9 @@ mod tests {
             browser_show_unavailable: false,
             browser_show_installed_only: false,
             browser_last_selected_modlist: None,
+            browser_manual_browser_mode: false,
+            browser_manual_watch_dir: String::new(),
+            browser_manual_max_active: 4,
             browser_list_paths: HashMap::new(),
             installed_modlists: HashMap::new(),
             add_to_fluorine: false,

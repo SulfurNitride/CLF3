@@ -120,8 +120,8 @@ impl InstallManifest {
     /// Write this manifest to its install directory, replacing any prior copy.
     pub fn save_to(&self, install_dir: &Path) -> Result<()> {
         let path = Self::path_in(install_dir);
-        let content = serde_json::to_string_pretty(self)
-            .context("Failed to serialize install manifest")?;
+        let content =
+            serde_json::to_string_pretty(self).context("Failed to serialize install manifest")?;
         std::fs::write(&path, content)
             .with_context(|| format!("Failed to write {}", path.display()))?;
         Ok(())
@@ -173,7 +173,9 @@ pub fn compare_versions(installed: &str, latest: &str) -> VersionCmp {
     }
 
     fn strip_v(s: &str) -> &str {
-        s.strip_prefix('v').or_else(|| s.strip_prefix('V')).unwrap_or(s)
+        s.strip_prefix('v')
+            .or_else(|| s.strip_prefix('V'))
+            .unwrap_or(s)
     }
 
     match (
@@ -213,7 +215,10 @@ mod tests {
         assert_eq!(loaded.machine_name, "tuxborn");
         assert_eq!(loaded.name, "Tuxborn");
         assert_eq!(loaded.installed_version, "1.2.3");
-        assert_eq!(loaded.wabbajack_url.as_deref(), Some("https://example.com/Tuxborn.wabbajack"));
+        assert_eq!(
+            loaded.wabbajack_url.as_deref(),
+            Some("https://example.com/Tuxborn.wabbajack")
+        );
         assert_eq!(loaded.downloads_dir, PathBuf::from("/home/u/wj/downloads"));
         assert_eq!(loaded.output_dir, dir.path().to_path_buf());
         assert!(!loaded.installed_at.is_empty());

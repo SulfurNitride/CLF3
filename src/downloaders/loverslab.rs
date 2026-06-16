@@ -8,6 +8,7 @@
 use anyhow::{bail, Context, Result};
 use reqwest::cookie::Jar;
 use reqwest::Client;
+use reqwest::Url;
 use scraper::{Html, Selector};
 use std::path::Path;
 use std::sync::Arc;
@@ -148,7 +149,10 @@ impl LoversLabDownloader {
                 .await;
         }
 
-        // Ensure the URL has ?do=download so we get the file list page
+        // Ensure the URL has ?do=download so we get the file list page.
+        // If the modlist already points at a concrete resource (`r=...`),
+        // keep it: some LoversLab slugs contain non-ASCII text and can arrive
+        // with literal '?' replacement characters, making the slug unusable.
         let download_page_url = ensure_download_url(page_url);
 
         info!("Fetching LoversLab download page: {}", download_page_url);
@@ -263,9 +267,41 @@ impl LoversLabDownloader {
         let entries = parse_file_list(&page_html, &csrf_key)?;
 
         if entries.is_empty() {
+            if let Some(download_url) = find_file_page_download_link(&page_html)
+                .or_else(|| find_canonical_download_url(&page_html))
+            {
+                let normalized =
+                    merge_resource_id(&ensure_download_url(&download_url), &download_page_url);
+                if normalized != download_page_url {
+                    info!(
+                        "LL returned file detail page for {}; following download button: {}",
+                        expected_name, normalized
+                    );
+                    return Box::pin(self.download(&normalized, expected_name, output_path)).await;
+                }
+            }
+            if let Some(download_url) =
+                synthesize_download_url_from_title(&download_page_url, &page_html)
+            {
+                let normalized = merge_resource_id(&download_url, &download_page_url);
+                if normalized != download_page_url {
+                    info!(
+                        "LL returned file page without canonical URL for {}; synthesized download URL: {}",
+                        expected_name, normalized
+                    );
+                    return Box::pin(self.download(&normalized, expected_name, output_path)).await;
+                }
+            }
             // Might be a single-file download — check if there's a direct download link
             if let Some(direct_url) = find_single_download_link(&page_html, &csrf_key) {
                 info!("Single-file download detected for {}", expected_name);
+                return self.download_file(&direct_url, output_path).await;
+            }
+            if let Some(direct_url) = build_confirmed_download_url(&download_page_url, &csrf_key) {
+                info!(
+                    "Single-file resource download detected for {} (r=)",
+                    expected_name
+                );
                 return self.download_file(&direct_url, output_path).await;
             }
             bail!(
@@ -500,33 +536,322 @@ fn find_single_download_link(html: &str, _csrf_key: &str) -> Option<String> {
     }
 }
 
-/// Ensure the URL points to the download file list page.
-fn ensure_download_url(url: &str) -> String {
-    // Strip fragment (#...) from URL first — fragments break the download page
-    let url = if let Some(hash_pos) = url.find('#') {
-        &url[..hash_pos]
-    } else {
-        url
-    };
-    let url = url.trim_end_matches('/');
+/// For normal file detail pages, find the sidebar "Download this file" button
+/// and follow it to the actual download selection/confirmation page.
+fn find_file_page_download_link(html: &str) -> Option<String> {
+    let document = Html::parse_document(html);
+    let selector = Selector::parse("a").ok()?;
 
-    // Strip any existing query params that aren't relevant
-    let base = if let Some(pos) = url.find("?do=download") {
-        // Keep just the base + ?do=download, strip r=, confirm=, csrfKey= etc
-        let base_end = pos + "?do=download".len();
-        &url[..base_end]
-    } else if url.contains('?') {
-        // Has other params but not do=download
-        return format!("{}&do=download", url);
-    } else {
-        // No query params at all — add ?do=download
-        return if url.ends_with('/') {
-            format!("{}?do=download", url)
+    for link in document.select(&selector) {
+        let href = link.value().attr("href")?;
+        if !href.contains("do=download") {
+            continue;
+        }
+        let text = link.text().collect::<String>().to_lowercase();
+        if !text.contains("download") {
+            continue;
+        }
+        let href = href.replace("&amp;", "&");
+        return if href.starts_with("http") {
+            Some(href)
         } else {
-            format!("{}/?do=download", url)
+            Some(format!("{}{}", BASE_URL, href))
         };
+    }
+
+    None
+}
+
+/// Some LoversLab `?do=download&r=...` requests return the normal file detail
+/// page. The detail page carries the real percent-encoded slug in canonical
+/// metadata even when the modlist URL slug was mangled to literal '?' chars.
+fn find_canonical_download_url(html: &str) -> Option<String> {
+    let document = Html::parse_document(html);
+
+    let canonical_selector = Selector::parse("link[rel='canonical']").ok()?;
+    if let Some(link) = document.select(&canonical_selector).next() {
+        if let Some(href) = link.value().attr("href") {
+            if href.contains("/files/file/") {
+                return Some(href.replace("&amp;", "&"));
+            }
+        }
+    }
+
+    let og_selector = Selector::parse("meta[property='og:url']").ok()?;
+    if let Some(meta) = document.select(&og_selector).next() {
+        if let Some(content) = meta.value().attr("content") {
+            if content.contains("/files/file/") {
+                return Some(content.replace("&amp;", "&"));
+            }
+        }
+    }
+
+    if let Some(url) = extract_json_string_value(html, "\"downloadUrl\"") {
+        if url.contains("/files/file/") {
+            return Some(url.replace("&amp;", "&"));
+        }
+    }
+
+    if let Some(url) = extract_json_string_value(html, "\"content_url\"") {
+        if url.contains("/files/file/") {
+            return Some(url.replace("&amp;", "&"));
+        }
+    }
+
+    None
+}
+
+fn synthesize_download_url_from_title(download_page_url: &str, html: &str) -> Option<String> {
+    let file_id = extract_loverslab_file_id(download_page_url)?;
+    let title = extract_file_title(html)?;
+    let slug = loverslab_slug_from_title(&title)?;
+
+    let mut url = Url::parse(BASE_URL).ok()?;
+    url.set_path(&format!("/files/file/{}-{}/", file_id, slug));
+    url.query_pairs_mut().append_pair("do", "download");
+    Some(url.to_string())
+}
+
+fn extract_file_title(html: &str) -> Option<String> {
+    let document = Html::parse_document(html);
+    let selector = Selector::parse("title").ok()?;
+    let title = document
+        .select(&selector)
+        .next()?
+        .text()
+        .collect::<String>();
+    let title = title.trim();
+    if title.is_empty() {
+        return None;
+    }
+
+    let without_site = title
+        .rsplit_once(" - LoversLab")
+        .map(|(before, _)| before)
+        .unwrap_or(title);
+    let without_category = without_site
+        .rsplit_once(" - ")
+        .map(|(before, _)| before)
+        .unwrap_or(without_site);
+    let title = without_category.trim();
+    (!title.is_empty()).then(|| title.to_string())
+}
+
+fn loverslab_slug_from_title(title: &str) -> Option<String> {
+    let mut slug = String::new();
+    let mut last_was_separator = true;
+
+    for ch in title.chars() {
+        if is_loverslab_slug_separator(ch) {
+            if !last_was_separator {
+                slug.push('-');
+                last_was_separator = true;
+            }
+            continue;
+        }
+
+        if ch.is_ascii() {
+            slug.push(ch.to_ascii_lowercase());
+        } else {
+            for lower in ch.to_lowercase() {
+                slug.push(lower);
+            }
+        }
+        last_was_separator = false;
+    }
+
+    let slug = slug.trim_matches('-').to_string();
+    (!slug.is_empty()).then_some(slug)
+}
+
+fn is_loverslab_slug_separator(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '/' | '\\'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '<'
+                | '>'
+                | '"'
+                | '\''
+                | '`'
+                | ':'
+                | ';'
+                | ','
+                | '.'
+                | '!'
+                | '?'
+                | '&'
+                | '|'
+                | '_'
+                | '+'
+                | '='
+                | '*'
+                | '#'
+                | '@'
+                | '^'
+                | '~'
+        )
+}
+
+fn extract_json_string_value(input: &str, quoted_key: &str) -> Option<String> {
+    let key_start = input.find(quoted_key)?;
+    let after_key = &input[key_start + quoted_key.len()..];
+    let colon = after_key.find(':')?;
+    let after_colon = after_key[colon + 1..].trim_start();
+    if !after_colon.starts_with('"') {
+        return None;
+    }
+
+    let mut escaped = false;
+    for (idx, ch) in after_colon.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => {
+                let raw = &after_colon[..=idx];
+                return serde_json::from_str::<String>(raw).ok();
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+/// Ensure the URL points to the download page.
+fn ensure_download_url(url: &str) -> String {
+    let without_fragment = url.split('#').next().unwrap_or(url).trim();
+
+    if let Ok(mut parsed) = Url::parse(without_fragment) {
+        let is_loverslab_file = is_loverslab_file_url(&parsed);
+        if is_loverslab_file && has_damaged_loverslab_slug(without_fragment) {
+            canonicalize_loverslab_file_path(&mut parsed);
+        }
+        let resource_id = extract_query_param_loose(without_fragment, "r").map(str::to_string);
+
+        let has_download = parsed
+            .query_pairs()
+            .any(|(key, value)| key == "do" && value == "download");
+        if is_loverslab_file {
+            parsed.set_query(None);
+            parsed.query_pairs_mut().append_pair("do", "download");
+            if let Some(resource_id) = resource_id {
+                parsed.query_pairs_mut().append_pair("r", &resource_id);
+            }
+        } else if !has_download {
+            parsed.query_pairs_mut().append_pair("do", "download");
+        }
+        return parsed.to_string();
+    }
+
+    // Fallback for malformed URLs such as LL slugs where non-ASCII text was
+    // replaced with literal '?' characters before parsing. Keep a concrete
+    // resource id if one is visible, but rebuild the path from the numeric file
+    // id so '?' in the damaged slug cannot become the query delimiter.
+    if let Some(file_id) = extract_loverslab_file_id(without_fragment) {
+        let mut rebuilt = format!("{}/files/file/{}/?do=download", BASE_URL, file_id);
+        if let Some(resource_id) = extract_query_param_loose(without_fragment, "r") {
+            rebuilt.push_str("&r=");
+            rebuilt.push_str(&resource_id);
+        }
+        return rebuilt;
+    }
+
+    let url = without_fragment.trim_end_matches('/');
+    if url.contains("?do=download") {
+        url.to_string()
+    } else if url.contains('?') {
+        format!("{}&do=download", url)
+    } else {
+        format!("{}/?do=download", url)
+    }
+}
+
+fn is_loverslab_file_url(url: &Url) -> bool {
+    (url.domain() == Some("loverslab.com") || url.domain() == Some("www.loverslab.com"))
+        && extract_loverslab_file_id(url.path()).is_some()
+}
+
+fn has_damaged_loverslab_slug(input: &str) -> bool {
+    let Some(file_start) = input.find("/files/file/") else {
+        return false;
     };
-    base.to_string()
+    let rest = &input[file_start..];
+    let first_question = rest.find('?');
+    let download_query = rest.find("?do=download");
+    match (first_question, download_query) {
+        (Some(first), Some(download)) => first < download,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+fn canonicalize_loverslab_file_path(url: &mut Url) -> bool {
+    if url.domain() != Some("loverslab.com") && url.domain() != Some("www.loverslab.com") {
+        return false;
+    }
+    let Some(file_id) = extract_loverslab_file_id(url.path()) else {
+        return false;
+    };
+    url.set_path(&format!("/files/file/{}/", file_id));
+    true
+}
+
+fn extract_loverslab_file_id(input: &str) -> Option<&str> {
+    let marker = "/files/file/";
+    let start = input.find(marker)? + marker.len();
+    let rest = &input[start..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    (end > 0).then_some(&rest[..end])
+}
+
+fn extract_query_param_loose<'a>(input: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("{}=", name);
+    let start = input.find(&needle)? + needle.len();
+    let rest = &input[start..];
+    let end = rest.find(['&', '#']).unwrap_or(rest.len());
+    (end > 0).then_some(&rest[..end])
+}
+
+fn merge_resource_id(download_url: &str, source_url: &str) -> String {
+    let Some(resource_id) = extract_query_param_loose(source_url, "r") else {
+        return download_url.to_string();
+    };
+    let Ok(mut parsed) = Url::parse(download_url) else {
+        return download_url.to_string();
+    };
+    let has_resource = parsed.query_pairs().any(|(key, _)| key == "r");
+    if !has_resource {
+        parsed.query_pairs_mut().append_pair("r", resource_id);
+    }
+    parsed.to_string()
+}
+
+fn build_confirmed_download_url(download_page_url: &str, csrf_key: &str) -> Option<String> {
+    let mut url = Url::parse(download_page_url).ok()?;
+    let resource_id = url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "r").then(|| value.into_owned()))?;
+
+    url.set_query(None);
+    url.query_pairs_mut()
+        .append_pair("do", "download")
+        .append_pair("r", &resource_id)
+        .append_pair("confirm", "1")
+        .append_pair("t", "1")
+        .append_pair("csrfKey", csrf_key);
+    Some(url.to_string())
 }
 
 /// Match an expected filename against the available file entries.
@@ -721,7 +1046,134 @@ mod tests {
             ensure_download_url(
                 "https://www.loverslab.com/files/file/123-mod/?do=download&r=456&confirm=1"
             ),
-            "https://www.loverslab.com/files/file/123-mod/?do=download"
+            "https://www.loverslab.com/files/file/123-mod/?do=download&r=456"
+        );
+        assert_eq!(
+            ensure_download_url(
+                "https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-???-?????-??-?????-???/?do=download&r=656247"
+            ),
+            "https://www.loverslab.com/files/file/2438/?do=download&r=656247"
+        );
+    }
+
+    #[test]
+    fn test_merge_resource_id() {
+        assert_eq!(
+            merge_resource_id(
+                "https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-%E2%95%B2/?do=download",
+                "https://www.loverslab.com/files/file/2438/?do=download&r=656247"
+            ),
+            "https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-%E2%95%B2/?do=download&r=656247"
+        );
+        assert_eq!(
+            merge_resource_id(
+                "https://www.loverslab.com/files/file/2438-slug/?do=download&r=668252",
+                "https://www.loverslab.com/files/file/2438/?do=download&r=656247"
+            ),
+            "https://www.loverslab.com/files/file/2438-slug/?do=download&r=668252"
+        );
+    }
+
+    #[test]
+    fn test_build_confirmed_download_url() {
+        assert_eq!(
+            build_confirmed_download_url(
+                "https://www.loverslab.com/files/file/2438/?do=download&r=656247",
+                "abc123"
+            )
+            .unwrap(),
+            "https://www.loverslab.com/files/file/2438/?do=download&r=656247&confirm=1&t=1&csrfKey=abc123"
+        );
+        assert!(build_confirmed_download_url(
+            "https://www.loverslab.com/files/file/2438/?do=download",
+            "abc123"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_find_file_page_download_link() {
+        let html = r#"
+            <ul class="ipsToolList">
+                <li>
+                    <a href='https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-%E2%95%B2/?do=download'
+                       class='ipsButton ipsButton_fullWidth ipsButton_large ipsButton_important'
+                       data-datalayer-postfetch>Download this file</a>
+                </li>
+            </ul>
+        "#;
+
+        assert_eq!(
+            find_file_page_download_link(html).unwrap(),
+            "https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-%E2%95%B2/?do=download"
+        );
+    }
+
+    #[test]
+    fn test_find_canonical_download_url() {
+        let html = r#"
+            <head>
+                <link rel="canonical" href="https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-%E2%95%B2-%E2%80%A2%CC%80-%CF%89-%E2%80%A2%CC%81-%E2%95%B1/" />
+                <meta property="og:url" content="https://www.loverslab.com/files/file/2438-other/">
+            </head>
+        "#;
+
+        assert_eq!(
+            find_canonical_download_url(html).unwrap(),
+            "https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-%E2%95%B2-%E2%80%A2%CC%80-%CF%89-%E2%80%A2%CC%81-%E2%95%B1/"
+        );
+    }
+
+    #[test]
+    fn test_find_canonical_download_url_from_raw_metadata() {
+        let html = r#"
+            <script type='application/ld+json'>
+            {
+                "downloadUrl": "https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-%E2%95%B2/?do=download"
+            }
+            </script>
+        "#;
+        assert_eq!(
+            find_canonical_download_url(html).unwrap(),
+            "https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-%E2%95%B2/?do=download"
+        );
+
+        let html = r#"
+            <script>
+                const IpsDataLayerContext = {"content_url":"https:\/\/www.loverslab.com\/files\/file\/2438-estrus-chaurus-spider-addon-%E2%95%B2\/"};
+            </script>
+        "#;
+        assert_eq!(
+            find_canonical_download_url(html).unwrap(),
+            "https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-%E2%95%B2/"
+        );
+    }
+
+    #[test]
+    fn test_synthesize_download_url_from_title() {
+        let html = r#"
+            <html>
+                <head>
+                    <title>Estrus Chaurus Spider Addon /╲/\( •̀ ω •́ )/\╱\ - Combat Sex - LoversLab</title>
+                </head>
+            </html>
+        "#;
+
+        assert_eq!(
+            extract_file_title(html).unwrap(),
+            "Estrus Chaurus Spider Addon /╲/\\( •̀ ω •́ )/\\╱\\"
+        );
+        assert_eq!(
+            loverslab_slug_from_title(&extract_file_title(html).unwrap()).unwrap(),
+            "estrus-chaurus-spider-addon-╲-•̀-ω-•́-╱"
+        );
+        assert_eq!(
+            synthesize_download_url_from_title(
+                "https://www.loverslab.com/files/file/2438/?do=download&r=656247",
+                html
+            )
+            .unwrap(),
+            "https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-%E2%95%B2-%E2%80%A2%CC%80-%CF%89-%E2%80%A2%CC%81-%E2%95%B1/?do=download"
         );
     }
 
