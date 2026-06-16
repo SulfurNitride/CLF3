@@ -86,7 +86,10 @@ impl ProgressReporter for JackifyReporter {
             self.print_progress(&format!("{}: {}/{}", label, count, total));
         }
         match phase {
-            Some(Phase::Extracting) | Some(Phase::BsaBuild) | Some(Phase::DdsTransform) => {
+            Some(Phase::Extracting)
+            | Some(Phase::BsaBuild)
+            | Some(Phase::DdsTransform)
+            | Some(Phase::Downloading) => {
                 self.emit(ProgressEvent::ArchiveComplete { index: count, total });
             }
             _ => {
