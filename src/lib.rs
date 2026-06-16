@@ -12,7 +12,6 @@ pub mod gpu;
 pub mod hash;
 pub mod installer;
 pub mod modlist;
-pub mod nxm_handler;
 pub mod octodiff;
 pub mod paths;
 pub mod self_update;

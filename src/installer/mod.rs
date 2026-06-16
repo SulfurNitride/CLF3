@@ -16,6 +16,7 @@ pub mod config_cache;
 pub mod downloader;
 pub mod game_preflight;
 pub mod handlers;
+pub mod manual_controller;
 pub mod pipeline;
 pub mod prevalidation;
 pub mod processor;
@@ -336,12 +337,14 @@ impl Installer {
 
         archives_to_check.par_iter().for_each(|archive| {
             let file_path = downloads_dir.join(&archive.name);
+            let is_alt_variant =
+                crate::installer::game_preflight::has_known_alt_variant(&archive.name);
 
             match fs::metadata(&file_path) {
                 Ok(meta) => {
                     let actual_size = meta.len();
                     let expected_size = archive.size as u64;
-                    if actual_size != expected_size {
+                    if actual_size != expected_size && !is_alt_variant {
                         errors.lock().expect("errors mutex").push((
                             archive.name.clone(),
                             format!(
@@ -353,12 +356,19 @@ impl Installer {
                         ));
                         reporter.overall_inc();
                         return;
+                    } else if actual_size != expected_size {
+                        tracing::warn!(
+                            "{} has different size (known CC alt-variant, got {} expected {}) — accepting",
+                            archive.name,
+                            actual_size,
+                            expected_size
+                        );
                     }
 
                     // Size OK — verify hash
                     match compute_file_hash(&file_path) {
                         Ok(actual_hash) => {
-                            if actual_hash != archive.hash {
+                            if actual_hash != archive.hash && !is_alt_variant {
                                 errors.lock().expect("errors mutex").push((
                                     archive.name.clone(),
                                     format!(
@@ -366,6 +376,13 @@ impl Installer {
                                         archive.hash, actual_hash
                                     ),
                                 ));
+                            } else if actual_hash != archive.hash {
+                                tracing::warn!(
+                                    "{} has different hash (known CC alt-variant, expected={}, actual={}) — accepting",
+                                    archive.name,
+                                    archive.hash,
+                                    actual_hash
+                                );
                             }
                         }
                         Err(e) => {

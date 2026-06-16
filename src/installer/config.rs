@@ -103,11 +103,20 @@ pub struct InstallConfig {
     /// Each 7z archive runs in its own external 7z process.
     pub max_parallel_7z_archives: usize,
 
-    /// Use NXM browser mode instead of direct API
-    pub nxm_mode: bool,
+    /// Use the local browser controller + Downloads-folder watcher for
+    /// non-premium/manual Nexus downloads.
+    pub manual_browser_mode: bool,
 
     /// Browser command to open Nexus pages
     pub browser: String,
+
+    /// Browser download folder to watch in manual browser mode. Defaults to
+    /// the OS Downloads folder when not set.
+    pub manual_watch_dir: Option<PathBuf>,
+
+    /// Maximum active browser-opened manual downloads. Manual browser mode
+    /// defaults to 4 when this is not provided by the CLI/GUI.
+    pub manual_max_active: usize,
 
     /// Optional directory to persist patched outputs by hash for reuse
     pub patch_cache_dir: Option<PathBuf>,
@@ -151,8 +160,10 @@ impl std::fmt::Debug for InstallConfig {
             .field("max_install_workers", &self.max_install_workers)
             .field("max_parallel_bsa_archives", &self.max_parallel_bsa_archives)
             .field("max_parallel_7z_archives", &self.max_parallel_7z_archives)
-            .field("nxm_mode", &self.nxm_mode)
+            .field("manual_browser_mode", &self.manual_browser_mode)
             .field("browser", &self.browser)
+            .field("manual_watch_dir", &self.manual_watch_dir)
+            .field("manual_max_active", &self.manual_max_active)
             .field("patch_cache_dir", &self.patch_cache_dir)
             .field(
                 "progress_callback",
@@ -197,7 +208,7 @@ impl InstallConfig {
             return Err(ConfigError::GameDirNotFound(self.game_dir.clone()));
         }
 
-        if self.nexus_api_key.is_empty() {
+        if self.nexus_api_key.is_empty() && !self.manual_browser_mode {
             return Err(ConfigError::MissingNexusKey);
         }
         if self.max_concurrent_downloads == 0 {
@@ -218,6 +229,11 @@ impl InstallConfig {
         if self.max_parallel_7z_archives == 0 {
             return Err(ConfigError::InvalidConcurrency(
                 "max_parallel_7z_archives must be >= 1",
+            ));
+        }
+        if self.manual_browser_mode && self.manual_max_active == 0 {
+            return Err(ConfigError::InvalidConcurrency(
+                "manual_max_active must be >= 1",
             ));
         }
 

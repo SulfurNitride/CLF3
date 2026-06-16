@@ -93,12 +93,12 @@ fn check_path(path: &Path, source: &'static str) -> Option<FluorineInstall> {
     // Directory: scan one level deep for the binary. Releases extract into a
     // top-level "fluorine-manager-X.Y.Z" folder, so check both the dir itself
     // and any subdirectory.
-    for candidate in std::iter::once(path.to_path_buf())
-        .chain(path.read_dir().ok().into_iter().flatten().filter_map(|e| {
+    for candidate in std::iter::once(path.to_path_buf()).chain(
+        path.read_dir().ok().into_iter().flatten().filter_map(|e| {
             let e = e.ok()?;
             e.file_type().ok()?.is_dir().then(|| e.path())
-        }))
-    {
+        }),
+    ) {
         let bin = candidate.join("fluorine-manager");
         if bin.is_file() {
             return Some(FluorineInstall {
@@ -121,8 +121,7 @@ pub fn register_portable_instance(install_path: &Path, make_current: bool) -> Re
 
     let settings_path = fluorine_settings_path()?;
     if let Some(parent) = settings_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {:?}", parent))?;
+        fs::create_dir_all(parent).with_context(|| format!("Failed to create {:?}", parent))?;
     }
 
     let mut sections: Vec<IniSection> = if settings_path.exists() {
@@ -192,8 +191,12 @@ pub async fn download_latest(dest_root: Option<PathBuf>) -> Result<PathBuf> {
     // The release extracts into a single top-level dir like
     // "fluorine-manager-0.2.0/". Hoist its binary path so the caller knows
     // where to point at.
-    let install = check_path(&dest, "fresh download")
-        .ok_or_else(|| anyhow!("Extracted Fluorine archive but couldn't find the binary in {}", dest.display()))?;
+    let install = check_path(&dest, "fresh download").ok_or_else(|| {
+        anyhow!(
+            "Extracted Fluorine archive but couldn't find the binary in {}",
+            dest.display()
+        )
+    })?;
 
     // Make sure it's executable (tar usually preserves the bit but `umask`
     // can chew it).
@@ -314,15 +317,13 @@ fn write_ini(path: &Path, sections: &[IniSection]) -> Result<()> {
         }
         // Separate non-final sections with a blank line if they didn't already
         // end with one. Matches Qt's own writer style.
-        if i + 1 < sections.len()
-            && !section.lines.last().map(|l| l.is_empty()).unwrap_or(true)
-        {
+        if i + 1 < sections.len() && !section.lines.last().map(|l| l.is_empty()).unwrap_or(true) {
             out.push('\n');
         }
     }
 
-    let mut file = fs::File::create(path)
-        .with_context(|| format!("Failed to create {:?}", path))?;
+    let mut file =
+        fs::File::create(path).with_context(|| format!("Failed to create {:?}", path))?;
     file.write_all(out.as_bytes())
         .with_context(|| format!("Failed to write {:?}", path))?;
     Ok(())

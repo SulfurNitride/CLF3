@@ -132,11 +132,7 @@ pub fn discover_installs(settings: &Settings) -> Vec<InstallRecord> {
                     });
             }
             Err(e) => {
-                tracing::warn!(
-                    "Failed to read manifest in {}: {:#}",
-                    dir.display(),
-                    e
-                );
+                tracing::warn!("Failed to read manifest in {}: {:#}", dir.display(), e);
             }
         }
     }
@@ -291,8 +287,13 @@ pub fn format_table(reports: &[UpdateReport]) -> String {
     for r in reports {
         col_name = col_name.max(r.machine_name.len().max(r.name.len()));
         col_inst = col_inst.max(r.installed_version.len().max(8));
-        col_galy = col_galy
-            .max(r.gallery_version.as_deref().map(str::len).unwrap_or(0).max(6));
+        col_galy = col_galy.max(
+            r.gallery_version
+                .as_deref()
+                .map(str::len)
+                .unwrap_or(0)
+                .max(6),
+        );
     }
 
     let mut out = String::new();
@@ -399,12 +400,18 @@ mod tests {
         let reports = build_update_reports(&installs, &gallery);
         assert_eq!(reports.len(), 2);
 
-        let tux = reports.iter().find(|r| r.machine_name == "tuxborn").unwrap();
+        let tux = reports
+            .iter()
+            .find(|r| r.machine_name == "tuxborn")
+            .unwrap();
         assert_eq!(tux.status, "newer");
         assert!(tux.update_available);
         assert_eq!(tux.gallery_version.as_deref(), Some("1.2.4"));
 
-        let lore = reports.iter().find(|r| r.machine_name == "lorerim").unwrap();
+        let lore = reports
+            .iter()
+            .find(|r| r.machine_name == "lorerim")
+            .unwrap();
         assert_eq!(lore.status, "equal");
         assert!(!lore.update_available);
     }
