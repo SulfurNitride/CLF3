@@ -366,13 +366,12 @@ fn index_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
                     {
                         // Look in game directory with case-insensitive path resolution
                         let game_file = &gf.game_file;
-                        let gd = ctx.config.game_dir.as_deref().unwrap_or(std::path::Path::new(""));
                         if let Some(resolved) =
-                            crate::paths::resolve_case_insensitive(gd, game_file)
+                            crate::paths::resolve_case_insensitive(&ctx.config.game_dir, game_file)
                         {
                             resolved
                         } else if let Some(resolved) = crate::paths::resolve_case_insensitive(
-                            gd,
+                            &ctx.config.game_dir,
                             &format!("Data/{}", game_file),
                         ) {
                             resolved
@@ -689,13 +688,12 @@ impl<'a> ProcessContext<'a> {
                     serde_json::from_str::<crate::modlist::DownloadState>(&archive.state_json)
                 {
                     let game_file = &gf.game_file;
-                    let gd = config.game_dir.as_deref().unwrap_or(std::path::Path::new(""));
                     if let Some(resolved) =
-                        crate::paths::resolve_case_insensitive(gd, game_file)
+                        crate::paths::resolve_case_insensitive(&config.game_dir, game_file)
                     {
                         archive_paths.insert(archive.hash.clone(), resolved);
                     } else if let Some(resolved) = crate::paths::resolve_case_insensitive(
-                        gd,
+                        &config.game_dir,
                         &format!("Data/{}", game_file),
                     ) {
                         archive_paths.insert(archive.hash.clone(), resolved);
@@ -705,9 +703,9 @@ impl<'a> ProcessContext<'a> {
                             archive_paths.insert(archive.hash.clone(), path);
                         } else {
                             warn!(
-                                "GameFileSource '{}' not found in game dir or downloads dir: {}",
+                                "GameFileSource '{}' not found in game dir ({}) or downloads dir",
                                 game_file,
-                                config.game_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+                                config.game_dir.display()
                             );
                         }
                     }

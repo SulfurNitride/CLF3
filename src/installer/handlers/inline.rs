@@ -95,14 +95,10 @@ fn remap_paths(content: &str, ctx: &ProcessContext) -> String {
         .trim_end_matches('/')
         .trim_end_matches('\\')
         .replace('\\', "/");
-    let game_dir_owned = ctx
+    let game_base = ctx
         .config
         .game_dir
-        .as_deref()
-        .unwrap_or_else(|| std::path::Path::new(""))
         .to_string_lossy()
-        .into_owned();
-    let game_base = game_dir_owned
         .trim_end_matches('/')
         .trim_end_matches('\\')
         .replace('\\', "/");

@@ -1243,13 +1243,12 @@ pub(crate) fn run_processing_loop(
                     serde_json::from_str::<crate::modlist::DownloadState>(&archive.state_json)
                 {
                     let game_file = &gf.game_file;
-                    let gd = ctx.config.game_dir.as_deref().unwrap_or(std::path::Path::new(""));
                     if let Some(resolved) =
-                        crate::paths::resolve_case_insensitive(gd, game_file)
+                        crate::paths::resolve_case_insensitive(&ctx.config.game_dir, game_file)
                     {
                         ctx.register_archive_path(archive.hash.clone(), resolved);
                     } else if let Some(resolved) = crate::paths::resolve_case_insensitive(
-                        gd,
+                        &ctx.config.game_dir,
                         &format!("Data/{}", game_file),
                     ) {
                         ctx.register_archive_path(archive.hash.clone(), resolved);

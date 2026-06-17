@@ -22,7 +22,7 @@ pub mod prevalidation;
 pub mod processor;
 pub mod progress;
 pub mod progress_cli;
-pub mod progress_jackify;
+pub mod progress_json;
 pub mod sidecar;
 pub mod streaming;
 
@@ -33,7 +33,7 @@ pub use config_cache::{ConfigCache, ModlistConfig};
 #[allow(unused_imports)] // NullReporter used by lib crate (GUI)
 pub use progress::{NullReporter, Phase, ProgressHandle, ProgressMode, ProgressReporter};
 pub use progress_cli::CliReporter;
-pub use progress_jackify::JackifyReporter;
+pub use progress_json::{JsonEventWriter, JsonReporter};
 
 use crate::modlist::{import_wabbajack_to_db, ModlistDb};
 use anyhow::{bail, Context, Result};
@@ -430,38 +430,46 @@ impl Installer {
         // === Phase 1: Game Check ===
         let game_check_start = Instant::now();
         self.reporter().phase_start(Phase::GameCheck);
-        if let Some(ref gd) = self.config.game_dir {
-            self.reporter().log(&format!("Game directory: {}", gd.display()));
-            if !gd.exists() {
-                bail!("Game directory does not exist: {}", gd.display());
-            }
-            self.reporter().log("Game directory validated");
+        self.reporter().log(&format!(
+            "Game directory: {}",
+            self.config.game_dir.display()
+        ));
+        if !self.config.game_dir.exists() {
+            bail!(
+                "Game directory does not exist: {}",
+                self.config.game_dir.display()
+            );
+        }
+        self.reporter().log("Game directory validated");
 
-            let preflight = game_preflight::check_game_files_from_db(&self.db, gd)?;
-            if preflight.total == 0 {
-                self.reporter()
-                    .log("No game files required by this modlist - skipping hash preflight");
-            } else {
-                self.reporter()
-                    .log(&format!("Verifying {} game files...", preflight.total));
-                if preflight.all_ok() {
-                    self.reporter()
-                        .log(&format!("All {} game files verified", preflight.total));
-                } else {
-                    for line in preflight.format_summary().lines() {
-                        self.reporter().log(line);
-                    }
-                    bail!(
-                        "Game file preflight failed: {} missing, {} hash mismatch. \
-                         Game likely updated or wrong store version — no downloads started. \
-                         Fix game files and re-run.",
-                        preflight.missing().len(),
-                        preflight.mismatched().len()
-                    );
-                }
-            }
+        // Hash every GameFileSource archive against the chosen game directory
+        // BEFORE spending bandwidth. Catches: game updated since modlist
+        // authored, missing DLC, wrong store variant (Steam vs GOG), etc.
+        //
+        // Runs parallel via rayon; typical cost <2s for Bethesda modlists.
+        let preflight = game_preflight::check_game_files_from_db(&self.db, &self.config.game_dir)?;
+        if preflight.total == 0 {
+            self.reporter()
+                .log("No game files required by this modlist — skipping hash preflight");
         } else {
-            self.reporter().log("No game directory specified - skipping game check and preflight");
+            self.reporter()
+                .log(&format!("Verifying {} game files...", preflight.total));
+            if preflight.all_ok() {
+                self.reporter()
+                    .log(&format!("All {} game files verified", preflight.total));
+            } else {
+                // Dump per-file diagnostics so user knows which files are bad.
+                for line in preflight.format_summary().lines() {
+                    self.reporter().log(line);
+                }
+                bail!(
+                    "Game file preflight failed: {} missing, {} hash mismatch. \
+                     Game likely updated or wrong store version — no downloads started. \
+                     Fix game files and re-run.",
+                    preflight.missing().len(),
+                    preflight.mismatched().len()
+                );
+            }
         }
 
         log_phase_metrics("Game Check", game_check_start);

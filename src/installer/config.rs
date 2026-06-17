@@ -2,8 +2,8 @@
 //!
 //! Defines the configuration structure for modlist installation.
 
-use serde::Serialize;
 use super::progress::ProgressReporter;
+use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -85,13 +85,13 @@ pub struct InstallConfig {
     /// Directory for downloaded archives
     pub downloads_dir: PathBuf,
 
-    /// Game installation directory (for GameFileSource); None if not available or not required
-    pub game_dir: Option<PathBuf>,
+    /// Game installation directory (for GameFileSource)
+    pub game_dir: PathBuf,
 
-    /// Nexus API key (apikey header)
+    /// Nexus API key (required for Nexus download links unless an OAuth token is provided)
     pub nexus_api_key: String,
 
-    /// Nexus OAuth bearer token (Authorization: Bearer header); takes precedence over nexus_api_key
+    /// Nexus OAuth bearer token. Takes precedence over nexus_api_key when present.
     pub nexus_oauth_token: Option<String>,
 
     /// Maximum concurrent downloads
@@ -161,7 +161,10 @@ impl std::fmt::Debug for InstallConfig {
             .field("downloads_dir", &self.downloads_dir)
             .field("game_dir", &self.game_dir)
             .field("nexus_api_key", &"[REDACTED]")
-            .field("nexus_oauth_token", &self.nexus_oauth_token.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "nexus_oauth_token",
+                &self.nexus_oauth_token.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("max_concurrent_downloads", &self.max_concurrent_downloads)
             .field("max_install_workers", &self.max_install_workers)
             .field("max_parallel_bsa_archives", &self.max_parallel_bsa_archives)
@@ -210,13 +213,17 @@ impl InstallConfig {
             return Err(ConfigError::WabbajackNotFound(self.wabbajack_path.clone()));
         }
 
-        if let Some(ref gd) = self.game_dir {
-            if !gd.exists() {
-                return Err(ConfigError::GameDirNotFound(gd.clone()));
-            }
+        if !self.game_dir.exists() {
+            return Err(ConfigError::GameDirNotFound(self.game_dir.clone()));
         }
 
-        if self.nexus_api_key.is_empty() && self.nexus_oauth_token.is_none() && !self.manual_browser_mode {
+        let has_api_key = !self.nexus_api_key.trim().is_empty();
+        let has_oauth_token = self
+            .nexus_oauth_token
+            .as_deref()
+            .map(|token| !token.trim().is_empty())
+            .unwrap_or(false);
+        if !has_api_key && !has_oauth_token && !self.manual_browser_mode {
             return Err(ConfigError::MissingNexusKey);
         }
         if self.max_concurrent_downloads == 0 {
@@ -258,7 +265,7 @@ pub enum ConfigError {
     #[error("Game directory not found: {0}")]
     GameDirNotFound(PathBuf),
 
-    #[error("Nexus API key is required (premium account needed)")]
+    #[error("Nexus API key or OAuth token is required (premium account needed)")]
     MissingNexusKey,
 
     #[error("Invalid concurrency setting: {0}")]
