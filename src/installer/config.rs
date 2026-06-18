@@ -3,6 +3,7 @@
 //! Defines the configuration structure for modlist installation.
 
 use super::progress::ProgressReporter;
+use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -29,7 +30,8 @@ impl Default for ExtractStrategy {
 pub type ProgressCallback = Arc<dyn Fn(ProgressEvent) + Send + Sync>;
 
 /// Events reported during installation for progress tracking
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
 #[allow(dead_code)] // Fields are read in the GUI (lib crate) but not by the binary crate
 pub enum ProgressEvent {
     /// Download progress update
@@ -86,8 +88,11 @@ pub struct InstallConfig {
     /// Game installation directory (for GameFileSource)
     pub game_dir: PathBuf,
 
-    /// Nexus API key (required for download links)
+    /// Nexus API key (required for Nexus download links unless an OAuth token is provided)
     pub nexus_api_key: String,
+
+    /// Nexus OAuth bearer token. Takes precedence over nexus_api_key when present.
+    pub nexus_oauth_token: Option<String>,
 
     /// Maximum concurrent downloads
     pub max_concurrent_downloads: usize,
@@ -156,6 +161,10 @@ impl std::fmt::Debug for InstallConfig {
             .field("downloads_dir", &self.downloads_dir)
             .field("game_dir", &self.game_dir)
             .field("nexus_api_key", &"[REDACTED]")
+            .field(
+                "nexus_oauth_token",
+                &self.nexus_oauth_token.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("max_concurrent_downloads", &self.max_concurrent_downloads)
             .field("max_install_workers", &self.max_install_workers)
             .field("max_parallel_bsa_archives", &self.max_parallel_bsa_archives)
@@ -208,7 +217,13 @@ impl InstallConfig {
             return Err(ConfigError::GameDirNotFound(self.game_dir.clone()));
         }
 
-        if self.nexus_api_key.is_empty() && !self.manual_browser_mode {
+        let has_api_key = !self.nexus_api_key.trim().is_empty();
+        let has_oauth_token = self
+            .nexus_oauth_token
+            .as_deref()
+            .map(|token| !token.trim().is_empty())
+            .unwrap_or(false);
+        if !has_api_key && !has_oauth_token && !self.manual_browser_mode {
             return Err(ConfigError::MissingNexusKey);
         }
         if self.max_concurrent_downloads == 0 {
@@ -250,7 +265,7 @@ pub enum ConfigError {
     #[error("Game directory not found: {0}")]
     GameDirNotFound(PathBuf),
 
-    #[error("Nexus API key is required (premium account needed)")]
+    #[error("Nexus API key or OAuth token is required (premium account needed)")]
     MissingNexusKey,
 
     #[error("Invalid concurrency setting: {0}")]

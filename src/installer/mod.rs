@@ -22,6 +22,7 @@ pub mod prevalidation;
 pub mod processor;
 pub mod progress;
 pub mod progress_cli;
+pub mod progress_json;
 pub mod sidecar;
 pub mod streaming;
 
@@ -32,6 +33,7 @@ pub use config_cache::{ConfigCache, ModlistConfig};
 #[allow(unused_imports)] // NullReporter used by lib crate (GUI)
 pub use progress::{NullReporter, Phase, ProgressHandle, ProgressMode, ProgressReporter};
 pub use progress_cli::CliReporter;
+pub use progress_json::{JsonEventWriter, JsonReporter};
 
 use crate::modlist::{import_wabbajack_to_db, ModlistDb};
 use anyhow::{bail, Context, Result};

@@ -1472,21 +1472,25 @@ pub(crate) fn run_processing_loop(
                             *count -= 1;
                             active_cvar.notify_one();
                         });
+
+                        // Only count archives with actual extraction work so the
+                        // counter stays in range of total_archives (which also
+                        // counts only archives with directives, not GameFileSource
+                        // or whole-file-only archives).
+                        archives_processed += 1;
+                        if total_archives > 0 {
+                            reporter.overall_set_message(&format!(
+                                "Extracting {} ({}/{})",
+                                name, archives_processed, total_archives,
+                            ));
+                        } else {
+                            reporter.overall_set_message(&format!("Processing {}", name));
+                        }
                     } else {
                         // No extraction work for this archive, but BSAs may
                         // still depend on it. Signal completion so the BSA
                         // readiness tracker can start dependent builds.
                         let _ = done_tx.send(hash.clone());
-                    }
-
-                    archives_processed += 1;
-                    if total_archives > 0 {
-                        reporter.overall_set_message(&format!(
-                            "Extracting {} ({}/{})",
-                            name, archives_processed, total_archives,
-                        ));
-                    } else {
-                        reporter.overall_set_message(&format!("Processing {}", name));
                     }
                 }
                 ArchiveEvent::Failed { hash, name, error } => {

@@ -27,7 +27,8 @@ mod textures;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use installer::{
-    CliReporter, ExtractStrategy, InstallConfig, Installer, ProgressMode, ProgressReporter,
+    CliReporter, ExtractStrategy, InstallConfig, Installer, JsonEventWriter, JsonReporter,
+    ProgressCallback, ProgressMode, ProgressReporter,
 };
 
 /// CLI-facing enum for the `--extract` flag. Maps to the internal
@@ -117,6 +118,10 @@ enum Commands {
         #[arg(long, env = "NEXUS_API_KEY")]
         nexus_key: Option<String>,
 
+        /// Nexus Mods OAuth bearer token (takes precedence over API key)
+        #[arg(long, env = "NEXUS_OAUTH_TOKEN")]
+        nexus_oauth_token: Option<String>,
+
         /// Maximum concurrent downloads (defaults to CPU thread count)
         #[arg(short, long)]
         concurrent: Option<usize>,
@@ -184,6 +189,22 @@ enum Commands {
         /// tooling driving CLF3.
         #[arg(long)]
         report_json: Option<PathBuf>,
+
+        /// Emit newline-delimited JSON progress events to stdout.
+        ///
+        /// Human-readable detail output is written to stderr in this mode.
+        #[arg(long)]
+        jackify: bool,
+    },
+
+    /// Download a .wabbajack file from the Wabbajack CDN
+    Fetch {
+        /// CDN URL of the .wabbajack file
+        url: String,
+
+        /// Output path for the downloaded file
+        #[arg(short, long)]
+        output: PathBuf,
     },
 
     /// Modlist update management (check for / apply gallery updates).
@@ -359,13 +380,18 @@ async fn main() -> Result<()> {
     // Default to opening the browser when invoked with no subcommand — makes
     // double-click from a desktop / file manager Just Work.
     let command = cli.command.unwrap_or(Commands::Browser);
+    let json_progress = matches!(&command, Commands::Install { jackify: true, .. });
 
-    let requested_progress_mode = match &command {
-        Commands::Install { progress, .. } => (*progress).into(),
-        // Other commands (Browser, SetApiKey, ListGpu, Config, Info, Fluorine…)
-        // never spawn the worker pool — keep the CLI reporter silent so the
-        // "System: starting…" / "Workers" UI doesn't render on top of them.
-        _ => ProgressMode::Plain,
+    let requested_progress_mode = if json_progress {
+        ProgressMode::Plain
+    } else {
+        match &command {
+            Commands::Install { progress, .. } => (*progress).into(),
+            // Other commands (Browser, SetApiKey, ListGpu, Config, Info, Fluorine…)
+            // never spawn the worker pool — keep the CLI reporter silent so the
+            // "System: starting…" / "Workers" UI doesn't render on top of them.
+            _ => ProgressMode::Plain,
+        }
     };
     let progress_mode = match requested_progress_mode {
         ProgressMode::Auto
@@ -381,10 +407,19 @@ async fn main() -> Result<()> {
     // so its writer factory can route tracing output through MultiProgress.
     let cli_reporter = CliReporter::new(16, progress_mode);
 
-    // Console layer — routes through CliReporter's MultiProgress
-    let console_layer = tracing_subscriber::fmt::layer()
-        .with_writer(cli_reporter.make_writer_factory())
-        .with_filter(console_filter);
+    // Console layer — routes through CliReporter's MultiProgress unless stdout
+    // is reserved for newline-delimited JSON.
+    let console_layer = if json_progress {
+        tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_filter(console_filter)
+            .boxed()
+    } else {
+        tracing_subscriber::fmt::layer()
+            .with_writer(cli_reporter.make_writer_factory())
+            .with_filter(console_filter)
+            .boxed()
+    };
 
     tracing_subscriber::registry()
         .with(file_layer)
@@ -651,6 +686,7 @@ async fn main() -> Result<()> {
             output,
             game,
             nexus_key,
+            nexus_oauth_token,
             concurrent,
             install_workers,
             bsa_workers,
@@ -665,7 +701,16 @@ async fn main() -> Result<()> {
             progress: _,
             machine_name,
             report_json,
+            jackify,
         } => {
+            let detail = |message: String| {
+                if jackify {
+                    eprintln!("{}", message);
+                } else {
+                    println!("{}", message);
+                }
+            };
+
             // Remember the original CLI argument as a URL if it was one — it
             // ends up recorded in `.clf3-install.json` so `modlist update`
             // can fall back to it later.
@@ -679,14 +724,16 @@ async fn main() -> Result<()> {
 
             // If wabbajack_file is a URL, download it first.
             let wabbajack_file = if original_wabbajack_url.is_some() {
-                fetch_wabbajack_from_url(&wabbajack_file).await?
+                fetch_wabbajack_from_url(&wabbajack_file, jackify).await?
             } else {
                 PathBuf::from(&wabbajack_file)
             };
 
             let settings = settings::Settings::load();
 
-            // Resolve API key: CLI arg > env var > saved settings
+            let nexus_oauth_token = nexus_oauth_token.filter(|token| !token.trim().is_empty());
+
+            // Resolve Nexus credentials: CLI/env OAuth token > CLI/env API key > saved API key.
             let nexus_key = nexus_key
                 .or_else(|| {
                     if settings.nexus_api_key.is_empty() {
@@ -695,10 +742,12 @@ async fn main() -> Result<()> {
                         Some(settings.nexus_api_key.clone())
                     }
                 })
-                .or_else(|| manual_browser_mode.then(String::new))
+                .or_else(|| {
+                    (manual_browser_mode || nexus_oauth_token.is_some()).then(String::new)
+                })
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "Nexus API key required. Set it with: clf3 set-api-key YOUR_KEY"
+                        "Nexus API key or OAuth token required. Set an API key with `clf3 set-api-key YOUR_KEY` or pass --nexus-oauth-token"
                     )
                 })?;
 
@@ -715,7 +764,11 @@ async fn main() -> Result<()> {
                     // modlist's expected hashes (Steam first, then Heroic/GOG).
                     match auto_detect_game_dir(&wabbajack_file) {
                         Some((p, store)) => {
-                            println!("Auto-detected game directory: {} ({})", p.display(), store);
+                            detail(format!(
+                                "Auto-detected game directory: {} ({})",
+                                p.display(),
+                                store
+                            ));
                             p
                         }
                         None => {
@@ -738,20 +791,20 @@ async fn main() -> Result<()> {
             let sevenzip_workers = sevenzip_workers.unwrap_or(thread_count).max(1);
             let manual_max_active = manual_max_active.unwrap_or(4).max(1);
 
-            println!("CLF3 - Wabbajack Modlist Installer");
-            println!("Concurrent downloads: {}", concurrent);
-            println!(
+            detail("CLF3 - Wabbajack Modlist Installer".to_string());
+            detail(format!("Concurrent downloads: {}", concurrent));
+            detail(format!(
                 "Install workers: {} (BSA archives in parallel: {})",
                 install_workers, bsa_workers
-            );
-            println!("7z archives in parallel: {}", sevenzip_workers);
+            ));
+            detail(format!("7z archives in parallel: {}", sevenzip_workers));
             if manual_browser_mode {
-                println!(
+                detail(format!(
                     "Manual browser mode: enabled (watching browser downloads, max active: {})",
                     manual_max_active
-                );
+                ));
             }
-            println!();
+            detail(String::new());
 
             let patch_cache_dir = if settings.patch_cache_dir.is_empty() {
                 None
@@ -771,12 +824,27 @@ async fn main() -> Result<()> {
 
             let install_dir_for_fluorine = output.clone();
 
+            let (progress_callback, active_reporter): (
+                Option<ProgressCallback>,
+                Arc<dyn ProgressReporter>,
+            ) = if jackify {
+                let writer = JsonEventWriter::stdout();
+                let callback = JsonReporter::download_skipped_callback(writer.clone());
+                (
+                    Some(callback),
+                    JsonReporter::new(writer) as Arc<dyn ProgressReporter>,
+                )
+            } else {
+                (None, cli_reporter.clone() as Arc<dyn ProgressReporter>)
+            };
+
             let config = InstallConfig {
                 wabbajack_path: wabbajack_file,
                 output_dir: output,
                 downloads_dir: downloads,
                 game_dir,
                 nexus_api_key: nexus_key,
+                nexus_oauth_token,
                 max_concurrent_downloads: concurrent,
                 max_install_workers: install_workers,
                 max_parallel_bsa_archives: bsa_workers,
@@ -786,8 +854,8 @@ async fn main() -> Result<()> {
                 manual_watch_dir,
                 manual_max_active,
                 patch_cache_dir,
-                progress_callback: None,
-                reporter: cli_reporter.clone() as Arc<dyn ProgressReporter>,
+                progress_callback,
+                reporter: active_reporter.clone(),
                 loverslab_email: ll_email,
                 loverslab_password: ll_password,
                 extract_strategy: extract.into(),
@@ -798,7 +866,7 @@ async fn main() -> Result<()> {
             let mut installer = Installer::new(config)?;
             let stats = installer.run_pipelined().await?;
 
-            let reporter = &cli_reporter;
+            let reporter = active_reporter.as_ref();
             let total_processed =
                 stats.directives_completed + stats.directives_skipped + stats.directives_failed;
 
@@ -890,6 +958,10 @@ async fn main() -> Result<()> {
             run_modlist_action(action).await?;
         }
 
+        Commands::Fetch { url, output } => {
+            run_fetch_command(&url, &output).await?;
+        }
+
         Commands::Info { wabbajack_file } => {
             println!("Parsing {}...\n", wabbajack_file.display());
 
@@ -953,6 +1025,34 @@ async fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn run_fetch_command(url: &str, output: &std::path::Path) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    println!("Fetching: {}", url);
+    println!("Output:   {}", output.display());
+
+    let downloader = downloaders::wabbajack_cdn::WabbajackCdnDownloader::new()?;
+    let last_reported = Arc::new(AtomicU64::new(0));
+
+    let bytes_written = downloader
+        .download_with_progress(url, output, 0, move |downloaded, total| {
+            if total == 0 {
+                return;
+            }
+
+            let pct = downloaded.saturating_mul(100) / total;
+            let last = last_reported.load(Ordering::Relaxed);
+            if pct >= last.saturating_add(5) || downloaded == total {
+                last_reported.store(pct, Ordering::Relaxed);
+                eprintln!("{}% ({} / {} bytes)", pct, downloaded, total);
+            }
+        })
+        .await?;
+
+    println!("Done: {} ({} bytes)", output.display(), bytes_written);
     Ok(())
 }
 
@@ -1160,7 +1260,15 @@ async fn ensure_fluorine_available() -> Result<fluorine::FluorineInstall> {
 
 /// Download a .wabbajack file from a URL into the CLF3 cache, returning the
 /// resolved local path. Reuses the existing cache file if present.
-async fn fetch_wabbajack_from_url(url: &str) -> Result<PathBuf> {
+async fn fetch_wabbajack_from_url(url: &str, details_to_stderr: bool) -> Result<PathBuf> {
+    let detail = |message: String| {
+        if details_to_stderr {
+            eprintln!("{}", message);
+        } else {
+            println!("{}", message);
+        }
+    };
+
     let cache_dir = dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("clf3")
@@ -1172,13 +1280,13 @@ async fn fetch_wabbajack_from_url(url: &str) -> Result<PathBuf> {
 
     let cached = std::fs::metadata(&dest).ok().filter(|m| m.len() > 0);
     if let Some(meta) = cached {
-        println!(
+        detail(format!(
             "Using cached .wabbajack file: {} ({} MiB)",
             dest.display(),
             meta.len() / (1024 * 1024)
-        );
+        ));
     } else {
-        println!("Downloading .wabbajack file from URL...");
+        detail("Downloading .wabbajack file from URL...".to_string());
         let cdn = downloaders::wabbajack_cdn::WabbajackCdnDownloader::new()?;
         let pb = indicatif::ProgressBar::new(0);
         pb.set_style(
@@ -1199,7 +1307,7 @@ async fn fetch_wabbajack_from_url(url: &str) -> Result<PathBuf> {
         .await?;
         pb.finish_with_message("Downloaded");
 
-        println!("Saved to: {}", dest.display());
+        detail(format!("Saved to: {}", dest.display()));
     }
 
     Ok(dest)
@@ -1403,16 +1511,22 @@ async fn run_modlist_update(name: String, yes: bool) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Gallery entry for '{}' has no download URL", machine_name))?
         .to_string();
     println!("Fetching latest .wabbajack from {} ...", download_url);
-    let wabbajack_path = fetch_wabbajack_from_url(&download_url).await?;
+    let wabbajack_path = fetch_wabbajack_from_url(&download_url, false).await?;
 
     // Resolve API keys + game dir like the normal install path.
+    let nexus_oauth_token = std::env::var("NEXUS_OAUTH_TOKEN")
+        .ok()
+        .filter(|token| !token.trim().is_empty());
     let nexus_key = if settings.nexus_api_key.is_empty() {
         std::env::var("NEXUS_API_KEY").ok()
     } else {
         Some(settings.nexus_api_key.clone())
     }
+    .or_else(|| nexus_oauth_token.as_ref().map(|_| String::new()))
     .ok_or_else(|| {
-        anyhow::anyhow!("Nexus API key required. Set it with: clf3 set-api-key YOUR_KEY")
+        anyhow::anyhow!(
+            "Nexus API key or OAuth token required. Set an API key with `clf3 set-api-key YOUR_KEY` or export NEXUS_OAUTH_TOKEN"
+        )
     })?;
 
     let game_dir = match auto_detect_game_dir(&wabbajack_path) {
@@ -1444,6 +1558,7 @@ async fn run_modlist_update(name: String, yes: bool) -> Result<()> {
         downloads_dir: downloads_dir.clone(),
         game_dir,
         nexus_api_key: nexus_key,
+        nexus_oauth_token,
         max_concurrent_downloads: thread_count,
         max_install_workers: thread_count,
         max_parallel_bsa_archives: 1,

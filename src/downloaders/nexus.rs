@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
-use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -91,16 +91,49 @@ pub struct NexusDownloader {
     validated: AtomicBool,
     /// Override to force non-premium mode even if account is premium
     premium_override: AtomicBool,
+    /// Human-readable auth source for validation errors.
+    auth_label: &'static str,
 }
 
 impl NexusDownloader {
     /// Create a new Nexus downloader with API key
     pub fn new(api_key: &str) -> Result<Self> {
+        Self::build_client(Some(api_key), None)
+    }
+
+    /// Create a new Nexus downloader with an OAuth bearer token.
+    pub fn with_bearer(token: &str) -> Result<Self> {
+        Self::build_client(None, Some(token))
+    }
+
+    /// Create a new Nexus downloader from configured credentials.
+    ///
+    /// OAuth bearer tokens take precedence over API keys when both are present.
+    pub fn from_config(api_key: &str, oauth_token: Option<&str>) -> Result<Self> {
+        if let Some(token) = oauth_token.map(str::trim).filter(|token| !token.is_empty()) {
+            return Self::with_bearer(token);
+        }
+        Self::new(api_key)
+    }
+
+    fn build_client(api_key: Option<&str>, oauth_token: Option<&str>) -> Result<Self> {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTH_HEADER,
-            HeaderValue::from_str(api_key).context("Invalid API key format")?,
-        );
+        let auth_label = if let Some(token) = oauth_token {
+            let bearer = format!("Bearer {}", token);
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&bearer).context("Invalid OAuth token format")?,
+            );
+            "OAuth token"
+        } else if let Some(key) = api_key {
+            headers.insert(
+                AUTH_HEADER,
+                HeaderValue::from_str(key).context("Invalid API key format")?,
+            );
+            "API key"
+        } else {
+            "credentials"
+        };
 
         let client = Client::builder()
             .default_headers(headers)
@@ -115,6 +148,7 @@ impl NexusDownloader {
             is_premium: AtomicBool::new(false),
             validated: AtomicBool::new(false),
             premium_override: AtomicBool::new(false),
+            auth_label,
         })
     }
 
@@ -130,7 +164,7 @@ impl NexusDownloader {
             .get(&url)
             .send()
             .await
-            .context("Failed to validate API key")?;
+            .with_context(|| format!("Failed to validate Nexus {}", self.auth_label))?;
 
         // Update rate limits from response
         if let Some(limits) = NexusRateLimits::from_response(&response) {
@@ -140,7 +174,12 @@ impl NexusDownloader {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            bail!("Nexus API key validation failed ({}): {}", status, body);
+            bail!(
+                "Nexus {} validation failed ({}): {}",
+                self.auth_label,
+                status,
+                body
+            );
         }
 
         let user_info: NexusUserInfo =
