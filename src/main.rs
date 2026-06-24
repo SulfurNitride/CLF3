@@ -20,7 +20,6 @@ mod installer;
 mod modlist;
 mod octodiff;
 mod paths;
-mod self_update;
 mod settings;
 mod textures;
 
@@ -255,24 +254,6 @@ enum Commands {
         action: FluorineAction,
     },
 
-    /// Self-update: check GitHub for a newer clf3 release and replace the
-    /// running binary in place. Atomic on Linux — the kernel keeps the old
-    /// inode mapped so the running invocation isn't disrupted.
-    SelfUpdate {
-        /// Only check; don't download or replace anything. Exits 0 if up to
-        /// date, 1 if an update is available.
-        #[arg(long)]
-        check: bool,
-
-        /// Skip the version-diff confirmation and apply.
-        #[arg(long, short)]
-        yes: bool,
-
-        /// Re-download and replace even when versions match (or are
-        /// unparseable). Useful for recovering from a broken install.
-        #[arg(long)]
-        force: bool,
-    },
 }
 
 #[derive(Subcommand)]
@@ -528,19 +509,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Best-effort startup check for a newer clf3 release. Skips itself for
-    // the `SelfUpdate` subcommand (to avoid double-querying GitHub) and runs
-    // with a short timeout so the network never blocks normal commands.
-    // Result is cached in `~/.config/clf3/update_cache.json` for 24h.
-    if !matches!(command, Commands::SelfUpdate { .. }) {
-        // Don't `await` directly — race it against a short timeout so an
-        // unreachable api.github.com doesn't visibly delay every invocation.
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            self_update::startup_check_with_notice(),
-        )
-        .await;
-    }
 
     match command {
         Commands::Browser => {
@@ -1020,9 +988,6 @@ async fn main() -> Result<()> {
             run_fluorine_action(action).await?;
         }
 
-        Commands::SelfUpdate { check, yes, force } => {
-            run_self_update(check, yes, force).await?;
-        }
     }
 
     Ok(())
@@ -1056,73 +1021,6 @@ async fn run_fetch_command(url: &str, output: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// `clf3 self-update` handler. Implements the three modes — check-only,
-/// interactive (default), and `--yes`/`--force` non-interactive apply.
-async fn run_self_update(check: bool, yes: bool, force: bool) -> Result<()> {
-    let release = self_update::fetch_latest_release()
-        .await
-        .context("Failed to query GitHub for the latest CLF3 release")?;
-    let remote_version = release.version().to_string();
-    let verdict = self_update::compare_to_running(&remote_version);
-
-    let local = self_update::current_version();
-    println!("Running version: {}", local);
-    println!("Latest release:  {} ({})", remote_version, release.name);
-    println!("Verdict:         {:?}", verdict);
-
-    if check {
-        if verdict.update_available() {
-            println!("\nUpdate available. Run `clf3 self-update --yes` to apply.");
-            std::process::exit(1);
-        } else {
-            println!("\nUp to date.");
-            return Ok(());
-        }
-    }
-
-    let should_apply = force
-        || matches!(verdict, self_update::UpdateVerdict::Newer)
-        || (yes
-            && matches!(
-                verdict,
-                self_update::UpdateVerdict::Equal | self_update::UpdateVerdict::Ahead
-            ));
-
-    if !should_apply {
-        match verdict {
-            self_update::UpdateVerdict::Equal | self_update::UpdateVerdict::Ahead => {
-                println!("\nNothing to do. Pass --force to re-download anyway.");
-                return Ok(());
-            }
-            self_update::UpdateVerdict::Unknown => {
-                anyhow::bail!(
-                    "Remote tag '{}' isn't comparable to running version '{}'. \
-                     Pass --force to overwrite anyway.",
-                    remote_version,
-                    local
-                );
-            }
-            self_update::UpdateVerdict::Newer => unreachable!(),
-        }
-    }
-
-    if !yes && !force {
-        println!(
-            "\nReady to download and replace the running clf3 binary. \
-             Re-run with --yes to apply."
-        );
-        anyhow::bail!("Self-update aborted (confirmation required — pass --yes to proceed)");
-    }
-
-    let outcome = self_update::run_update(force).await?;
-    if outcome.replaced {
-        println!("\nclf3 updated to {}.", outcome.version);
-        println!("Restart any running clf3 invocations to pick up the new binary.");
-    } else {
-        println!("\nNo replacement needed — already on {}.", outcome.version);
-    }
-    Ok(())
-}
 
 /// Make sure a Fluorine install is available, downloading the latest release
 /// if not, then register `install_dir` as a portable instance.
