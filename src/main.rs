@@ -137,22 +137,6 @@ enum Commands {
         #[arg(long)]
         sevenzip_workers: Option<usize>,
 
-        /// Use a local browser controller and watch a download folder for non-premium Nexus files
-        #[arg(long)]
-        manual_browser_mode: bool,
-
-        /// Browser command to open Nexus pages (default: xdg-open)
-        #[arg(long, default_value = "xdg-open")]
-        browser: String,
-
-        /// Folder to watch for browser downloads in --manual-browser-mode
-        #[arg(long)]
-        manual_watch_dir: Option<PathBuf>,
-
-        /// Maximum browser-opened manual downloads in --manual-browser-mode
-        #[arg(long)]
-        manual_max_active: Option<usize>,
-
         /// LoversLab email (overrides saved setting)
         #[arg(long, env = "LOVERSLAB_EMAIL")]
         ll_email: Option<String>,
@@ -659,10 +643,6 @@ async fn main() -> Result<()> {
             install_workers,
             bsa_workers,
             sevenzip_workers,
-            manual_browser_mode,
-            browser,
-            manual_watch_dir,
-            manual_max_active,
             ll_email,
             ll_password,
             extract,
@@ -711,7 +691,7 @@ async fn main() -> Result<()> {
                     }
                 })
                 .or_else(|| {
-                    (manual_browser_mode || nexus_oauth_token.is_some()).then(String::new)
+                    nexus_oauth_token.is_some().then(String::new)
                 })
                 .ok_or_else(|| {
                     anyhow::anyhow!(
@@ -757,7 +737,6 @@ async fn main() -> Result<()> {
             let install_workers = install_workers.unwrap_or(thread_count).max(1);
             let bsa_workers = bsa_workers.unwrap_or(1).max(1);
             let sevenzip_workers = sevenzip_workers.unwrap_or(thread_count).max(1);
-            let manual_max_active = manual_max_active.unwrap_or(4).max(1);
 
             detail("CLF3 - Wabbajack Modlist Installer".to_string());
             detail(format!("Concurrent downloads: {}", concurrent));
@@ -766,12 +745,6 @@ async fn main() -> Result<()> {
                 install_workers, bsa_workers
             ));
             detail(format!("7z archives in parallel: {}", sevenzip_workers));
-            if manual_browser_mode {
-                detail(format!(
-                    "Manual browser mode: enabled (watching browser downloads, max active: {})",
-                    manual_max_active
-                ));
-            }
             detail(String::new());
 
             let patch_cache_dir = if settings.patch_cache_dir.is_empty() {
@@ -817,10 +790,6 @@ async fn main() -> Result<()> {
                 max_install_workers: install_workers,
                 max_parallel_bsa_archives: bsa_workers,
                 max_parallel_7z_archives: sevenzip_workers,
-                manual_browser_mode,
-                browser,
-                manual_watch_dir,
-                manual_max_active,
                 patch_cache_dir,
                 progress_callback,
                 reporter: active_reporter.clone(),
@@ -1461,10 +1430,6 @@ async fn run_modlist_update(name: String, yes: bool) -> Result<()> {
         max_install_workers: thread_count,
         max_parallel_bsa_archives: 1,
         max_parallel_7z_archives: thread_count,
-        manual_browser_mode: false,
-        browser: "xdg-open".into(),
-        manual_watch_dir: None,
-        manual_max_active: 4,
         patch_cache_dir,
         progress_callback: None,
         reporter: cli_reporter.clone() as Arc<dyn ProgressReporter>,

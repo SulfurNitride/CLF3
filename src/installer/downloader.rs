@@ -513,35 +513,6 @@ Copied files with different names will not be reused. Examples: {}",
         need_download.len()
     ));
 
-    if config.manual_browser_mode {
-        let (manual_pending, auto_pending) = split_manual_browser_pending(config, need_download);
-        if !manual_pending.is_empty() {
-            reporter.log(&format!(
-                "Manual browser downloads: {}; automatic downloads: {}",
-                manual_pending.len(),
-                auto_pending.len()
-            ));
-            let manual_future = super::manual_controller::download_manual_browser_archives(
-                db,
-                config,
-                manual_pending,
-                None,
-            );
-            let auto_future = async {
-                if auto_pending.is_empty() {
-                    Ok(DownloadStats::default())
-                } else {
-                    download_non_nexus_files(db, config, auto_pending).await
-                }
-            };
-            let (manual_stats, auto_stats) = tokio::try_join!(manual_future, auto_future)?;
-            let stats = merge_parallel_download_stats(auto_stats, manual_stats, already_downloaded);
-            print_download_summary(reporter.as_ref(), &stats);
-            return Ok(stats);
-        }
-        need_download = auto_pending;
-    }
-
     let pending = need_download;
     let concurrency = config.max_concurrent_downloads;
 
@@ -988,35 +959,6 @@ pub async fn download_archives_streaming(
         need_download.len()
     ));
 
-    if config.manual_browser_mode {
-        let (manual_pending, auto_pending) = split_manual_browser_pending(config, need_download);
-        if !manual_pending.is_empty() {
-            reporter.log(&format!(
-                "Manual browser downloads: {}; automatic downloads: {}",
-                manual_pending.len(),
-                auto_pending.len()
-            ));
-            let manual_future = super::manual_controller::download_manual_browser_archives(
-                db,
-                config,
-                manual_pending,
-                Some(tx),
-            );
-            let auto_future = async {
-                if auto_pending.is_empty() {
-                    Ok(DownloadStats::default())
-                } else {
-                    download_pending_archives_streaming(db, config, tx, auto_pending).await
-                }
-            };
-            let (manual_stats, auto_stats) = tokio::try_join!(manual_future, auto_future)?;
-            let stats = merge_parallel_download_stats(auto_stats, manual_stats, already_downloaded);
-            print_download_summary(reporter.as_ref(), &stats);
-            return Ok(stats);
-        }
-        need_download = auto_pending;
-    }
-
     let pending = need_download;
     let concurrency = config.max_concurrent_downloads;
 
@@ -1145,79 +1087,6 @@ enum DownloadResult {
     Skipped,
     Manual,
     Failed,
-}
-
-fn split_manual_browser_pending(
-    config: &InstallConfig,
-    pending: Vec<ArchiveInfo>,
-) -> (Vec<ArchiveInfo>, Vec<ArchiveInfo>) {
-    let has_loverslab_credentials =
-        !config.loverslab_email.is_empty() && !config.loverslab_password.is_empty();
-    let mut manual = Vec::new();
-    let mut automatic = Vec::new();
-
-    for archive in pending {
-        if is_manual_browser_candidate(&archive, has_loverslab_credentials) {
-            manual.push(archive);
-        } else {
-            automatic.push(archive);
-        }
-    }
-
-    (manual, automatic)
-}
-
-fn is_manual_browser_candidate(archive: &ArchiveInfo, has_loverslab_credentials: bool) -> bool {
-    let Ok(state) = serde_json::from_str::<DownloadState>(&archive.state_json) else {
-        return false;
-    };
-    match &state {
-        DownloadState::Nexus(_) => true,
-        DownloadState::Manual(_) => {
-            check_manual(&state, archive, has_loverslab_credentials).is_some()
-        }
-        _ => false,
-    }
-}
-
-fn merge_manual_downloads(
-    mut downloads: Vec<ManualDownloadInfo>,
-    manual_browser_stats: &DownloadStats,
-) -> Vec<ManualDownloadInfo> {
-    downloads.extend(manual_browser_stats.manual_downloads.clone());
-    downloads
-}
-
-fn merge_failed_downloads(
-    mut downloads: Vec<FailedDownloadInfo>,
-    manual_browser_stats: &DownloadStats,
-) -> Vec<FailedDownloadInfo> {
-    downloads.extend(manual_browser_stats.failed_downloads.clone());
-    downloads
-}
-
-fn merge_parallel_download_stats(
-    mut automatic: DownloadStats,
-    manual_browser: DownloadStats,
-    already_downloaded: usize,
-) -> DownloadStats {
-    automatic.downloaded += manual_browser.downloaded;
-    automatic.skipped += already_downloaded + manual_browser.skipped;
-    automatic.failed += manual_browser.failed;
-    automatic.manual += manual_browser.manual;
-    automatic.failed_downloads =
-        merge_failed_downloads(automatic.failed_downloads, &manual_browser);
-    automatic.manual_downloads =
-        merge_manual_downloads(automatic.manual_downloads, &manual_browser);
-    automatic
-}
-
-fn print_download_summary(reporter: &dyn ProgressReporter, stats: &DownloadStats) {
-    reporter.log("\n=== Download Summary ===");
-    reporter.log(&format!("Downloaded: {}", stats.downloaded));
-    reporter.log(&format!("Skipped:    {}", stats.skipped));
-    reporter.log(&format!("Manual:     {}", stats.manual));
-    reporter.log(&format!("Failed:     {}", stats.failed));
 }
 
 /// Process a single archive (check, download, or mark manual)

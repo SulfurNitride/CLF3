@@ -16,7 +16,6 @@ pub mod config_cache;
 pub mod downloader;
 pub mod game_preflight;
 pub mod handlers;
-pub mod manual_controller;
 pub mod pipeline;
 pub mod prevalidation;
 pub mod processor;
