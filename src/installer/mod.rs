@@ -441,6 +441,23 @@ impl Installer {
         }
         self.reporter().log("Game directory validated");
 
+        // Apply the FNV 4GB patch before running preflight so the patched
+        // hash is in place when we verify game files.  Modlists vary on
+        // whether they store the stock or patched hash; game_preflight
+        // accepts both via the alt-variant list.
+        if let Ok(Some(game_type)) = self.db.get_metadata("game_type") {
+            if game_type == "FalloutNewVegas" {
+                if let Err(e) = crate::fnv4gb::ensure_fnv_4gb_patched(
+                    &self.config.game_dir,
+                    self.reporter().as_ref(),
+                ) {
+                    // Non-fatal: warn and continue; the modlist may not need it.
+                    self.reporter()
+                        .log(&format!("Warning: FNV 4GB patch step failed: {:#}", e));
+                }
+            }
+        }
+
         // Hash every GameFileSource archive against the chosen game directory
         // BEFORE spending bandwidth. Catches: game updated since modlist
         // authored, missing DLC, wrong store variant (Steam vs GOG), etc.

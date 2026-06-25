@@ -14,6 +14,7 @@ mod browser_gui;
 mod bsa;
 mod downloaders;
 mod fluorine;
+mod fnv4gb;
 mod game_finder;
 mod hash;
 mod installer;

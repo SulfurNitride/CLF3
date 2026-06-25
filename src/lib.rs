@@ -7,6 +7,7 @@ pub mod archive;
 pub mod bsa;
 pub mod downloaders;
 pub mod fluorine;
+pub mod fnv4gb;
 pub mod game_finder;
 pub mod gpu;
 pub mod hash;
