@@ -2,7 +2,8 @@
 //! Download phase coordinator
 //!
 //! Coordinates downloading all archives from various sources with parallel downloads.
-//! Supports direct API mode (premium) and manual browser mode (non-premium).
+//! Nexus downloads use the Premium API; genuinely manual non-Nexus sources
+//! are reported to the user with their download instructions.
 
 use crate::downloaders::{
     download_file_with_callback, GoogleDriveDownloader, HttpClient, LoversLabDownloader,

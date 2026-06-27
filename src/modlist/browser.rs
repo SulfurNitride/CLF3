@@ -5,7 +5,7 @@ use crate::downloaders::wabbajack_cdn::WabbajackCdnDownloader;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
@@ -13,6 +13,31 @@ const REPOSITORIES_URL: &str =
     "https://raw.githubusercontent.com/wabbajack-tools/mod-lists/master/repositories.json";
 const FEATURED_URL: &str =
     "https://raw.githubusercontent.com/wabbajack-tools/mod-lists/master/featured_lists.json";
+const SEARCH_INDEX_URL: &str =
+    "https://raw.githubusercontent.com/wabbajack-tools/mod-lists/refs/heads/master/reports/searchIndex.json";
+
+/// Wabbajack's generated index of Mod Organizer mod names per modlist.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SearchIndex {
+    #[serde(rename = "AllMods", default)]
+    pub all_mods: Vec<String>,
+    #[serde(rename = "ModsPerList", default)]
+    pub mods_per_list: HashMap<String, HashSet<String>>,
+}
+
+impl SearchIndex {
+    /// Apply exact-name mod filters using Wabbajack's gallery semantics.
+    pub fn matches(&self, machine_name: &str, required: &[String], excluded: &[String]) -> bool {
+        if required.is_empty() && excluded.is_empty() {
+            return true;
+        }
+        let Some(mods) = self.mods_per_list.get(machine_name) else {
+            return required.is_empty();
+        };
+        required.iter().all(|name| mods.contains(name))
+            && excluded.iter().all(|name| !mods.contains(name))
+    }
+}
 
 /// Download metadata for a modlist
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -260,6 +285,49 @@ impl ModlistBrowser {
         Ok(featured)
     }
 
+    /// Fetch Wabbajack's mod-name search index used by the gallery filters.
+    pub async fn fetch_search_index(&self) -> Result<SearchIndex> {
+        self.client
+            .get(SEARCH_INDEX_URL)
+            .send()
+            .await
+            .context("Failed to fetch searchIndex.json")?
+            .error_for_status()
+            .context("Wabbajack search index returned an error")?
+            .json()
+            .await
+            .context("Failed to parse searchIndex.json")
+    }
+
+    fn search_index_cache_path() -> Result<PathBuf> {
+        Ok(Self::cache_dir()?.join("searchIndex.json"))
+    }
+
+    pub fn save_search_index_cache(index: &SearchIndex) -> Result<()> {
+        std::fs::write(Self::search_index_cache_path()?, serde_json::to_vec(index)?)?;
+        Ok(())
+    }
+
+    pub fn load_search_index_cache() -> Result<SearchIndex> {
+        let bytes = std::fs::read(Self::search_index_cache_path()?)?;
+        serde_json::from_slice(&bytes).context("Failed to parse cached searchIndex.json")
+    }
+
+    /// The upstream report changes much less often than gallery metadata.
+    pub fn has_recent_search_index_cache() -> bool {
+        let Ok(path) = Self::search_index_cache_path() else {
+            return false;
+        };
+        let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+            return false;
+        };
+        std::time::SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default()
+            .as_secs()
+            < 24 * 60 * 60
+    }
+
     /// Search modlists by query and optional game filter
     pub fn search<'a>(
         &'a self,
@@ -437,6 +505,23 @@ impl ModlistBrowser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_index_applies_required_and_excluded_mods() {
+        let index = SearchIndex {
+            all_mods: vec!["SkyUI".into(), "ENB".into(), "USSEP".into()],
+            mods_per_list: HashMap::from([(
+                "test-list".into(),
+                HashSet::from(["SkyUI".into(), "USSEP".into()]),
+            )]),
+        };
+
+        assert!(index.matches("test-list", &["SkyUI".into()], &["ENB".into()]));
+        assert!(!index.matches("test-list", &["ENB".into()], &[]));
+        assert!(!index.matches("test-list", &[], &["USSEP".into()]));
+        assert!(!index.matches("unknown-list", &["SkyUI".into()], &[]));
+        assert!(index.matches("unknown-list", &[], &["SkyUI".into()]));
+    }
 
     #[tokio::test]
     #[ignore] // Requires network

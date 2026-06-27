@@ -6,7 +6,7 @@
 
 use crate::downloaders::{LoversLabDownloader, NexusDownloader};
 use crate::game_finder::{detect_all_games, find_by_gog_id, find_by_steam_id, Launcher};
-use crate::modlist::browser::{ModlistBrowser, ModlistMetadata};
+use crate::modlist::browser::{ModlistBrowser, ModlistMetadata, SearchIndex};
 use crate::settings::{BrowserListPaths, Settings};
 use crate::textures::{list_gpus, GpuInfo};
 use eframe::egui;
@@ -67,6 +67,8 @@ struct SharedState {
     images: HashMap<String, ImageState>,
     fetch_done: bool,
     fetch_error: Option<String>,
+    search_index: Option<Arc<SearchIndex>>,
+    search_index_error: Option<String>,
 }
 
 /// Top-level navigation between the modlist browser and the settings editor.
@@ -98,6 +100,11 @@ struct BrowserApp {
     show_unavailable: bool,
     /// Show only modlists for games the user has installed (Steam or Heroic/GOG).
     show_installed_only: bool,
+    /// Exact MO2 mod names selected from Wabbajack's search index.
+    must_include_mods: Vec<String>,
+    must_exclude_mods: Vec<String>,
+    include_mod_query: String,
+    exclude_mod_query: String,
     /// Set of canonical Wabbajack `GameType` strings the user has installed.
     /// Populated once at startup via `detect_all_games()`. Case-insensitive
     /// match to `ModlistMetadata.game` in `filtered_modlists`.
@@ -204,12 +211,18 @@ impl BrowserApp {
                 images: HashMap::new(),
                 fetch_done: false,
                 fetch_error: None,
+                search_index: None,
+                search_index_error: None,
             })),
             search: String::new(),
             game_filter: settings.browser_game_filter.clone(),
             show_nsfw: settings.browser_show_nsfw,
             show_unavailable: settings.browser_show_unavailable,
             show_installed_only: settings.browser_show_installed_only,
+            must_include_mods: Vec::new(),
+            must_exclude_mods: Vec::new(),
+            include_mod_query: String::new(),
+            exclude_mod_query: String::new(),
             installed_game_types,
             installed_game_count,
             selected: None,
@@ -261,6 +274,31 @@ impl BrowserApp {
                     return;
                 }
             };
+
+            // This index is independent of gallery metadata. Failure only
+            // disables mod-name filters; the rest of the browser still works.
+            let cached_index = ModlistBrowser::has_recent_search_index_cache()
+                .then(ModlistBrowser::load_search_index_cache)
+                .and_then(Result::ok);
+            let index = if let Some(index) = cached_index {
+                Some(index)
+            } else {
+                match browser.fetch_search_index().await {
+                    Ok(index) => {
+                        let _ = ModlistBrowser::save_search_index_cache(&index);
+                        Some(index)
+                    }
+                    Err(e) => {
+                        shared.lock().expect("lock shared state").search_index_error =
+                            Some(format!("Mod filters unavailable: {}", e));
+                        None
+                    }
+                }
+            };
+            if let Some(index) = index {
+                shared.lock().expect("lock shared state").search_index = Some(Arc::new(index));
+                ctx.request_repaint();
+            }
 
             // Try cache first
             if ModlistBrowser::has_recent_cache() {
@@ -420,6 +458,15 @@ impl BrowserApp {
                 if !self.search.is_empty() && !m.matches_query(&self.search) {
                     return false;
                 }
+                if let Some(index) = &state.search_index {
+                    if !index.matches(
+                        &m.machine_name,
+                        &self.must_include_mods,
+                        &self.must_exclude_mods,
+                    ) {
+                        return false;
+                    }
+                }
                 true
             })
             .cloned()
@@ -566,7 +613,6 @@ impl BrowserApp {
         ];
         Some((exe, args))
     }
-
 }
 
 impl eframe::App for BrowserApp {
@@ -800,6 +846,36 @@ impl BrowserApp {
             });
             ui.add_space(4.0);
 
+            let (search_index, index_error) = {
+                let state = self.shared.lock().expect("lock shared state");
+                (state.search_index.clone(), state.search_index_error.clone())
+            };
+            if let Some(index) = search_index {
+                Self::render_mod_selector(
+                    ui,
+                    "Must include:",
+                    &mut self.include_mod_query,
+                    &mut self.must_include_mods,
+                    &self.must_exclude_mods,
+                    &index.all_mods,
+                    "include_mod_filter",
+                );
+                Self::render_mod_selector(
+                    ui,
+                    "Must not include:",
+                    &mut self.exclude_mod_query,
+                    &mut self.must_exclude_mods,
+                    &self.must_include_mods,
+                    &index.all_mods,
+                    "exclude_mod_filter",
+                );
+            } else if let Some(error) = index_error {
+                ui.small(error);
+            } else {
+                ui.add_enabled(false, egui::Label::new("Loading mod filters…"));
+            }
+            ui.add_space(4.0);
+
             if self.game_filter != old_game_filter
                 || self.show_nsfw != old_show_nsfw
                 || self.show_unavailable != old_show_unavailable
@@ -808,6 +884,74 @@ impl BrowserApp {
                 self.remember_browser_state();
             }
         });
+    }
+
+    fn render_mod_selector(
+        ui: &mut egui::Ui,
+        label: &str,
+        query: &mut String,
+        selected: &mut Vec<String>,
+        opposite: &[String],
+        all_mods: &[String],
+        id: &'static str,
+    ) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(label);
+            let response = ui.add(
+                egui::TextEdit::singleline(query)
+                    .id(egui::Id::new(id))
+                    .desired_width(260.0)
+                    .hint_text("Type a mod name"),
+            );
+
+            let normalized = query.trim().to_lowercase();
+            let first_match = all_mods.iter().find(|name| {
+                name.to_lowercase().contains(&normalized)
+                    && !selected.contains(name)
+                    && !opposite.contains(name)
+            });
+            if !normalized.is_empty()
+                && response.has_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+            {
+                if let Some(name) = first_match {
+                    selected.push(name.clone());
+                    query.clear();
+                }
+            }
+
+            let mut remove = None;
+            for (idx, name) in selected.iter().enumerate() {
+                if ui.small_button(format!("× {}", name)).clicked() {
+                    remove = Some(idx);
+                }
+            }
+            if let Some(idx) = remove {
+                selected.remove(idx);
+            }
+        });
+
+        let normalized = query.trim().to_lowercase();
+        if !normalized.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(100.0);
+                for name in all_mods
+                    .iter()
+                    .filter(|name| {
+                        name.to_lowercase().contains(&normalized)
+                            && !selected.contains(name)
+                            && !opposite.contains(name)
+                    })
+                    .take(8)
+                {
+                    if ui.small_button(name.as_str()).clicked() {
+                        selected.push(name.clone());
+                        query.clear();
+                        break;
+                    }
+                }
+            });
+        }
     }
 
     /// Bottom panel: directory inputs + generated command + Run/Copy buttons.
