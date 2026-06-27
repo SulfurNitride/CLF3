@@ -141,12 +141,6 @@ const ALT_VARIANT_FILE_BASENAMES: &[&str] = &[
     // bake these in (e.g. Fallen World).
     "ccotmfo4001-remnants.esl",
     "ccbgsfo4046-tescan.esl",
-    // Fallout New Vegas executables — the 4GB LAA patch (IMAGE_FILE_LARGE_ADDRESS_AWARE)
-    // modifies exactly two bytes in the PE Characteristics field, changing the
-    // xxHash64. Modlists may store either the stock or the pre-patched hash;
-    // we accept both because the runtime behaviour is identical (or better).
-    "falloutnv.exe",
-    "falloutnvlauncher.exe",
 ];
 
 /// Returns true if the given modlist `game_file` path (or archive name) is on
