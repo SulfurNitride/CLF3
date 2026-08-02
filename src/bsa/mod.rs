@@ -14,6 +14,7 @@
 mod ba2_reader;
 mod ba2_writer;
 mod cache;
+mod disk_spool;
 mod reader;
 mod tes3_reader;
 mod writer;

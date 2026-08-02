@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
+use super::disk_spool::DiskSpool;
 use super::{default_flags_fo3, default_flags_oblivion, detect_types, detect_version};
 
 /// File entry that reads from disk on demand instead of holding data in memory
@@ -21,6 +22,13 @@ struct FileEntry {
     dir_path: String,
     file_name: String,
     disk_path: PathBuf,
+}
+
+struct SpooledBsaFile {
+    dir_path: String,
+    file_name: String,
+    range: std::ops::Range<usize>,
+    decompressed_len: Option<usize>,
 }
 
 impl FileEntry {
@@ -148,8 +156,9 @@ impl BsaBuilder {
 
     /// Build and write the BSA to disk.
     ///
-    /// Reads files from disk on demand during parallel compression.
-    /// Peak memory ≈ num_rayon_threads * largest_file_size (not total archive size).
+    /// Files are compressed in parallel and immediately moved to a disk-backed
+    /// spool. Peak anonymous memory is bounded by active workers rather than
+    /// the complete compressed archive size.
     pub fn build(self, output_path: &Path) -> Result<()> {
         if self.is_empty() {
             bail!("Cannot create empty BSA archive");
@@ -182,25 +191,46 @@ impl BsaBuilder {
             })
             .collect();
 
-        // Read + compress files in parallel. Each thread reads one file at a time.
+        let spool = DiskSpool::new_near(output_path)?;
+        let spool_writer = spool.writer();
+
+        // Read + compress files in parallel. Each completed payload is spilled
+        // before the worker takes another file, so increasing rayon threads
+        // increases throughput without retaining the whole archive in RAM.
         let version = self.version;
-        let processed: Result<Vec<(String, String, BsaFile)>> = entries
+        let processed: Result<Vec<SpooledBsaFile>> = entries
             .into_par_iter()
             .map(|entry| {
                 let dir_path = entry.dir_path.clone();
                 let file_name = entry.file_name.clone();
                 let file = entry.into_bsa_file(version, should_compress)?;
-                Ok((dir_path, file_name, file))
+                let decompressed_len = file.decompressed_len();
+                let range = spool_writer
+                    .append(std::iter::once(file.as_bytes()))?
+                    .pop()
+                    .expect("one spooled BSA payload");
+                Ok(SpooledBsaFile {
+                    dir_path,
+                    file_name,
+                    range,
+                    decompressed_len,
+                })
             })
             .collect();
 
         let processed = processed?;
+        let mapping = spool.map()?;
 
         // Build archive
         let mut archive = Archive::new();
-        for (dir_path, file_name, file) in processed {
-            let archive_key = ArchiveKey::from(dir_path.as_bytes());
-            let directory_key = DirectoryKey::from(file_name.as_bytes());
+        for entry in processed {
+            let archive_key = ArchiveKey::from(entry.dir_path.as_bytes());
+            let directory_key = DirectoryKey::from(entry.file_name.as_bytes());
+            let bytes = &mapping[entry.range];
+            let file = match entry.decompressed_len {
+                Some(len) => BsaFile::from_compressed(bytes, len),
+                None => BsaFile::from_decompressed(bytes),
+            };
 
             match archive.get_mut(&archive_key) {
                 Some(directory) => {
@@ -417,7 +447,7 @@ impl Default for BsaWriterManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use ba2::prelude::*;
     use tempfile::tempdir;
 
     #[test]
@@ -445,5 +475,32 @@ mod tests {
 
         assert_eq!(builder.file_count(), 2);
         assert!(!builder.is_empty());
+    }
+
+    #[test]
+    fn test_create_compressed_bsa_from_disk_spool() -> Result<()> {
+        let dir = tempdir()?;
+        let source = dir.path().join("payload.bin");
+        let output = dir.path().join("test.bsa");
+        let expected = vec![0x5a; 1024 * 1024];
+        fs::write(&source, &expected)?;
+
+        let mut builder = BsaBuilder::new();
+        builder.add_file("meshes/test/payload.bin", source);
+        builder.build(&output)?;
+
+        let (archive, options) = Archive::read(output.as_path())?;
+        let directory_key = ArchiveKey::from(b"meshes/test".as_slice());
+        let file_key = DirectoryKey::from(b"payload.bin".as_slice());
+        let archived = archive
+            .get(&directory_key)
+            .and_then(|directory| directory.get(&file_key))
+            .context("payload.bin missing from BSA")?;
+        let write_options: FileCompressionOptions = options.into();
+        let mut restored = Vec::new();
+        archived.write(&mut restored, &write_options)?;
+        assert_eq!(restored, expected);
+
+        Ok(())
     }
 }

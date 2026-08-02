@@ -1290,8 +1290,15 @@ pub(crate) fn run_processing_loop(
     // Limits how many archives are being extracted simultaneously.
     let max_concurrent = extract_workers.max(2);
 
+    // BSA/BA2 creation has its own limit. Archive compression uses the rayon
+    // pool internally, so launching an unbounded number of builders both
+    // oversubscribes the CPU and multiplies their per-worker memory buffers.
+    let max_concurrent_bsa = config.max_parallel_bsa_archives.unwrap_or(1).max(1);
+
     let active_count = std::sync::Mutex::new(0usize);
     let active_cvar = std::sync::Condvar::new();
+    let active_bsa_count = std::sync::Mutex::new(0usize);
+    let active_bsa_cvar = std::sync::Condvar::new();
 
     // Completion channel: extraction threads signal when done (hash of completed archive)
     let (done_tx, done_rx) = std::sync::mpsc::channel::<String>();
@@ -1320,6 +1327,8 @@ pub(crate) fn run_processing_loop(
         let logged_failures = &logged_failures;
         let active_count = &active_count;
         let active_cvar = &active_cvar;
+        let active_bsa_count = &active_bsa_count;
+        let active_bsa_cvar = &active_bsa_cvar;
         let extract_status = &extract_status;
         let extract_counter = &extract_counter;
         let dds_status = &dds_status;
@@ -1391,6 +1400,16 @@ pub(crate) fn run_processing_loop(
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| directive.to.clone());
 
+                        // Respect --bsa-workers. Previously every ready BSA was
+                        // spawned immediately, regardless of this setting.
+                        {
+                            let mut count = active_bsa_count.lock().expect("BSA count lock");
+                            while *count >= max_concurrent_bsa {
+                                count = active_bsa_cvar.wait(count).expect("BSA count cvar");
+                            }
+                            *count += 1;
+                        }
+
                         // Build BSA on a separate thread
                         thread_scope.spawn(move || {
                             match handle_create_bsa(ctx, &directive) {
@@ -1410,6 +1429,10 @@ pub(crate) fn run_processing_loop(
                             unsafe {
                                 libmimalloc_sys::mi_collect(true);
                             }
+
+                            let mut count = active_bsa_count.lock().expect("BSA count lock");
+                            *count -= 1;
+                            active_bsa_cvar.notify_one();
                         });
                         bsa_tracker.built_count += 1;
                     }
@@ -1515,6 +1538,15 @@ pub(crate) fn run_processing_loop(
             let mut count = active_count.lock().expect("active_count lock");
             while *count > 0 {
                 count = active_cvar.wait(count).expect("active_count cvar");
+            }
+        }
+
+        // Do not overlap the final, receiver-thread BSA builds with builders
+        // that were started early in the streaming pipeline.
+        {
+            let mut count = active_bsa_count.lock().expect("BSA count lock");
+            while *count > 0 {
+                count = active_bsa_cvar.wait(count).expect("BSA count cvar");
             }
         }
 
@@ -1935,20 +1967,21 @@ pub(crate) fn run_processing_loop_phased(
 
         if !bsa_directives.is_empty() {
             let bsa_total = bsa_directives.len();
+            let bsa_workers = config.max_parallel_bsa_archives.unwrap_or(1).max(1);
             reporter.log(&format!(
-                "  Phase 3: Building {} BSA archives (2 concurrent)...",
-                bsa_total
+                "  Phase 3: Building {} BSA archives ({} concurrent)...",
+                bsa_total, bsa_workers
             ));
             let bsa_status = reporter.begin_status("BSA");
             bsa_status.set_count(0, bsa_total);
             let bsa_built = AtomicUsize::new(0);
 
-            // Process 2 BSAs concurrently: while one compresses (CPU), the next
-            // reads its staged files from disk (I/O). This eliminates the gap
-            // between sequential BSA builds.
+            // Each builder already compresses files in parallel internally.
+            // Outer concurrency is independently configurable and defaults to
+            // one to avoid multiplying memory and disk pressure.
             let bsa_cursor = AtomicUsize::new(0);
             std::thread::scope(|s| {
-                for _ in 0..2 {
+                for _ in 0..bsa_workers {
                     s.spawn(|| loop {
                         let idx = bsa_cursor.fetch_add(1, Ordering::Relaxed);
                         if idx >= bsa_total {

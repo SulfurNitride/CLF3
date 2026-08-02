@@ -5,17 +5,20 @@
 use anyhow::{bail, Context, Result};
 use ba2::fo4::{
     Archive, ArchiveKey, ArchiveOptionsBuilder, Chunk, ChunkCompressionOptions,
-    CompressionFormat as Ba2CrateCompression, CompressionLevel, File as Ba2File,
+    CompressionFormat as Ba2CrateCompression, CompressionLevel, File as Ba2File, FileHeader,
     FileReadOptionsBuilder, Format, Version,
 };
 use ba2::prelude::*;
-use ba2::{CompressionResult, Copied};
+use ba2::{CompressableFrom, CompressionResult, Copied};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs;
 use std::io::BufWriter;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use tracing::info;
+
+use super::disk_spool::{DiskSpool, DiskSpoolWriter};
 
 /// Compression format for BA2 archives
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -27,6 +30,17 @@ pub enum Ba2CompressionFormat {
     Zlib,
     /// LZ4 compression (Starfield)
     Lz4,
+}
+
+impl Ba2CompressionFormat {
+    fn to_crate_format(self) -> Ba2CrateCompression {
+        match self {
+            // The compression format is irrelevant for uncompressed chunks,
+            // but ZIP is the compatible archive-level value for FO4 BA2s.
+            Self::None | Self::Zlib => Ba2CrateCompression::Zip,
+            Self::Lz4 => Ba2CrateCompression::LZ4,
+        }
+    }
 }
 
 /// Archive format variant
@@ -87,6 +101,61 @@ impl Ba2Version {
 struct FileEntry {
     archive_path: String,
     disk_path: PathBuf,
+}
+
+/// Small, in-memory description of a chunk whose bytes live in `DiskSpool`.
+struct SpooledChunk {
+    range: Range<usize>,
+    decompressed_len: Option<usize>,
+    mips: Option<std::ops::RangeInclusive<u16>>,
+}
+
+/// The metadata retained for a compressed BA2 file. Unlike `Ba2File<'static>`,
+/// this does not own the compressed payload.
+struct SpooledBa2File {
+    key: ArchiveKey<'static>,
+    header: FileHeader,
+    chunks: Vec<SpooledChunk>,
+}
+
+impl SpooledBa2File {
+    fn from_file(
+        archive_path: String,
+        file: Ba2File<'static>,
+        spool: &DiskSpoolWriter,
+    ) -> Result<Self> {
+        let ranges = spool.append(file.iter().map(Chunk::as_bytes))?;
+        let chunks = file
+            .iter()
+            .zip(ranges)
+            .map(|(chunk, range)| SpooledChunk {
+                range,
+                decompressed_len: chunk.decompressed_len(),
+                mips: chunk.mips.clone(),
+            })
+            .collect();
+
+        Ok(Self {
+            key: ArchiveKey::from(archive_path.as_bytes()),
+            header: file.header.clone(),
+            chunks,
+        })
+    }
+
+    fn materialize<'spool>(self, spool: &'spool [u8]) -> (ArchiveKey<'static>, Ba2File<'spool>) {
+        let chunks = self.chunks.into_iter().map(|metadata| {
+            let bytes = &spool[metadata.range];
+            let mut chunk = match metadata.decompressed_len {
+                Some(len) => Chunk::from_compressed(bytes, len),
+                None => Chunk::from_decompressed(bytes),
+            };
+            chunk.mips = metadata.mips;
+            chunk
+        });
+        let mut file: Ba2File<'spool> = chunks.collect();
+        file.header = self.header;
+        (self.key, file)
+    }
 }
 
 /// Builder for creating BA2 archives
@@ -211,8 +280,9 @@ impl Ba2Builder {
 
     /// Build and write the BA2 to disk.
     ///
-    /// Reads files from disk on demand during parallel compression.
-    /// Peak memory ≈ num_rayon_threads * largest_file_size (not total archive size).
+    /// Files are compressed in parallel and immediately moved to a disk-backed
+    /// spool. Peak anonymous memory is therefore bounded by active workers,
+    /// rather than growing to the complete compressed archive size.
     pub fn build(self, output_path: &Path) -> Result<()> {
         if self.is_empty() {
             bail!("Cannot create empty BA2 archive");
@@ -245,8 +315,16 @@ impl Ba2Builder {
 
         let compress = self.compression != Ba2CompressionFormat::None;
 
-        // Read + compress files in parallel. Each thread reads one file at a time.
-        let archive_entries: Result<Vec<(ArchiveKey<'static>, Ba2File<'static>)>> = entries
+        let spool = DiskSpool::new_near(output_path)?;
+        let spool_writer = spool.writer();
+        let compression_options = ChunkCompressionOptions::builder()
+            .compression_format(self.compression.to_crate_format())
+            .compression_level(CompressionLevel::FO4)
+            .build();
+
+        // Compress at full rayon parallelism, but spill each finished file
+        // immediately. Only one file per active worker remains anonymous RAM.
+        let archive_entries: Result<Vec<SpooledBa2File>> = entries
             .into_par_iter()
             .map(|entry| {
                 let data = fs::read(&entry.disk_path).with_context(|| {
@@ -256,8 +334,7 @@ impl Ba2Builder {
                 let chunk = Chunk::from_decompressed(data.into_boxed_slice());
 
                 let chunk = if compress {
-                    let options = ChunkCompressionOptions::default();
-                    match chunk.compress(&options) {
+                    match chunk.compress(&compression_options) {
                         Ok(compressed) => compressed,
                         Err(_) => chunk,
                     }
@@ -266,21 +343,22 @@ impl Ba2Builder {
                 };
 
                 let file: Ba2File = [chunk].into_iter().collect();
-                let key: ArchiveKey = entry.archive_path.as_bytes().into();
-
-                Ok((key, file))
+                SpooledBa2File::from_file(entry.archive_path, file, &spool_writer)
             })
             .collect();
 
         let archive_entries = archive_entries?;
-
-        // Build archive from entries
-        let archive: Archive = archive_entries.into_iter().collect();
+        let mapping = spool.map()?;
+        let archive: Archive = archive_entries
+            .into_iter()
+            .map(|entry| entry.materialize(&mapping))
+            .collect();
 
         // Configure options with version from modlist
         let options = ArchiveOptionsBuilder::default()
             .version(self.version.to_crate_version())
             .strings(self.strings)
+            .compression_format(self.compression.to_crate_format())
             .build();
 
         // Create parent directory
@@ -325,7 +403,7 @@ impl Ba2Builder {
         // Build read options for DX10 format
         let read_options = FileReadOptionsBuilder::new()
             .format(Format::DX10)
-            .compression_format(Ba2CrateCompression::Zip)
+            .compression_format(self.compression.to_crate_format())
             .compression_level(CompressionLevel::FO4)
             .compression_result(if compress {
                 CompressionResult::Compressed
@@ -334,8 +412,12 @@ impl Ba2Builder {
             })
             .build();
 
-        // Read + compress files in parallel — one file per rayon thread
-        let archive_entries: Result<Vec<(ArchiveKey<'static>, Ba2File<'static>)>> = entries
+        let spool = DiskSpool::new_near(output_path)?;
+        let spool_writer = spool.writer();
+
+        // Read + compress files in parallel, spilling each completed texture
+        // into the shared disk-backed spool before accepting more work.
+        let archive_entries: Result<Vec<SpooledBa2File>> = entries
             .into_par_iter()
             .map(|entry| {
                 let data = fs::read(&entry.disk_path).with_context(|| {
@@ -346,19 +428,22 @@ impl Ba2Builder {
                     format!("Failed to parse DDS texture: {}", entry.archive_path)
                 })?;
 
-                let key: ArchiveKey = entry.archive_path.as_bytes().into();
-                Ok((key, file))
+                SpooledBa2File::from_file(entry.archive_path, file, &spool_writer)
             })
             .collect();
 
         let archive_entries = archive_entries?;
-        let archive: Archive = archive_entries.into_iter().collect();
+        let mapping = spool.map()?;
+        let archive: Archive = archive_entries
+            .into_iter()
+            .map(|entry| entry.materialize(&mapping))
+            .collect();
 
         // DX10 format requires format flag set in archive options
         let options = ArchiveOptionsBuilder::default()
             .version(self.version.to_crate_version())
             .format(Format::DX10)
-            .compression_format(Ba2CrateCompression::Zip)
+            .compression_format(self.compression.to_crate_format())
             .strings(self.strings)
             .build();
 
@@ -392,6 +477,7 @@ impl Default for Ba2Builder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ba2::fo4::FileWriteOptions;
     use tempfile::tempdir;
 
     #[test]
@@ -408,7 +494,7 @@ mod tests {
         let dir = tempdir()?;
         let output = dir.path().join("test.ba2");
 
-        let mut builder = Ba2Builder::new().with_compression(Ba2CompressionFormat::None);
+        let mut builder = Ba2Builder::new().with_compression(Ba2CompressionFormat::Zlib);
 
         // Write staged files to disk
         let f1 = dir.path().join("hello.txt");
@@ -425,10 +511,101 @@ mod tests {
         assert!(output.exists());
 
         // Try to read it back using the path
-        let (archive, _) =
+        let (archive, options) =
             Archive::read(output.as_path()).with_context(|| "Failed to read created BA2")?;
 
         assert_eq!(archive.len(), 2);
+
+        let key = ArchiveKey::from(b"test/hello.txt".as_slice());
+        let archived = archive.get(&key).context("hello.txt missing from BA2")?;
+        let write_options: FileWriteOptions = options.into();
+        let mut restored = Vec::new();
+        archived.write(&mut restored, &write_options)?;
+        assert_eq!(restored, b"Hello world!");
+
+        // The disk spool changes storage ownership only. Verify that it still
+        // produces exactly the bytes emitted by the crate's original fully
+        // in-memory construction path (important for Wabbajack output hashes).
+        let compression = ChunkCompressionOptions::builder()
+            .compression_format(Ba2CrateCompression::Zip)
+            .compression_level(CompressionLevel::FO4)
+            .build();
+        let reference_entries = [
+            ("test/hello.txt", b"Hello world!".as_slice()),
+            ("test/sub/world.txt", b"World!".as_slice()),
+        ]
+        .into_iter()
+        .map(|(path, data)| {
+            let chunk = Chunk::from_decompressed(data.to_vec().into_boxed_slice())
+                .compress(&compression)?;
+            let file: Ba2File = [chunk].into_iter().collect();
+            Ok((ArchiveKey::from(path.as_bytes()), file))
+        })
+        .collect::<Result<Vec<_>>>()?;
+        let reference_archive: Archive = reference_entries.into_iter().collect();
+        let reference_options = ArchiveOptionsBuilder::default()
+            .version(Version::v7)
+            .strings(true)
+            .compression_format(Ba2CrateCompression::Zip)
+            .build();
+        let mut reference_bytes = Vec::new();
+        reference_archive.write(&mut reference_bytes, &reference_options)?;
+        assert_eq!(fs::read(&output)?, reference_bytes);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_dx10_ba2_matches_in_memory_writer() -> Result<()> {
+        use image_dds::ddsfile::{D3DFormat, Dds, NewD3dParams};
+
+        let dir = tempdir()?;
+        let source = dir.path().join("texture.dds");
+        let output = dir.path().join("Example - Textures.ba2");
+        let mut dds = Dds::new_d3d(NewD3dParams {
+            height: 64,
+            width: 64,
+            depth: None,
+            format: D3DFormat::DXT1,
+            mipmap_levels: Some(1),
+            caps2: None,
+        })?;
+        for (index, byte) in dds.data.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        let mut source_file = fs::File::create(&source)?;
+        dds.write(&mut source_file)?;
+
+        let mut builder = Ba2Builder::from_name("Example - Textures.ba2")
+            .with_version(Ba2Version::V8)
+            .with_compression(Ba2CompressionFormat::Zlib);
+        builder.add_file("textures/example/texture.dds", source.clone());
+        builder.build(&output)?;
+
+        let source_bytes = fs::read(&source)?;
+        let read_options = FileReadOptionsBuilder::new()
+            .format(Format::DX10)
+            .compression_format(Ba2CrateCompression::Zip)
+            .compression_level(CompressionLevel::FO4)
+            .compression_result(CompressionResult::Compressed)
+            .build();
+        let file = Ba2File::read(Copied(&source_bytes), &read_options)?;
+        let key = ArchiveKey::from(b"textures/example/texture.dds".as_slice());
+        let reference: Archive = [(key, file)].into_iter().collect();
+        let options = ArchiveOptionsBuilder::default()
+            .version(Version::v8)
+            .format(Format::DX10)
+            .compression_format(Ba2CrateCompression::Zip)
+            .strings(true)
+            .build();
+        let mut reference_bytes = Vec::new();
+        reference.write(&mut reference_bytes, &options)?;
+
+        assert_eq!(fs::read(&output)?, reference_bytes);
+        let (archive, read_back_options) = Archive::read(output.as_path())?;
+        assert_eq!(archive.len(), 1);
+        assert_eq!(read_back_options.format(), Format::DX10);
+        assert_eq!(read_back_options.version(), Version::v8);
 
         Ok(())
     }
