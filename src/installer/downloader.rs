@@ -10,7 +10,7 @@ use crate::downloaders::{
     MediaFireDownloader, NexusDownloader, ProgressCallback as HttpProgressCallback,
     WabbajackCdnDownloader, YandexDownloader,
 };
-use crate::hash::{verify_file_hash, verify_file_hash_detailed};
+use crate::hash::{compute_file_hash, verify_file_hash, verify_file_hash_detailed};
 use crate::modlist::{ArchiveInfo, DownloadState, ModlistDb};
 
 use super::config::{InstallConfig, ProgressEvent};
@@ -20,7 +20,7 @@ use anyhow::{bail, Context, Result};
 use futures::stream::{self, StreamExt};
 use rayon::prelude::*;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -135,6 +135,160 @@ fn scan_existing_outputs(output_dir: &Path) -> Result<HashMap<String, u64>> {
     }
 
     Ok(existing)
+}
+
+/// Find manually supplied archives in the top level of the downloads directory.
+///
+/// Wabbajack identifies archives by size and xxHash64 rather than by filename.
+/// Callers check canonical paths (including their sidecar fast path) and exclude
+/// them from this fallback, which runs before slow canonical hash verification
+/// so a bad canonical file cannot block a valid differently named archive. The
+/// directory is read once, entries are processed in path order for deterministic
+/// duplicate handling, and a candidate is hashed at most once.
+fn find_manual_archive_matches(
+    downloads_dir: &Path,
+    expected: &[(String, u64)],
+    excluded_paths: &HashSet<PathBuf>,
+) -> Result<HashMap<String, PathBuf>> {
+    if expected.is_empty() || !downloads_dir.is_dir() {
+        return Ok(HashMap::new());
+    }
+
+    // Group expected hashes by size so files with the wrong size are rejected
+    // without being read. Keep the hash-to-size relationship as well because a
+    // malformed manifest could theoretically contain the same hash with two
+    // different sizes.
+    let mut hashes_by_size: HashMap<u64, HashSet<String>> = HashMap::new();
+    let mut expected_sizes_by_hash: HashMap<String, HashSet<u64>> = HashMap::new();
+    for (hash, size) in expected {
+        hashes_by_size
+            .entry(*size)
+            .or_default()
+            .insert(hash.clone());
+        expected_sizes_by_hash
+            .entry(hash.clone())
+            .or_default()
+            .insert(*size);
+    }
+
+    let mut entries: Vec<PathBuf> = fs::read_dir(downloads_dir)
+        .with_context(|| {
+            format!(
+                "Failed to scan downloads directory for local archives: {}",
+                downloads_dir.display()
+            )
+        })?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect();
+    entries.sort();
+
+    let mut matches = HashMap::new();
+    let mut remaining_hashes: HashSet<String> = expected_sizes_by_hash.keys().cloned().collect();
+
+    for path in entries {
+        if remaining_hashes.is_empty() {
+            break;
+        }
+        if excluded_paths.contains(&path) || is_ignored_manual_archive_candidate(&path) {
+            continue;
+        }
+
+        let file_type = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta.file_type(),
+            Err(_) => continue,
+        };
+        // Do not follow symlinks or consider directories as user archives.
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let size = match fs::metadata(&path) {
+            Ok(meta) => meta.len(),
+            Err(_) => continue,
+        };
+        let Some(size_hashes) = hashes_by_size.get(&size) else {
+            continue;
+        };
+
+        // This is the only hash operation for this candidate. In particular,
+        // files with a non-matching size never reach the hash function.
+        let actual_hash = match compute_file_hash(&path) {
+            Ok(hash) => hash,
+            Err(error) => {
+                debug!(
+                    "Unable to hash local archive candidate '{}': {}",
+                    path.display(),
+                    error
+                );
+                continue;
+            }
+        };
+        if !size_hashes.contains(&actual_hash)
+            || !expected_sizes_by_hash
+                .get(&actual_hash)
+                .is_some_and(|sizes| sizes.contains(&size))
+        {
+            continue;
+        }
+
+        // Entries are sorted, so the first matching file wins deterministically
+        // when a directory contains duplicate copies of an archive.
+        if matches.contains_key(&actual_hash) {
+            continue;
+        }
+        matches.insert(actual_hash.clone(), path);
+        remaining_hashes.remove(&actual_hash);
+    }
+
+    Ok(matches)
+}
+
+/// Sidecars and files left by interrupted downloads are metadata, not archive
+/// candidates. Hidden CLF3 working files and common temporary suffixes are also
+/// excluded so they cannot accidentally satisfy a manifest hash.
+fn is_ignored_manual_archive_candidate(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return true;
+    };
+    let lower_name = name.to_ascii_lowercase();
+    name.starts_with('.')
+        || lower_name.ends_with(".clf3hash")
+        || lower_name.ends_with(".clf3manifest")
+        || lower_name.ends_with(".part")
+        || lower_name.ends_with(".partial")
+        || lower_name.ends_with(".tmp")
+}
+
+/// Verify an archive path using the same size and hash expectations as the
+/// canonical-path checks. A DB local_path is only reusable after this check;
+/// its completed status alone is not trusted.
+fn existing_archive_path_matches(path: &Path, archive: &ArchiveInfo) -> Result<bool> {
+    let meta = match fs::metadata(path) {
+        Ok(meta) if meta.is_file() => meta,
+        Ok(_) | Err(_) => return Ok(false),
+    };
+    if meta.len() != archive.size as u64 {
+        return Ok(false);
+    }
+    if super::sidecar::archive_hash_valid(path, &archive.hash) {
+        return Ok(true);
+    }
+    Ok(verify_archive_hash_or_miss(path, &archive.hash))
+}
+
+/// A stale or unreadable DB path is a cache miss, not a download-phase error.
+fn verify_archive_hash_or_miss(path: &Path, expected_hash: &str) -> bool {
+    match verify_file_hash(path, expected_hash) {
+        Ok(matches) => matches,
+        Err(error) => {
+            debug!(
+                "Unable to verify existing archive path '{}': {}",
+                path.display(),
+                error
+            );
+            false
+        }
+    }
 }
 
 /// Download statistics
@@ -285,8 +439,9 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
     let mut already_downloaded = 0usize;
     let mut already_downloaded_size: u64 = 0;
     let mut need_download: Vec<ArchiveInfo> = Vec::new();
-    let mut missing_named_count = 0usize;
-    let mut missing_named_examples: Vec<String> = Vec::new();
+    let mut fallback_archives: Vec<ArchiveInfo> = Vec::new();
+    let mut excluded_fallback_paths: HashSet<PathBuf> = HashSet::new();
+    let mut verified_local_path_hits = 0usize;
 
     // First pass: check which archives exist — sidecar cache skips re-hashing
     let mut archives_to_verify: Vec<(ArchiveInfo, PathBuf)> = Vec::new();
@@ -302,6 +457,7 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
 
         let output_path = config.downloads_dir.join(&archive.name);
         if output_path.exists() {
+            excluded_fallback_paths.insert(output_path.clone());
             if let Ok(meta) = fs::metadata(&output_path) {
                 if meta.len() != archive.size as u64 {
                     warn!(
@@ -312,7 +468,10 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
                     );
                 }
                 // Fast path: sidecar cache says hash+size+mtime match — skip re-hashing
-                if super::sidecar::archive_hash_valid(&output_path, &archive.hash) {
+                if meta.is_file()
+                    && meta.len() == archive.size as u64
+                    && super::sidecar::archive_hash_valid(&output_path, &archive.hash)
+                {
                     db.mark_archive_downloaded(
                         &archive.hash,
                         output_path.to_string_lossy().as_ref(),
@@ -322,16 +481,65 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
                     sidecar_hits += 1;
                     continue;
                 }
+                if let Some(local_path) = archive.local_path.as_deref().map(PathBuf::from) {
+                    // A previous fallback match may have been recorded in the
+                    // DB while a stale canonical file was later copied in.
+                    // Validate that path too before hashing or replacing it.
+                    if local_path != output_path
+                        && existing_archive_path_matches(&local_path, &archive)?
+                    {
+                        db.mark_archive_downloaded(
+                            &archive.hash,
+                            local_path.to_string_lossy().as_ref(),
+                        )?;
+                        if let Err(e) =
+                            super::sidecar::write_archive_hash(&local_path, &archive.hash)
+                        {
+                            debug!(
+                                "Failed to write archive sidecar for {}: {}",
+                                local_path.display(),
+                                e
+                            );
+                        }
+                        already_downloaded += 1;
+                        already_downloaded_size += archive.size as u64;
+                        verified_local_path_hits += 1;
+                        continue;
+                    }
+                }
                 // Slow path: need to actually hash the file
                 archives_to_verify.push((archive, output_path));
+                fallback_archives.push(archives_to_verify.last().unwrap().0.clone());
                 continue;
             }
-        } else {
-            // Important UX signal: copied archives must match the exact expected name/path.
-            missing_named_count += 1;
-            if missing_named_examples.len() < 5 {
-                missing_named_examples.push(archive.name.clone());
+            warn!(
+                "Unable to inspect existing archive '{}'; will try another local path or redownload",
+                output_path.display()
+            );
+        }
+
+        if let Some(local_path) = archive.local_path.as_deref().map(PathBuf::from) {
+            // A previous run may have stored a differently named path. Verify it
+            // before reusing it; a completed DB status is not sufficient proof.
+            if local_path != output_path && existing_archive_path_matches(&local_path, &archive)? {
+                db.mark_archive_downloaded(&archive.hash, local_path.to_string_lossy().as_ref())?;
+                if let Err(e) = super::sidecar::write_archive_hash(&local_path, &archive.hash) {
+                    debug!(
+                        "Failed to write archive sidecar for {}: {}",
+                        local_path.display(),
+                        e
+                    );
+                }
+                already_downloaded += 1;
+                already_downloaded_size += archive.size as u64;
+                verified_local_path_hits += 1;
+                continue;
             }
+            // If local_path is stale, continue through the fallback matcher and
+            // eventually schedule a download if no valid alternate exists.
+            fallback_archives.push(archive.clone());
+        } else {
+            fallback_archives.push(archive.clone());
         }
         need_download.push(archive);
     }
@@ -341,14 +549,80 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
             sidecar_hits
         ));
     }
+    if verified_local_path_hits > 0 {
+        reporter.log(&format!(
+            "  {} archives reused from verified database local paths",
+            verified_local_path_hits
+        ));
+    }
 
-    if missing_named_count > 0 {
+    // Search all unresolved archives together so each top-level candidate is
+    // considered once. Exact-name files are excluded because they are either
+    // sidecar hits or already queued for the normal verification pass.
+    let fallback_expected: Vec<(String, u64)> = fallback_archives
+        .iter()
+        .map(|archive| (archive.hash.clone(), archive.size as u64))
+        .collect();
+    let fallback_matches = find_manual_archive_matches(
+        &config.downloads_dir,
+        &fallback_expected,
+        &excluded_fallback_paths,
+    )?;
+    let mut fallback_matched_hashes = HashSet::new();
+    let mut fallback_hit_count = 0usize;
+    for archive in &fallback_archives {
+        let Some(path) = fallback_matches.get(&archive.hash) else {
+            continue;
+        };
+        // The DB normally has one row per hash, but avoid double-counting a
+        // malformed manifest that repeats the same archive record.
+        if !fallback_matched_hashes.insert(archive.hash.clone()) {
+            continue;
+        }
+        db.mark_archive_downloaded(&archive.hash, path.to_string_lossy().as_ref())?;
+        if let Err(e) = super::sidecar::write_archive_hash(path, &archive.hash) {
+            debug!(
+                "Failed to write archive sidecar for {}: {}",
+                path.display(),
+                e
+            );
+        }
+        already_downloaded += 1;
+        already_downloaded_size += archive.size as u64;
+        fallback_hit_count += 1;
+        reporter.log(&format!(
+            "Matched manually supplied archive '{}' to expected '{}' by size and hash",
+            path.file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default(),
+            archive.name
+        ));
+    }
+    if fallback_hit_count > 0 {
+        reporter.log(&format!(
+            "  {} differently named archive(s) reused from the downloads directory",
+            fallback_hit_count
+        ));
+    }
+
+    archives_to_verify.retain(|(archive, _)| !fallback_matched_hashes.contains(&archive.hash));
+    need_download.retain(|archive| !fallback_matched_hashes.contains(&archive.hash));
+
+    let unresolved_missing_named: Vec<&ArchiveInfo> = need_download
+        .iter()
+        .filter(|archive| !config.downloads_dir.join(&archive.name).exists())
+        .collect();
+    if !unresolved_missing_named.is_empty() {
+        let examples = unresolved_missing_named
+            .iter()
+            .take(5)
+            .map(|archive| archive.name.as_str())
+            .collect::<Vec<_>>();
         warn!(
-            "{} required archives were not found at exact expected path/name under '{}'. \
-Copied files with different names will not be reused. Examples: {}",
-            missing_named_count,
+            "{} required archives were not found at an exact or matching path under '{}'. Examples: {}",
+            unresolved_missing_named.len(),
             config.downloads_dir.display(),
-            missing_named_examples.join(", ")
+            examples.join(", ")
         );
     }
 
@@ -395,9 +669,7 @@ Copied files with different names will not be reused. Examples: {}",
         verify_status.finish();
 
         // Process results sequentially (DB writes, file deletes, bookkeeping)
-        for ((archive, output_path), result) in
-            archives_to_verify.iter().zip(verify_results.into_iter())
-        {
+        for ((archive, output_path), result) in archives_to_verify.iter().zip(verify_results) {
             match result {
                 Ok((true, _actual_hash)) => {
                     // Hash matches - archive is valid, write sidecar for next run
@@ -767,6 +1039,9 @@ pub async fn download_archives_streaming(
     let mut need_download: Vec<ArchiveInfo> = Vec::new();
     let mut archives_to_verify: Vec<(ArchiveInfo, PathBuf)> = Vec::new();
     let mut sidecar_verified: Vec<(ArchiveInfo, PathBuf)> = Vec::new();
+    let mut verified_local_paths: Vec<(ArchiveInfo, PathBuf)> = Vec::new();
+    let mut fallback_archives: Vec<ArchiveInfo> = Vec::new();
+    let mut excluded_fallback_paths: HashSet<PathBuf> = HashSet::new();
 
     for archive in archives_to_check {
         if let Some(path) = resolve_game_file_source_archive(config, &archive) {
@@ -783,18 +1058,150 @@ pub async fn download_archives_streaming(
 
         let output_path = config.downloads_dir.join(&archive.name);
         if output_path.exists() && fs::metadata(&output_path).is_ok() {
+            excluded_fallback_paths.insert(output_path.clone());
             // Fast path: sidecar cache says hash+size+mtime match
-            if super::sidecar::archive_hash_valid(&output_path, &archive.hash) {
+            if fs::metadata(&output_path)
+                .map(|meta| meta.is_file() && meta.len() == archive.size as u64)
+                .unwrap_or(false)
+                && super::sidecar::archive_hash_valid(&output_path, &archive.hash)
+            {
                 db.mark_archive_downloaded(&archive.hash, output_path.to_string_lossy().as_ref())?;
                 already_downloaded += 1;
                 already_downloaded_size += archive.size as u64;
                 sidecar_verified.push((archive, output_path));
                 continue;
             }
+            if let Some(local_path) = archive.local_path.as_deref().map(PathBuf::from) {
+                if local_path != output_path
+                    && existing_archive_path_matches(&local_path, &archive)?
+                {
+                    db.mark_archive_downloaded(
+                        &archive.hash,
+                        local_path.to_string_lossy().as_ref(),
+                    )?;
+                    if let Err(e) = super::sidecar::write_archive_hash(&local_path, &archive.hash) {
+                        debug!(
+                            "Failed to write archive sidecar for {}: {}",
+                            local_path.display(),
+                            e
+                        );
+                    }
+                    already_downloaded += 1;
+                    already_downloaded_size += archive.size as u64;
+                    verified_local_paths.push((archive, local_path));
+                    continue;
+                }
+            }
             archives_to_verify.push((archive, output_path));
+            fallback_archives.push(archives_to_verify.last().unwrap().0.clone());
             continue;
         }
+        if let Some(local_path) = archive.local_path.as_deref().map(PathBuf::from) {
+            if local_path != output_path && existing_archive_path_matches(&local_path, &archive)? {
+                db.mark_archive_downloaded(&archive.hash, local_path.to_string_lossy().as_ref())?;
+                if let Err(e) = super::sidecar::write_archive_hash(&local_path, &archive.hash) {
+                    debug!(
+                        "Failed to write archive sidecar for {}: {}",
+                        local_path.display(),
+                        e
+                    );
+                }
+                already_downloaded += 1;
+                already_downloaded_size += archive.size as u64;
+                verified_local_paths.push((archive, local_path));
+                continue;
+            }
+        }
+        fallback_archives.push(archive.clone());
         need_download.push(archive);
+    }
+
+    // Share the same size-filtered, hash-based fallback as the batch path.
+    let fallback_expected: Vec<(String, u64)> = fallback_archives
+        .iter()
+        .map(|archive| (archive.hash.clone(), archive.size as u64))
+        .collect();
+    let fallback_matches = find_manual_archive_matches(
+        &config.downloads_dir,
+        &fallback_expected,
+        &excluded_fallback_paths,
+    )?;
+    let mut fallback_matched_hashes = HashSet::new();
+    let mut fallback_hit_count = 0usize;
+    let mut fallback_ready_archives: Vec<&ArchiveInfo> = fallback_archives
+        .iter()
+        .filter(|archive| fallback_matches.contains_key(&archive.hash))
+        .collect();
+    if let Some(prio) = priority {
+        // Keep the same BSA-first ordering used for verified and downloaded
+        // archives so manually supplied files do not delay their consumers.
+        fallback_ready_archives.sort_by(|a, b| {
+            let pa = prio.get(&a.hash).copied().unwrap_or(0);
+            let pb = prio.get(&b.hash).copied().unwrap_or(0);
+            pb.cmp(&pa)
+        });
+    }
+    for archive in fallback_ready_archives {
+        let Some(path) = fallback_matches.get(&archive.hash) else {
+            continue;
+        };
+        if !fallback_matched_hashes.insert(archive.hash.clone()) {
+            continue;
+        }
+        db.mark_archive_downloaded(&archive.hash, path.to_string_lossy().as_ref())?;
+        if let Err(e) = super::sidecar::write_archive_hash(path, &archive.hash) {
+            debug!(
+                "Failed to write archive sidecar for {}: {}",
+                path.display(),
+                e
+            );
+        }
+        already_downloaded += 1;
+        already_downloaded_size += archive.size as u64;
+        fallback_hit_count += 1;
+        reporter.log(&format!(
+            "Matched manually supplied archive '{}' to expected '{}' by size and hash",
+            path.file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default(),
+            archive.name
+        ));
+        let _ = tx.send(ArchiveEvent::Ready {
+            hash: archive.hash.clone(),
+            name: archive.name.clone(),
+            path: path.clone(),
+        });
+    }
+    if fallback_hit_count > 0 {
+        reporter.log(&format!(
+            "  {} differently named archive(s) reused from the downloads directory",
+            fallback_hit_count
+        ));
+    }
+    archives_to_verify.retain(|(archive, _)| !fallback_matched_hashes.contains(&archive.hash));
+    need_download.retain(|archive| !fallback_matched_hashes.contains(&archive.hash));
+
+    // Emit verified database paths in priority order, just like sidecar and
+    // canonical-path hits, so reruns preserve BSA-first streaming behavior.
+    if !verified_local_paths.is_empty() {
+        reporter.log(&format!(
+            "  {} archives reused from verified database local paths",
+            verified_local_paths.len()
+        ));
+        if let Some(prio) = priority {
+            verified_local_paths.sort_by(|a, b| {
+                let pa = prio.get(&a.0.hash).copied().unwrap_or(0);
+                let pb = prio.get(&b.0.hash).copied().unwrap_or(0);
+                pb.cmp(&pa)
+            });
+        }
+        for (archive, path) in verified_local_paths {
+            let _ = tx.send(ArchiveEvent::Ready {
+                hash: archive.hash.clone(),
+                name: archive.name.clone(),
+                path,
+            });
+        }
     }
 
     // Emit sidecar-verified archives immediately (no hashing needed)
@@ -2394,6 +2801,7 @@ async fn download_non_nexus_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn extract_moddb_start_url_from_addon_page() {
@@ -2411,5 +2819,100 @@ mod tests {
             mirror,
             "https://www.moddb.com/downloads/mirror/88982/130/abc123"
         );
+    }
+
+    #[test]
+    fn manual_archive_matcher_reuses_differently_named_file() -> Result<()> {
+        let downloads = tempfile::tempdir()?;
+        let content = b"recovered archive contents";
+        let alternate = downloads.path().join("Attack-MCO-DXP-v1606.zip");
+        fs::write(&alternate, content)?;
+        let expected_hash = compute_file_hash(&alternate)?;
+
+        let matches = find_manual_archive_matches(
+            downloads.path(),
+            &[(expected_hash.clone(), content.len() as u64)],
+            &HashSet::new(),
+        )?;
+
+        assert_eq!(matches.get(&expected_hash), Some(&alternate));
+        Ok(())
+    }
+
+    #[test]
+    fn manual_archive_matcher_rejects_wrong_hash_and_size() -> Result<()> {
+        let downloads = tempfile::tempdir()?;
+        let wrong_hash_file = downloads.path().join("same-size-wrong-hash.zip");
+        fs::write(&wrong_hash_file, b"wrong content")?;
+        let expected_hash = crate::hash::compute_bytes_hash(b"right content");
+
+        let wrong_hash_matches = find_manual_archive_matches(
+            downloads.path(),
+            &[(expected_hash, fs::metadata(&wrong_hash_file)?.len())],
+            &HashSet::new(),
+        )?;
+        assert!(wrong_hash_matches.is_empty());
+
+        let wrong_size_matches = find_manual_archive_matches(
+            downloads.path(),
+            &[(
+                compute_file_hash(&wrong_hash_file)?,
+                fs::metadata(&wrong_hash_file)?.len() + 1,
+            )],
+            &HashSet::new(),
+        )?;
+        assert!(wrong_size_matches.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn manual_archive_matcher_does_not_let_canonical_wrong_file_mask_alternate() -> Result<()> {
+        let downloads = tempfile::tempdir()?;
+        let canonical = downloads.path().join("expected-name.zip");
+        let alternate = downloads.path().join("recovered-copy.zip");
+        fs::write(&canonical, b"wrong archive")?;
+        fs::write(&alternate, b"valid archive")?;
+        let expected_hash = compute_file_hash(&alternate)?;
+        let mut excluded = HashSet::new();
+        excluded.insert(canonical.clone());
+
+        let matches = find_manual_archive_matches(
+            downloads.path(),
+            &[(expected_hash.clone(), fs::metadata(&alternate)?.len())],
+            &excluded,
+        )?;
+
+        assert_eq!(matches.get(&expected_hash), Some(&alternate));
+        Ok(())
+    }
+
+    #[test]
+    fn manual_archive_matcher_chooses_deterministic_duplicate_and_skips_artifacts() -> Result<()> {
+        let downloads = tempfile::tempdir()?;
+        let first = downloads.path().join("a-copy.zip");
+        let second = downloads.path().join("z-copy.zip");
+        fs::write(&first, b"same archive")?;
+        fs::write(&second, b"same archive")?;
+        fs::write(downloads.path().join("ignored.clf3hash"), b"same archive")?;
+        fs::write(downloads.path().join("ignored.partial"), b"same archive")?;
+        let expected_hash = compute_file_hash(&first)?;
+
+        let matches = find_manual_archive_matches(
+            downloads.path(),
+            &[(expected_hash.clone(), fs::metadata(&first)?.len())],
+            &HashSet::new(),
+        )?;
+
+        assert_eq!(matches.get(&expected_hash), Some(&first));
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_archive_hash_is_treated_as_a_cache_miss() -> Result<()> {
+        let downloads = tempfile::tempdir()?;
+        let missing = downloads.path().join("missing.archive");
+
+        assert!(!verify_archive_hash_or_miss(&missing, "expected-hash"));
+        Ok(())
     }
 }
