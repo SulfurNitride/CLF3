@@ -1829,7 +1829,7 @@ fn find_file_in_temp_dir(temp_dir: &Path, file_path: &str) -> Option<PathBuf> {
 }
 
 /// Read a single file from an archive without bulk extraction.
-/// Works for ZIP (iterate to find entry) and BSA/BA2 (direct file access).
+/// Uses native ZIP/Bethesda readers and the general extractor for other formats.
 fn read_single_file_from_archive(
     archive_path: &Path,
     archive_type: ArchiveType,
@@ -1860,13 +1860,31 @@ fn read_single_file_from_archive(
         ArchiveType::Tes3Bsa | ArchiveType::Bsa | ArchiveType::Ba2 => {
             bsa::extract_archive_file(archive_path, file_path)
         }
-        _ => {
-            anyhow::bail!(
-                "Cannot read individual files from archive type {:?}",
-                archive_type
-            )
-        }
+        _ => crate::archive::sevenzip::extract_file_case_insensitive(archive_path, file_path),
     }
+}
+
+/// Follow nested archive members by their actual format, including .fomod files
+/// containing ZIP/7z archives. Keep temporary archives alive until the read ends.
+fn read_nested_texture_source(
+    archive_path: &Path,
+    members: &[String],
+    temp_root: &Path,
+) -> Result<Vec<u8>> {
+    let (member, remaining) = members
+        .split_first()
+        .context("Empty texture archive path")?;
+    let data =
+        read_single_file_from_archive(archive_path, detect_archive_type(archive_path)?, member)
+            .with_context(|| format!("Failed to read texture archive member {member}"))?;
+    if remaining.is_empty() {
+        return Ok(data);
+    }
+    let nested = tempfile::Builder::new()
+        .prefix(".clf3_texture_archive_")
+        .tempfile_in(temp_root)?;
+    fs::write(nested.path(), data)?;
+    read_nested_texture_source(nested.path(), remaining, temp_root)
 }
 
 /// Process TransformedTexture directives with progress display
@@ -2067,8 +2085,8 @@ fn process_transformed_texture(
                 None
             };
 
-            // Handle nested BSAs: extract BSA files to temp
-            let mut nested_bsa_temps: HashMap<String, tempfile::NamedTempFile> = HashMap::new();
+            // Extract nested archives once; their contents may be BSA, BA2, ZIP, 7z, or RAR.
+            let mut nested_archive_temps: HashMap<String, tempfile::NamedTempFile> = HashMap::new();
             {
                 let mut needed_bsas: HashMap<String, HashSet<String>> = HashMap::new();
                 for (_, d) in &to_process {
@@ -2086,18 +2104,12 @@ fn process_transformed_texture(
                         read_single_file_from_archive(&archive_path, archive_type, bsa_path).ok()
                     };
                     if let Some(data) = bsa_data {
-                        let suffix = if bsa_path.to_lowercase().ends_with(".ba2") {
-                            ".ba2"
-                        } else {
-                            ".bsa"
-                        };
                         if let Ok(temp_bsa) = tempfile::Builder::new()
-                            .prefix(".clf3_bsa_")
-                            .suffix(suffix)
+                            .prefix(".clf3_texture_archive_")
                             .tempfile_in(&ctx.config.output_dir)
                         {
                             if fs::write(temp_bsa.path(), &data).is_ok() {
-                                nested_bsa_temps.insert(bsa_path.clone(), temp_bsa);
+                                nested_archive_temps.insert(bsa_path.clone(), temp_bsa);
                             }
                         }
                     }
@@ -2115,10 +2127,15 @@ fn process_transformed_texture(
                     }
                 } else if directive.archive_hash_path.len() >= 3 {
                     let bsa_path = &directive.archive_hash_path[1];
-                    let file_in_bsa = &directive.archive_hash_path[2];
-                    nested_bsa_temps
-                        .get(bsa_path)
-                        .and_then(|tb| bsa::extract_archive_file(tb.path(), file_in_bsa).ok())
+                    nested_archive_temps.get(bsa_path).and_then(|archive| {
+                        read_nested_texture_source(
+                            archive.path(),
+                            &directive.archive_hash_path[2..],
+                            &ctx.config.output_dir,
+                        )
+                        .map_err(|e| warn!("Texture source {}: {e:#}", directive.to))
+                        .ok()
+                    })
                 } else {
                     None
                 };
@@ -2626,6 +2643,87 @@ fn process_single_directive(ctx: &ProcessContext, directive: &Directive) -> Resu
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_nested_texture_from_7z_fomod() {
+        let tmp = tempdir().unwrap();
+        let source = tmp.path().join("source");
+        fs::create_dir_all(source.join("textures/MCM")).unwrap();
+        let data = b"DDS test texture payload";
+        fs::write(source.join("textures/MCM/Meter.dds"), data).unwrap();
+        let fomod = tmp.path().join("The Mod Configuration Menu.fomod");
+        sevenz_rust2::compress_to_path(&source, &fomod).unwrap();
+        assert_eq!(detect_archive_type(&fomod).unwrap(), ArchiveType::SevenZ);
+        let actual =
+            read_nested_texture_source(&fomod, &["TEXTURES\\mcm\\meter.dds".into()], tmp.path())
+                .unwrap();
+        assert_eq!(actual, data);
+        assert!(read_nested_texture_source(
+            &fomod,
+            &["textures/MCM/missing.dds".into()],
+            tmp.path()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_nested_texture_follows_all_archive_members() {
+        use std::io::Write;
+        let tmp = tempdir().unwrap();
+        let inner = tmp.path().join("inner.fomod");
+        let mut zip = zip::ZipWriter::new(File::create(&inner).unwrap());
+        zip.start_file(
+            "textures/Meter.dds",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(b"DDS nested payload").unwrap();
+        zip.finish().unwrap();
+        let outer = tmp.path().join("outer.archive");
+        let mut zip = zip::ZipWriter::new(File::create(&outer).unwrap());
+        zip.start_file("Inner.fomod", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&fs::read(inner).unwrap()).unwrap();
+        zip.finish().unwrap();
+        assert_eq!(
+            read_nested_texture_source(
+                &outer,
+                &["inner.fomod".into(), "Textures\\Meter.dds".into()],
+                tmp.path()
+            )
+            .unwrap(),
+            b"DDS nested payload"
+        );
+        assert!(read_nested_texture_source(&outer, &[], tmp.path()).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires CLF3_MCM_ARCHIVE pointing to the downloaded MCM 1.5 archive"]
+    fn test_nested_texture_real_mcm_archive() {
+        let archive = PathBuf::from(std::env::var_os("CLF3_MCM_ARCHIVE").unwrap());
+        let tmp = tempdir().unwrap();
+        for name in [
+            "Meter",
+            "MeterArrow",
+            "Arrow",
+            "Check0",
+            "Check1",
+            "Icon",
+            "Indicator1",
+            "MCM",
+        ] {
+            let data = read_nested_texture_source(
+                &archive,
+                &[
+                    "The Mod Configuration Menu.fomod".into(),
+                    format!("textures\\MCM\\{name}.dds"),
+                ],
+                tmp.path(),
+            )
+            .unwrap();
+            assert!(data.starts_with(b"DDS "), "{name} is not a DDS texture");
+        }
+    }
 
     #[test]
     fn test_patch_basis_store_roundtrip() {
