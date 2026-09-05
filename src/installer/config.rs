@@ -6,6 +6,9 @@ use super::progress::ProgressReporter;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
+
+use super::host::HostedDownloadProvider;
 
 /// How the install pipeline schedules download vs. extraction work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +139,14 @@ pub struct InstallConfig {
     /// Recorded in the post-install manifest so `clf3 modlist update` can
     /// fall back to it when the gallery entry has moved.
     pub wabbajack_url: Option<String>,
+
+    /// Host-owned resolver used by Fluorine. When present, CLF3 never reads
+    /// Nexus credentials and never persists the returned signed URLs.
+    pub hosted_download_provider: Option<Arc<dyn HostedDownloadProvider>>,
+
+    /// Cooperative install cancellation. Hosted mode shares this with the
+    /// stdio bridge; standalone callers receive a fresh, uncancelled token.
+    pub cancellation_token: CancellationToken,
 }
 
 impl std::fmt::Debug for InstallConfig {
@@ -162,6 +173,10 @@ impl std::fmt::Debug for InstallConfig {
             .field("reporter", &"<reporter>")
             .field("loverslab_email", &self.loverslab_email)
             .field("loverslab_password", &"[REDACTED]")
+            .field(
+                "hosted_download_provider",
+                &self.hosted_download_provider.as_ref().map(|_| "<host>"),
+            )
             .finish()
     }
 }
@@ -204,7 +219,7 @@ impl InstallConfig {
             .as_deref()
             .map(|token| !token.trim().is_empty())
             .unwrap_or(false);
-        if !has_api_key && !has_oauth_token {
+        if !has_api_key && !has_oauth_token && self.hosted_download_provider.is_none() {
             return Err(ConfigError::MissingNexusKey);
         }
         if self.max_concurrent_downloads == 0 {

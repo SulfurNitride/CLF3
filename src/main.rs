@@ -27,7 +27,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use installer::{
     CliReporter, ExtractStrategy, InstallConfig, Installer, JsonEventWriter, JsonReporter,
-    ProgressCallback, ProgressMode, ProgressReporter,
+    ProgressCallback, ProgressMode, ProgressReporter, StdioHost,
 };
 
 /// CLI-facing enum for the `--extract` flag. Maps to the internal
@@ -97,6 +97,17 @@ struct Cli {
 enum Commands {
     /// Browse available Wabbajack modlists
     Browser,
+
+    /// Emit the Wabbajack gallery as JSON for graphical hosts.
+    Gallery {
+        /// Ignore the on-disk cache and refresh repository metadata.
+        #[arg(long)]
+        refresh: bool,
+
+        /// Include host-facing metadata such as locally detected game types.
+        #[arg(long)]
+        host_metadata: bool,
+    },
 
     /// Install a Wabbajack modlist
     Install {
@@ -178,6 +189,11 @@ enum Commands {
         /// Human-readable detail output is written to stderr in this mode.
         #[arg(long)]
         jackify: bool,
+
+        /// Resolve protected and manual downloads through a versioned stdio
+        /// host protocol. Requires --jackify.
+        #[arg(long)]
+        hosted: bool,
     },
 
     /// Download a .wabbajack file from the Wabbajack CDN
@@ -237,7 +253,6 @@ enum Commands {
         #[command(subcommand)]
         action: FluorineAction,
     },
-
 }
 
 #[derive(Subcommand)]
@@ -493,12 +508,66 @@ async fn main() -> Result<()> {
         });
     }
 
-
     match command {
         Commands::Browser => {
             if let Err(e) = browser_gui::launch_browser() {
                 eprintln!("Browser GUI error: {}", e);
                 std::process::exit(1);
+            }
+        }
+
+        Commands::Gallery {
+            refresh,
+            host_metadata,
+        } => {
+            let mut browser = modlist::ModlistBrowser::new()?;
+            if !refresh && modlist::ModlistBrowser::has_recent_cache() {
+                let _ = browser.load_cache();
+            }
+            if refresh || browser.modlists().is_empty() {
+                browser.fetch_modlists().await?;
+                let _ = browser.save_cache();
+            }
+            if host_metadata {
+                use game_finder::{detect_all_games, find_by_gog_id, find_by_steam_id, Launcher};
+                use std::collections::BTreeSet;
+
+                let search_index =
+                    if !refresh && modlist::ModlistBrowser::has_recent_search_index_cache() {
+                        modlist::ModlistBrowser::load_search_index_cache().ok()
+                    } else {
+                        match browser.fetch_search_index().await {
+                            Ok(index) => {
+                                let _ = modlist::ModlistBrowser::save_search_index_cache(&index);
+                                Some(index)
+                            }
+                            Err(error) => {
+                                eprintln!("[gallery] Mod filters unavailable: {error}");
+                                None
+                            }
+                        }
+                    };
+
+                let mut installed_games = BTreeSet::new();
+                for game in detect_all_games().games {
+                    let known = match game.launcher {
+                        Launcher::Steam { .. } => find_by_steam_id(&game.app_id),
+                        Launcher::Heroic { .. } => find_by_gog_id(&game.app_id),
+                    };
+                    if let Some(game_type) = known.and_then(|game| game.wabbajack_type) {
+                        installed_games.insert(game_type.to_ascii_lowercase());
+                    }
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "modlists": browser.modlists(),
+                        "installed_games": installed_games,
+                        "search_index": search_index,
+                    }))?
+                );
+            } else {
+                println!("{}", serde_json::to_string(browser.modlists())?);
             }
         }
 
@@ -650,7 +719,20 @@ async fn main() -> Result<()> {
             machine_name,
             report_json,
             jackify,
+            hosted,
         } => {
+            if hosted && !jackify {
+                anyhow::bail!("--hosted requires --jackify so stdout remains strict NDJSON");
+            }
+
+            let hosted_writer = hosted.then(JsonEventWriter::stdout);
+            let hosted_bridge = if let Some(writer) = hosted_writer.clone() {
+                let bridge = StdioHost::start(writer);
+                bridge.wait_until_ready().await?;
+                Some(bridge)
+            } else {
+                None
+            };
             let detail = |message: String| {
                 if jackify {
                     eprintln!("{}", message);
@@ -677,27 +759,70 @@ async fn main() -> Result<()> {
                 PathBuf::from(&wabbajack_file)
             };
 
+            if let Some(writer) = &hosted_writer {
+                let plan = modlist::parse_wabbajack_file(&wabbajack_file)?;
+                let download_size: u64 = plan.archives.iter().map(|archive| archive.size).sum();
+                let artifacts: Vec<_> = plan
+                    .archives
+                    .iter()
+                    .filter_map(|archive| match &archive.state {
+                        modlist::DownloadState::Nexus(nexus) => {
+                            let subtitle = [nexus.author.as_deref(), nexus.version.as_deref()]
+                                .into_iter()
+                                .flatten()
+                                .filter(|value| !value.is_empty())
+                                .collect::<Vec<_>>()
+                                .join(" · ");
+                            Some(serde_json::json!({
+                                "name": archive.name,
+                                "display_name": nexus.name.as_deref().unwrap_or(&archive.name),
+                                "subtitle": subtitle,
+                                "image_url": nexus.image_url,
+                            }))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                writer.emit_value(&serde_json::json!({
+                    "type": "plan_ready",
+                    "name": plan.name,
+                    "author": plan.author,
+                    "version": plan.version,
+                    "game": plan.game_type,
+                    "archive_count": plan.archives.len(),
+                    "download_size": download_size,
+                    "directive_count": plan.directives.len(),
+                    "artifacts": artifacts,
+                }));
+            }
+
             let settings = settings::Settings::load();
 
-            let nexus_oauth_token = nexus_oauth_token.filter(|token| !token.trim().is_empty());
+            let nexus_oauth_token = if hosted {
+                None
+            } else {
+                nexus_oauth_token.filter(|token| !token.trim().is_empty())
+            };
 
             // Resolve Nexus credentials: CLI/env OAuth token > CLI/env API key > saved API key.
-            let nexus_key = nexus_key
-                .or_else(|| {
-                    if settings.nexus_api_key.is_empty() {
-                        None
-                    } else {
-                        Some(settings.nexus_api_key.clone())
-                    }
-                })
-                .or_else(|| {
-                    nexus_oauth_token.is_some().then(String::new)
-                })
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Nexus API key or OAuth token required. Set an API key with `clf3 set-api-key YOUR_KEY` or pass --nexus-oauth-token"
-                    )
-                })?;
+            let nexus_key = if hosted {
+                String::new()
+            } else {
+                nexus_key
+                    .or_else(|| {
+                        if settings.nexus_api_key.is_empty() {
+                            None
+                        } else {
+                            Some(settings.nexus_api_key.clone())
+                        }
+                    })
+                    .or_else(|| nexus_oauth_token.is_some().then(String::new))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Nexus API key or OAuth token required. Set an API key with `clf3 set-api-key YOUR_KEY` or pass --nexus-oauth-token"
+                        )
+                    })?
+            };
 
             // Resolve LL credentials: CLI arg > env var > saved settings
             let ll_email = ll_email.unwrap_or_else(|| settings.loverslab_email.clone());
@@ -728,6 +853,7 @@ async fn main() -> Result<()> {
                     }
                 }
             };
+            let resolved_game_dir = game_dir.clone();
 
             // Default to CPU thread count
             let thread_count = std::thread::available_parallelism()
@@ -769,7 +895,7 @@ async fn main() -> Result<()> {
                 Option<ProgressCallback>,
                 Arc<dyn ProgressReporter>,
             ) = if jackify {
-                let writer = JsonEventWriter::stdout();
+                let writer = hosted_writer.unwrap_or_else(JsonEventWriter::stdout);
                 let callback = JsonReporter::download_skipped_callback(writer.clone());
                 (
                     Some(callback),
@@ -798,6 +924,15 @@ async fn main() -> Result<()> {
                 extract_strategy: extract.into(),
                 machine_name: resolved_machine_name,
                 wabbajack_url: original_wabbajack_url,
+                hosted_download_provider: hosted_bridge
+                    .clone()
+                    .map(|host| host as Arc<dyn installer::HostedDownloadProvider>),
+                cancellation_token: hosted_bridge
+                    .as_ref()
+                    .map(|host| {
+                        installer::HostedDownloadProvider::cancellation_token(host.as_ref())
+                    })
+                    .unwrap_or_default(),
             };
 
             let mut installer = Installer::new(config)?;
@@ -854,6 +989,17 @@ async fn main() -> Result<()> {
                 && stats.archives_failed == 0
                 && stats.directives_failed == 0;
 
+            if let Some(host) = &hosted_bridge {
+                if installation_succeeded {
+                    host.emit_install_completed(&stats, &resolved_game_dir);
+                } else {
+                    host.emit_install_failed(
+                        &stats,
+                        "Installation is incomplete; retry after resolving failed artifacts",
+                    );
+                }
+            }
+
             if stats.archives_manual > 0 || stats.archives_failed > 0 {
                 reporter.log("\nSome archives need manual download. Fix issues and run again.");
             } else if stats.directives_failed > 0 {
@@ -864,7 +1010,7 @@ async fn main() -> Result<()> {
 
             // Fluorine auto-registration. Only runs on a clean install so we
             // don't add half-broken instances to the user's Fluorine sidebar.
-            if installation_succeeded && settings.add_to_fluorine {
+            if installation_succeeded && settings.add_to_fluorine && !hosted {
                 if let Err(e) =
                     ensure_fluorine_and_register(&settings, &install_dir_for_fluorine).await
                 {
@@ -956,7 +1102,6 @@ async fn main() -> Result<()> {
         Commands::Fluorine { action } => {
             run_fluorine_action(action).await?;
         }
-
     }
 
     Ok(())
@@ -989,7 +1134,6 @@ async fn run_fetch_command(url: &str, output: &std::path::Path) -> Result<()> {
     println!("Done: {} ({} bytes)", output.display(), bytes_written);
     Ok(())
 }
-
 
 /// Make sure a Fluorine install is available, downloading the latest release
 /// if not, then register `install_dir` as a portable instance.
@@ -1438,6 +1582,8 @@ async fn run_modlist_update(name: String, yes: bool) -> Result<()> {
         extract_strategy: installer::ExtractStrategy::Streaming,
         machine_name: Some(machine_name.clone()),
         wabbajack_url: Some(download_url),
+        hosted_download_provider: None,
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
     };
 
     let mut installer = Installer::new(config)?;

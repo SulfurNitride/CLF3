@@ -11,3 +11,7 @@
 .swarm/
 .mcp.json
 CLAUDE.md
+
+# Local installer runs and standalone build output
+*.log
+/clf3-linux-x86_64

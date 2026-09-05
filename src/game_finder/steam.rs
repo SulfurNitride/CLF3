@@ -58,7 +58,7 @@ pub fn detect_steam_games() -> Vec<Game> {
         }
     }
 
-    println!("[game_finder] Steam: Found {} installed games", games.len());
+    eprintln!("[game_finder] Steam: Found {} installed games", games.len());
     games
 }
 
@@ -86,7 +86,7 @@ fn find_steam_installations(home: &str) -> Vec<SteamInstallation> {
             if !installations.iter().any(|i: &SteamInstallation| {
                 i.path.canonicalize().unwrap_or(i.path.clone()) == canonical
             }) {
-                println!(
+                eprintln!(
                     "[game_finder] Found Steam installation: {} (flatpak={}, snap={})",
                     full_path.display(),
                     is_flatpak,

@@ -14,6 +14,7 @@ use crate::hash::{compute_file_hash, verify_file_hash, verify_file_hash_detailed
 use crate::modlist::{ArchiveInfo, DownloadState, ModlistDb};
 
 use super::config::{InstallConfig, ProgressEvent};
+use super::host::{HostedManualRequest, HostedNexusRequest};
 use super::progress::{ProgressHandle, ProgressReporter};
 
 use anyhow::{bail, Context, Result};
@@ -324,7 +325,7 @@ pub struct FailedDownloadInfo {
 
 /// Shared state for download coordination
 struct DownloadContext {
-    nexus: NexusDownloader,
+    nexus: Option<NexusDownloader>,
     http: HttpClient,
     cdn: WabbajackCdnDownloader,
     gdrive: GoogleDriveDownloader,
@@ -349,8 +350,33 @@ struct DownloadContext {
 
 impl DownloadContext {
     /// Create a progress handle for a download item.
-    fn begin_download(&self, name: &str, total_bytes: u64) -> Arc<dyn ProgressHandle> {
-        self.reporter.begin_item(name, Some(total_bytes))
+    fn begin_download(
+        &self,
+        name: &str,
+        total_bytes: u64,
+        state: &DownloadState,
+    ) -> Arc<dyn ProgressHandle> {
+        let (display_name, subtitle, image_url) = match state {
+            DownloadState::Nexus(nexus) => {
+                let display = nexus.name.as_deref().unwrap_or(name);
+                let subtitle = [nexus.author.as_deref(), nexus.version.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .filter(|value| !value.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                (display, subtitle, nexus.image_url.as_deref())
+            }
+            _ => (name, source_type_name(state).to_string(), None),
+        };
+        self.reporter.begin_item_with_metadata(
+            name,
+            Some(total_bytes),
+            "Downloading",
+            display_name,
+            &subtitle,
+            image_url,
+        )
     }
 }
 
@@ -358,10 +384,14 @@ impl DownloadContext {
 async fn build_context(config: &InstallConfig, total_archives: usize) -> Result<DownloadContext> {
     let loverslab = init_loverslab(config).await;
     Ok(DownloadContext {
-        nexus: NexusDownloader::from_config(
-            &config.nexus_api_key,
-            config.nexus_oauth_token.as_deref(),
-        )?,
+        nexus: if config.hosted_download_provider.is_some() {
+            None
+        } else {
+            Some(NexusDownloader::from_config(
+                &config.nexus_api_key,
+                config.nexus_oauth_token.as_deref(),
+            )?)
+        },
         http: HttpClient::new()?,
         cdn: WabbajackCdnDownloader::new()?,
         gdrive: GoogleDriveDownloader::new()?,
@@ -944,11 +974,16 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
     reporter.log(&format!("Failed:     {}", stats.failed));
 
     // Print Nexus rate limits
-    let limits = ctx.nexus.rate_limits();
-    reporter.log(&format!(
-        "\nNexus API: {}/{} hourly, {}/{} daily",
-        limits.hourly_remaining, limits.hourly_limit, limits.daily_remaining, limits.daily_limit
-    ));
+    if let Some(nexus) = &ctx.nexus {
+        let limits = nexus.rate_limits();
+        reporter.log(&format!(
+            "\nNexus API: {}/{} hourly, {}/{} daily",
+            limits.hourly_remaining,
+            limits.hourly_limit,
+            limits.daily_remaining,
+            limits.daily_limit
+        ));
+    }
 
     Ok(stats)
 }
@@ -1479,11 +1514,16 @@ pub async fn download_archives_streaming(
     reporter.log(&format!("Manual:     {}", stats.manual));
     reporter.log(&format!("Failed:     {}", stats.failed));
 
-    let limits = ctx.nexus.rate_limits();
-    reporter.log(&format!(
-        "\nNexus API: {}/{} hourly, {}/{} daily",
-        limits.hourly_remaining, limits.hourly_limit, limits.daily_remaining, limits.daily_limit
-    ));
+    if let Some(nexus) = &ctx.nexus {
+        let limits = nexus.rate_limits();
+        reporter.log(&format!(
+            "\nNexus API: {}/{} hourly, {}/{} daily",
+            limits.hourly_remaining,
+            limits.hourly_limit,
+            limits.daily_remaining,
+            limits.daily_limit
+        ));
+    }
 
     Ok(stats)
 }
@@ -1504,6 +1544,10 @@ async fn process_archive(
     archive: &ArchiveInfo,
     output_path: &Path,
 ) -> (DownloadResult, Option<(String, i64)>) {
+    if ctx.config.cancellation_token.is_cancelled() {
+        ctx.reporter.log("Installation cancelled by host");
+        return (DownloadResult::Failed, None);
+    }
     // Check if file already exists with correct size
     if output_path.exists() {
         if let Ok(meta) = fs::metadata(output_path) {
@@ -1531,15 +1575,17 @@ async fn process_archive(
 
     // Check for manual downloads first
     if let Some(manual_info) = check_manual(&state, archive, ctx.loverslab.is_some()) {
-        ctx.manual_downloads.lock().await.push(manual_info);
-        ctx.reporter.overall_inc();
-        update_overall_message(ctx);
-        report_archive_complete(ctx, &archive.name);
-        return (DownloadResult::Manual, None);
+        if ctx.config.hosted_download_provider.is_none() {
+            ctx.manual_downloads.lock().await.push(manual_info);
+            ctx.reporter.overall_inc();
+            update_overall_message(ctx);
+            report_archive_complete(ctx, &archive.name);
+            return (DownloadResult::Manual, None);
+        }
     }
 
     // Create a progress handle for this download
-    let handle = ctx.begin_download(&archive.name, archive.size as u64);
+    let handle = ctx.begin_download(&archive.name, archive.size as u64, &state);
 
     // Download based on source type
     let source = source_type_name(&state);
@@ -1951,6 +1997,9 @@ async fn download_archive(
     let is_alt_variant = crate::installer::game_preflight::has_known_alt_variant(&archive.name);
 
     loop {
+        if ctx.config.cancellation_token.is_cancelled() {
+            bail!("Installation cancelled by host");
+        }
         attempt += 1;
 
         // Reset progress for retry
@@ -2200,6 +2249,40 @@ async fn download_archive_inner(
         DownloadState::Nexus(nexus_state) => {
             let domain = NexusDownloader::game_domain(&nexus_state.game_name);
 
+            if let Some(provider) = &ctx.config.hosted_download_provider {
+                let urls = provider
+                    .resolve_nexus(HostedNexusRequest {
+                        archive_name: archive.name.clone(),
+                        expected_size: archive.size as u64,
+                        domain: domain.to_string(),
+                        mod_id: nexus_state.mod_id,
+                        file_id: nexus_state.file_id,
+                    })
+                    .await?;
+                let mut failures = Vec::new();
+                for url in urls {
+                    if ctx.config.cancellation_token.is_cancelled() {
+                        bail!("Installation cancelled by host");
+                    }
+                    match download_file_with_callback(
+                        &ctx.http,
+                        &url,
+                        output_path,
+                        Some(archive.size as u64),
+                        callback_ref,
+                    )
+                    .await
+                    {
+                        Ok(_) => return Ok(((), None)),
+                        Err(error) => failures.push(error.to_string()),
+                    }
+                }
+                bail!(
+                    "All host-provided Nexus mirrors failed: {}",
+                    failures.join("; ")
+                );
+            }
+
             // Check if we have a valid cached URL
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2216,6 +2299,8 @@ async fn download_archive_inner(
                     // Expired, fetch new URL
                     let url = ctx
                         .nexus
+                        .as_ref()
+                        .context("Nexus downloader unavailable")?
                         .get_download_link(domain, nexus_state.mod_id, nexus_state.file_id)
                         .await
                         .with_context(|| {
@@ -2232,6 +2317,8 @@ async fn download_archive_inner(
                 // No cache, fetch new URL
                 let url = ctx
                     .nexus
+                    .as_ref()
+                    .context("Nexus downloader unavailable")?
                     .get_download_link(domain, nexus_state.mod_id, nexus_state.file_id)
                     .await
                     .with_context(|| {
@@ -2386,6 +2473,44 @@ async fn download_archive_inner(
 
         // Manual downloads are handled by check_manual()
         DownloadState::Manual(manual_state) => {
+            let provider = if check_manual(state, archive, ctx.loverslab.is_some()).is_some() {
+                ctx.config.hosted_download_provider.as_ref()
+            } else {
+                None
+            };
+            if let Some(provider) = provider {
+                let source = provider
+                    .resolve_manual(HostedManualRequest {
+                        archive_name: archive.name.clone(),
+                        expected_size: archive.size as u64,
+                        expected_hash: archive.hash.clone(),
+                        url: manual_state.url.clone(),
+                        prompt: manual_state.prompt.clone(),
+                    })
+                    .await?;
+                if !source.is_file() {
+                    bail!(
+                        "Host-provided manual archive does not exist: {}",
+                        source.display()
+                    );
+                }
+                let source_is_destination = std::fs::canonicalize(&source)
+                    .ok()
+                    .zip(std::fs::canonicalize(output_path).ok())
+                    .is_some_and(|(source, destination)| source == destination);
+                if !source_is_destination {
+                    tokio::fs::copy(&source, output_path)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to copy host-provided archive {} to {}",
+                                source.display(),
+                                output_path.display()
+                            )
+                        })?;
+                }
+                return Ok(((), None));
+            }
             if is_moddb_url(&manual_state.url) {
                 let resolved_url = resolve_moddb_download_url(&ctx.http, &manual_state.url)
                     .await

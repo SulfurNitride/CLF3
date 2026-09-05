@@ -73,8 +73,25 @@ pub fn list_files(bsa_path: &Path) -> Result<Vec<BsaFileEntry>> {
     for (dir_key, folder) in archive.iter() {
         let dir_name = String::from_utf8_lossy(dir_key.name().as_bytes());
 
-        for (file_key, file) in folder.iter() {
+        // Some valid Oblivion BSAs have a filename table whose order differs
+        // from the file-record order. bsa-rs associates those names by
+        // position, so recover the correct association using the hash stored
+        // in each file record instead.
+        let files_by_hash: std::collections::HashMap<u64, _> = folder
+            .iter()
+            .map(|(file_key, file)| (file_key.hash().numeric(), file))
+            .collect();
+
+        for (file_key, _) in folder.iter() {
             let file_name = String::from_utf8_lossy(file_key.name().as_bytes());
+            let wanted_key = ba2::tes4::DirectoryKey::from(file_key.name().as_bytes());
+            let Some(file) = files_by_hash.get(&wanted_key.hash().numeric()) else {
+                warn!(
+                    "BSA filename hash did not match a file record: {}\\{}",
+                    dir_name, file_name
+                );
+                continue;
+            };
 
             // Build full path with backslash (BSA convention)
             let full_path = if dir_name.is_empty() || dir_name == "." {
@@ -113,15 +130,15 @@ pub fn extract_file(bsa_path: &Path, file_path: &str) -> Result<Vec<u8>> {
         ("", normalized.as_str())
     };
 
-    // Search case-insensitively
+    let wanted_dir_key = ba2::tes4::ArchiveKey::from(dir_name.as_bytes());
+    let wanted_file_key = ba2::tes4::DirectoryKey::from(file_name.as_bytes());
+
+    // Match the hashes stored in the file records. This remains correct for
+    // Oblivion BSAs whose filename table is not in file-record order.
     for (dir_key, folder) in archive.iter() {
-        let current_dir = String::from_utf8_lossy(dir_key.name().as_bytes());
-
-        if current_dir.eq_ignore_ascii_case(dir_name) {
+        if dir_key.hash() == wanted_dir_key.hash() {
             for (file_key, file) in folder.iter() {
-                let current_file = String::from_utf8_lossy(file_key.name().as_bytes());
-
-                if current_file.eq_ignore_ascii_case(file_name) {
+                if file_key.hash() == wanted_file_key.hash() {
                     // Extract with decompression if needed (uses version from archive options)
                     let data = if file.is_decompressed() {
                         file.as_bytes().to_vec()
@@ -258,26 +275,35 @@ where
 
     let compression_options: FileCompressionOptions = (&options).into();
 
+    // Build a lookup keyed by the directory/file hashes stored in BSA records.
+    // Do not trust filename-table position: a number of valid Oblivion BSAs
+    // use a different filename order than their file records.
+    let wanted_by_hash: std::collections::HashMap<(u64, u64), &str> = wanted
+        .iter()
+        .filter_map(|path| {
+            let normalized = path.replace('/', "\\");
+            let (dir, file) = normalized
+                .rfind('\\')
+                .map(|idx| (&normalized[..idx], &normalized[idx + 1..]))
+                .unwrap_or(("", normalized.as_str()));
+            if file.is_empty() {
+                return None;
+            }
+            let dir_hash = ba2::tes4::ArchiveKey::from(dir.as_bytes()).hash().numeric();
+            let file_hash = ba2::tes4::DirectoryKey::from(file.as_bytes())
+                .hash()
+                .numeric();
+            Some(((dir_hash, file_hash), path.as_str()))
+        })
+        .collect();
+
     // Phase 1: Collect matching file references (fast, no decompression)
     let mut entries: Vec<(String, &BsaFile)> = Vec::new();
     for (dir_key, folder) in archive.iter() {
-        let dir_name = String::from_utf8_lossy(dir_key.name().as_bytes())
-            .to_lowercase()
-            .replace('\\', "/");
-
         for (file_key, file) in folder.iter() {
-            let file_name = String::from_utf8_lossy(file_key.name().as_bytes())
-                .to_lowercase()
-                .replace('\\', "/");
-            // wanted-set uses lowercase forward-slash paths.
-            let full_path = if dir_name.is_empty() || dir_name == "." {
-                file_name.clone()
-            } else {
-                format!("{}/{}", dir_name, file_name)
-            };
-
-            if wanted.contains(&full_path) {
-                entries.push((full_path, file));
+            let key = (dir_key.hash().numeric(), file_key.hash().numeric());
+            if let Some(path) = wanted_by_hash.get(&key) {
+                entries.push(((*path).to_string(), file));
             }
         }
     }
@@ -336,6 +362,9 @@ pub fn available_memory() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::Mutex;
+    use tempfile::tempdir;
 
     #[test]
     fn test_memory_functions() {
@@ -344,5 +373,57 @@ mod tests {
 
         // Just test it runs without panic
         let _ = memory_pressure();
+    }
+
+    #[test]
+    fn test_out_of_order_oblivion_filename_table() -> Result<()> {
+        let temp = tempdir()?;
+        let alpha = temp.path().join("alpha.bin");
+        let beta = temp.path().join("beta.bin");
+        let archive_path = temp.path().join("Oblivion - Test.bsa");
+        fs::write(&alpha, b"alpha payload")?;
+        fs::write(&beta, b"beta payload")?;
+
+        let mut builder = crate::bsa::BsaBuilder::from_name("Oblivion - Test.bsa");
+        // Equal-length names make it safe to swap the raw filename-table entries.
+        builder.add_file("meshes/alpha.dds", alpha);
+        builder.add_file("meshes/beta_.dds", beta);
+        builder.build(&archive_path)?;
+
+        let mut raw = fs::read(&archive_path)?;
+        let u32_at = |offset: usize| {
+            u32::from_le_bytes(raw[offset..offset + 4].try_into().expect("u32 field")) as usize
+        };
+        let folder_count = u32_at(16);
+        let file_count = u32_at(20);
+        let folder_names_len = u32_at(24);
+        let file_names_offset =
+            0x24 + folder_count * 0x10 + folder_names_len + folder_count + file_count * 0x10;
+        let name_len = "alpha.dds".len() + 1;
+        for index in 0..name_len {
+            raw.swap(
+                file_names_offset + index,
+                file_names_offset + name_len + index,
+            );
+        }
+        fs::write(&archive_path, raw)?;
+
+        let wanted = HashSet::from([
+            "meshes/alpha.dds".to_string(),
+            "meshes/beta_.dds".to_string(),
+        ]);
+        let extracted = Mutex::new(std::collections::HashMap::new());
+        extract_batch_streaming(&archive_path, &wanted, |path, data| {
+            extracted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(path.to_string(), data);
+            Ok(())
+        })?;
+
+        let extracted = extracted.into_inner().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(extracted["meshes/alpha.dds"], b"alpha payload");
+        assert_eq!(extracted["meshes/beta_.dds"], b"beta payload");
+        Ok(())
     }
 }

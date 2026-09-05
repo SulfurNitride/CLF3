@@ -16,6 +16,7 @@ pub mod config_cache;
 pub mod downloader;
 pub mod game_preflight;
 pub mod handlers;
+pub mod host;
 pub mod pipeline;
 pub mod prevalidation;
 pub mod processor;
@@ -29,6 +30,7 @@ pub mod streaming;
 pub use config::{ExtractStrategy, InstallConfig, ProgressCallback, ProgressEvent};
 #[allow(unused_imports)] // Used by lib crate (GUI)
 pub use config_cache::{ConfigCache, ModlistConfig};
+pub use host::{HostedDownloadProvider, StdioHost};
 #[allow(unused_imports)] // NullReporter used by lib crate (GUI)
 pub use progress::{NullReporter, Phase, ProgressHandle, ProgressMode, ProgressReporter};
 pub use progress_cli::CliReporter;
@@ -423,6 +425,9 @@ impl Installer {
     /// as soon as it finishes downloading. Texture and BSA phases still run
     /// sequentially after all extraction completes (Phase 1 MVP).
     pub async fn run_pipelined(&mut self) -> Result<InstallStats> {
+        if self.config.cancellation_token.is_cancelled() {
+            bail!("Installation cancelled by host");
+        }
         let mut stats = InstallStats::default();
         let total_start = Instant::now();
 
@@ -609,6 +614,10 @@ impl Installer {
             .join()
             .map_err(|_| anyhow::anyhow!("Download thread panicked"))??;
 
+        if self.config.cancellation_token.is_cancelled() {
+            bail!("Installation cancelled by host");
+        }
+
         stats.archives_downloaded = download_stats.downloaded;
         stats.archives_skipped = download_stats.skipped;
         stats.archives_failed = download_stats.failed;
@@ -640,6 +649,9 @@ impl Installer {
         // === Phase 3: InlineFile + RemappedInlineFile ===
         let inline_start = Instant::now();
         self.reporter().phase_start(Phase::Installing);
+        if self.config.cancellation_token.is_cancelled() {
+            bail!("Installation cancelled by host");
+        }
         dp.inline_phase()?;
         trim_allocator_rss("inline files");
         log_phase_metrics("Inline Files", inline_start);
@@ -657,6 +669,9 @@ impl Installer {
         if dds_needs_work > 0 {
             let dds_start = Instant::now();
             self.reporter().phase_start(Phase::DdsTransform);
+            if self.config.cancellation_token.is_cancelled() {
+                bail!("Installation cancelled by host");
+            }
             dp.texture_phase()?;
             trim_allocator_rss("texture phase");
             log_phase_metrics("DDS Transform", dds_start);
@@ -675,6 +690,9 @@ impl Installer {
         if bsa_needs_work > 0 {
             let bsa_start = Instant::now();
             self.reporter().phase_start(Phase::BsaBuild);
+            if self.config.cancellation_token.is_cancelled() {
+                bail!("Installation cancelled by host");
+            }
             dp.bsa_phase()?;
             trim_allocator_rss("bsa build phase");
             log_phase_metrics("BSA Build", bsa_start);
@@ -686,6 +704,9 @@ impl Installer {
         // === Phase 6: Cleanup ===
         let cleanup_start = Instant::now();
         self.reporter().phase_start(Phase::Cleanup);
+        if self.config.cancellation_token.is_cancelled() {
+            bail!("Installation cancelled by host");
+        }
         dp.cleanup_phase()?;
         trim_allocator_rss("cleanup phase");
         log_phase_metrics("Cleanup", cleanup_start);

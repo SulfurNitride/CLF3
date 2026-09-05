@@ -79,6 +79,20 @@ pub trait ProgressReporter: Send + Sync {
         Arc::new(NullHandle)
     }
 
+    /// Begin an item with host-facing presentation metadata. Reporters that do
+    /// not render rich worker rows can use the ordinary item implementation.
+    fn begin_item_with_metadata(
+        &self,
+        name: &str,
+        total_bytes: Option<u64>,
+        _stage: &str,
+        _display_name: &str,
+        _subtitle: &str,
+        _image_url: Option<&str>,
+    ) -> Arc<dyn ProgressHandle> {
+        self.begin_item(name, total_bytes)
+    }
+
     /// Create a persistent status counter (not pooled — lives until dropped).
     /// Used for dedicated phase counters (e.g. "Extracted: 45/120 archives").
     fn begin_status(&self, _label: &str) -> Arc<dyn ProgressHandle> {

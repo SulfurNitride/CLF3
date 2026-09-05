@@ -766,6 +766,7 @@ fn resolve_patch_basis_for_archive(
 }
 
 /// Prepared archive data ready for extraction (no DB access needed).
+#[derive(Clone)]
 struct PreparedArchive {
     archive_hash: String,
     archive_name: String,
@@ -867,9 +868,10 @@ fn extract_prepared_archive(
     // When Some, spill DDS data to channel instead of processing inline.
     // Used by phased path to defer all DDS to a dedicated phase.
     dds_spill_tx: Option<&std::sync::mpsc::SyncSender<super::streaming::DdsJob>>,
-) {
+) -> usize {
     const MAX_LOGGED_FAILURES: usize = 100;
     let extract_start = std::time::Instant::now();
+    let mut archive_failures = 0usize;
 
     let archive_name_for_progress = prepared.archive_name.clone();
     let rss_before = crate::installer::current_rss_kb().unwrap_or(0);
@@ -979,6 +981,7 @@ fn extract_prepared_archive(
                 );
                 written.fetch_add(ok, Ordering::Relaxed);
                 failed.fetch_add(fail, Ordering::Relaxed);
+                archive_failures += fail;
                 let done = dds_counter.fetch_add(ok + fail, Ordering::Relaxed) + ok + fail;
                 if let Some(ref s) = *dds_status.lock().expect("dds lock") {
                     s.set_count(done, total_textures);
@@ -990,6 +993,7 @@ fn extract_prepared_archive(
         written.fetch_add(arc_written.load(Ordering::Relaxed), Ordering::Relaxed);
         skipped.fetch_add(arc_skipped.load(Ordering::Relaxed), Ordering::Relaxed);
         failed.fetch_add(arc_failed.load(Ordering::Relaxed), Ordering::Relaxed);
+        archive_failures += arc_failed.load(Ordering::Relaxed);
 
         // BSA reads don't have separate finalization — record all time as extraction
         let archive_bytes = std::fs::metadata(&prepared.archive_path)
@@ -1056,6 +1060,7 @@ fn extract_prepared_archive(
                     );
                 }
                 failed.fetch_add(archive_result.failed_count, Ordering::Relaxed);
+                archive_failures += archive_result.failed_count;
 
                 // DDS textures: spill raw data for deferred processing, or process inline
                 let phase_dds_start = std::time::Instant::now();
@@ -1085,6 +1090,7 @@ fn extract_prepared_archive(
                         );
                         written.fetch_add(ok, Ordering::Relaxed);
                         failed.fetch_add(fail, Ordering::Relaxed);
+                        archive_failures += fail;
                         let done = dds_counter.fetch_add(ok + fail, Ordering::Relaxed) + ok + fail;
                         if let Some(ref s) = *dds_status.lock().expect("dds lock") {
                             s.set_count(done, total_textures);
@@ -1098,6 +1104,7 @@ fn extract_prepared_archive(
                         );
                         written.fetch_add(ok, Ordering::Relaxed);
                         failed.fetch_add(fail, Ordering::Relaxed);
+                        archive_failures += fail;
                         let done = dds_counter.fetch_add(ok + fail, Ordering::Relaxed) + ok + fail;
                         if let Some(ref s) = *dds_status.lock().expect("dds lock") {
                             s.set_count(done, total_textures);
@@ -1123,6 +1130,7 @@ fn extract_prepared_archive(
                     );
                 }
                 failed.fetch_add(fin_stats.failed, Ordering::Relaxed);
+                archive_failures += fin_stats.failed;
                 let fin_elapsed = phase_fin_start.elapsed();
 
                 // Record per-phase metrics
@@ -1171,6 +1179,7 @@ fn extract_prepared_archive(
                     error!("FAIL: Archive {}: {:#}", prepared.archive_name, e);
                 }
                 failed.fetch_add(prepared.resolved.len(), Ordering::Relaxed);
+                archive_failures += prepared.resolved.len();
             }
         }
     }
@@ -1184,6 +1193,135 @@ fn extract_prepared_archive(
     let done = extract_counter.fetch_add(1, Ordering::Relaxed) + 1;
     if let Some(ref s) = *extract_status.lock().expect("extract_status lock") {
         s.set_count(done, total_archives);
+    }
+
+    archive_failures
+}
+
+/// Retry archives that reported directive failures after the normal archive pass.
+/// Successful outputs are detected and skipped, so each pass only does the work
+/// that is still missing. Returns archives that still fail after all retries.
+#[allow(clippy::too_many_arguments)]
+fn retry_failed_archives(
+    mut retry_queue: Vec<(PreparedArchive, usize)>,
+    ctx: &ProcessContext,
+    extracted: &AtomicUsize,
+    written: &AtomicUsize,
+    skipped: &AtomicUsize,
+    failed: &AtomicUsize,
+    logged_failures: &Arc<AtomicUsize>,
+    reporter: &Arc<dyn super::progress::ProgressReporter>,
+    metrics: &ExtractionMetrics,
+) -> Vec<(PreparedArchive, usize)> {
+    const MAX_RETRIES: usize = 3;
+
+    for attempt in 1..=MAX_RETRIES {
+        if retry_queue.is_empty() {
+            break;
+        }
+
+        reporter.log(&format!(
+            "Retrying {} failed archive(s) at end of extraction (attempt {}/{})...",
+            retry_queue.len(),
+            attempt,
+            MAX_RETRIES
+        ));
+
+        let mut next_queue = Vec::new();
+        for (prepared, previous_failures) in retry_queue {
+            // Replace the previous pass's failures with this attempt's result.
+            failed.fetch_sub(previous_failures, Ordering::Relaxed);
+
+            let retry_counter = AtomicUsize::new(0);
+            let no_status: Mutex<Option<Arc<dyn super::progress::ProgressHandle>>> =
+                Mutex::new(None);
+            let no_dds_status: Mutex<Option<Arc<dyn super::progress::ProgressHandle>>> =
+                Mutex::new(None);
+            let retry_failures = extract_prepared_archive(
+                prepared.clone(),
+                ctx,
+                extracted,
+                written,
+                skipped,
+                failed,
+                logged_failures,
+                reporter,
+                &no_status,
+                &retry_counter,
+                0,
+                &no_dds_status,
+                &AtomicUsize::new(0),
+                0,
+                metrics,
+                None,
+            );
+
+            if retry_failures > 0 {
+                next_queue.push((prepared, retry_failures));
+            }
+        }
+        retry_queue = next_queue;
+    }
+
+    if !retry_queue.is_empty() {
+        reporter.log(&format!(
+            "{} archive(s) still have failures after 3 retries",
+            retry_queue.len()
+        ));
+    }
+
+    retry_queue
+}
+
+fn retry_failed_whole_file_directives(
+    mut retry_queue: Vec<(i64, FromArchiveDirective)>,
+    ctx: &ProcessContext,
+    extracted: &AtomicUsize,
+    skipped: &AtomicUsize,
+    failed: &AtomicUsize,
+    reporter: &Arc<dyn super::progress::ProgressReporter>,
+) {
+    const MAX_RETRIES: usize = 3;
+
+    for attempt in 1..=MAX_RETRIES {
+        if retry_queue.is_empty() {
+            return;
+        }
+
+        reporter.log(&format!(
+            "Retrying {} failed whole-file action(s) at end of extraction (attempt {}/{})...",
+            retry_queue.len(),
+            attempt,
+            MAX_RETRIES
+        ));
+        failed.fetch_sub(retry_queue.len(), Ordering::Relaxed);
+
+        let attempt_extracted = Arc::new(AtomicUsize::new(0));
+        let attempt_skipped = Arc::new(AtomicUsize::new(0));
+        let attempt_failed = Arc::new(AtomicUsize::new(0));
+        let failed_indices = process_whole_file_directives(
+            &retry_queue,
+            ctx,
+            &attempt_extracted,
+            &attempt_skipped,
+            &attempt_failed,
+        );
+
+        extracted.fetch_add(attempt_extracted.load(Ordering::Relaxed), Ordering::Relaxed);
+        skipped.fetch_add(attempt_skipped.load(Ordering::Relaxed), Ordering::Relaxed);
+        failed.fetch_add(attempt_failed.load(Ordering::Relaxed), Ordering::Relaxed);
+
+        retry_queue = failed_indices
+            .into_iter()
+            .map(|idx| retry_queue[idx].clone())
+            .collect();
+    }
+
+    if !retry_queue.is_empty() {
+        reporter.log(&format!(
+            "{} whole-file action(s) still failed after 3 retries",
+            retry_queue.len()
+        ));
     }
 }
 
@@ -1259,6 +1397,7 @@ pub(crate) fn run_processing_loop(
     }
 
     // Process whole-file directives first (simple copy, no archive extraction needed)
+    let mut whole_file_retry_queue = Vec::new();
     if !grouped.whole_file.is_empty() {
         reporter.log(&format!(
             "Copying {} whole-file directives...",
@@ -1267,7 +1406,7 @@ pub(crate) fn run_processing_loop(
         let arc_extracted = Arc::new(AtomicUsize::new(0));
         let arc_skipped = Arc::new(AtomicUsize::new(0));
         let arc_failed = Arc::new(AtomicUsize::new(0));
-        let _ = process_whole_file_directives(
+        let failed_indices = process_whole_file_directives(
             &grouped.whole_file,
             ctx,
             &arc_extracted,
@@ -1277,6 +1416,10 @@ pub(crate) fn run_processing_loop(
         extracted.fetch_add(arc_extracted.load(Ordering::Relaxed), Ordering::Relaxed);
         skipped.fetch_add(arc_skipped.load(Ordering::Relaxed), Ordering::Relaxed);
         failed.fetch_add(arc_failed.load(Ordering::Relaxed), Ordering::Relaxed);
+        whole_file_retry_queue = failed_indices
+            .into_iter()
+            .map(|idx| grouped.whole_file[idx].clone())
+            .collect();
     }
 
     // Build extraction thread pool (used for within-archive parallel decompression)
@@ -1302,6 +1445,8 @@ pub(crate) fn run_processing_loop(
 
     // Completion channel: extraction threads signal when done (hash of completed archive)
     let (done_tx, done_rx) = std::sync::mpsc::channel::<String>();
+    // Failed archives are held for three retry passes after normal extraction.
+    let (retry_tx, retry_rx) = std::sync::mpsc::channel::<(PreparedArchive, usize)>();
 
     // Status counters — created lazily on first extraction to avoid ghost bars
     // during the download scanning phase.
@@ -1465,10 +1610,12 @@ pub(crate) fn run_processing_loop(
                         // Phase 2: Extract + inline DDS (no DB needed — runs on separate thread)
                         let done_tx = done_tx.clone();
                         let hash_done = hash.clone();
+                        let retry_tx = retry_tx.clone();
 
                         let metrics = extraction_metrics.clone();
                         thread_scope.spawn(move || {
-                            extract_prepared_archive(
+                            let retry_prepared = prepared.clone();
+                            let archive_failures = extract_prepared_archive(
                                 prepared,
                                 ctx,
                                 extracted,
@@ -1486,6 +1633,10 @@ pub(crate) fn run_processing_loop(
                                 &metrics,
                                 None, // overlapped path: process DDS inline
                             );
+
+                            if archive_failures > 0 {
+                                let _ = retry_tx.send((retry_prepared, archive_failures));
+                            }
 
                             // Signal completion for BSA readiness tracking
                             let _ = done_tx.send(hash_done);
@@ -1550,6 +1701,19 @@ pub(crate) fn run_processing_loop(
             }
         }
 
+        let retry_queue: Vec<_> = retry_rx.try_iter().collect();
+        let _still_failed = retry_failed_archives(
+            retry_queue,
+            ctx,
+            extracted,
+            written,
+            skipped,
+            failed,
+            logged_failures,
+            reporter,
+            &extraction_metrics,
+        );
+
         // Drain remaining BSA completions
         drop(done_tx);
         while let Ok(completed_hash) = done_rx.recv() {
@@ -1603,6 +1767,15 @@ pub(crate) fn run_processing_loop(
 
     extraction_metrics.stop_wall_clock();
 
+    retry_failed_whole_file_directives(
+        whole_file_retry_queue,
+        ctx,
+        &extracted,
+        &skipped,
+        &failed,
+        reporter,
+    );
+
     // Finish status counters
     if let Some(ref s) = *extract_status.lock().expect("lock") {
         s.finish();
@@ -1654,6 +1827,7 @@ pub(crate) fn run_processing_loop_phased(
     let failed = Arc::new(AtomicUsize::new(0));
     let logged_failures = Arc::new(AtomicUsize::new(0));
     let extraction_metrics = Arc::new(ExtractionMetrics::new());
+    let failed_archives: Mutex<Vec<(PreparedArchive, usize)>> = Mutex::new(Vec::new());
 
     let total_archives: usize = {
         let mut all_hashes = HashSet::new();
@@ -1691,38 +1865,18 @@ pub(crate) fn run_processing_loop_phased(
     }
 
     // Process whole-file directives after drain so all archive paths are known
+    let mut whole_file_retry_queue = Vec::new();
     if !grouped.whole_file.is_empty() {
         reporter.log(&format!(
             "Copying {} whole-file directives...",
             grouped.whole_file.len()
         ));
-        let mut wf_failed =
+        let wf_failed =
             process_whole_file_directives(&grouped.whole_file, ctx, &extracted, &skipped, &failed);
-
-        // Retry failed whole-file directives up to 3 times
-        for attempt in 1..=3 {
-            if wf_failed.is_empty() {
-                break;
-            }
-            let retry_directives: Vec<(i64, FromArchiveDirective)> = wf_failed
-                .iter()
-                .map(|&idx| grouped.whole_file[idx].clone())
-                .collect();
-            reporter.log(&format!(
-                "Retrying {} failed whole-file directives (attempt {}/3)...",
-                retry_directives.len(),
-                attempt,
-            ));
-            // Undo the failure counts for items we're retrying
-            failed.fetch_sub(retry_directives.len(), Ordering::Relaxed);
-            wf_failed = process_whole_file_directives(
-                &retry_directives,
-                ctx,
-                &extracted,
-                &skipped,
-                &failed,
-            );
-        }
+        whole_file_retry_queue = wf_failed
+            .into_iter()
+            .map(|idx| grouped.whole_file[idx].clone())
+            .collect();
     }
 
     // === Prepare all archives (DB work on main thread) ===
@@ -1862,7 +2016,8 @@ pub(crate) fn run_processing_loop_phased(
                         };
                         let wrap_status = Mutex::new(Some(extract_status.clone()));
                         let wrap_dds = Mutex::new(dds_status.clone());
-                        extract_prepared_archive(
+                        let retry_prepared = owned.clone();
+                        let archive_failures = extract_prepared_archive(
                             owned,
                             ctx,
                             &extracted,
@@ -1880,6 +2035,12 @@ pub(crate) fn run_processing_loop_phased(
                             &extraction_metrics,
                             Some(&dds_tx), // spill DDS to channel
                         );
+                        if archive_failures > 0 {
+                            failed_archives
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push((retry_prepared, archive_failures));
+                        }
                         reporter.overall_inc();
                     }
                 });
@@ -2061,7 +2222,8 @@ pub(crate) fn run_processing_loop_phased(
                         };
                         let wrap_status = Mutex::new(Some(extract_status.clone()));
                         let wrap_dds = Mutex::new(dds_status.clone());
-                        extract_prepared_archive(
+                        let retry_prepared = owned.clone();
+                        let archive_failures = extract_prepared_archive(
                             owned,
                             ctx,
                             &extracted,
@@ -2079,6 +2241,12 @@ pub(crate) fn run_processing_loop_phased(
                             &extraction_metrics,
                             None, // simple archives have no DDS
                         );
+                        if archive_failures > 0 {
+                            failed_archives
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push((retry_prepared, archive_failures));
+                        }
                         reporter.overall_inc();
                     }
                 });
@@ -2090,6 +2258,28 @@ pub(crate) fn run_processing_loop_phased(
         phase4_start.elapsed().as_secs_f64(),
         simple.len()
     ));
+
+    let retry_queue =
+        std::mem::take(&mut *failed_archives.lock().unwrap_or_else(|e| e.into_inner()));
+    let _still_failed = retry_failed_archives(
+        retry_queue,
+        ctx,
+        &extracted,
+        &written,
+        &skipped,
+        &failed,
+        &logged_failures,
+        reporter,
+        &extraction_metrics,
+    );
+    retry_failed_whole_file_directives(
+        whole_file_retry_queue,
+        ctx,
+        &extracted,
+        &skipped,
+        &failed,
+        reporter,
+    );
 
     extraction_metrics.stop_wall_clock();
     extract_status.finish();

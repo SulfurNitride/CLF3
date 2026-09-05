@@ -31,7 +31,7 @@ pub fn detect_heroic_games() -> Vec<Game> {
             continue;
         }
 
-        println!(
+        eprintln!(
             "[game_finder] Found Heroic installation: {}",
             heroic_path.display()
         );
@@ -45,7 +45,7 @@ pub fn detect_heroic_games() -> Vec<Game> {
         games.extend(epic_games);
     }
 
-    println!(
+    eprintln!(
         "[game_finder] Heroic: Found {} installed games",
         games.len()
     );
