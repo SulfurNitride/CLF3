@@ -87,5 +87,51 @@ class CollectionHost(unittest.TestCase):
         self.assertNotEqual(self.child.wait(timeout=5), 0)
 
 
+
+class HostedInstallProtocol(unittest.TestCase):
+    def setUp(self):
+        self.child = subprocess.Popen([str(BINARY), "collection", "hosted-install"],
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, text=True, bufsize=1)
+
+    def tearDown(self):
+        if self.child.poll() is None:
+            self.child.kill()
+        self.child.wait(timeout=5)
+        for pipe in (self.child.stdin, self.child.stdout, self.child.stderr):
+            pipe.close()
+
+    receive = CollectionHost.receive
+    send = CollectionHost.send
+
+    def test_requires_separate_install_negotiation_before_local_io(self):
+        hello = self.receive()
+        self.assertEqual(hello["required_capabilities"], ["collection_hosted_install_v1"])
+        self.send({"type": "hello_ack", "protocol_version": 1,
+                   "capabilities": ["collection_plan_v1"]})
+        self.assertEqual(self.receive()["type"], "collection_failed")
+        self.assertNotEqual(self.child.wait(timeout=5), 0)
+
+    def test_cancel_after_negotiation_without_creating_a_job(self):
+        hello = self.receive()
+        self.send({"type": "hello_ack", "protocol_version": 1,
+                   "capabilities": ["collection_hosted_install_v1"]})
+        self.send({"type": "cancel", "job_id": hello["job_id"]})
+        self.assertEqual(self.receive()["type"], "collection_cancelled")
+        self.assertEqual(self.child.wait(timeout=5), 0)
+
+    def test_credentials_are_rejected_without_echo(self):
+        hello = self.receive()
+        self.send({"type": "hello_ack", "protocol_version": 1,
+                   "capabilities": ["collection_hosted_install_v1"]})
+        self.send({"type": "collection_install", "job_id": hello["job_id"],
+                   "request": {"protocol_version": 1, "api_key": "install-secret-never-echo"}})
+        event = self.receive()
+        self.assertEqual(event["type"], "collection_failed")
+        self.assertNotIn("install-secret-never-echo", json.dumps(event))
+        self.child.wait(timeout=5)
+        self.assertNotIn("install-secret-never-echo", self.child.stderr.read())
+
+
 if __name__ == "__main__":
     unittest.main()

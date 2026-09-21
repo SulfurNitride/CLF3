@@ -1,4 +1,4 @@
-//! Planning-only extension negotiated separately from Wabbajack protocol v1.
+//! Collections operations negotiated separately from Wabbajack protocol v1.
 //! The host supplies an already acquired package; credentials and signed URLs
 //! are not accepted by this protocol or stored in the resulting plan.
 
@@ -17,9 +17,10 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 pub const COLLECTION_PROTOCOL_VERSION: u32 = 1;
+pub const INSTALL_CAPABILITY: &str = "collection_hosted_install_v1";
 pub const PLAN_CAPABILITY: &str = "collection_plan_v1";
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CollectionHostCommand {
     HelloAck {
@@ -36,6 +37,10 @@ pub enum CollectionHostCommand {
     CollectionRequestFailed {
         job_id: String,
         request_id: String,
+    },
+    CollectionInstall {
+        job_id: String,
+        request: super::worker::WorkerRequest,
     },
     Cancel {
         job_id: String,
@@ -83,13 +88,30 @@ impl CollectionHostCommand {
 }
 
 pub async fn run(source_url: &str, all_optional: bool, game_version: Option<String>) -> Result<()> {
+    run_with_options(
+        source_url,
+        all_optional,
+        game_version,
+        None,
+        Default::default(),
+    )
+    .await
+}
+
+pub async fn run_with_options(
+    source_url: &str,
+    all_optional: bool,
+    game_version: Option<String>,
+    game_path: Option<PathBuf>,
+    selected_optional: std::collections::BTreeSet<String>,
+) -> Result<()> {
     let locator = parse_collection_url(source_url)?;
     let job_id = Uuid::new_v4().to_string();
     let request_id = Uuid::new_v4().to_string();
     emit(
         &json!({"type":"hello", "protocol_version": COLLECTION_PROTOCOL_VERSION,
         "engine_version":env!("CARGO_PKG_VERSION"), "job_id":job_id,
-        "capabilities":[PLAN_CAPABILITY], "required_capabilities":[PLAN_CAPABILITY]}),
+        "capabilities":[PLAN_CAPABILITY, INSTALL_CAPABILITY], "game_support":game_support(), "required_capabilities":[PLAN_CAPABILITY]}),
     )?;
     let mut input = spawn_reader()?;
     let result = async {
@@ -120,12 +142,12 @@ pub async fn run(source_url: &str, all_optional: bool, game_version: Option<Stri
         }
         let (path, schema_id, resolved) =
             response.validate_package(&job_id, &request_id, &locator)?;
-        let options = PlanOptions {
+        let mut options = PlanOptions {
             schema_id: Some(schema_id),
             locator: Some(resolved.clone()),
             all_optional,
             game_version,
-            ..Default::default()
+            selected_optional,
         };
         // Blocking archive work stays off the protocol reader. A cancellation or
         // disconnected host wins over a prepared plan and prevents publication.
@@ -134,8 +156,26 @@ pub async fn run(source_url: &str, all_optional: bool, game_version: Option<Stri
         std::thread::Builder::new()
             .name("collection-planner".into())
             .spawn(move || {
-                let result = CollectionPackage::open(&path)
-                    .and_then(|package| CollectionPlan::build(&package, &options));
+                let result = (|| {
+                    let package = CollectionPackage::open(&path)?;
+                    if let Some(game_path) = game_path {
+                        let game = super::games::require(package.collection.domain())?;
+                        let exe = super::paths::resolve_file(&game_path, game.executable)?;
+                        options.game_version = super::publish::executable_version(&exe)?;
+                    }
+                    let plan = CollectionPlan::build(&package, &options)?;
+                    let sources: std::collections::BTreeMap<_, _> = plan
+                        .members
+                        .iter()
+                        .filter(|m| m.selected)
+                        .filter_map(|m| {
+                            let source = &package.collection.mods[m.source_index].source;
+                            (source.source_type == "direct")
+                                .then(|| (m.artifact_id.clone(), source.url.clone()))
+                        })
+                        .collect();
+                    Ok::<_, anyhow::Error>((plan, sources))
+                })();
                 let _ = sender.send(result);
             })
             .context("Start collection planning worker")?;
@@ -152,11 +192,11 @@ pub async fn run(source_url: &str, all_optional: bool, game_version: Option<Stri
     }
     .await;
     match result {
-        Ok(Some(plan)) => {
+        Ok(Some((plan, sources))) => {
             emit(
                 &json!({"type":"collection_plan_ready", "job_id":job_id, "request_id":request_id,
                 "status":if plan.blockers.is_empty() {"planned"} else {"blocked"},
-                "installation_available":false, "plan":plan}),
+                "installation_available":false, "acquisition_sources":sources, "plan":plan}),
             )?;
             Ok(())
         }
@@ -225,4 +265,145 @@ async fn receive(
         .await
         .context("Timed out waiting for collection host")?
         .context("Collection host disconnected")?
+}
+
+/// Export the engine registry so frontends never guess another game's adapter.
+pub fn game_support() -> serde_json::Value {
+    json!(super::games::PROFILES
+        .iter()
+        .map(|g| json!({
+            "domain":g.domain, "name":g.name, "manager_name":g.manager_name(),
+            "executable":g.executable, "steam_ids":g.steam_ids,
+            "experimental":g.experimental, "masterlist_url":g.masterlist.url(),
+            "masterlist_sha256":g.masterlist.sha256
+        }))
+        .collect::<Vec<_>>())
+}
+
+pub fn install_local(
+    request: &super::worker::WorkerRequest,
+    token: &tokio_util::sync::CancellationToken,
+    progress: &super::progress::Progress<'_>,
+) -> Result<PathBuf> {
+    use super::worker::{read_json, recover};
+    if request.protocol_version != 1
+        || [
+            &request.package,
+            &request.plan,
+            &request.artifacts,
+            &request.stage,
+            &request.game,
+            &request.output,
+        ]
+        .iter()
+        .any(|p| !p.is_absolute())
+    {
+        bail!("Invalid hosted worker protocol or local paths");
+    }
+    let identity = request
+        .job_identity
+        .as_deref()
+        .filter(|s| !s.is_empty() && s.len() <= 128)
+        .context("A hosted installation requires a stable job identity")?;
+    let plan: CollectionPlan = read_json(&request.plan, 32 * 1024 * 1024)?;
+    if plan
+        .locator
+        .as_ref()
+        .is_some_and(|l| l.revision.is_none() || l.revision == Some(0))
+    {
+        bail!("Review an explicitly pinned collection revision");
+    }
+    let job = request.plan.parent().context("Missing job directory")?;
+    if request.stage.parent() != Some(job) || request.artifacts.parent() != Some(job) {
+        bail!("Staging and artifact mapping must belong to the hosted job directory");
+    }
+    let _lock = super::stage::lock_job(job)?;
+    if request.output.symlink_metadata().is_ok() {
+        recover(&request.output, identity, &plan, token, progress)?;
+        return Ok(request.output.join(".collection/report.json"));
+    }
+    let prepared = crate::collection_app::Prepared {
+        author: String::new(),
+        job: job.into(),
+        package: request.package.clone(),
+        inputs: crate::collection_app::Inputs {
+            game: request.game.clone(),
+            output: request.output.clone(),
+            cache: job.join("acquired"),
+            masterlist: request.masterlist.clone().unwrap_or_default(),
+            profile_ini: request.profile_ini.clone().unwrap_or_default(),
+            ..Default::default()
+        },
+        plan: plan.clone(),
+        manual_archives: Default::default(),
+    };
+    crate::collection_app::preflight(&prepared)?;
+    let path = super::worker::execute(request, token, progress)?;
+    // Completion is a verified publication, including a rename that raced cancellation.
+    recover(
+        &request.output,
+        identity,
+        &plan,
+        &Default::default(),
+        progress,
+    )?;
+    Ok(path)
+}
+
+pub async fn run_install() -> Result<()> {
+    let job_id = Uuid::new_v4().to_string();
+    emit(&json!({"type":"hello", "protocol_version":1,
+        "engine_version":env!("CARGO_PKG_VERSION"), "job_id":job_id,
+        "capabilities":[INSTALL_CAPABILITY], "required_capabilities":[INSTALL_CAPABILITY]}))?;
+    let mut input = spawn_reader()?;
+    let token = tokio_util::sync::CancellationToken::new();
+    let result = async {
+        match receive(&mut input, Duration::from_secs(30)).await? {
+            CollectionHostCommand::HelloAck { protocol_version:1, capabilities }
+                if capabilities.iter().any(|c| c == INSTALL_CAPABILITY) => (),
+            CollectionHostCommand::Cancel { job_id:id } if id == job_id => return Ok(None),
+            _ => bail!("Host does not support collection_hosted_install_v1"),
+        }
+        let request = match receive(&mut input, Duration::from_secs(30)).await? {
+            CollectionHostCommand::CollectionInstall {job_id:id, request} if id == job_id => request,
+            CollectionHostCommand::Cancel {job_id:id} if id == job_id => return Ok(None),
+            _ => bail!("Invalid hosted installation request"),
+        };
+        let worker_token = token.clone();
+        let worker_job = job_id.clone();
+        let (tx, mut work) = oneshot::channel();
+        std::thread::spawn(move || {
+            let progress = |event| {
+                if emit(&json!({"type":"collection_progress", "job_id":worker_job, "progress":event})).is_err() {
+                    worker_token.cancel();
+                }
+            };
+            let result = install_local(&request, &worker_token, &progress);
+            let _ = tx.send(result);
+        });
+        tokio::select! {
+            biased;
+            command = receive(&mut input, Duration::from_secs(7 * 24 * 3600)) => {
+                token.cancel();
+                let valid_cancel = matches!(command, Ok(CollectionHostCommand::Cancel {job_id:id}) if id == job_id);
+                // Join before reporting cancellation; publication/staging must be quiescent.
+                let result = (&mut work).await.context("Installation worker stopped")?;
+                if !valid_cancel { bail!("Collection host disconnected or sent an invalid command"); }
+                match result { Ok(path) => Ok(Some(path)), Err(_) => Ok(None) }
+            }
+            result = &mut work => Ok(Some(result.context("Installation worker stopped")??)),
+        }
+    }.await;
+    match result {
+        Ok(Some(path)) => emit(
+            &json!({"type":"collection_install_completed", "job_id":job_id, "report_path":path}),
+        ),
+        Ok(None) => emit(&json!({"type":"collection_cancelled", "job_id":job_id})),
+        Err(_) => {
+            // Package and OS errors can contain untrusted strings. Never echo them.
+            emit(&json!({"type":"collection_failed", "job_id":job_id,
+                "message":"Collection installation failed verification. Review the game, plan and local files; the job can be resumed."}))?;
+            bail!("Hosted collection installation failed")
+        }
+    }
 }

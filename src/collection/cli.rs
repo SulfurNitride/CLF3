@@ -52,6 +52,8 @@ pub enum CollectionCommand {
     },
     /// Describe the Collections protocol and currently implemented operations.
     Capabilities,
+    /// Install a reviewed local job using negotiated, credential-free stdio.
+    HostedInstall,
     /// Ask Fluorine for a pinned local package over versioned JSON stdio.
     HostedPlan {
         source_url: String,
@@ -59,6 +61,10 @@ pub enum CollectionCommand {
         all_optional: bool,
         #[arg(long)]
         game_version: Option<String>,
+        #[arg(long)]
+        game_path: Option<PathBuf>,
+        #[arg(long = "include-optional")]
+        selected_optional: Vec<String>,
     },
 }
 
@@ -82,6 +88,7 @@ pub struct PackageArgs {
 
 pub async fn run(args: &CollectionArgs) -> Result<()> {
     match &args.command {
+        CollectionCommand::HostedInstall => super::host::run_install().await?,
         CollectionCommand::GuiWorker { request } => super::worker::run(request)?,
         CollectionCommand::Publish {
             job,
@@ -127,10 +134,10 @@ pub async fn run(args: &CollectionArgs) -> Result<()> {
         CollectionCommand::Capabilities => emit(&json!({
             "type": "collection_capabilities", "protocol_version": 1,
             "engine_version": env!("CARGO_PKG_VERSION"), "plan_schema_version": 1,
-            "capabilities": ["collection_plan_v1", "local_packages", "artifact_member_identity", "asset_rule_validation", "provider_exclusion_planning", "local_staging", "recorded_files", "bundle", "bsdiff40", "verified_resume", "fomod_replay", "rar", "portable_publication", "loot", "skse_launcher", "game_extender_launcher", "profile_ini_tweaks", "collection_separators", "game_profiles", "legacy_plugin_activation", "timestamp_plugin_order"],
+            "capabilities": ["collection_hosted_install_v1", "collection_plan_v1", "local_packages", "artifact_member_identity", "asset_rule_validation", "provider_exclusion_planning", "local_staging", "recorded_files", "bundle", "bsdiff40", "verified_resume", "fomod_replay", "rar", "portable_publication", "loot", "skse_launcher", "game_extender_launcher", "profile_ini_tweaks", "collection_separators", "game_profiles", "legacy_plugin_activation", "timestamp_plugin_order"],
             "collection_schema_ids": [1], "games": super::games::PROFILES.iter().map(|g| g.domain).collect::<Vec<_>>(),
-            "game_support": super::games::PROFILES.iter().map(|g| json!({"domain":g.domain,"name":g.name,"experimental":g.experimental})).collect::<Vec<_>>(),
-            "installation_available": true, "hosted_installation_available": false,
+            "game_support": super::host::game_support(),
+            "installation_available": true, "hosted_installation_available": true,
             "standalone_worker": super::worker::WORKER_CAPABILITY, "credentials": "host_only"
         }))?,
         CollectionCommand::Inspect(input) | CollectionCommand::Plan(input) => {
@@ -160,8 +167,17 @@ pub async fn run(args: &CollectionArgs) -> Result<()> {
             source_url,
             all_optional,
             game_version,
+            game_path,
+            selected_optional,
         } => {
-            super::host::run(source_url, *all_optional, game_version.clone()).await?;
+            super::host::run_with_options(
+                source_url,
+                *all_optional,
+                game_version.clone(),
+                game_path.clone(),
+                selected_optional.iter().cloned().collect(),
+            )
+            .await?;
         }
         CollectionCommand::Stage {
             input,

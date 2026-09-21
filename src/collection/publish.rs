@@ -796,6 +796,28 @@ pub fn publish_with_progress(
     if output.exists() {
         bail!("Output appeared during publication");
     }
+    // A destination created between validation and commit must never be replaced.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let source = std::ffi::CString::new(root.as_os_str().as_bytes())?;
+        let target = std::ffi::CString::new(output.as_os_str().as_bytes())?;
+        if unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                target.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error()).context(
+                "Publish completed portable instance without replacing an existing destination",
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
     std::fs::rename(root, output).context("Publish completed portable instance")?;
     File::open(parent)?.sync_all()?;
     Ok(report)

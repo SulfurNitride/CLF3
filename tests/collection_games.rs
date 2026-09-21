@@ -416,3 +416,60 @@ fn unimplemented_adapters_remain_blocked_with_game_specific_reasons() {
         .is_err());
     }
 }
+
+#[test]
+fn hosted_installation_cancels_resumes_and_verifies_all_six_game_adapters() {
+    use clf3::collection::host::install_local;
+    for game in games::PROFILES {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (_, plan) = fixture(root, game);
+        let job = root.join("host-job");
+        atomic_json(&job.join("plan.json"), &plan).unwrap();
+        atomic_json(
+            &job.join("artifacts.json"),
+            &BTreeMap::<String, PathBuf>::new(),
+        )
+        .unwrap();
+        let mut request = WorkerRequest {
+            protocol_version: 1,
+            job_identity: Some("hosted-game-fixture".into()),
+            package: root.join("package"),
+            plan: job.join("plan.json"),
+            artifacts: job.join("artifacts.json"),
+            stage: job.join("stage"),
+            game: root.join("game"),
+            output: root.join("installed"),
+            profile_ini: None,
+            masterlist: None,
+            masterlist_sha256: None,
+        };
+        let original = digest_file(&request.game.join(game.executable)).unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        assert!(install_local(&request, &token, &|_| token.cancel()).is_err());
+        assert!(!request.output.exists());
+        install_local(&request, &Default::default(), &|_| {})
+            .unwrap_or_else(|e| panic!("{}: {e:#}", game.domain));
+        let before = std::fs::read(request.output.join("profiles/Default/modlist.txt")).unwrap();
+        install_local(&request, &Default::default(), &|_| {}).unwrap();
+        assert_eq!(
+            std::fs::read(request.output.join("profiles/Default/modlist.txt")).unwrap(),
+            before
+        );
+        assert_eq!(
+            digest_file(&request.game.join(game.executable)).unwrap(),
+            original
+        );
+        let report: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(request.output.join(".collection/report.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["runtime_launch_tested"], false);
+        request.job_identity = Some("different-host-job".into());
+        assert!(install_local(&request, &Default::default(), &|_| {}).is_err());
+        assert_eq!(
+            std::fs::read(request.output.join("profiles/Default/modlist.txt")).unwrap(),
+            before
+        );
+    }
+}
