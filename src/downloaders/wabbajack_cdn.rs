@@ -5,7 +5,7 @@
 
 use anyhow::{bail, Context, Result};
 use flate2::read::GzDecoder;
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// CDN domain remapping (B-CDN to official domains)
 const CDN_REMAPS: &[(&str, &str)] = &[
@@ -150,18 +150,8 @@ impl WabbajackCdnDownloader {
         F: Fn(u64, u64) + Send + Sync + 'static,
     {
         const PARALLEL_DOWNLOADS: usize = 16;
-
-        // Fetch the definition file
         let definition = self.get_definition(base_url).await?;
-
-        info!(
-            "CDN file: {} ({} parts, {} bytes)",
-            definition.original_file_name,
-            definition.parts.len(),
-            definition.size
-        );
-
-        // Verify expected size matches (if provided)
+        validate_definition(&definition)?;
         if expected_size > 0 && definition.size != expected_size {
             bail!(
                 "CDN definition size mismatch: expected {}, got {}",
@@ -169,114 +159,145 @@ impl WabbajackCdnDownloader {
                 definition.size
             );
         }
-
         let total_size = definition.size;
-        let part_urls = Self::get_part_urls(base_url, &definition);
+        let is_wabbajack = definition
+            .original_file_name
+            .to_ascii_lowercase()
+            .ends_with(".wabbajack")
+            || output_path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("wabbajack"));
 
-        // Create output directory
-        if let Some(parent) = output_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+        // A preallocated file can have the right length while containing holes.
+        // Both CLI and GUI must go through the same content verification.
+        if output_path.exists() {
+            let path = output_path.to_path_buf();
+            let expected = definition.clone();
+            match tokio::task::spawn_blocking(move || {
+                verify_artifact(&path, &expected, is_wabbajack)
+            })
+            .await?
+            {
+                Ok(()) => {
+                    info!("Using verified cached file: {}", output_path.display());
+                    progress_callback(total_size, total_size);
+                    return Ok(total_size);
+                }
+                Err(error) => warn!(
+                    "Cached download is invalid; downloading a verified replacement: {error:#}"
+                ),
+            }
         }
 
-        // Pre-allocate the output file
-        let file = File::create(output_path)
-            .await
-            .with_context(|| format!("Failed to create {}", output_path.display()))?;
-        file.set_len(total_size).await?;
-        drop(file);
-
-        // Progress tracking
+        let parent = output_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        tokio::fs::create_dir_all(parent).await?;
+        // Never expose an unfinished download under its final cache name.
+        // TempPath removes partial data on error or async cancellation.
+        let temporary = tempfile::Builder::new()
+            .prefix(".clf3-download-")
+            .suffix(".part")
+            .tempfile_in(parent)?;
+        temporary.as_file().set_len(total_size)?;
+        let temporary_path = temporary.path().to_path_buf();
         let downloaded_bytes = Arc::new(AtomicU64::new(0));
         let progress_callback = Arc::new(progress_callback);
-
-        // Download parts in parallel
-        let parts_with_urls: Vec<_> = definition.parts.iter().zip(part_urls.iter()).collect();
-
-        let client = self.client.clone();
-        let output_path_owned = output_path.to_path_buf();
-
-        let results: Vec<Result<()>> = stream::iter(parts_with_urls)
+        let part_urls = Self::get_part_urls(base_url, &definition);
+        stream::iter(definition.parts.clone().into_iter().zip(part_urls))
             .map(|(part, url)| {
-                let client = client.clone();
-                let url = url.clone();
-                let output_path = output_path_owned.clone();
+                let client = self.client.clone();
+                let path = temporary_path.clone();
                 let downloaded_bytes = downloaded_bytes.clone();
                 let progress_callback = progress_callback.clone();
-                let part_index = part.index;
-                let part_offset = part.offset as u64;
-                let part_size = part.size;
-
                 async move {
-                    // Download the part with retry
-                    let bytes = super::with_retry(
-                        &format!("CDN part {}", part_index),
+                    super::with_retry(
+                        &format!("CDN part {}", part.index),
                         super::MAX_RETRIES,
-                        || Self::download_part_static(&client, &url),
+                        || Self::download_verified_part(&client, &url, &path, &part),
                     )
                     .await?;
-
-                    if bytes.len() != part_size {
-                        bail!(
-                            "Part {} size mismatch: expected {}, got {}",
-                            part_index,
-                            part_size,
-                            bytes.len()
-                        );
-                    }
-
-                    // Write at the correct offset using pwrite (atomic, no seek race)
-                    let output_path_clone = output_path.clone();
-                    let bytes_clone = bytes.clone();
-                    tokio::task::spawn_blocking(move || {
-                        use std::os::unix::fs::FileExt;
-                        let file = std::fs::OpenOptions::new()
-                            .write(true)
-                            .open(&output_path_clone)
-                            .with_context(|| {
-                                format!(
-                                    "Failed to open {} for writing",
-                                    output_path_clone.display()
-                                )
-                            })?;
-                        file.write_all_at(&bytes_clone, part_offset)?;
-                        Ok::<(), anyhow::Error>(())
-                    })
-                    .await
-                    .context("Write task panicked")??;
-
-                    // Update progress
-                    let new_total = downloaded_bytes
-                        .fetch_add(bytes.len() as u64, Ordering::Relaxed)
-                        + bytes.len() as u64;
-                    progress_callback(new_total, total_size);
-
-                    Ok(())
+                    let received = downloaded_bytes.fetch_add(part.size as u64, Ordering::Relaxed)
+                        + part.size as u64;
+                    progress_callback(received, total_size);
+                    Ok::<(), anyhow::Error>(())
                 }
             })
             .buffer_unordered(PARALLEL_DOWNLOADS)
-            .collect()
-            .await;
-
-        // Check for any errors
-        for result in results {
-            result?;
+            .try_collect::<Vec<_>>()
+            .await?;
+        if downloaded_bytes.load(Ordering::Relaxed) != total_size {
+            bail!("CDN download did not cover the complete file");
         }
-
-        let total_downloaded = downloaded_bytes.load(Ordering::Relaxed);
-        if expected_size > 0 && total_downloaded != expected_size {
-            bail!(
-                "Total size mismatch: expected {}, got {}",
-                expected_size,
-                total_downloaded
-            );
-        }
-
+        // Stream the final hash instead of retaining a multi-GiB archive in RAM.
+        let expected = definition.clone();
+        tokio::task::spawn_blocking(move || {
+            verify_artifact(&temporary_path, &expected, is_wabbajack)
+        })
+        .await??;
+        temporary.as_file().sync_all()?;
+        temporary.persist(output_path).with_context(|| {
+            format!(
+                "Could not publish verified download to {}",
+                output_path.display()
+            )
+        })?;
         info!(
-            "Downloaded {} bytes to {}",
-            total_downloaded,
+            "Verified and saved {} bytes to {}",
+            total_size,
             output_path.display()
         );
-        Ok(total_downloaded)
+        Ok(total_size)
+    }
+
+    async fn download_verified_part(
+        client: &Client,
+        url: &str,
+        path: &Path,
+        part: &CdnPart,
+    ) -> Result<()> {
+        use base64::Engine;
+        let mut response = client
+            .get(url)
+            .timeout(std::time::Duration::from_secs(300))
+            .send()
+            .await?
+            .error_for_status()?;
+        if response
+            .content_length()
+            .is_some_and(|size| size != part.size as u64)
+        {
+            bail!(
+                "Part {} response length differs from its definition",
+                part.index
+            );
+        }
+        // Independent descriptors give each parallel part its own file cursor.
+        let mut file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
+        file.seek(std::io::SeekFrom::Start(part.offset as u64))
+            .await?;
+        let mut received = 0u64;
+        let mut hash = xxhash_rust::xxh64::Xxh64::new(0);
+        while let Some(chunk) = response.chunk().await? {
+            received = received
+                .checked_add(chunk.len() as u64)
+                .context("Part size overflow")?;
+            if received > part.size as u64 {
+                bail!("Part {} exceeded its declared size", part.index);
+            }
+            hash.update(&chunk);
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        if received != part.size as u64 {
+            bail!("Part {} is incomplete", part.index);
+        }
+        let actual = base64::engine::general_purpose::STANDARD.encode(hash.digest().to_le_bytes());
+        if actual != part.hash {
+            bail!("Part {} checksum mismatch", part.index);
+        }
+        Ok(())
     }
 
     /// Static version of download_part for use in async closures
@@ -356,6 +377,57 @@ impl WabbajackCdnDownloader {
         info!("Downloaded {} bytes via direct link", bytes.len());
         Ok(bytes.len() as u64)
     }
+}
+
+fn validate_definition(definition: &CdnFileDefinition) -> Result<()> {
+    use base64::Engine;
+    let valid_hash = |hash: &str| {
+        base64::engine::general_purpose::STANDARD
+            .decode(hash)
+            .is_ok_and(|bytes| bytes.len() == 8)
+    };
+    if !valid_hash(&definition.hash) {
+        bail!("Invalid CDN file checksum");
+    }
+    let mut parts: Vec<_> = definition.parts.iter().collect();
+    parts.sort_by_key(|part| part.offset);
+    let mut offset = 0u64;
+    let mut indices = std::collections::HashSet::new();
+    for part in parts {
+        if part.size == 0
+            || part.offset as u64 != offset
+            || !indices.insert(part.index)
+            || !valid_hash(&part.hash)
+        {
+            bail!("Invalid CDN part layout or checksum at part {}", part.index);
+        }
+        offset = offset
+            .checked_add(part.size as u64)
+            .context("CDN part offset overflow")?;
+    }
+    if offset != definition.size {
+        bail!("CDN parts do not cover the declared file size");
+    }
+    Ok(())
+}
+
+fn verify_artifact(path: &Path, definition: &CdnFileDefinition, is_wabbajack: bool) -> Result<()> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() != definition.size {
+        bail!("Cached/downloaded file size mismatch");
+    }
+    if is_wabbajack {
+        let file = std::fs::File::open(path)?;
+        let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))
+            .context("Invalid Wabbajack ZIP archive")?;
+        archive
+            .by_name("modlist")
+            .context("Wabbajack archive has no modlist entry")?;
+    }
+    if !crate::hash::verify_file_hash(path, &definition.hash)? {
+        bail!("Cached/downloaded file checksum mismatch");
+    }
+    Ok(())
 }
 
 impl Default for WabbajackCdnDownloader {

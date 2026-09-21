@@ -1220,7 +1220,7 @@ async fn ensure_fluorine_available() -> Result<fluorine::FluorineInstall> {
 }
 
 /// Download a .wabbajack file from a URL into the CLF3 cache, returning the
-/// resolved local path. Reuses the existing cache file if present.
+/// resolved local path. Reuses cached files only after content verification.
 async fn fetch_wabbajack_from_url(url: &str, details_to_stderr: bool) -> Result<PathBuf> {
     let detail = |message: String| {
         if details_to_stderr {
@@ -1239,37 +1239,26 @@ async fn fetch_wabbajack_from_url(url: &str, details_to_stderr: bool) -> Result<
     let filename = cache_filename_from_wabbajack_url(url);
     let dest = cache_dir.join(&filename);
 
-    let cached = std::fs::metadata(&dest).ok().filter(|m| m.len() > 0);
-    if let Some(meta) = cached {
-        detail(format!(
-            "Using cached .wabbajack file: {} ({} MiB)",
-            dest.display(),
-            meta.len() / (1024 * 1024)
-        ));
-    } else {
-        detail("Downloading .wabbajack file from URL...".to_string());
-        let cdn = downloaders::wabbajack_cdn::WabbajackCdnDownloader::new()?;
-        let pb = indicatif::ProgressBar::new(0);
-        pb.set_style(
-            indicatif::ProgressStyle::default_bar()
-                .template("{msg} [{bar:40}] {bytes}/{total_bytes}")
-                .expect("valid template")
-                .progress_chars("=> "),
-        );
-        pb.set_message("Downloading");
-
-        let pb_clone = pb.clone();
-        cdn.download_with_progress(url, &dest, 0, move |downloaded, total| {
-            if pb_clone.length() == Some(0) && total > 0 {
-                pb_clone.set_length(total);
-            }
-            pb_clone.set_position(downloaded);
-        })
-        .await?;
-        pb.finish_with_message("Downloaded");
-
-        detail(format!("Saved to: {}", dest.display()));
-    }
+    detail("Checking/downloading a verified .wabbajack file...".to_string());
+    let cdn = downloaders::wabbajack_cdn::WabbajackCdnDownloader::new()?;
+    let pb = indicatif::ProgressBar::new(0);
+    pb.set_style(
+        indicatif::ProgressStyle::default_bar()
+            .template("{msg} [{bar:40}] {bytes}/{total_bytes}")
+            .expect("valid template")
+            .progress_chars("=> "),
+    );
+    pb.set_message("Downloading / verifying");
+    let pb_clone = pb.clone();
+    cdn.download_with_progress(url, &dest, 0, move |downloaded, total| {
+        if pb_clone.length() == Some(0) && total > 0 {
+            pb_clone.set_length(total);
+        }
+        pb_clone.set_position(downloaded);
+    })
+    .await?;
+    pb.finish_with_message("Verified");
+    detail(format!("Verified .wabbajack file: {}", dest.display()));
 
     Ok(dest)
 }
