@@ -281,7 +281,8 @@ fn pad_rgba_with_edge_replicate(
 }
 
 /// Pre-generate BC7-ready mip images from a base RGBA image.
-/// Small mip levels (< 4x4) are padded up to 4x4 for BC block encoding.
+/// Every mip is edge-padded to a 4x4 block boundary, including non-power-of-two
+/// dimensions. Resizing the next mip always uses the unpadded image.
 fn build_bc7_mip_images(
     base: RgbaImage,
     target_width: u32,
@@ -295,10 +296,10 @@ fn build_bc7_mip_images(
     let mut mip_height = target_height;
 
     for mip_level in 0..mip_count {
-        let encode_width = mip_width.max(4);
-        let encode_height = mip_height.max(4);
+        let encode_width = mip_width.max(4).next_multiple_of(4);
+        let encode_height = mip_height.max(4).next_multiple_of(4);
 
-        let rgba_data = if mip_width < 4 || mip_height < 4 {
+        let rgba_data = if mip_width != encode_width || mip_height != encode_height {
             pad_rgba_with_edge_replicate(
                 current_image.as_raw(),
                 mip_width,
@@ -918,12 +919,12 @@ fn process_bc7_batch_gpu(
 
     // Separate successful preparations from failures
     let mut good: Vec<PreparedBc7Texture> = Vec::new();
-    for prep in prepared {
+    for (prep, job) in prepared.into_iter().zip(jobs) {
         match prep {
             Ok(p) => good.push(p),
             Err(e) => {
                 completed.fetch_add(1, Ordering::Relaxed);
-                results.push((None, Err(e)));
+                results.push((job.id.clone(), Err(e)));
             }
         }
     }
@@ -987,16 +988,10 @@ fn flush_gpu_batch(
     let batch_size = textures.len();
     debug!("Flushing GPU batch: {} textures", batch_size);
 
-    let mut batch = encoder.create_batch();
     let mut job_meta: Vec<(Option<String>, u32, u32, usize)> = Vec::with_capacity(batch_size);
 
     for texture in textures.iter() {
         let mip_count = texture.mip_images.len();
-        for (mip_data, w, h) in &texture.mip_images {
-            if let Err(e) = encoder.queue_bc7(&mut batch, mip_data, *w, *h) {
-                warn!("Failed to queue BC7 mip: {}", e);
-            }
-        }
         job_meta.push((
             texture.id.clone(),
             texture.target_width,
@@ -1005,7 +1000,25 @@ fn flush_gpu_batch(
         ));
     }
 
-    match encoder.flush_batch(batch) {
+    // Never assemble partial queue results: a missing mip shifts all later
+    // texture offsets and used to cause an out-of-bounds panic here.
+    let encoded = (|| -> Result<Vec<Vec<u8>>> {
+        let mut batch = encoder.create_batch();
+        for texture in textures.iter() {
+            for (mip_data, w, h) in &texture.mip_images {
+                encoder
+                    .queue_bc7(&mut batch, mip_data, *w, *h)
+                    .context("Failed to queue BC7 mip")?;
+            }
+        }
+        let all_mips = encoder.flush_batch(batch)?;
+        let expected: usize = job_meta.iter().map(|(_, _, _, count)| count).sum();
+        if all_mips.len() != expected {
+            anyhow::bail!("GPU returned {} of {} BC7 mips", all_mips.len(), expected);
+        }
+        Ok(all_mips)
+    })();
+    match encoded {
         Ok(all_mips) => {
             let mut mip_offset = 0;
             for (id, w, h, mip_count) in job_meta {
@@ -1217,6 +1230,98 @@ pub fn process_texture_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bc7_mips_align_every_dimension_and_replicate_edges() {
+        let base = RgbaImage::from_fn(6, 5, |x, y| image::Rgba([x as u8, y as u8, 0, 255]));
+        let mips = build_bc7_mip_images(base, 6, 5);
+        assert_eq!(
+            mips.iter().map(|(_, w, h)| (*w, *h)).collect::<Vec<_>>(),
+            vec![(8, 8), (4, 4), (4, 4)]
+        );
+        let first = RgbaImage::from_raw(8, 8, mips[0].0.clone()).unwrap();
+        assert_eq!(first.get_pixel(7, 7).0, [5, 4, 0, 255]);
+        assert_eq!(first.get_pixel(2, 7).0, [2, 4, 0, 255]);
+        assert_eq!(first.get_pixel(7, 2).0, [5, 2, 0, 255]);
+        for (width, height) in [
+            (120, 512),
+            (152, 512),
+            (184, 1024),
+            (120, 256),
+            (280, 1024),
+            (40, 128),
+        ] {
+            let mips = build_bc7_mip_images(RgbaImage::new(width, height), width, height);
+            for (level, (bytes, w, h)) in mips.iter().enumerate() {
+                assert_eq!(*w, (width >> level).max(1).next_multiple_of(4));
+                assert_eq!(*h, (height >> level).max(1).next_multiple_of(4));
+                assert_eq!(bytes.len(), (*w * *h * 4) as usize);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a working GPU"]
+    fn test_bc7_non_aligned_gpu_batch() {
+        let mut encoder = GpuEncoder::new().unwrap();
+        let dimensions = [
+            (120, 512),
+            (152, 512),
+            (184, 1024),
+            (120, 256),
+            (280, 1024),
+            (40, 128),
+        ];
+        let mut textures: Vec<_> = dimensions
+            .iter()
+            .enumerate()
+            .map(|(i, &(w, h))| PreparedBc7Texture {
+                target_width: w,
+                target_height: h,
+                id: Some(i.to_string()),
+                mip_images: build_bc7_mip_images(
+                    RgbaImage::from_pixel(w, h, image::Rgba([70, 130, 180, 255])),
+                    w,
+                    h,
+                ),
+            })
+            .collect();
+        let mut results = Vec::new();
+        let completed = AtomicUsize::new(0);
+        flush_gpu_batch(&mut encoder, &mut textures, &mut results, &completed);
+        assert_eq!(completed.load(Ordering::Relaxed), dimensions.len());
+        for ((id, result), &(w, h)) in results.into_iter().zip(&dimensions) {
+            let result = result.unwrap();
+            let dds = Dds::read(Cursor::new(&result.data)).unwrap();
+            assert_eq!((dds.get_width(), dds.get_height()), (w, h));
+            let expected_size: usize = (0..calculate_mip_levels(w, h))
+                .map(|level| {
+                    ((w >> level).max(1).div_ceil(4) * (h >> level).max(1).div_ceil(4) * 16)
+                        as usize
+                })
+                .sum();
+            assert_eq!(dds.data.len(), expected_size);
+            decode_dds_to_rgba(&result.data).unwrap();
+            println!(
+                "GPU BC7 texture {:?}: {}x{}, all mips encoded and DDS decoded",
+                id, w, h
+            );
+        }
+
+        // A rejected queue item must return an error/fallback, never shift the
+        // remaining mip offsets or panic while slicing a partial result array.
+        textures.push(PreparedBc7Texture {
+            target_width: 4,
+            target_height: 4,
+            id: Some("bad".into()),
+            mip_images: vec![(vec![0; 4], 4, 4)],
+        });
+        let mut results = Vec::new();
+        flush_gpu_batch(&mut encoder, &mut textures, &mut results, &completed);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.as_deref(), Some("bad"));
+        assert!(results[0].1.is_err());
+    }
 
     #[test]
     fn test_output_format_from_str() {

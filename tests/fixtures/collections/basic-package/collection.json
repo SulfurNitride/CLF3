@@ -1,0 +1,12 @@
+{
+  "info": {
+    "name": "CLF3 local collection fixture",
+    "domainName": "skyrimspecialedition"
+  },
+  "mods": [
+    {
+      "name": "Fixture bundle",
+      "source": {"type": "bundle", "fileExpression": "fixture", "tag": "fixture-bundle"}
+    }
+  ]
+}

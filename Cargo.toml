@@ -1,8 +1,8 @@
 [package]
 name = "clf3"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
-description = "Wabbajack modlist installer for Linux"
+description = "Wabbajack and Nexus Collections installer for Linux"
 license = "MIT"
 repository = "https://github.com/SulfurNitride/CLF3"
 
@@ -18,6 +18,7 @@ path = "src/main.rs"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+encoding_rs = "0.8"
 
 # Database
 rusqlite = { version = "0.38", features = ["bundled"] }
@@ -66,6 +67,8 @@ futures = "0.3.31"
 # Mega downloads (native API, no proxy)
 # mega needs reqwest 0.12 for its HttpClient impl — we rename it to avoid conflict with our 0.13
 mega = "0.8"
+aes = "0.8"
+ctr = "0.9"
 reqwest_012 = { package = "reqwest", version = "0.12", features = ["json", "stream"] }
 async-trait = "0.1"
 tokio-util = { version = "0.7", features = ["compat"] }
@@ -102,6 +105,9 @@ which = "8.0"
 
 # Hashing
 md5 = "0.7"
+sha2 = "0.10"
+crc32fast = "1.5"
+qbsdiff = "1.4"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 base64 = "0.22"
 
@@ -125,11 +131,20 @@ console = "0.16.3"
 eframe = "0.31"
 egui_extras = { version = "0.31", features = ["image"] }
 rfd = "0.15"
+roxmltree = "0.21.1"
+libloot = "0.29"
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Collection conformance runs verify tens of GiB even in development builds.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.md5]
+opt-level = 3
 
 [dev-dependencies]
 # tempfile also in main dependencies now

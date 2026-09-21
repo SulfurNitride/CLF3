@@ -5,6 +5,7 @@
 //! Nexus downloads use the Premium API; genuinely manual non-Nexus sources
 //! are reported to the user with their download instructions.
 
+use crate::downloaders::loverslab::ManualDownloadRequired;
 use crate::downloaders::{
     download_file_with_callback, GoogleDriveDownloader, HttpClient, LoversLabDownloader,
     MediaFireDownloader, NexusDownloader, ProgressCallback as HttpProgressCallback,
@@ -1601,6 +1602,17 @@ async fn process_archive(
             (DownloadResult::Success, url_to_cache)
         }
         Err(e) => {
+            if let Some(manual) = ll_manual_fallback(&e, &state, archive) {
+                ctx.reporter
+                    .log(&format!("MANUAL {} - {}", archive.name, e));
+                handle.set_message(&format!("Manual download needed: {}", archive.name));
+                handle.finish();
+                ctx.manual_downloads.lock().await.push(manual);
+                ctx.reporter.overall_inc();
+                update_overall_message(ctx);
+                report_archive_complete(ctx, &archive.name);
+                return (DownloadResult::Manual, None);
+            }
             ctx.failed.fetch_add(1, Ordering::Relaxed);
             ctx.reporter.overall_inc();
             let error_msg = root_cause(&e);
@@ -1628,6 +1640,25 @@ async fn process_archive(
             (DownloadResult::Failed, None)
         }
     }
+}
+
+fn ll_manual_fallback(
+    error: &anyhow::Error,
+    state: &DownloadState,
+    archive: &ArchiveInfo,
+) -> Option<ManualDownloadInfo> {
+    if !error.is::<ManualDownloadRequired>() {
+        return None;
+    }
+    let DownloadState::Manual(state) = state else {
+        return None;
+    };
+    Some(ManualDownloadInfo {
+        name: archive.name.clone(),
+        url: state.url.clone(),
+        expected_size: archive.size as u64,
+        prompt: Some(format!("{} — {}", state.prompt, error)),
+    })
 }
 
 /// Update the overall progress bar message with current stats
@@ -2114,6 +2145,9 @@ async fn download_archive(
                 return Ok(url_to_cache);
             }
             Err(e) => {
+                if e.is::<ManualDownloadRequired>() {
+                    return Err(e);
+                }
                 let error_str = format!("{:#}", e);
                 let is_rate_limit =
                     error_str.contains("429") || error_str.to_lowercase().contains("rate limit");
@@ -2205,6 +2239,46 @@ async fn download_archive(
             }
         }
     }
+}
+
+/// Keep the host-selected file in the normal outer size/hash verification path.
+async fn download_hosted_manual(
+    provider: &dyn super::host::HostedDownloadProvider,
+    manual_state: &crate::modlist::ManualState,
+    archive: &ArchiveInfo,
+    output_path: &Path,
+) -> Result<()> {
+    let source = provider
+        .resolve_manual(HostedManualRequest {
+            archive_name: archive.name.clone(),
+            expected_size: archive.size as u64,
+            expected_hash: archive.hash.clone(),
+            url: manual_state.url.clone(),
+            prompt: manual_state.prompt.clone(),
+        })
+        .await?;
+    if !source.is_file() {
+        bail!(
+            "Host-provided manual archive does not exist: {}",
+            source.display()
+        );
+    }
+    let source_is_destination = std::fs::canonicalize(&source)
+        .ok()
+        .zip(std::fs::canonicalize(output_path).ok())
+        .is_some_and(|(source, destination)| source == destination);
+    if !source_is_destination {
+        tokio::fs::copy(&source, output_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to copy host-provided archive {} to {}",
+                    source.display(),
+                    output_path.display()
+                )
+            })?;
+    }
+    Ok(())
 }
 
 /// Create a progress callback that emits ProgressEvent::DownloadProgress
@@ -2437,8 +2511,12 @@ async fn download_archive_inner(
             info!("Mega download for {} - trying native API", archive.name);
             handle.set_message(&format!("Mega: {}", truncate_name(&archive.name, 30)));
 
-            match crate::downloaders::mega_native::download_mega_file(&mega_state.url, output_path)
-                .await
+            match crate::downloaders::mega_native::download_mega_file_with_callback(
+                &mega_state.url,
+                output_path,
+                callback_ref,
+            )
+            .await
             {
                 Ok(()) => {
                     info!("Mega native download succeeded for {}", archive.name);
@@ -2479,36 +2557,8 @@ async fn download_archive_inner(
                 None
             };
             if let Some(provider) = provider {
-                let source = provider
-                    .resolve_manual(HostedManualRequest {
-                        archive_name: archive.name.clone(),
-                        expected_size: archive.size as u64,
-                        expected_hash: archive.hash.clone(),
-                        url: manual_state.url.clone(),
-                        prompt: manual_state.prompt.clone(),
-                    })
+                download_hosted_manual(provider.as_ref(), manual_state, archive, output_path)
                     .await?;
-                if !source.is_file() {
-                    bail!(
-                        "Host-provided manual archive does not exist: {}",
-                        source.display()
-                    );
-                }
-                let source_is_destination = std::fs::canonicalize(&source)
-                    .ok()
-                    .zip(std::fs::canonicalize(output_path).ok())
-                    .is_some_and(|(source, destination)| source == destination);
-                if !source_is_destination {
-                    tokio::fs::copy(&source, output_path)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "Failed to copy host-provided archive {} to {}",
-                                source.display(),
-                                output_path.display()
-                            )
-                        })?;
-                }
                 return Ok(((), None));
             }
             if is_moddb_url(&manual_state.url) {
@@ -2550,11 +2600,34 @@ async fn download_archive_inner(
                     handle.set_message(&format!("LL: {}", truncate_name(&archive.name, 35)));
 
                     let result = ll
-                        .download(&manual_state.url, &archive.name, output_path)
+                        .download_with_callback(
+                            &manual_state.url,
+                            &archive.name,
+                            output_path,
+                            callback_ref,
+                        )
                         .await;
 
                     match result {
                         Ok(()) => Ok(((), None)),
+                        Err(e) if e.is::<ManualDownloadRequired>() => {
+                            // The chooser and description have both been checked.
+                            // Hand unresolved files back to the host or manual list.
+                            drop(_permit);
+                            if let Some(provider) = &ctx.config.hosted_download_provider {
+                                handle.set_message(&format!("Manual: {}", archive.name));
+                                download_hosted_manual(
+                                    provider.as_ref(),
+                                    manual_state,
+                                    archive,
+                                    output_path,
+                                )
+                                .await?;
+                                Ok(((), None))
+                            } else {
+                                Err(e)
+                            }
+                        }
                         Err(e) => {
                             let err_msg = format!("{:#}", e);
                             // If LL redirected to Mega (lost URL fragment), try proxy/mirror
@@ -2623,9 +2696,10 @@ async fn download_archive_inner(
                 );
                 handle.set_message(&format!("Mega: {}", truncate_name(&archive.name, 30)));
 
-                match crate::downloaders::mega_native::download_mega_file(
+                match crate::downloaders::mega_native::download_mega_file_with_callback(
                     &manual_state.url,
                     output_path,
+                    callback_ref,
                 )
                 .await
                 {
@@ -2927,6 +3001,34 @@ async fn download_non_nexus_files(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn unresolved_ll_files_keep_manual_instructions_but_network_errors_do_not() {
+        let state = DownloadState::Manual(crate::modlist::ManualState {
+            url: "https://www.loverslab.com/files/file/123-mod/".into(),
+            prompt: "Get the pinned archive".into(),
+        });
+        let archive = ArchiveInfo {
+            name: "Missing.7z".into(),
+            hash: "expected".into(),
+            size: 100,
+            meta: String::new(),
+            state_json: String::new(),
+            download_status: String::new(),
+            extraction_status: String::new(),
+            local_path: None,
+            cached_url: None,
+            url_expires: None,
+        };
+        let error = anyhow::Error::new(ManualDownloadRequired("Exact file not found".into()))
+            .context("LL resolution");
+        let manual = ll_manual_fallback(&error, &state, &archive).unwrap();
+        assert_eq!(manual.name, "Missing.7z");
+        assert_eq!(manual.expected_size, 100);
+        assert_eq!(manual.url, "https://www.loverslab.com/files/file/123-mod/");
+        assert!(manual.prompt.unwrap().contains("Get the pinned archive"));
+        assert!(ll_manual_fallback(&anyhow::anyhow!("HTTP 503"), &state, &archive).is_none());
+    }
 
     #[test]
     fn extract_moddb_start_url_from_addon_page() {

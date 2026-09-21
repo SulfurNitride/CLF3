@@ -16,12 +16,6 @@ Modlist installer for Linux. Installs Wabbajack modlists without needing Windows
 
 Named after Chlorine Trifluoride - burns through modlists like ClF3 burns through concrete.
 
-## Status
-
-**Early development** - Testing welcome!
-
-Games/Modlist Tested: BG3EE, Tuxborn, LoreRim, Heartland Redux, Fallout Anomaly, Viva New Vegas, Outlander.
-
 ## Build
 
 ```bash

@@ -5,6 +5,8 @@
 
 pub mod archive;
 pub mod bsa;
+pub mod collection;
+pub mod collection_app;
 pub mod downloaders;
 pub mod fluorine;
 pub mod game_finder;

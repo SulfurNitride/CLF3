@@ -1,0 +1,98 @@
+{
+  "name": "Merethic Body, Physics, Presets, and Skimpy Outfits Overlay",
+  "description": "Selective Merethic overlay for an existing Fluorine/MO2 instance",
+  "archive_state_overrides": {
+    "Forest Nymph.7z": {
+      "$type": "MediaFireDownloader+State, Wabbajack.Lib",
+      "Url": "https://www.mediafire.com/file/ele6f2ccd8og9i8/Forest+Nymph.7z/file"
+    }
+  },
+  "groups": [
+    {
+      "separator": "[Merethic Overlay] Body Framework_separator",
+      "folders": [
+        "BodySlide and Outfit Studio",
+        "Caliente's Beautiful Bodies Enhancer -CBBE-",
+        "CBBE 3BA",
+        "CBBE 3BA - Physics Only",
+        "HIMBO",
+        "HIMBO V5 - BG-DG-DB Refits",
+        "HIMBO V5 - CC Refits",
+        "OBody NG",
+        "OBody - Merethic Config",
+        "OBody Next Generation ORefit JSON Master List",
+        "3BA With Obody Collision Physics Fix",
+        "Schlongs of Skyrim SE",
+        "Baka SOS SMP Patch"
+      ]
+    },
+    {
+      "separator": "[Merethic Overlay] Male and Female Skins_separator",
+      "folders": [
+        "Bits and pieces female skin - v2.0 - Pre Merethic v1.10",
+        "Bits and pieces female skin - v2.0 - Merethic v1.10+",
+        "Bits and pieces female skin - v2.0 - iAm's Choices",
+        "BnP CBBE 4k Wetfunction Patch",
+        "BnP male skin (Replacer+Player version)",
+        "FA Dibellan - Simply Better Bits for CBBE-3BA",
+        "Mu Dynamic NormalMap",
+        "Merethic BnP 2.0 Futa Patch",
+        "BnP - Child Skin",
+        "BnP teeth overhaul"
+      ]
+    },
+    {
+      "separator": "[Merethic Overlay] Body Physics_separator",
+      "folders": [
+        "CBPC - Physics with Collisions",
+        "Faster HDT-SMP",
+        "Faster HDT-SMP - AVX512 DLL",
+        "XP32 Maximum Skeleton lite",
+        "XP32 Maximum Skeleton Special Extended (Stripped)",
+        "Pandora XPMSE Lite Patch",
+        "SMP-NPC crash fix",
+        "Auto Physics Reset",
+        "92BBB Physics BHUNP and CBBE 3BA",
+        "3BA Jello Butt Physics (CBPC Config)",
+        "Aphrodelyn's 3BA CBPC Physics and Collision Configs",
+        "Petite to Plenty - A CBPC Config for Realistic Collisions and Physics",
+        "SHINI Physics Config",
+        "CBPC Anus Support",
+        "CBPC Anus Support - 1.6.1170 DLL"
+      ]
+    }
+  ],
+  "presets": {
+    "separator": "[Merethic Overlay] BodySlide Presets_separator",
+    "exclude_folders": []
+  },
+  "outfits": {
+    "separator": "[Merethic Overlay] Skimpy Outfits_separator",
+    "patterns": [
+      "1001 Nights", "Amsedillir", "Apachii Maid", "Asura's Guard",
+      "Ayleid Piercings", "BD.?s Armor and Clothes", "Bikini",
+      "Bisquits Pain Bringer", "Bladedancer", "Cindersoul", "COCO",
+      "Dark (Apprentice|Disciple|Dreams|Elf Blader|Mage|Witch)",
+      "Daughters of Dimitrescu", "DD -", "Destroyer", "Deze Clothing",
+      "Dovakini", "Draugr Halloween", "DX ", "Ebonscale",
+      "Egil's Demon Hunter", "ELLE -", "Elven Lake", "Forest Nymph",
+      "Fuse00 - Arianna", "Goma Fine Clothes", "H2135", "Hellraiser",
+      "Invicta Couture", "Kinnari", "KSO Mage Robes", "Lavatera",
+      "MAGECORE", "Melodic Raven", "Obi", "Penelope", "Purple Esmeralda",
+      "Red Riding Hood", "Regalia of the Scorned", "ReSqueeze", "Sand Snake",
+      "Sharkish Piercings", "Shino - Shadow Princess", "Silver Witch",
+      "Skimped", "Southbound Scouts", "T\\.A\\.W\\.O\\.S\\.A\\.",
+      "TAWOBA|Tawoba", "TEWOBA", "Twilight Princess",
+      "Viridian Knight.*Skimpy", "Volkihar Assassin", "Vtaw Fiend",
+      "Wild Witch", "YoRHa 2B", "Queen Marika", "Spiked Tape",
+      "\\[NINI\\]", "\\[Rektas\\] Luna"
+    ],
+    "extra_folders": [
+      "Apachii Maid Armor CBBE HDT",
+      "SPID Apachii Maid Outfits for Vanilla NPCs",
+      "Tawoba 6.1 unofficial tweaks and fixes",
+      "TEWOBA Replacer Helms",
+      "Viridian Knight (Skimpy Standalone) - Recolored"
+    ]
+  }
+}

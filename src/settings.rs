@@ -8,6 +8,9 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
 /// Browser install path choices saved per Wabbajack list.
@@ -131,9 +134,8 @@ pub struct Settings {
     #[serde(default)]
     pub installed_modlists: HashMap<String, InstalledModlistRecord>,
 
-    /// When set, finished installs are registered as portable instances in
-    /// Fluorine Manager. If Fluorine isn't installed on disk, the integration
-    /// downloads the latest release automatically.
+    /// Legacy preference retained for settings compatibility; standalone
+    /// installations ignore it and never register with a manager automatically.
     #[serde(default)]
     pub add_to_fluorine: bool,
 
@@ -196,7 +198,18 @@ impl Settings {
         let path = Self::settings_path()?;
         let content = serde_json::to_string_pretty(self).context("Failed to serialize settings")?;
 
-        std::fs::write(&path, content).with_context(|| format!("Failed to write {:?}", path))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&path)
+            .with_context(|| format!("Failed to open {:?} for writing", path))?;
+        file.write_all(content.as_bytes())
+            .with_context(|| format!("Failed to write {:?}", path))?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("Failed to secure permissions on {:?}", path))?;
 
         Ok(())
     }

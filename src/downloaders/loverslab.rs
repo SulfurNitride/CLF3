@@ -1,10 +1,11 @@
 //! LoversLab automated downloader
 //!
-//! Logs into LoversLab (IPS4 forum) with email/password, scrapes the
-//! download page for each file, matches the expected filename, and
-//! downloads the correct attachment.  Downloads are sequential (one at
-//! a time) to avoid rate-limiting.
+//! Uses LoversLab's authenticated IPS Downloads controller with numeric file
+//! and resource IDs. Only the AJAX file chooser (or forum attachments) needs
+//! HTML parsing; display slugs and page titles are not part of resolution.
+//! The installer serializes downloads and verifies the modlist archive hash.
 
+use super::http::ProgressCallback;
 use anyhow::{bail, Context, Result};
 use reqwest::cookie::Jar;
 use reqwest::Client;
@@ -14,10 +15,15 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
-use tracing::{debug, info, warn};
+use tracing::info;
 
 const BASE_URL: &str = "https://www.loverslab.com";
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0";
+
+/// Resolution needs a user-selected file rather than another automatic retry.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct ManualDownloadRequired(pub String);
 
 /// A logged-in LoversLab session that can download files.
 pub struct LoversLabDownloader {
@@ -31,11 +37,12 @@ pub struct LoversLabDownloader {
 struct FileEntry {
     name: String,
     download_url: String,
+    wait: bool,
 }
 
 impl LoversLabDownloader {
     /// Create a new downloader by logging in with the given credentials.
-    /// Returns `None` if credentials are empty.
+    /// Fails if credentials are empty or the server does not confirm a login.
     pub async fn login(email: &str, password: &str) -> Result<Self> {
         if email.is_empty() || password.is_empty() {
             bail!("LoversLab credentials not configured");
@@ -72,11 +79,6 @@ impl LoversLabDownloader {
         let csrf_key = extract_csrf_key(&login_page)
             .context("Could not find csrfKey on LoversLab login page")?;
 
-        debug!(
-            "Got LoversLab csrfKey: {}...",
-            &csrf_key[..8.min(csrf_key.len())]
-        );
-
         // Step 2: POST login form
         let params = [
             ("csrfKey", csrf_key.as_str()),
@@ -110,16 +112,12 @@ impl LoversLabDownloader {
             bail!("LoversLab login failed: incorrect email or password");
         }
 
-        // Verify we're actually logged in by checking for a logout link
-        if !body.contains("/logout/") && !status.is_redirection() {
-            // Try to detect what went wrong
-            warn!(
-                "LoversLab login may have failed (status={}, body_len={})",
-                status,
-                body.len()
+        // A challenge/error page must not be mistaken for a verified account.
+        if !status.is_success() || !body.contains("/logout/") {
+            bail!(
+                "LoversLab login was not confirmed (HTTP {}); interactive sign-in may be required",
+                status
             );
-            // Don't bail — the redirect may have consumed the body, and
-            // cookie-based auth might still work on subsequent requests.
         }
 
         info!("LoversLab login successful");
@@ -141,278 +139,302 @@ impl LoversLabDownloader {
         expected_name: &str,
         output_path: &Path,
     ) -> Result<()> {
-        // Forum topics and blog entries embed attachments as ipsAttachLink
-        // elements rather than exposing a ?do=download file list.
+        self.download_with_callback(page_url, expected_name, output_path, None)
+            .await
+    }
+
+    pub async fn download_with_callback(
+        &self,
+        page_url: &str,
+        expected_name: &str,
+        output_path: &Path,
+        progress: Option<&ProgressCallback>,
+    ) -> Result<()> {
+        if !is_loverslab_url(page_url) {
+            bail!("Expected a LoversLab URL");
+        }
         if page_url.contains("/topic/") || page_url.contains("/blogs/entry/") {
             return self
-                .download_forum_attachment(page_url, expected_name, output_path)
+                .download_forum_attachment(page_url, expected_name, output_path, progress)
                 .await;
         }
 
-        // Ensure the URL has ?do=download so we get the file list page.
-        // If the modlist already points at a concrete resource (`r=...`),
-        // keep it: some LoversLab slugs contain non-ASCII text and can arrive
-        // with literal '?' replacement characters, making the slug unusable.
-        let download_page_url = ensure_download_url(page_url);
-
-        info!("Fetching LoversLab download page: {}", download_page_url);
-
-        // Use no-redirect client to capture Location headers (Mega redirects have #key in fragment)
-        let initial_resp = self
-            .no_redirect_client
-            .get(&download_page_url)
-            .send()
-            .await
-            .with_context(|| format!("Failed to fetch LL page: {}", download_page_url))?;
-
-        // Handle redirects manually
-        if initial_resp.status().is_redirection() {
-            if let Some(location) = initial_resp.headers().get("location") {
-                let location_str = location.to_str().unwrap_or("");
-                if location_str.contains("mega.nz") {
-                    info!(
-                        "LL redirects to Mega (with key): {} -> {}",
-                        download_page_url, location_str
-                    );
-                    return super::mega_native::download_mega_file(location_str, output_path)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "Mega download failed for {} (redirected from LL: {})",
-                                expected_name, download_page_url
-                            )
-                        });
-                }
-            }
-            // Non-Mega redirect — follow with the normal client
-        }
-
-        // Fetch the page with the normal client (follows redirects, has full cookie support)
-        let response = self
-            .client
-            .get(&download_page_url)
-            .send()
-            .await
-            .with_context(|| format!("Failed to fetch LL page: {}", download_page_url))?;
-
-        // Check if the response is already a file download (not HTML)
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-
-        if !content_type.contains("text/html") && !content_type.is_empty() {
-            info!(
-                "LL returned direct download (content-type: {}): {}",
-                content_type, expected_name
-            );
-            return Self::stream_response_to_file(response, output_path).await;
-        }
-
-        let page_html = response
-            .text()
-            .await
-            .context("Failed to read LL download page")?;
-
-        // Check if we got redirected to login (session expired)
-        if page_html.contains("id=\"elSignIn_submit\"") || page_html.contains("_processLogin") {
-            bail!("LoversLab session expired — re-login required");
-        }
-
-        // Check if the page contains a Mega link instead of a direct download
-        if let Some(mega_url) = extract_mega_url(&page_html) {
-            info!(
-                "LL page contains Mega link: {} -> {}",
-                download_page_url, mega_url
-            );
-            return super::mega_native::download_mega_file(&mega_url, output_path)
-                .await
-                .with_context(|| {
-                    format!(
-                        "Mega download failed for {} (linked from LL: {})",
-                        expected_name, download_page_url
-                    )
-                });
-        }
-
-        let csrf_key = match extract_csrf_key(&page_html) {
-            Some(key) => key,
-            None => {
-                // Log diagnostic info to help debug
-                let page_len = page_html.len();
-                let has_cloudflare = page_html.contains("Just a moment");
-                let has_login = page_html.contains("elSignIn");
-                let title = page_html
-                    .find("<title>")
-                    .and_then(|start| {
-                        let rest = &page_html[start + 7..];
-                        rest.find("</title>").map(|end| &rest[..end])
-                    })
-                    .unwrap_or("unknown");
-                warn!(
-                    "LL page missing csrfKey for {}: title='{}', len={}, cloudflare={}, login={}",
-                    expected_name, title, page_len, has_cloudflare, has_login
-                );
-                bail!(
-                    "Could not find csrfKey on LL download page (page title: '{}', {} bytes)",
-                    title,
-                    page_len
-                );
-            }
-        };
-
-        // Parse the file list
-        let entries = parse_file_list(&page_html, &csrf_key)?;
-
-        if entries.is_empty() {
-            if let Some(download_url) = find_file_page_download_link(&page_html)
-                .or_else(|| find_canonical_download_url(&page_html))
-            {
-                let normalized =
-                    merge_resource_id(&ensure_download_url(&download_url), &download_page_url);
-                if normalized != download_page_url {
-                    info!(
-                        "LL returned file detail page for {}; following download button: {}",
-                        expected_name, normalized
-                    );
-                    return Box::pin(self.download(&normalized, expected_name, output_path)).await;
-                }
-            }
-            if let Some(download_url) =
-                synthesize_download_url_from_title(&download_page_url, &page_html)
-            {
-                let normalized = merge_resource_id(&download_url, &download_page_url);
-                if normalized != download_page_url {
-                    info!(
-                        "LL returned file page without canonical URL for {}; synthesized download URL: {}",
-                        expected_name, normalized
-                    );
-                    return Box::pin(self.download(&normalized, expected_name, output_path)).await;
-                }
-            }
-            // Might be a single-file download — check if there's a direct download link
-            if let Some(direct_url) = find_single_download_link(&page_html, &csrf_key) {
-                info!("Single-file download detected for {}", expected_name);
-                return self.download_file(&direct_url, output_path).await;
-            }
-            if let Some(direct_url) = build_confirmed_download_url(&download_page_url, &csrf_key) {
-                info!(
-                    "Single-file resource download detected for {} (r=)",
-                    expected_name
-                );
-                return self.download_file(&direct_url, output_path).await;
-            }
-            bail!(
-                "No downloadable files found on LL page: {}",
-                download_page_url
-            );
-        }
-
+        let download_url =
+            controller_download_url(page_url, false).context("Unsupported LoversLab file URL")?;
+        let resource_id = query_value(&download_url, "r");
         info!(
-            "Found {} files on LL page, looking for: {}",
-            entries.len(),
+            "Resolving LoversLab file {} for {}",
+            query_value(&download_url, "id").unwrap_or_default(),
             expected_name
         );
 
-        // Match the expected filename against the available files
-        let matched = match_filename(expected_name, &entries).with_context(|| {
-            let available: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-            format!(
-                "Could not match '{}' against available files: {:?}",
-                expected_name, available
-            )
-        })?;
-
-        info!(
-            "Matched '{}' -> '{}' ({})",
-            expected_name, matched.name, matched.download_url
-        );
-
-        self.download_file(&matched.download_url, output_path).await
-    }
-
-    /// Download a file from a resolved URL to disk, streaming to avoid truncation.
-    async fn download_file(&self, url: &str, output_path: &Path) -> Result<()> {
-        let resp = self
-            .client
-            .get(url)
-            .send()
+        // The same request the site's file chooser makes. Single-file pages
+        // can return an attachment immediately; do not fetch them twice.
+        let response = match self.request_download(&download_url, true).await? {
+            DownloadResponse::Mega(url) => {
+                return super::mega_native::download_mega_file_with_callback(
+                    url.as_str(),
+                    output_path,
+                    progress,
+                )
+                .await
+            }
+            DownloadResponse::Http(response) => response,
+        };
+        if is_file_response(response.headers()) {
+            return Self::stream_response_to_file(response, output_path, progress).await;
+        }
+        let html = response
+            .text()
             .await
-            .with_context(|| format!("Failed to download from LL: {}", url))?;
-
-        if !resp.status().is_success() {
-            bail!(
-                "LoversLab download failed with status {}: {}",
-                resp.status(),
-                url
-            );
+            .context("Failed to read LL file chooser")?;
+        if html.contains("_processLogin") || html.contains("id=\"elSignIn_submit\"") {
+            bail!("LoversLab session expired — re-login required");
+        }
+        let entries = parse_file_list(&html)?;
+        if let Some(matched) = select_file_entry(expected_name, resource_id.as_deref(), &entries) {
+            return self.download_entry(matched, output_path, progress).await;
+        }
+        // A pinned resource must never silently switch to another attachment.
+        if resource_id.is_some() {
+            if entries.is_empty() {
+                if let Some(entry) = find_single_download_link(&html) {
+                    let selected = Url::parse(&entry.download_url)
+                        .ok()
+                        .and_then(|url| query_value(&url, "r"));
+                    if selected == resource_id {
+                        return self.download_entry(&entry, output_path, progress).await;
+                    }
+                }
+            }
+            return Err(ManualDownloadRequired(format!(
+                "LL resource for '{}' was not found",
+                expected_name
+            ))
+            .into());
+        }
+        if entries.is_empty() {
+            if let Some(entry) = find_single_download_link(&html) {
+                return self.download_entry(&entry, output_path, progress).await;
+            }
         }
 
-        Self::stream_response_to_file(resp, output_path).await
+        // Authors can attach additional files inside a download description.
+        // These do not appear in the Downloads chooser (Tahrovin's SCOE pack
+        // is one example). Query the same numeric record and match attachments.
+        let mut detail_url = download_url.clone();
+        let detail_query: Vec<_> = detail_url
+            .query_pairs()
+            .filter(|(key, _)| matches!(key.as_ref(), "app" | "module" | "controller" | "id"))
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        detail_url.set_query(None);
+        detail_url.query_pairs_mut().extend_pairs(detail_query);
+        self.download_forum_attachment(detail_url.as_str(), expected_name, output_path, progress)
+            .await
+    }
+
+    async fn download_entry(
+        &self,
+        entry: &FileEntry,
+        output_path: &Path,
+        progress: Option<&ProgressCallback>,
+    ) -> Result<()> {
+        let url = controller_download_url(&entry.download_url, true)
+            .or_else(|| Url::parse(&entry.download_url).ok())
+            .context("Invalid LoversLab download action")?;
+        if entry.wait {
+            // IPS's downloads.front.view.download controller first requests a
+            // JSON countdown, then navigates to the same URL after it expires.
+            let response = match self.request_download(&url, true).await? {
+                DownloadResponse::Http(response) => response,
+                DownloadResponse::Mega(_) => {
+                    bail!("Unexpected redirect while starting LL download countdown")
+                }
+            };
+            let countdown: DownloadCountdown = response
+                .json()
+                .await
+                .map_err(|e| e.without_url())
+                .context("Invalid LL download countdown")?;
+            let seconds = countdown.download.saturating_sub(countdown.current_time);
+            if seconds > 300 {
+                bail!("LoversLab requires a {} second wait; retry later", seconds);
+            }
+            info!("Waiting {} seconds for LoversLab download", seconds);
+            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+        }
+        self.download_file(url.as_str(), output_path, progress)
+            .await
+    }
+
+    /// Follow each redirect once, preserving external fragments (Mega keys).
+    /// Cookies remain scoped by the shared cookie jar; AJAX headers stay on LL.
+    async fn request_download(&self, initial: &Url, ajax: bool) -> Result<DownloadResponse> {
+        let mut url = initial.clone();
+        for _ in 0..10 {
+            if !matches!(url.scheme(), "http" | "https") {
+                bail!("Unsupported LoversLab download redirect scheme");
+            }
+            if matches!(url.domain(), Some("mega.nz" | "www.mega.nz")) {
+                return Ok(DownloadResponse::Mega(url));
+            }
+            let mut request = self.no_redirect_client.get(url.clone());
+            if ajax && is_loverslab_url(url.as_str()) {
+                request = request.header("X-Requested-With", "XMLHttpRequest");
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|e| e.without_url())
+                .context("LoversLab download request failed")?;
+            if response.status().is_redirection() {
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .context("LL download redirect has no Location")?;
+                url = url.join(location).context("Invalid LL download redirect")?;
+                continue;
+            }
+            if !response.status().is_success() {
+                bail!(
+                    "LoversLab download request failed (HTTP {})",
+                    response.status()
+                );
+            }
+            return Ok(DownloadResponse::Http(response));
+        }
+        bail!("Too many LoversLab download redirects")
+    }
+
+    async fn download_file(
+        &self,
+        url: &str,
+        output_path: &Path,
+        progress: Option<&ProgressCallback>,
+    ) -> Result<()> {
+        let url = Url::parse(url).context("Invalid LL attachment URL")?;
+        match self.request_download(&url, false).await? {
+            DownloadResponse::Mega(url) => {
+                super::mega_native::download_mega_file_with_callback(
+                    url.as_str(),
+                    output_path,
+                    progress,
+                )
+                .await
+            }
+            DownloadResponse::Http(response) => {
+                Self::stream_response_to_file(response, output_path, progress).await
+            }
+        }
     }
 
     /// Stream an HTTP response body to a file, verifying Content-Length.
-    async fn stream_response_to_file(resp: reqwest::Response, output_path: &Path) -> Result<()> {
+    async fn stream_response_to_file(
+        resp: reqwest::Response,
+        output_path: &Path,
+        progress: Option<&ProgressCallback>,
+    ) -> Result<()> {
         use futures::StreamExt;
 
+        if !resp.status().is_success() || !is_file_response(resp.headers()) {
+            bail!(
+                "LoversLab returned a page or error instead of a file (HTTP {})",
+                resp.status()
+            );
+        }
         let expected_len = resp.content_length();
+        let started = std::time::Instant::now();
+        let mut last_report = started;
+        if let Some(callback) = progress {
+            callback(0, expected_len.unwrap_or(0), 0.0);
+        }
 
         if let Some(parent) = output_path.parent() {
-            tokio::fs::create_dir_all(parent).await.ok();
+            tokio::fs::create_dir_all(parent)
+                .await
+                .context("Failed to create LL download directory")?;
         }
 
         let mut file = File::create(output_path)
             .await
             .with_context(|| format!("Failed to create file: {}", output_path.display()))?;
 
-        let mut stream = resp.bytes_stream();
-        let mut written: u64 = 0;
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("Error reading LL download stream")?;
-            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
-                .await
-                .context("Failed to write chunk to disk")?;
-            written += chunk.len() as u64;
-        }
-
-        tokio::io::AsyncWriteExt::flush(&mut file).await.ok();
-
-        // Verify we got the complete file
-        if let Some(expected) = expected_len {
-            if written != expected {
-                let _ = tokio::fs::remove_file(output_path).await;
-                bail!(
-                    "LL download incomplete: got {} bytes, expected {} (connection dropped)",
-                    written,
-                    expected
-                );
+        let result: Result<u64> = async {
+            let mut stream = resp.bytes_stream();
+            let mut written: u64 = 0;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk
+                    .map_err(|e| e.without_url())
+                    .context("Error reading LL download stream")?;
+                file.write_all(&chunk)
+                    .await
+                    .context("Failed to write chunk to disk")?;
+                written += chunk.len() as u64;
+                if last_report.elapsed() >= std::time::Duration::from_millis(250) {
+                    if let Some(callback) = progress {
+                        callback(
+                            written,
+                            expected_len.unwrap_or(0),
+                            written as f64 / started.elapsed().as_secs_f64().max(0.001),
+                        );
+                    }
+                    last_report = std::time::Instant::now();
+                }
             }
+            file.flush().await.context("Failed to flush LL download")?;
+            if let Some(expected) = expected_len {
+                if written != expected {
+                    bail!(
+                        "LL download incomplete: got {} bytes, expected {}",
+                        written,
+                        expected
+                    );
+                }
+            }
+            Ok(written)
         }
-
+        .await;
+        drop(file);
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(output_path).await;
+        }
+        let written = result?;
+        if let Some(callback) = progress {
+            callback(
+                written,
+                expected_len.unwrap_or(written),
+                written as f64 / started.elapsed().as_secs_f64().max(0.001),
+            );
+        }
         info!("Downloaded {} ({} bytes)", output_path.display(), written);
 
         Ok(())
     }
 
-    /// Download a file from a LoversLab forum topic page.
-    /// Forum posts have attachments as `ipsAttachLink` elements with direct download URLs.
+    /// Discover exact attachments in a forum, blog, or file description.
     async fn download_forum_attachment(
         &self,
         topic_url: &str,
         expected_name: &str,
         output_path: &Path,
+        progress: Option<&ProgressCallback>,
     ) -> Result<()> {
-        info!("Fetching LL forum topic for attachment: {}", topic_url);
+        info!(
+            "Looking for LL description/forum attachment: {}",
+            expected_name
+        );
 
         let page_html = self
             .client
             .get(topic_url)
             .send()
             .await
-            .with_context(|| format!("Failed to fetch LL topic: {}", topic_url))?
+            .map_err(|e| e.without_url())
+            .context("Failed to fetch LL topic")?
+            .error_for_status()
+            .map_err(|e| e.without_url())?
             .text()
             .await
             .context("Failed to read LL topic page")?;
@@ -420,30 +442,17 @@ impl LoversLabDownloader {
         // Parse ipsAttachLink elements: <a class="ipsAttachLink" href="...attachment.php?id=X&key=Y">filename</a>
         let attachments = parse_forum_attachments(&page_html)?;
 
-        if attachments.is_empty() {
-            bail!("No attachments found on LL forum topic: {}", topic_url);
-        }
-
-        info!(
-            "Found {} attachments on forum page, looking for: {}",
-            attachments.len(),
-            expected_name
-        );
-
-        let matched = match_filename(expected_name, &attachments).with_context(|| {
-            let available: Vec<_> = attachments.iter().map(|e| e.name.as_str()).collect();
-            format!(
-                "Could not match '{}' against forum attachments: {:?}",
-                expected_name, available
-            )
+        let matched = match_filename(expected_name, &attachments).ok_or_else(|| {
+            ManualDownloadRequired(format!(
+                "Requested LL file '{}' was not found uniquely in the chooser or page attachments",
+                expected_name
+            ))
         })?;
 
-        info!(
-            "Matched forum attachment '{}' -> '{}' ({})",
-            expected_name, matched.name, matched.download_url
-        );
+        info!("Matched LL forum attachment: {}", matched.name);
 
-        self.download_file(&matched.download_url, output_path).await
+        self.download_file(&matched.download_url, output_path, progress)
+            .await
     }
 }
 
@@ -458,16 +467,14 @@ fn extract_csrf_key(html: &str) -> Option<String> {
         }
     }
 
-    // Method 2: Hidden form input
-    let needle = "name=\"csrfKey\" value=\"";
-    if let Some(start) = html.find(needle) {
-        let rest = &html[start + needle.len()..];
-        if let Some(end) = rest.find('"') {
-            return Some(rest[..end].to_string());
-        }
-    }
-
-    None
+    let document = Html::parse_document(html);
+    let selector = Selector::parse("input[name='csrfKey']").ok()?;
+    document
+        .select(&selector)
+        .next()?
+        .value()
+        .attr("value")
+        .map(str::to_string)
 }
 
 /// Parse the file list from a LoversLab `?do=download` page.
@@ -475,7 +482,7 @@ fn extract_csrf_key(html: &str) -> Option<String> {
 /// Each file entry is an `<li class='ipsDataItem'>` containing:
 /// - `<h4 class='ipsDataItem_title'><span>filename</span></h4>`
 /// - `<a href='...?do=download&r=ID&confirm=1&t=1&csrfKey=...' data-action="download">`
-fn parse_file_list(html: &str, _csrf_key: &str) -> Result<Vec<FileEntry>> {
+fn parse_file_list(html: &str) -> Result<Vec<FileEntry>> {
     let document = Html::parse_document(html);
     let item_selector =
         Selector::parse("li.ipsDataItem").map_err(|e| anyhow::anyhow!("Bad selector: {:?}", e))?;
@@ -492,26 +499,23 @@ fn parse_file_list(html: &str, _csrf_key: &str) -> Result<Vec<FileEntry>> {
             None => continue,
         };
 
-        let url = match item.select(&link_selector).next() {
-            Some(el) => match el.value().attr("href") {
-                Some(href) => {
-                    // HTML entities are decoded by scraper, but ensure full URL
-                    let href = href.replace("&amp;", "&");
-                    if href.starts_with("http") {
-                        href
-                    } else {
-                        format!("{}{}", BASE_URL, href)
-                    }
-                }
-                None => continue,
-            },
-            None => continue,
+        let Some(link) = item.select(&link_selector).next() else {
+            continue;
         };
+        // scraper already decodes entities in the server's action URL.
+        let Some(href) = link.value().attr("href") else {
+            continue;
+        };
+        let url = Url::parse(BASE_URL)?.join(href)?;
 
         if !name.is_empty() {
             entries.push(FileEntry {
                 name,
-                download_url: url,
+                download_url: url.to_string(),
+                wait: link
+                    .value()
+                    .attr("data-wait")
+                    .is_some_and(|value| !value.is_empty()),
             });
         }
     }
@@ -519,388 +523,185 @@ fn parse_file_list(html: &str, _csrf_key: &str) -> Result<Vec<FileEntry>> {
     Ok(entries)
 }
 
-/// For single-file download pages, look for a direct download link.
-fn find_single_download_link(html: &str, _csrf_key: &str) -> Option<String> {
+/// A confirmation dialog with a single explicit download action.
+fn find_single_download_link(html: &str) -> Option<FileEntry> {
     let document = Html::parse_document(html);
-
-    // Look for a download button/link with data-action="download"
     let selector = Selector::parse("a[data-action='download']").ok()?;
-    let link = document.select(&selector).next()?;
-    let href = link.value().attr("href")?;
-
-    let href = href.replace("&amp;", "&");
-    if href.starts_with("http") {
-        Some(href)
-    } else {
-        Some(format!("{}{}", BASE_URL, href))
-    }
-}
-
-/// For normal file detail pages, find the sidebar "Download this file" button
-/// and follow it to the actual download selection/confirmation page.
-fn find_file_page_download_link(html: &str) -> Option<String> {
-    let document = Html::parse_document(html);
-    let selector = Selector::parse("a").ok()?;
-
-    for link in document.select(&selector) {
-        let href = link.value().attr("href")?;
-        if !href.contains("do=download") {
-            continue;
-        }
-        let text = link.text().collect::<String>().to_lowercase();
-        if !text.contains("download") {
-            continue;
-        }
-        let href = href.replace("&amp;", "&");
-        return if href.starts_with("http") {
-            Some(href)
-        } else {
-            Some(format!("{}{}", BASE_URL, href))
-        };
-    }
-
-    None
-}
-
-/// Some LoversLab `?do=download&r=...` requests return the normal file detail
-/// page. The detail page carries the real percent-encoded slug in canonical
-/// metadata even when the modlist URL slug was mangled to literal '?' chars.
-fn find_canonical_download_url(html: &str) -> Option<String> {
-    let document = Html::parse_document(html);
-
-    let canonical_selector = Selector::parse("link[rel='canonical']").ok()?;
-    if let Some(link) = document.select(&canonical_selector).next() {
-        if let Some(href) = link.value().attr("href") {
-            if href.contains("/files/file/") {
-                return Some(href.replace("&amp;", "&"));
-            }
-        }
-    }
-
-    let og_selector = Selector::parse("meta[property='og:url']").ok()?;
-    if let Some(meta) = document.select(&og_selector).next() {
-        if let Some(content) = meta.value().attr("content") {
-            if content.contains("/files/file/") {
-                return Some(content.replace("&amp;", "&"));
-            }
-        }
-    }
-
-    if let Some(url) = extract_json_string_value(html, "\"downloadUrl\"") {
-        if url.contains("/files/file/") {
-            return Some(url.replace("&amp;", "&"));
-        }
-    }
-
-    if let Some(url) = extract_json_string_value(html, "\"content_url\"") {
-        if url.contains("/files/file/") {
-            return Some(url.replace("&amp;", "&"));
-        }
-    }
-
-    None
-}
-
-fn synthesize_download_url_from_title(download_page_url: &str, html: &str) -> Option<String> {
-    let file_id = extract_loverslab_file_id(download_page_url)?;
-    let title = extract_file_title(html)?;
-    let slug = loverslab_slug_from_title(&title)?;
-
-    let mut url = Url::parse(BASE_URL).ok()?;
-    url.set_path(&format!("/files/file/{}-{}/", file_id, slug));
-    url.query_pairs_mut().append_pair("do", "download");
-    Some(url.to_string())
-}
-
-fn extract_file_title(html: &str) -> Option<String> {
-    let document = Html::parse_document(html);
-    let selector = Selector::parse("title").ok()?;
-    let title = document
-        .select(&selector)
-        .next()?
-        .text()
-        .collect::<String>();
-    let title = title.trim();
-    if title.is_empty() {
+    let mut links = document.select(&selector);
+    let link = links.next()?;
+    if links.next().is_some() {
         return None;
     }
-
-    let without_site = title
-        .rsplit_once(" - LoversLab")
-        .map(|(before, _)| before)
-        .unwrap_or(title);
-    let without_category = without_site
-        .rsplit_once(" - ")
-        .map(|(before, _)| before)
-        .unwrap_or(without_site);
-    let title = without_category.trim();
-    (!title.is_empty()).then(|| title.to_string())
+    Some(FileEntry {
+        name: String::new(),
+        download_url: Url::parse(BASE_URL)
+            .ok()?
+            .join(link.value().attr("href")?)
+            .ok()?
+            .to_string(),
+        wait: link
+            .value()
+            .attr("data-wait")
+            .is_some_and(|value| !value.is_empty()),
+    })
 }
 
-fn loverslab_slug_from_title(title: &str) -> Option<String> {
-    let mut slug = String::new();
-    let mut last_was_separator = true;
+enum DownloadResponse {
+    Http(reqwest::Response),
+    Mega(Url),
+}
 
-    for ch in title.chars() {
-        if is_loverslab_slug_separator(ch) {
-            if !last_was_separator {
-                slug.push('-');
-                last_was_separator = true;
-            }
-            continue;
-        }
+#[derive(serde::Deserialize)]
+struct DownloadCountdown {
+    download: u64,
+    #[serde(rename = "currentTime")]
+    current_time: u64,
+}
 
-        if ch.is_ascii() {
-            slug.push(ch.to_ascii_lowercase());
-        } else {
-            for lower in ch.to_lowercase() {
-                slug.push(lower);
-            }
-        }
-        last_was_separator = false;
+fn query_value(url: &Url, key: &str) -> Option<String> {
+    url.query_pairs()
+        .find_map(|(k, v)| (k == key).then(|| v.into_owned()))
+}
+
+/// IPS's non-friendly route avoids all dependence on a file's display slug.
+/// Preserve only the server's download action parameters. The initial lookup
+/// deliberately drops any stale CSRF/confirmation parameters in a modlist.
+fn controller_download_url(input: &str, confirmed: bool) -> Option<Url> {
+    let source = Url::parse(input).ok()?;
+    if !is_loverslab_url(input) {
+        return None;
     }
-
-    let slug = slug.trim_matches('-').to_string();
-    (!slug.is_empty()).then_some(slug)
+    let file_id = if let Some(rest) = source.path().strip_prefix("/files/file/") {
+        rest.chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+    } else if source.path() == "/index.php"
+        && query_value(&source, "app").as_deref() == Some("downloads")
+        && query_value(&source, "module").as_deref() == Some("downloads")
+        && query_value(&source, "controller").as_deref() == Some("view")
+    {
+        query_value(&source, "id")?
+    } else {
+        return None;
+    };
+    if file_id.is_empty() || !file_id.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let mut url = Url::parse(&format!("{BASE_URL}/index.php")).ok()?;
+    url.query_pairs_mut()
+        .append_pair("app", "downloads")
+        .append_pair("module", "downloads")
+        .append_pair("controller", "view")
+        .append_pair("id", &file_id)
+        .append_pair("do", "download");
+    // Literal '?' replacements in old modlist slugs can precede the real
+    // query delimiter, so find r= only at a query boundary, before fragments.
+    let resource = input
+        .split('#')
+        .next()?
+        .split(['?', '&'])
+        .find_map(|part| part.strip_prefix("r="));
+    if let Some(resource) = resource {
+        if resource.is_empty() || !resource.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        url.query_pairs_mut().append_pair("r", resource);
+    }
+    if confirmed {
+        for key in ["confirm", "t", "csrfKey"] {
+            if let Some(value) = query_value(&source, key) {
+                url.query_pairs_mut().append_pair(key, &value);
+            }
+        }
+    }
+    Some(url)
 }
 
-fn is_loverslab_slug_separator(ch: char) -> bool {
-    ch.is_whitespace()
+/// Reject error pages/JSON even when they use HTTP 200. The response must be
+/// an attachment or a recognized archive/binary type before opening the file.
+fn is_file_response(headers: &reqwest::header::HeaderMap) -> bool {
+    let content_type = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if content_type.starts_with("text/")
+        || content_type.contains("json")
+        || content_type.contains("xml")
+        || content_type.contains("javascript")
+    {
+        return false;
+    }
+    let attachment = headers
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .eq_ignore_ascii_case("attachment")
+        });
+    attachment
         || matches!(
-            ch,
-            '/' | '\\'
-                | '('
-                | ')'
-                | '['
-                | ']'
-                | '{'
-                | '}'
-                | '<'
-                | '>'
-                | '"'
-                | '\''
-                | '`'
-                | ':'
-                | ';'
-                | ','
-                | '.'
-                | '!'
-                | '?'
-                | '&'
-                | '|'
-                | '_'
-                | '+'
-                | '='
-                | '*'
-                | '#'
-                | '@'
-                | '^'
-                | '~'
+            content_type.as_str(),
+            "application/octet-stream"
+                | "application/zip"
+                | "application/x-zip-compressed"
+                | "application/x-7z-compressed"
+                | "application/x-rar-compressed"
+                | "application/vnd.rar"
+                | "application/x-rar"
+                | "application/rar"
+                | "application/download"
+                | "application/force-download"
         )
 }
 
-fn extract_json_string_value(input: &str, quoted_key: &str) -> Option<String> {
-    let key_start = input.find(quoted_key)?;
-    let after_key = &input[key_start + quoted_key.len()..];
-    let colon = after_key.find(':')?;
-    let after_colon = after_key[colon + 1..].trim_start();
-    if !after_colon.starts_with('"') {
-        return None;
-    }
-
-    let mut escaped = false;
-    for (idx, ch) in after_colon.char_indices().skip(1) {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '"' => {
-                let raw = &after_colon[..=idx];
-                return serde_json::from_str::<String>(raw).ok();
-            }
-            _ => {}
-        }
-    }
-
-    None
-}
-
-/// Ensure the URL points to the download page.
-fn ensure_download_url(url: &str) -> String {
-    let without_fragment = url.split('#').next().unwrap_or(url).trim();
-
-    if let Ok(mut parsed) = Url::parse(without_fragment) {
-        let is_loverslab_file = is_loverslab_file_url(&parsed);
-        if is_loverslab_file && has_damaged_loverslab_slug(without_fragment) {
-            canonicalize_loverslab_file_path(&mut parsed);
-        }
-        let resource_id = extract_query_param_loose(without_fragment, "r").map(str::to_string);
-
-        let has_download = parsed
-            .query_pairs()
-            .any(|(key, value)| key == "do" && value == "download");
-        if is_loverslab_file {
-            parsed.set_query(None);
-            parsed.query_pairs_mut().append_pair("do", "download");
-            if let Some(resource_id) = resource_id {
-                parsed.query_pairs_mut().append_pair("r", &resource_id);
-            }
-        } else if !has_download {
-            parsed.query_pairs_mut().append_pair("do", "download");
-        }
-        return parsed.to_string();
-    }
-
-    // Fallback for malformed URLs such as LL slugs where non-ASCII text was
-    // replaced with literal '?' characters before parsing. Keep a concrete
-    // resource id if one is visible, but rebuild the path from the numeric file
-    // id so '?' in the damaged slug cannot become the query delimiter.
-    if let Some(file_id) = extract_loverslab_file_id(without_fragment) {
-        let mut rebuilt = format!("{}/files/file/{}/?do=download", BASE_URL, file_id);
-        if let Some(resource_id) = extract_query_param_loose(without_fragment, "r") {
-            rebuilt.push_str("&r=");
-            rebuilt.push_str(&resource_id);
-        }
-        return rebuilt;
-    }
-
-    let url = without_fragment.trim_end_matches('/');
-    if url.contains("?do=download") {
-        url.to_string()
-    } else if url.contains('?') {
-        format!("{}&do=download", url)
-    } else {
-        format!("{}/?do=download", url)
-    }
-}
-
-fn is_loverslab_file_url(url: &Url) -> bool {
-    (url.domain() == Some("loverslab.com") || url.domain() == Some("www.loverslab.com"))
-        && extract_loverslab_file_id(url.path()).is_some()
-}
-
-fn has_damaged_loverslab_slug(input: &str) -> bool {
-    let Some(file_start) = input.find("/files/file/") else {
-        return false;
+/// Match exact filenames, allowing only case/whitespace and Wabbajack's
+/// duplicate suffix. Never guess a different version from a shared prefix.
+fn select_file_entry<'a>(
+    expected: &str,
+    resource_id: Option<&str>,
+    entries: &'a [FileEntry],
+) -> Option<&'a FileEntry> {
+    let Some(resource_id) = resource_id else {
+        return match_filename(expected, entries);
     };
-    let rest = &input[file_start..];
-    let first_question = rest.find('?');
-    let download_query = rest.find("?do=download");
-    match (first_question, download_query) {
-        (Some(first), Some(download)) => first < download,
-        (Some(_), None) => true,
-        _ => false,
-    }
+    let mut matches = entries.iter().filter(|entry| {
+        Url::parse(&entry.download_url)
+            .ok()
+            .and_then(|url| query_value(&url, "r"))
+            .as_deref()
+            == Some(resource_id)
+    });
+    let entry = matches.next()?;
+    matches.next().is_none().then_some(entry)
 }
 
-fn canonicalize_loverslab_file_path(url: &mut Url) -> bool {
-    if url.domain() != Some("loverslab.com") && url.domain() != Some("www.loverslab.com") {
-        return false;
-    }
-    let Some(file_id) = extract_loverslab_file_id(url.path()) else {
-        return false;
-    };
-    url.set_path(&format!("/files/file/{}/", file_id));
-    true
-}
-
-fn extract_loverslab_file_id(input: &str) -> Option<&str> {
-    let marker = "/files/file/";
-    let start = input.find(marker)? + marker.len();
-    let rest = &input[start..];
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    (end > 0).then_some(&rest[..end])
-}
-
-fn extract_query_param_loose<'a>(input: &'a str, name: &str) -> Option<&'a str> {
-    let needle = format!("{}=", name);
-    let start = input.find(&needle)? + needle.len();
-    let rest = &input[start..];
-    let end = rest.find(['&', '#']).unwrap_or(rest.len());
-    (end > 0).then_some(&rest[..end])
-}
-
-fn merge_resource_id(download_url: &str, source_url: &str) -> String {
-    let Some(resource_id) = extract_query_param_loose(source_url, "r") else {
-        return download_url.to_string();
-    };
-    let Ok(mut parsed) = Url::parse(download_url) else {
-        return download_url.to_string();
-    };
-    let has_resource = parsed.query_pairs().any(|(key, _)| key == "r");
-    if !has_resource {
-        parsed.query_pairs_mut().append_pair("r", resource_id);
-    }
-    parsed.to_string()
-}
-
-fn build_confirmed_download_url(download_page_url: &str, csrf_key: &str) -> Option<String> {
-    let mut url = Url::parse(download_page_url).ok()?;
-    let resource_id = url
-        .query_pairs()
-        .find_map(|(key, value)| (key == "r").then(|| value.into_owned()))?;
-
-    url.set_query(None);
-    url.query_pairs_mut()
-        .append_pair("do", "download")
-        .append_pair("r", &resource_id)
-        .append_pair("confirm", "1")
-        .append_pair("t", "1")
-        .append_pair("csrfKey", csrf_key);
-    Some(url.to_string())
-}
-
-/// Match an expected filename against the available file entries.
-///
-/// Tries exact match first, then progressively fuzzier matching:
-/// 1. Exact match (case-insensitive)
-/// 2. Match after stripping trailing " (1)", " (2)" etc. from expected name
-/// 3. Match checking if expected name starts with / contains file entry name
-/// 4. Best substring match
 fn match_filename<'a>(expected: &str, entries: &'a [FileEntry]) -> Option<&'a FileEntry> {
-    let expected_lower = expected.to_lowercase();
-
-    // Strip trailing " (N)" suffix that Wabbajack adds for duplicate filenames
-    let expected_clean = strip_duplicate_suffix(&expected_lower);
-
-    // Normalize whitespace for comparison (collapse multiple spaces into one)
-    let normalize_ws = |s: &str| -> String { s.split_whitespace().collect::<Vec<_>>().join(" ") };
-    let expected_norm = normalize_ws(&expected_clean);
-
-    // 1. Exact match (with whitespace normalization)
-    if let Some(entry) = entries.iter().find(|e| {
-        let entry_lower = e.name.to_lowercase();
-        entry_lower == expected_lower
-            || entry_lower == expected_clean
-            || normalize_ws(&entry_lower) == expected_norm
-    }) {
-        return Some(entry);
-    }
-
-    // 2. Check if entry name is contained within expected name or vice versa
-    if let Some(entry) = entries.iter().find(|e| {
-        let entry_lower = e.name.to_lowercase();
-        expected_clean.contains(&entry_lower) || entry_lower.contains(&expected_clean)
-    }) {
-        return Some(entry);
-    }
-
-    // 4. Best match by longest common prefix (after stripping extension)
-    let expected_stem = strip_extension(&expected_clean);
-    let mut best: Option<(usize, &FileEntry)> = None;
-    for entry in entries {
-        let entry_stem = strip_extension(&entry.name.to_lowercase());
-        let common = common_prefix_len(&expected_stem, &entry_stem);
-        if common > 0 && best.is_none_or(|(best_len, _)| common > best_len) {
-            best = Some((common, entry));
+    let normalize = |name: &str| {
+        name.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let expected = normalize(expected);
+    let clean = strip_duplicate_suffix(&expected);
+    for target in [&expected, &clean] {
+        let mut matches = entries
+            .iter()
+            .filter(|entry| normalize(&entry.name) == *target);
+        if let Some(entry) = matches.next() {
+            return matches.next().is_none().then_some(entry);
         }
     }
-
-    best.map(|(_, entry)| entry)
+    None
 }
 
 /// Strip trailing ` (1)`, ` (2)`, etc. from a filename.
@@ -910,7 +711,11 @@ fn strip_duplicate_suffix(name: &str) -> String {
         let after_paren = &name[paren_start + 2..];
         if let Some(paren_end) = after_paren.find(')') {
             let between = &after_paren[..paren_end];
-            if between.chars().all(|c| c.is_ascii_digit()) {
+            if !between.is_empty()
+                && between.chars().all(|c| c.is_ascii_digit())
+                && (after_paren[paren_end + 1..].starts_with('.')
+                    || after_paren[paren_end + 1..].is_empty())
+            {
                 // It's a duplicate suffix like " (1)" — remove it
                 let before = &name[..paren_start];
                 let after = &after_paren[paren_end + 1..];
@@ -919,47 +724,6 @@ fn strip_duplicate_suffix(name: &str) -> String {
         }
     }
     name.to_string()
-}
-
-/// Strip file extension from a name.
-fn strip_extension(name: &str) -> String {
-    if let Some(dot) = name.rfind('.') {
-        name[..dot].to_string()
-    } else {
-        name.to_string()
-    }
-}
-
-/// Length of the common prefix between two strings.
-fn common_prefix_len(a: &str, b: &str) -> usize {
-    a.chars()
-        .zip(b.chars())
-        .take_while(|(ca, cb)| ca == cb)
-        .count()
-}
-
-/// Extract a Mega URL from page HTML if present.
-fn extract_mega_url(html: &str) -> Option<String> {
-    // Look for mega.nz links in href attributes
-    if let Some(start) = html.find("https://mega.nz/") {
-        let rest = &html[start..];
-        // Find the end of the URL (quote, space, or angle bracket)
-        let end = rest.find(['"', '\'', ' ', '<', '>']).unwrap_or(rest.len());
-        let url = &rest[..end];
-        if url.len() > 20 {
-            return Some(url.to_string());
-        }
-    }
-    // Also check for old-style mega.nz/#! links
-    if let Some(start) = html.find("https://mega.nz/#!") {
-        let rest = &html[start..];
-        let end = rest.find(['"', '\'', ' ', '<', '>']).unwrap_or(rest.len());
-        let url = &rest[..end];
-        if url.len() > 20 {
-            return Some(url.to_string());
-        }
-    }
-    None
 }
 
 /// Parse forum post attachments (ipsAttachLink elements).
@@ -972,22 +736,16 @@ fn parse_forum_attachments(html: &str) -> Result<Vec<FileEntry>> {
 
     for link in document.select(&selector) {
         let name = link.text().collect::<String>().trim().to_string();
-        let url = match link.value().attr("href") {
-            Some(href) => {
-                let href = href.replace("&amp;", "&");
-                if href.starts_with("http") {
-                    href
-                } else {
-                    format!("{}{}", BASE_URL, href)
-                }
-            }
-            None => continue,
+        let Some(href) = link.value().attr("href") else {
+            continue;
         };
+        let url = Url::parse(BASE_URL)?.join(href)?.to_string();
 
         if !name.is_empty() && url.contains("attachment.php") {
             entries.push(FileEntry {
                 name,
                 download_url: url,
+                wait: false,
             });
         }
     }
@@ -997,12 +755,304 @@ fn parse_forum_attachments(html: &str) -> Result<Vec<FileEntry>> {
 
 /// Check if a URL is a LoversLab URL.
 pub fn is_loverslab_url(url: &str) -> bool {
-    url.contains("loverslab.com/")
+    Url::parse(url).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && matches!(url.domain(), Some("loverslab.com" | "www.loverslab.com"))
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port().is_none()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_uses_ids_even_with_damaged_slugs() {
+        let url = controller_download_url(
+            "https://www.loverslab.com/files/file/2438-broken-???-slug/?do=download&r=656247&confirm=1&csrfKey=stale#ignored",
+            false,
+        ).unwrap();
+        assert_eq!(url.path(), "/index.php");
+        assert_eq!(query_value(&url, "id").as_deref(), Some("2438"));
+        assert_eq!(query_value(&url, "r").as_deref(), Some("656247"));
+        assert!(query_value(&url, "confirm").is_none());
+        assert!(query_value(&url, "csrfKey").is_none());
+        assert_eq!(controller_download_url(url.as_str(), false), Some(url));
+    }
+
+    #[test]
+    fn controller_preserves_server_action_and_rejects_unrelated_urls() {
+        let url = controller_download_url(
+            "https://www.loverslab.com/files/file/13011-display/?do=download&r=959512&confirm=1&t=1&csrfKey=fresh",
+            true,
+        ).unwrap();
+        assert_eq!(query_value(&url, "csrfKey").as_deref(), Some("fresh"));
+        assert_eq!(query_value(&url, "confirm").as_deref(), Some("1"));
+        assert_eq!(query_value(&url, "r").as_deref(), Some("959512"));
+        for input in [
+            "https://example.com/loverslab.com/files/file/123/",
+            "https://loverslab.com.example.com/files/file/123/",
+            "https://www.loverslab.com/files/file/no-id/",
+            "https://www.loverslab.com/files/file/123/?r=invalid",
+            "https://www.loverslab.com/topic/123/",
+        ] {
+            assert!(controller_download_url(input, false).is_none(), "{input}");
+        }
+        let url = controller_download_url(
+            "https://www.loverslab.com/files/file/123/?other=456#r=789",
+            false,
+        )
+        .unwrap();
+        assert!(query_value(&url, "r").is_none());
+    }
+
+    #[test]
+    fn missing_versions_and_ambiguous_names_are_not_guessed() {
+        let entries = vec![FileEntry {
+            name: "Mod v2.0.7z".into(),
+            download_url: "https://example.com/file".into(),
+            wait: false,
+        }];
+        assert!(match_filename("Mod v1.0.7z", &entries).is_none());
+        assert!(match_filename("Mod v2.0.7z", &[entries[0].clone(), entries[0].clone()]).is_none());
+        assert!(match_filename("  MOD   v2.0 (2).7z", &entries).is_some());
+    }
+
+    #[test]
+    fn pinned_resource_cannot_fall_back_to_a_different_file() {
+        let entries = vec![
+            FileEntry {
+                name: "Mod.7z".into(),
+                download_url: "https://www.loverslab.com/files/file/123/?do=download&r=100".into(),
+                wait: false,
+            },
+            FileEntry {
+                name: "Older Mod.7z".into(),
+                download_url: "https://www.loverslab.com/files/file/123/?do=download&r=200".into(),
+                wait: false,
+            },
+        ];
+        assert_eq!(
+            select_file_entry("Mod.7z", Some("200"), &entries)
+                .unwrap()
+                .name,
+            "Older Mod.7z"
+        );
+        assert!(select_file_entry("Mod.7z", Some("300"), &entries).is_none());
+        assert_eq!(
+            select_file_entry("Mod.7z", None, &entries).unwrap().name,
+            "Mod.7z"
+        );
+    }
+
+    #[test]
+    fn chooser_needs_no_global_csrf_and_retains_countdown() {
+        let html = r#"<li class='ipsDataItem'><h4 class='ipsDataItem_title'><span>Mod.7z</span></h4>
+            <a data-action='download' data-wait='1' href='/files/file/123-mod/?do=download&amp;r=456&amp;csrfKey=fresh'>Download</a></li>"#;
+        assert!(extract_csrf_key(html).is_none());
+        let entries = parse_file_list(html).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].wait);
+        assert!(entries[0].download_url.contains("&csrfKey=fresh"));
+        assert!(find_single_download_link(html).unwrap().wait);
+        assert!(find_single_download_link(&format!("{html}{html}")).is_none());
+    }
+
+    #[test]
+    fn only_binary_responses_are_files() {
+        use reqwest::header::{HeaderMap, HeaderValue, CONTENT_DISPOSITION, CONTENT_TYPE};
+        let mut headers = HeaderMap::new();
+        assert!(!is_file_response(&headers));
+        for content_type in [
+            "text/html",
+            "application/json",
+            "application/problem+json",
+            "application/xhtml+xml",
+        ] {
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+            assert!(!is_file_response(&headers));
+        }
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/x-7z-compressed"),
+        );
+        assert!(is_file_response(&headers));
+        headers.remove(CONTENT_TYPE);
+        headers.insert(
+            CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment; filename=mod.7z"),
+        );
+        assert!(is_file_response(&headers));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/html"));
+        assert!(!is_file_response(&headers));
+    }
+
+    fn test_client() -> LoversLabDownloader {
+        LoversLabDownloader {
+            client: Client::builder().no_proxy().build().unwrap(),
+            no_redirect_client: Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+        }
+    }
+
+    async fn server(
+        responses: Vec<(&'static str, &'static str)>,
+    ) -> (Url, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/start", listener.local_addr().unwrap())).unwrap();
+        let task = tokio::spawn(async move {
+            for (path, response) in responses {
+                let (mut socket, _) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut buf = [0; 1024];
+                    let read = socket.read(&mut buf).await.unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&buf[..read]);
+                }
+                assert!(
+                    String::from_utf8_lossy(&request).starts_with(&format!("GET {path} HTTP/1.1"))
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn follows_redirects_once_and_streams_the_original_response() {
+        let (url, server) = server(vec![
+            ("/start", "HTTP/1.1 302 Found\r\nLocation: /file\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+            ("/file", "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata"),
+        ]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("file.7z");
+        test_client()
+            .download_file(url.as_str(), &output, None)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(output).unwrap(), b"data");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preserves_mega_fragment_after_intermediate_redirect() {
+        let (url, server) = server(vec![
+            ("/start", "HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+            ("/next", "HTTP/1.1 302 Found\r\nLocation: https://mega.nz/file/example#secret-key\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+        ]).await;
+        let DownloadResponse::Mega(url) = test_client().request_download(&url, true).await.unwrap()
+        else {
+            panic!("Expected Mega redirect");
+        };
+        assert_eq!(url.fragment(), Some("secret-key"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_pages_and_http_errors_without_overwriting_files() {
+        for response in [
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 5\r\nConnection: close\r\n\r\nlogin",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/octet-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ] {
+            let (url, server) = server(vec![("/start", response)]).await;
+            let dir = tempfile::tempdir().unwrap();
+            let output = dir.path().join("file.7z");
+            std::fs::write(&output, b"existing").unwrap();
+            assert!(test_client().download_file(url.as_str(), &output, None).await.is_err());
+            assert_eq!(std::fs::read(output).unwrap(), b"existing");
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn removes_truncated_downloads() {
+        let (url, server) = server(vec![("/start",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort",
+        )]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("file.7z");
+        assert!(test_client()
+            .download_file(url.as_str(), &output, None)
+            .await
+            .is_err());
+        assert!(!output.exists());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn countdown_handshake_precedes_transfer() {
+        let (url, server) = server(vec![
+            ("/start", "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"download\":100,\"currentTime\":100}"),
+            ("/start", "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata"),
+        ]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("file.7z");
+        let entry = FileEntry {
+            name: "file.7z".into(),
+            download_url: url.to_string(),
+            wait: true,
+        };
+        test_client()
+            .download_entry(&entry, &output, None)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(output).unwrap(), b"data");
+        server.await.unwrap();
+    }
+
+    /// Verify small LL files, or one CLF3_LL_TEST_ARCHIVE, from a real modlist.
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_modlist_small_files() {
+        let selected = std::env::var("CLF3_LL_TEST_ARCHIVE").ok();
+        let path = std::env::var("CLF3_LL_TEST_MODLIST").expect("CLF3_LL_TEST_MODLIST not set");
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+        let modlist: serde_json::Value =
+            serde_json::from_reader(zip.by_name("modlist").unwrap()).unwrap();
+        let email = std::env::var("LOVERSLAB_EMAIL").expect("LOVERSLAB_EMAIL not set");
+        let password = std::env::var("LOVERSLAB_PASSWORD").expect("LOVERSLAB_PASSWORD not set");
+        let ll = LoversLabDownloader::login(&email, &password).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut verified = 0;
+        for archive in modlist["Archives"].as_array().unwrap() {
+            let Some(url) = archive["State"]["Url"].as_str() else {
+                continue;
+            };
+            let size = archive["Size"].as_u64().unwrap();
+            let name = archive["Name"].as_str().unwrap();
+            if !is_loverslab_url(url)
+                || selected
+                    .as_ref()
+                    .map_or(size >= 25 * 1024, |selected| selected != name)
+            {
+                continue;
+            }
+            let output = dir.path().join(format!("archive-{verified}"));
+            ll.download(url, name, &output)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            assert_eq!(std::fs::metadata(&output).unwrap().len(), size, "{name}");
+            assert!(
+                crate::hash::verify_file_hash(&output, archive["Hash"].as_str().unwrap()).unwrap(),
+                "{name}"
+            );
+            println!("Verified {name}: {size} bytes, modlist hash matches");
+            verified += 1;
+        }
+        assert!(verified > 0, "No small LL archives in modlist");
+    }
 
     #[test]
     fn test_is_loverslab_url() {
@@ -1033,151 +1083,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_download_url() {
-        assert_eq!(
-            ensure_download_url("https://www.loverslab.com/files/file/123-mod/"),
-            "https://www.loverslab.com/files/file/123-mod/?do=download"
-        );
-        assert_eq!(
-            ensure_download_url("https://www.loverslab.com/files/file/123-mod/?do=download"),
-            "https://www.loverslab.com/files/file/123-mod/?do=download"
-        );
-        assert_eq!(
-            ensure_download_url(
-                "https://www.loverslab.com/files/file/123-mod/?do=download&r=456&confirm=1"
-            ),
-            "https://www.loverslab.com/files/file/123-mod/?do=download&r=456"
-        );
-        assert_eq!(
-            ensure_download_url(
-                "https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-???-?????-??-?????-???/?do=download&r=656247"
-            ),
-            "https://www.loverslab.com/files/file/2438/?do=download&r=656247"
-        );
-    }
-
-    #[test]
-    fn test_merge_resource_id() {
-        assert_eq!(
-            merge_resource_id(
-                "https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-%E2%95%B2/?do=download",
-                "https://www.loverslab.com/files/file/2438/?do=download&r=656247"
-            ),
-            "https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-%E2%95%B2/?do=download&r=656247"
-        );
-        assert_eq!(
-            merge_resource_id(
-                "https://www.loverslab.com/files/file/2438-slug/?do=download&r=668252",
-                "https://www.loverslab.com/files/file/2438/?do=download&r=656247"
-            ),
-            "https://www.loverslab.com/files/file/2438-slug/?do=download&r=668252"
-        );
-    }
-
-    #[test]
-    fn test_build_confirmed_download_url() {
-        assert_eq!(
-            build_confirmed_download_url(
-                "https://www.loverslab.com/files/file/2438/?do=download&r=656247",
-                "abc123"
-            )
-            .unwrap(),
-            "https://www.loverslab.com/files/file/2438/?do=download&r=656247&confirm=1&t=1&csrfKey=abc123"
-        );
-        assert!(build_confirmed_download_url(
-            "https://www.loverslab.com/files/file/2438/?do=download",
-            "abc123"
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn test_find_file_page_download_link() {
-        let html = r#"
-            <ul class="ipsToolList">
-                <li>
-                    <a href='https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-%E2%95%B2/?do=download'
-                       class='ipsButton ipsButton_fullWidth ipsButton_large ipsButton_important'
-                       data-datalayer-postfetch>Download this file</a>
-                </li>
-            </ul>
-        "#;
-
-        assert_eq!(
-            find_file_page_download_link(html).unwrap(),
-            "https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-%E2%95%B2/?do=download"
-        );
-    }
-
-    #[test]
-    fn test_find_canonical_download_url() {
-        let html = r#"
-            <head>
-                <link rel="canonical" href="https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-%E2%95%B2-%E2%80%A2%CC%80-%CF%89-%E2%80%A2%CC%81-%E2%95%B1/" />
-                <meta property="og:url" content="https://www.loverslab.com/files/file/2438-other/">
-            </head>
-        "#;
-
-        assert_eq!(
-            find_canonical_download_url(html).unwrap(),
-            "https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-%E2%95%B2-%E2%80%A2%CC%80-%CF%89-%E2%80%A2%CC%81-%E2%95%B1/"
-        );
-    }
-
-    #[test]
-    fn test_find_canonical_download_url_from_raw_metadata() {
-        let html = r#"
-            <script type='application/ld+json'>
-            {
-                "downloadUrl": "https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-%E2%95%B2/?do=download"
-            }
-            </script>
-        "#;
-        assert_eq!(
-            find_canonical_download_url(html).unwrap(),
-            "https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-%E2%95%B2/?do=download"
-        );
-
-        let html = r#"
-            <script>
-                const IpsDataLayerContext = {"content_url":"https:\/\/www.loverslab.com\/files\/file\/2438-estrus-chaurus-spider-addon-%E2%95%B2\/"};
-            </script>
-        "#;
-        assert_eq!(
-            find_canonical_download_url(html).unwrap(),
-            "https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-%E2%95%B2/"
-        );
-    }
-
-    #[test]
-    fn test_synthesize_download_url_from_title() {
-        let html = r#"
-            <html>
-                <head>
-                    <title>Estrus Chaurus Spider Addon /╲/\( •̀ ω •́ )/\╱\ - Combat Sex - LoversLab</title>
-                </head>
-            </html>
-        "#;
-
-        assert_eq!(
-            extract_file_title(html).unwrap(),
-            "Estrus Chaurus Spider Addon /╲/\\( •̀ ω •́ )/\\╱\\"
-        );
-        assert_eq!(
-            loverslab_slug_from_title(&extract_file_title(html).unwrap()).unwrap(),
-            "estrus-chaurus-spider-addon-╲-•̀-ω-•́-╱"
-        );
-        assert_eq!(
-            synthesize_download_url_from_title(
-                "https://www.loverslab.com/files/file/2438/?do=download&r=656247",
-                html
-            )
-            .unwrap(),
-            "https://www.loverslab.com/files/file/2438-estrus-chaurus-spider-addon-%E2%95%B2-%E2%80%A2%CC%80-%CF%89-%E2%80%A2%CC%81-%E2%95%B1/?do=download"
-        );
-    }
-
-    #[test]
     fn test_strip_duplicate_suffix() {
         assert_eq!(
             strip_duplicate_suffix("co more creatures 1.8.2 (with hostile creatures) (1).rar"),
@@ -1197,10 +1102,12 @@ mod tests {
             FileEntry {
                 name: "Mod v1.0.rar".to_string(),
                 download_url: "http://example.com/1".to_string(),
+                wait: false,
             },
             FileEntry {
                 name: "Mod v2.0.rar".to_string(),
                 download_url: "http://example.com/2".to_string(),
+                wait: false,
             },
         ];
         let result = match_filename("Mod v2.0.rar", &entries).unwrap();
@@ -1213,10 +1120,12 @@ mod tests {
             FileEntry {
                 name: "CO More Creatures 1.8.2.rar".to_string(),
                 download_url: "http://example.com/1".to_string(),
+                wait: false,
             },
             FileEntry {
                 name: "CO More Creatures 1.8.2 (With Hostile Creatures).rar".to_string(),
                 download_url: "http://example.com/2".to_string(),
+                wait: false,
             },
         ];
         let result = match_filename(
@@ -1257,7 +1166,7 @@ mod tests {
             </ul>
         "#;
 
-        let entries = parse_file_list(html, "abc123").unwrap();
+        let entries = parse_file_list(html).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "TestFile v1.0.rar");
         assert_eq!(entries[1].name, "TestFile v2.0.rar");

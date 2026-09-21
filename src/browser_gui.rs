@@ -51,8 +51,8 @@ pub fn launch_browser() -> Result<(), eframe::Error> {
 enum ImageState {
     /// Download in flight.
     Loading,
-    /// Raw image bytes ready to be turned into a texture.
-    Downloaded(Vec<u8>),
+    /// Decoded thumbnail ready to upload; decoding runs outside the UI thread.
+    Downloaded(egui::ColorImage),
     /// Texture uploaded to GPU.
     Texture(egui::TextureHandle),
     /// Failed to load.
@@ -76,6 +76,7 @@ struct SharedState {
 enum Tab {
     #[default]
     Browser,
+    Collections,
     Settings,
 }
 
@@ -89,6 +90,7 @@ enum ValidationStatus {
 }
 
 struct BrowserApp {
+    collections: crate::collections_gui::CollectionsView,
     shared: Arc<Mutex<SharedState>>,
     /// Search query string.
     search: String,
@@ -203,8 +205,34 @@ impl BrowserApp {
         let settings = Settings::load();
         let downloads_dir = settings.default_downloads_dir.clone();
         let install_dir = settings.default_install_dir.clone();
+        let collection_games = clf3::collection::games::PROFILES
+            .iter()
+            .filter_map(|profile| {
+                detected
+                    .games
+                    .iter()
+                    .find(|g| {
+                        profile.steam_ids.contains(&g.app_id.as_str())
+                            || g.install_path.join(profile.executable).is_file()
+                    })
+                    .map(|game| {
+                        let ini = game
+                            .get_prefix_my_games_path()
+                            .map(|p| p.join(profile.my_games))
+                            .filter(|p| p.is_dir())
+                            .unwrap_or_default();
+                        (profile.domain.to_owned(), (game.install_path.clone(), ini))
+                    })
+            })
+            .collect();
+        let collections = crate::collections_gui::CollectionsView::new(
+            collection_games,
+            &settings.default_downloads_dir,
+            &settings.default_install_dir,
+        );
 
         Self {
+            collections,
             shared: Arc::new(Mutex::new(SharedState {
                 modlists: Vec::new(),
                 games: Vec::new(),
@@ -412,15 +440,22 @@ impl BrowserApp {
                 // Collect batch results.
                 for handle in handles {
                     if let Ok((key, result)) = handle.await {
-                        let mut state = shared.lock().expect("lock shared state");
-                        match result {
+                        let decoded = match result {
                             Ok(bytes) => {
-                                state.images.insert(key, ImageState::Downloaded(bytes));
+                                tokio::task::spawn_blocking(move || decode_thumbnail(bytes))
+                                    .await
+                                    .ok()
+                                    .flatten()
                             }
-                            Err(_) => {
-                                state.images.insert(key, ImageState::Failed);
-                            }
-                        }
+                            Err(_) => None,
+                        };
+                        let mut state = shared.lock().expect("lock shared state");
+                        state.images.insert(
+                            key,
+                            decoded
+                                .map(ImageState::Downloaded)
+                                .unwrap_or(ImageState::Failed),
+                        );
                     }
                 }
 
@@ -617,6 +652,7 @@ impl BrowserApp {
 
 impl eframe::App for BrowserApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.collections.poll(ctx);
         // Kick off fetch on first frame.
         self.start_fetch(ctx);
 
@@ -629,10 +665,9 @@ impl eframe::App for BrowserApp {
             }
         }
 
-        // Convert a small number of downloaded images to GPU textures each
-        // frame. Decoding every ready image in one pass makes the browser feel
-        // frozen on launch when many thumbnails arrive together.
-        let images_to_convert: Vec<(String, Vec<u8>)> = {
+        // Upload a small number of decoded thumbnails while their tab is
+        // visible. Full-size image decoding never blocks tab navigation.
+        let images_to_convert: Vec<(String, egui::ColorImage)> = {
             let mut state = self.shared.lock().expect("lock shared state");
             let keys_to_convert: Vec<String> = state
                 .images
@@ -644,7 +679,11 @@ impl eframe::App for BrowserApp {
                         None
                     }
                 })
-                .take(IMAGE_CONVERSIONS_PER_FRAME)
+                .take(if self.current_tab == Tab::Browser {
+                    IMAGE_CONVERSIONS_PER_FRAME
+                } else {
+                    0
+                })
                 .collect();
 
             keys_to_convert
@@ -661,21 +700,9 @@ impl eframe::App for BrowserApp {
                 .collect()
         };
 
-        for (key, bytes) in images_to_convert {
-            let converted = match image::load_from_memory(&bytes) {
-                Ok(img) => {
-                    let rgba = img.to_rgba8();
-                    let size = [rgba.width() as usize, rgba.height() as usize];
-                    let pixels = rgba.into_raw();
-                    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-                    ImageState::Texture(ctx.load_texture(
-                        &key,
-                        color_image,
-                        egui::TextureOptions::LINEAR,
-                    ))
-                }
-                Err(_) => ImageState::Failed,
-            };
+        for (key, image) in images_to_convert {
+            let converted =
+                ImageState::Texture(ctx.load_texture(&key, image, egui::TextureOptions::LINEAR));
 
             let mut state = self.shared.lock().expect("lock shared state");
             state.images.insert(key, converted);
@@ -693,6 +720,7 @@ impl eframe::App for BrowserApp {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.current_tab, Tab::Browser, "Modlist Browser");
+                ui.selectable_value(&mut self.current_tab, Tab::Collections, "Collections");
                 ui.selectable_value(&mut self.current_tab, Tab::Settings, "Settings");
             });
             ui.add_space(2.0);
@@ -700,6 +728,11 @@ impl eframe::App for BrowserApp {
 
         match self.current_tab {
             Tab::Browser => self.render_browser_tab(ctx),
+            Tab::Collections => {
+                if self.collections.render(ctx, &self.settings.nexus_api_key) {
+                    self.current_tab = Tab::Settings;
+                }
+            }
             Tab::Settings => self.render_settings_tab(ctx),
         }
 
@@ -1103,7 +1136,10 @@ impl BrowserApp {
                         );
 
                         let run_clicked = ui
-                            .add_enabled(spawn_args.is_some(), egui::Button::new("Run"))
+                            .add_enabled(
+                                spawn_args.is_some() && !self.collections.is_busy(),
+                                egui::Button::new("Run"),
+                            )
                             .on_hover_text(
                                 "Launches the install in a new terminal window and closes \
                                  the browser. Falls back to the parent terminal if no \
@@ -1223,23 +1259,6 @@ impl BrowserApp {
                     .size(11.0)
                     .color(egui::Color32::from_gray(140)),
                 );
-                ui.add_space(12.0);
-
-                // --- Fluorine integration (single toggle at the top) ---
-                let prev_add_to_fluorine = self.settings.add_to_fluorine;
-                let cb = ui.checkbox(
-                    &mut self.settings.add_to_fluorine,
-                    "Add finished installs to Fluorine",
-                );
-                cb.on_hover_text(
-                    "After a successful install, register the install directory as a \
-                     portable instance in Fluorine Manager. If Fluorine isn't installed, \
-                     CLF3 will download the latest release from GitHub automatically.",
-                );
-                if self.settings.add_to_fluorine != prev_add_to_fluorine {
-                    let _ = self.settings.save();
-                }
-
                 ui.add_space(12.0);
 
                 // --- Default Directories ---
@@ -1831,4 +1850,24 @@ impl BrowserApp {
                 });
             });
     }
+}
+
+/// Decode and shrink gallery artwork away from the GUI event loop.
+fn decode_thumbnail(bytes: Vec<u8>) -> Option<egui::ColorImage> {
+    if bytes.len() > 32 * 1024 * 1024 {
+        return None;
+    }
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    reader.limits(limits);
+    let rgba = reader.decode().ok()?.thumbnail(400, 226).to_rgba8();
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        rgba.as_raw(),
+    ))
 }

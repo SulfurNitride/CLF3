@@ -12,6 +12,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod archive;
 mod browser_gui;
 mod bsa;
+mod collections_gui;
 mod downloaders;
 mod fluorine;
 mod game_finder;
@@ -95,6 +96,8 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
+    /// Inspect and plan Nexus Collections without loading account credentials.
+    Collection(clf3::collection::cli::CollectionArgs),
     /// Browse available Wabbajack modlists
     Browser,
 
@@ -248,7 +251,7 @@ enum Commands {
         wabbajack_file: PathBuf,
     },
 
-    /// Fluorine Manager integration (auto-register finished installs).
+    /// Explicit Fluorine Manager utilities (never run automatically).
     Fluorine {
         #[command(subcommand)]
         action: FluorineAction,
@@ -276,12 +279,6 @@ enum FluorineAction {
         /// Also set this as the current instance Fluorine opens by default.
         #[arg(long)]
         make_current: bool,
-    },
-
-    /// Toggle whether successful installs are auto-registered with Fluorine.
-    Enable {
-        /// `true` or `false`. Persisted in settings.
-        value: bool,
     },
 
     /// Make sure Fluorine is available on disk (downloading the latest
@@ -328,6 +325,12 @@ enum ModlistAction {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Collection inspection is read-only and credential-free. Do not initialize
+    // settings, a browser, NXM registration, or persistent log files for it.
+    if let Some(Commands::Collection(args)) = &cli.command {
+        return clf3::collection::cli::run(args).await;
+    }
 
     // Set up file logging (always enabled) next to the executable
     let log_dir = std::env::current_exe()
@@ -509,6 +512,7 @@ async fn main() -> Result<()> {
     }
 
     match command {
+        Commands::Collection(_) => unreachable!("collection commands return before initialization"),
         Commands::Browser => {
             if let Err(e) = browser_gui::launch_browser() {
                 eprintln!("Browser GUI error: {}", e);
@@ -889,8 +893,6 @@ async fn main() -> Result<()> {
                 .filter(|s| !s.is_empty())
                 .or_else(|| derive_machine_name_from_settings(&settings, &output));
 
-            let install_dir_for_fluorine = output.clone();
-
             let (progress_callback, active_reporter): (
                 Option<ProgressCallback>,
                 Arc<dyn ProgressReporter>,
@@ -1008,21 +1010,6 @@ async fn main() -> Result<()> {
                 reporter.log("\nInstallation complete!");
             }
 
-            // Fluorine auto-registration. Only runs on a clean install so we
-            // don't add half-broken instances to the user's Fluorine sidebar.
-            if installation_succeeded && settings.add_to_fluorine && !hosted {
-                if let Err(e) =
-                    ensure_fluorine_and_register(&settings, &install_dir_for_fluorine).await
-                {
-                    reporter.log(&format!("\nFluorine integration failed: {}", e));
-                } else {
-                    reporter.log(&format!(
-                        "\nRegistered '{}' as a Fluorine portable instance.",
-                        install_dir_for_fluorine.display()
-                    ));
-                }
-            }
-
             // Optional structured report for external tooling.
             if let Some(report_path) = report_json {
                 let content = serde_json::to_string_pretty(&stats)
@@ -1137,25 +1124,6 @@ async fn run_fetch_command(url: &str, output: &std::path::Path) -> Result<()> {
 
 /// Make sure a Fluorine install is available, downloading the latest release
 /// if not, then register `install_dir` as a portable instance.
-async fn ensure_fluorine_and_register(
-    settings: &settings::Settings,
-    install_dir: &std::path::Path,
-) -> Result<()> {
-    let override_path = if settings.fluorine_path.is_empty() {
-        None
-    } else {
-        Some(settings.fluorine_path.as_str())
-    };
-
-    if fluorine::detect(override_path).is_none() {
-        tracing::info!("Fluorine not detected — downloading the latest release");
-        fluorine::download_latest(None).await?;
-    }
-
-    fluorine::register_portable_instance(install_dir, false)?;
-    Ok(())
-}
-
 async fn run_fluorine_action(action: FluorineAction) -> Result<()> {
     match action {
         FluorineAction::Status => {
@@ -1166,14 +1134,6 @@ async fn run_fluorine_action(action: FluorineAction) -> Result<()> {
                 Some(settings.fluorine_path.as_str())
             };
 
-            println!(
-                "Auto-register installs: {}",
-                if settings.add_to_fluorine {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            );
             match fluorine::detect(override_path) {
                 Some(install) => println!(
                     "Detected:               {} (via {})",
@@ -1218,16 +1178,6 @@ async fn run_fluorine_action(action: FluorineAction) -> Result<()> {
             );
         }
 
-        FluorineAction::Enable { value } => {
-            let mut settings = settings::Settings::load();
-            settings.add_to_fluorine = value;
-            settings.save()?;
-            println!(
-                "Fluorine auto-register: {}",
-                if value { "enabled" } else { "disabled" }
-            );
-        }
-
         FluorineAction::Ensure { json } => {
             let install = ensure_fluorine_available().await?;
             if json {
@@ -1249,7 +1199,7 @@ async fn run_fluorine_action(action: FluorineAction) -> Result<()> {
 }
 
 /// Detect Fluorine; if missing, download the latest release. Returns the
-/// resolved install. Unlike `ensure_fluorine_and_register`, this does NOT
+/// resolved install. This explicit utility does NOT
 /// touch Fluorine's QSettings file — useful as a "primer" called by external
 /// launchers that just want the binary path.
 async fn ensure_fluorine_available() -> Result<fluorine::FluorineInstall> {
