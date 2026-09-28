@@ -92,9 +92,17 @@ impl StdioHost {
             .expect("ready protocol lock")
             .is_none()
         {
-            tokio::time::timeout(std::time::Duration::from_secs(30), self.ready.notified())
-                .await
-                .context("Timed out waiting for Fluorine protocol handshake")?;
+            tokio::select! {
+                _ = self.cancellation.cancelled() => {
+                    bail!("Host cancelled or disconnected before the protocol handshake")
+                }
+                result = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    self.ready.notified(),
+                ) => {
+                    result.context("Timed out waiting for Fluorine protocol handshake")?;
+                }
+            }
         }
         let version = self
             .ready_protocol
@@ -291,5 +299,28 @@ mod tests {
     #[test]
     fn host_command_rejects_untyped_input() {
         assert!(serde_json::from_str::<HostCommand>(r#"{"urls":[]}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn handshake_wait_stops_when_host_disconnects() {
+        let host = StdioHost {
+            writer: JsonEventWriter::stdout(),
+            pending: Mutex::new(HashMap::new()),
+            ready: Notify::new(),
+            ready_protocol: Mutex::new(None),
+            cancellation: CancellationToken::new(),
+        };
+        host.cancellation.cancel();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            host.wait_until_ready(),
+        )
+        .await
+        .expect("handshake should fail promptly after disconnect");
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("before the protocol handshake"));
     }
 }

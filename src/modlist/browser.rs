@@ -104,6 +104,24 @@ pub struct ModlistMetadata {
     pub download_metadata: Option<DownloadMetadata>,
     #[serde(default)]
     pub version: String,
+    /// Timestamp Wabbajack last updated this gallery entry. This is distinct
+    /// from the local gallery cache file's modification time.
+    #[serde(
+        rename = "dateUpdated",
+        alias = "DateUpdated",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub date_updated: Option<String>,
+    /// Original creation timestamp for the gallery entry, when supplied.
+    /// Some upstream entries use the Unix epoch as an unset sentinel.
+    #[serde(
+        rename = "dateCreated",
+        alias = "DateCreated",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub date_created: Option<String>,
     // Fields we populate ourselves (included in cache for quick loading)
     #[serde(default)]
     pub repository_name: String,
@@ -503,6 +521,33 @@ mod tests {
         assert!(!index.matches("test-list", &[], &["USSEP".into()]));
         assert!(!index.matches("unknown-list", &["SkyUI".into()], &[]));
         assert!(index.matches("unknown-list", &[], &["SkyUI".into()]));
+    }
+
+    #[test]
+    fn gallery_timestamps_round_trip_and_old_cache_entries_still_load() {
+        let source = r#"{
+            "title": "Example list",
+            "dateCreated": "1970-01-01T00:00:00Z",
+            "dateUpdated": "2026-09-27T10:31:00.8081925Z"
+        }"#;
+        let metadata: ModlistMetadata = serde_json::from_str(source).unwrap();
+        assert_eq!(
+            metadata.date_created.as_deref(),
+            Some("1970-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            metadata.date_updated.as_deref(),
+            Some("2026-09-27T10:31:00.8081925Z")
+        );
+
+        let cached = serde_json::to_value(&metadata).unwrap();
+        assert_eq!(cached["dateCreated"], "1970-01-01T00:00:00Z");
+        assert_eq!(cached["dateUpdated"], "2026-09-27T10:31:00.8081925Z");
+
+        let old_cache: ModlistMetadata =
+            serde_json::from_str(r#"{"title":"Old entry"}"#).unwrap();
+        assert_eq!(old_cache.date_created, None);
+        assert_eq!(old_cache.date_updated, None);
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 [package]
 name = "clf3"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 description = "Wabbajack and Nexus Collections installer for Linux"
 license = "MIT"

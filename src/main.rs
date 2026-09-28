@@ -1676,7 +1676,8 @@ fn auto_detect_game_dir(wabbajack_path: &std::path::Path) -> Option<(PathBuf, &'
                 store,
                 path.display()
             );
-            println!(
+            // Hosted stdout is reserved for the JSON protocol.
+            eprintln!(
                 "Game file preflight passed on {} candidate: {}",
                 store,
                 path.display()

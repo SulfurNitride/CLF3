@@ -3,13 +3,21 @@ name: Build
 on:
   push:
     branches: [main, master]
+    tags:
+      - '[0-9]*.[0-9]*.[0-9]*'
+      - 'v*'
   pull_request:
     branches: [main, master]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build-linux:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -19,14 +27,28 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          # Cache the release build artifacts
           cache-targets: "true"
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
 
+      - name: Validate release tag
+        shell: bash
+        run: |
+          cargo_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            if [[ "$tag_version" != "$cargo_version" ]]; then
+              echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Test
+        run: cargo test --locked -j4
+
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked -j4
 
       - name: Download 7-Zip
         run: |
@@ -36,12 +58,37 @@ jobs:
           cp 7z-temp/7zz release/
 
       - name: Package release
-        run: |
-          cp target/release/clf3 release/
-          chmod +x release/clf3 release/7zz
+        run: scripts/package_release.sh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: clf3-linux-x64
-          path: release
+          name: clf3-linux-x86_64-${{ github.ref_name }}
+          path: dist/*
+
+  publish-release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build-linux
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged assets
+        uses: actions/download-artifact@v4
+        with:
+          name: clf3-linux-x86_64-${{ github.ref_name }}
+          path: dist
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: CLF3 ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/clf3-linux-x86_64-*.tar.gz
+            dist/clf3-linux-x86_64-*.zip
+            dist/clf3-linux-x64.zip
+            dist/SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

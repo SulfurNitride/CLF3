@@ -2348,7 +2348,7 @@ async fn download_archive_inner(
                     .await
                     {
                         Ok(_) => return Ok(((), None)),
-                        Err(error) => failures.push(error.to_string()),
+                        Err(error) => failures.push(format!("{:#}", error)),
                     }
                 }
                 bail!(
