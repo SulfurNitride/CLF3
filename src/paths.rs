@@ -11,7 +11,7 @@
 // Module not yet integrated into main installation pipeline
 #![allow(dead_code)]
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 
 /// CP437 to Unicode mapping for bytes 0x80-0xFF
@@ -216,8 +216,64 @@ fn find_blocking_entry(dir_path: &Path) -> Option<std::path::PathBuf> {
 
 /// Join a base path with a Windows-style relative path
 /// Converts separators and creates a proper PathBuf
+///
+/// The result always stays inside `base`: root, drive-prefix, `.` and `..`
+/// components are dropped. Modlists are validated on load (see
+/// [`unsafe_relative_path_reason`]), so this is a backstop that only changes
+/// the result for paths that validation would already have rejected.
 pub fn join_windows_path(base: &Path, relative: &str) -> PathBuf {
-    base.join(to_linux_path(relative))
+    let relative = to_linux_path(relative);
+    let mut out = base.to_path_buf();
+    for component in Path::new(&relative).components() {
+        if let Component::Normal(part) = component {
+            out.push(part);
+        }
+    }
+    out
+}
+
+/// Why a modlist-supplied relative path (a directive `To`, a BSA entry path)
+/// is unsafe to join onto an install root, or `None` if it is fine.
+///
+/// Rejects empty paths, absolute paths, Windows drive prefixes (`C:`), NUL
+/// bytes and any `..` component, in either separator style.
+pub fn unsafe_relative_path_reason(path: &str) -> Option<&'static str> {
+    if path.is_empty() {
+        return Some("empty path");
+    }
+    if path.contains('\0') {
+        return Some("contains a NUL byte");
+    }
+    let normalized = to_linux_path(path);
+    if normalized.starts_with('/') {
+        return Some("absolute path");
+    }
+    let bytes = normalized.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Some("drive-qualified path");
+    }
+    if normalized.split('/').any(|part| part == "..") {
+        return Some("contains a '..' component");
+    }
+    None
+}
+
+/// Why a modlist-supplied archive file name is unsafe to join onto the
+/// downloads directory, or `None` if it is a plain file name.
+pub fn unsafe_file_name_reason(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("empty name");
+    }
+    if name.contains('\0') {
+        return Some("contains a NUL byte");
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Some("contains a path separator");
+    }
+    if name == "." || name == ".." {
+        return Some("is a relative directory name");
+    }
+    None
 }
 
 /// Thread-safe directory creation cache.
@@ -348,6 +404,57 @@ impl DirCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn join_windows_path_stays_inside_base() {
+        let base = Path::new("/install");
+        assert_eq!(
+            join_windows_path(base, "mods\\Foo\\foo.esp"),
+            PathBuf::from("/install/mods/Foo/foo.esp")
+        );
+        assert_eq!(
+            join_windows_path(base, "..\\..\\.bashrc"),
+            PathBuf::from("/install/.bashrc")
+        );
+        assert_eq!(
+            join_windows_path(base, "\\home\\u\\.bashrc"),
+            PathBuf::from("/install/home/u/.bashrc")
+        );
+        assert_eq!(
+            join_windows_path(base, "/etc/passwd"),
+            PathBuf::from("/install/etc/passwd")
+        );
+    }
+
+    #[test]
+    fn unsafe_relative_paths_are_rejected() {
+        for ok in ["mods\\Foo\\foo.esp", "profiles/Default/modlist.txt", "a..b\\c...d", ".hidden"] {
+            assert_eq!(unsafe_relative_path_reason(ok), None, "{ok}");
+        }
+        for bad in [
+            "",
+            "..\\x",
+            "mods\\..\\..\\x",
+            "mods/../x",
+            "\\home\\u\\x",
+            "/etc/passwd",
+            "C:\\Windows\\x",
+            "c:x",
+            "a\0b",
+        ] {
+            assert!(unsafe_relative_path_reason(bad).is_some(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn unsafe_archive_names_are_rejected() {
+        for ok in ["SkyUI_5_2_SE-12604-5-2SE.7z", "Ünïcödé Pack.zip", "..foo.7z"] {
+            assert_eq!(unsafe_file_name_reason(ok), None, "{ok}");
+        }
+        for bad in ["", ".", "..", "../x.7z", "sub\\x.7z", "/home/u/x.docx", "a\0b"] {
+            assert!(unsafe_file_name_reason(bad).is_some(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn test_to_linux_path() {

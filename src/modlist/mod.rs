@@ -81,7 +81,66 @@ pub fn parse_wabbajack_file(path: &Path) -> Result<Modlist> {
         modlist.directives.len()
     );
 
+    validate_modlist_paths(&modlist)?;
+
     Ok(modlist)
+}
+
+/// Bumped whenever load-time validation rules change, so state databases
+/// imported under older rules are re-imported (and re-validated).
+const PATH_VALIDATION_VERSION: &str = "1";
+
+/// Reject modlists whose archive names or output paths would escape the
+/// downloads / install directories (e.g. `..\..\.bashrc`, `/home/u/x`).
+///
+/// Every path a .wabbajack supplies is later joined onto a user directory and
+/// written to (or, for archives, hashed and possibly deleted), so a single
+/// bad entry is a hard error rather than a skipped directive.
+pub fn validate_modlist_paths(modlist: &Modlist) -> Result<()> {
+    const MAX_REPORTED: usize = 5;
+    let mut problems = Vec::new();
+    let mut total = 0usize;
+    let mut record = |what: String| {
+        total += 1;
+        if problems.len() < MAX_REPORTED {
+            problems.push(what);
+        }
+    };
+
+    for archive in &modlist.archives {
+        if let Some(reason) = crate::paths::unsafe_file_name_reason(&archive.name) {
+            record(format!("archive name {:?}: {}", archive.name, reason));
+        }
+    }
+    for directive in &modlist.directives {
+        let to = directive.to_path();
+        if let Some(reason) = crate::paths::unsafe_relative_path_reason(to) {
+            record(format!("output path {:?}: {}", to, reason));
+        }
+        if let Directive::CreateBSA(bsa) = directive {
+            for state in &bsa.file_states {
+                if let Some(reason) = crate::paths::unsafe_relative_path_reason(state.path()) {
+                    record(format!("BSA entry {:?} in {:?}: {}", state.path(), to, reason));
+                }
+            }
+        }
+    }
+
+    if total > 0 {
+        anyhow::bail!(
+            "Refusing to install '{}': {} unsafe path(s) would write outside the install or \
+             downloads directory. This .wabbajack file is malformed or has been tampered with.\n  {}{}",
+            modlist.name,
+            total,
+            problems.join("\n  "),
+            if total > problems.len() {
+                format!("\n  ... and {} more", total - problems.len())
+            } else {
+                String::new()
+            }
+        );
+    }
+    Ok(())
 }
 
 /// Open a .wabbajack file and import into a database
@@ -100,6 +159,12 @@ pub fn import_wabbajack_to_db(wabbajack_path: &Path, db_path: &Path) -> Result<M
         (Some(fp), Some(path)) => {
             if fp != current_fingerprint || path != wabbajack_path_str {
                 info!("Wabbajack file changed, clearing database...");
+                db.clear_all_data()?;
+                true
+            } else if db.get_metadata("path_validation")?.as_deref()
+                != Some(PATH_VALIDATION_VERSION)
+            {
+                info!("Database predates path validation, re-importing...");
                 db.clear_all_data()?;
                 true
             } else {
@@ -132,6 +197,7 @@ pub fn import_wabbajack_to_db(wabbajack_path: &Path, db_path: &Path) -> Result<M
         // Store fingerprint and path for future checks
         db.set_metadata("wabbajack_fingerprint", &current_fingerprint)?;
         db.set_metadata("wabbajack_path", &wabbajack_path_str)?;
+        db.set_metadata("path_validation", PATH_VALIDATION_VERSION)?;
     } else {
         info!("Using existing database (wabbajack file unchanged)");
     }
@@ -148,6 +214,41 @@ pub fn import_wabbajack_to_db(wabbajack_path: &Path, db_path: &Path) -> Result<M
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn modlist_with(archive_name: &str, to: &str) -> Modlist {
+        serde_json::from_value(serde_json::json!({
+            "Name": "Test", "Version": "1.0", "WabbajackVersion": "3.0",
+            "GameType": "SkyrimSpecialEdition", "IsNSFW": false,
+            "Archives": [{
+                "Hash": "AAAAAAAAAAA=", "Meta": "", "Name": archive_name, "Size": 1,
+                "State": {"$type": "HttpDownloader, Wabbajack.Lib", "Url": "https://example.invalid/a"}
+            }],
+            "Directives": [{
+                "$type": "InlineFile", "To": to, "Hash": "AAAAAAAAAAA=", "Size": 1,
+                "SourceDataID": "00000000-0000-0000-0000-000000000000"
+            }]
+        }))
+        .expect("fixture parses")
+    }
+
+    #[test]
+    fn validate_modlist_paths_accepts_normal_paths() {
+        let modlist = modlist_with("SkyUI_5_2_SE-12604-5-2SE.7z", "mods\\SkyUI\\SkyUI_SE.esp");
+        validate_modlist_paths(&modlist).expect("normal modlist is valid");
+    }
+
+    #[test]
+    fn validate_modlist_paths_rejects_escapes() {
+        let err = validate_modlist_paths(&modlist_with("ok.7z", "..\\..\\.bashrc")).unwrap_err();
+        assert!(err.to_string().contains("'..' component"), "{err}");
+
+        let err = validate_modlist_paths(&modlist_with("ok.7z", "\\home\\u\\.bashrc")).unwrap_err();
+        assert!(err.to_string().contains("absolute path"), "{err}");
+
+        let err =
+            validate_modlist_paths(&modlist_with("/home/u/thesis.docx", "mods\\a.esp")).unwrap_err();
+        assert!(err.to_string().contains("path separator"), "{err}");
+    }
 
     // Test with actual Tuxborn file if available
     #[test]
