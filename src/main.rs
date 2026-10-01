@@ -370,36 +370,33 @@ async fn main() -> Result<()> {
     } else {
         match &command {
             Commands::Install { progress, .. } => (*progress).into(),
+            // `modlist update` runs a full install through this reporter.
+            Commands::Modlist {
+                action: ModlistAction::Update { .. },
+            } => ProgressMode::Auto,
             // Other commands (Browser, SetApiKey, ListGpu, Config, Info, Fluorine…)
             // never spawn the worker pool — keep the CLI reporter silent so the
             // "System: starting…" / "Workers" UI doesn't render on top of them.
             _ => ProgressMode::Plain,
         }
     };
-    let progress_mode = match requested_progress_mode {
-        ProgressMode::Auto
-            if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() =>
-        {
-            ProgressMode::Full
-        }
-        ProgressMode::Auto => ProgressMode::Plain,
-        mode => mode,
-    };
-
     // Create CLI reporter for progress bars — must exist before tracing init
-    // so its writer factory can route tracing output through MultiProgress.
-    let cli_reporter = CliReporter::new(16, progress_mode);
+    // so its writer factory can route tracing output through the live display.
+    // `Auto` resolves to Full on a terminal and Plain otherwise.
+    let cli_reporter = CliReporter::new(16, requested_progress_mode);
 
     // Console layer — routes through CliReporter's MultiProgress unless stdout
     // is reserved for newline-delimited JSON.
     let console_layer = if json_progress {
         tracing_subscriber::fmt::layer()
             .with_writer(std::io::stderr)
+            .with_ansi(std::io::stderr().is_terminal())
             .with_filter(console_filter)
             .boxed()
     } else {
         tracing_subscriber::fmt::layer()
             .with_writer(cli_reporter.make_writer_factory())
+            .with_ansi(std::io::stderr().is_terminal())
             .with_filter(console_filter)
             .boxed()
     };
@@ -1025,7 +1022,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Modlist { action } => {
-            run_modlist_action(action).await?;
+            run_modlist_action(action, &cli_reporter).await?;
         }
 
         Commands::Fetch { url, output } => {
@@ -1316,10 +1313,10 @@ fn derive_machine_name_from_settings(
 }
 
 /// Top-level dispatcher for `clf3 modlist <action>`.
-async fn run_modlist_action(action: ModlistAction) -> Result<()> {
+async fn run_modlist_action(action: ModlistAction, cli_reporter: &Arc<CliReporter>) -> Result<()> {
     match action {
         ModlistAction::Check { name, json } => run_modlist_check(name, json).await,
-        ModlistAction::Update { name, yes } => run_modlist_update(name, yes).await,
+        ModlistAction::Update { name, yes } => run_modlist_update(name, yes, cli_reporter).await,
     }
 }
 
@@ -1368,7 +1365,7 @@ async fn run_modlist_check(name: Option<String>, json: bool) -> Result<()> {
 
 /// `clf3 modlist update <name>`: re-install the modlist against the latest
 /// gallery version, reusing the original install and downloads directories.
-async fn run_modlist_update(name: String, yes: bool) -> Result<()> {
+async fn run_modlist_update(name: String, yes: bool, cli_reporter: &Arc<CliReporter>) -> Result<()> {
     let settings = settings::Settings::load();
     let installs = modlist::update::discover_installs(&settings);
 
@@ -1493,8 +1490,6 @@ async fn run_modlist_update(name: String, yes: bool) -> Result<()> {
     let thread_count = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-
-    let cli_reporter = CliReporter::new(16, ProgressMode::Plain);
 
     let patch_cache_dir = if settings.patch_cache_dir.is_empty() {
         None

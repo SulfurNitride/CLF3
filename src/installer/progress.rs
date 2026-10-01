@@ -1,7 +1,8 @@
 //! Unified progress reporting trait
 //!
 //! All engine code reports progress through `ProgressReporter`.
-//! Implementations: `CliReporter` (indicatif + console), `GuiReporter` (mpsc → Slint).
+//! Implementations: `CliReporter` (indicatif dashboard / plain lines) and
+//! `JsonReporter` (newline-delimited JSON for external drivers).
 
 use std::fmt;
 use std::sync::Arc;

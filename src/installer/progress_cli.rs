@@ -1,87 +1,356 @@
 //! CLI progress reporter using indicatif + console
 //!
-//! Owns the `MultiProgress` display and provides a `MakeWriter` for tracing integration.
+//! Two renderers sit behind [`CliReporter`]:
+//!
+//! - **Full** (interactive terminal): a single dashboard block (phase, overall
+//!   bar, phase counters, system stats) followed by one row per active item.
+//!   Item rows are created when work starts and removed when it ends; items
+//!   beyond what fits on screen are tracked off-screen and promoted as rows
+//!   free up, so nothing is silently dropped.
+//! - **Plain** (pipes, CI, log capture): line-oriented output written straight
+//!   to stderr, with throttled heartbeat lines instead of per-update spam.
+//!
+//! Both renderers share a [`LineSink`] that tracing output is routed through,
+//! so log lines never tear the live display.
 
-use super::progress::{NullHandle, Phase, ProgressHandle, ProgressMode, ProgressReporter};
+use super::progress::{Phase, ProgressHandle, ProgressMode, ProgressReporter};
 use console::style;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once, Weak};
 use std::time::{Duration, Instant};
 
-/// CLI reporter backed by indicatif `MultiProgress`.
+/// Redraw cadence for spinners / elapsed clocks.
+const TICK: Duration = Duration::from_millis(200);
+/// System stats (net/disk/RAM) refresh cadence, in ticks.
+const SYSTEM_EVERY_TICKS: u32 = 5;
+/// Minimum spacing between Plain-mode heartbeat lines triggered by progress.
+const PLAIN_HEARTBEAT: Duration = Duration::from_secs(5);
+/// Plain mode prints a keep-alive line at least this often while work is active,
+/// so CI runners with "no output" timeouts don't kill long downloads.
+const PLAIN_KEEPALIVE: Duration = Duration::from_secs(30);
+/// Rows reserved for the dashboard, prompt and a little scrollback.
+const RESERVED_ROWS: usize = 8;
+
+// ---------------------------------------------------------------------------
+// Line output
+// ---------------------------------------------------------------------------
+
+/// Writes whole lines without tearing the live display.
+///
+/// `MultiProgress::println` is a no-op when the draw target is hidden (e.g.
+/// stderr is not a terminal), so hidden/absent displays write to stderr
+/// directly instead.
+struct LineSink {
+    mp: Option<MultiProgress>,
+}
+
+impl LineSink {
+    fn line(&self, msg: &str) {
+        match &self.mp {
+            Some(mp) if !mp.is_hidden() => {
+                let _ = mp.println(msg);
+            }
+            Some(mp) => mp.suspend(|| write_stderr(msg)),
+            None => write_stderr(msg),
+        }
+    }
+}
+
+fn write_stderr(msg: &str) {
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(err, "{}", msg);
+    let _ = err.flush();
+}
+
+// ---------------------------------------------------------------------------
+// Reporter
+// ---------------------------------------------------------------------------
+
+/// CLI reporter: interactive dashboard on terminals, plain lines otherwise.
 pub struct CliReporter {
-    mp: MultiProgress,
-    mode: ProgressMode,
-    overall: Mutex<Option<ProgressBar>>,
-    system_status: ProgressBar,
-    active_header: ProgressBar,
-    /// Fixed pool of reusable bars for concurrent items (downloads, archive extractions).
-    pool: Vec<ProgressBar>,
-    pool_available: Vec<Mutex<bool>>,
-    /// Per-slot current download speed in bytes/sec (0 when idle or extracting).
-    bar_speeds: Arc<Vec<AtomicU64>>,
-    ticker_shutdown: Arc<AtomicBool>,
-    /// `true` while we're in a phase that benefits from the live system status
-    /// bar + worker pool (Downloading / Installing / DdsTransform / BsaBuild).
-    /// Toggled on `phase_start`; non-active phases (GameCheck, Cleanup) keep
-    /// the status line hidden so it doesn't render across the whole pipeline.
-    status_visible: AtomicBool,
+    sink: Arc<LineSink>,
+    renderer: Renderer,
+}
+
+enum Renderer {
+    Full(Arc<Live>),
+    Plain(Arc<Plain>),
 }
 
 impl CliReporter {
-    /// Create a new CLI reporter with a bar pool of the given size.
-    ///
-    /// In Full mode the system status / worker header / pool bars start
-    /// *hidden* (blank-styled) and only become visible once `phase_start`
-    /// reports an active phase (Downloading / Installing / DdsTransform /
-    /// BsaBuild). This avoids the status line stomping over Game Check /
-    /// Cleanup output where there's no meaningful network/disk activity to
-    /// display.
-    pub fn new(pool_size: usize, mode: ProgressMode) -> Arc<Self> {
-        let mp = MultiProgress::new();
-        let blank_style = blank_style();
+    /// Create a CLI reporter. `max_rows` caps the number of item rows shown at
+    /// once (it is further capped by terminal height). `ProgressMode::Auto`
+    /// picks Full when both stdout and stderr are terminals.
+    pub fn new(max_rows: usize, mode: ProgressMode) -> Arc<Self> {
+        let mode = match mode {
+            ProgressMode::Auto
+                if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() =>
+            {
+                ProgressMode::Full
+            }
+            ProgressMode::Auto => ProgressMode::Plain,
+            mode => mode,
+        };
 
-        // Start blank in both modes; Full-mode bars get their real style
-        // applied on the first active `phase_start`.
-        let system_status = mp.add(ProgressBar::new_spinner());
-        system_status.set_style(blank_style.clone());
-
-        let active_header = mp.add(ProgressBar::new_spinner());
-        active_header.set_style(blank_style.clone());
-
-        let mut pool = Vec::with_capacity(pool_size);
-        let mut pool_available = Vec::with_capacity(pool_size);
-        let mut bar_speeds = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            let bar = mp.add(ProgressBar::new(0));
-            bar.set_style(blank_style.clone());
-            pool.push(bar);
-            pool_available.push(Mutex::new(true));
-            bar_speeds.push(AtomicU64::new(0));
-        }
-
-        let reporter = Arc::new(Self {
-            mp,
-            mode,
-            overall: Mutex::new(None),
-            system_status,
-            active_header,
-            pool,
-            pool_available,
-            bar_speeds: Arc::new(bar_speeds),
-            ticker_shutdown: Arc::new(AtomicBool::new(false)),
-            status_visible: AtomicBool::new(false),
-        });
-
-        if mode == ProgressMode::Full {
-            Self::spawn_system_ticker(&reporter);
-        }
-        reporter
+        let (sink, renderer) = if mode == ProgressMode::Full {
+            let mp = MultiProgress::new();
+            let sink = Arc::new(LineSink {
+                mp: Some(mp.clone()),
+            });
+            let live = Live::new(mp, max_rows.max(1));
+            (sink, Renderer::Full(live))
+        } else {
+            let sink = Arc::new(LineSink { mp: None });
+            (sink.clone(), Renderer::Plain(Plain::new(sink)))
+        };
+        Arc::new(Self { sink, renderer })
     }
 
-    /// Phases that benefit from the live system status + worker pool display.
-    /// GameCheck / Cleanup / any unknown future phase stays hidden.
+    /// `MakeWriter` for the tracing subscriber that routes through this
+    /// reporter so log lines print above the live display.
+    pub fn make_writer_factory(self: &Arc<Self>) -> CliWriterFactory {
+        CliWriterFactory {
+            sink: Arc::clone(&self.sink),
+        }
+    }
+}
+
+impl ProgressReporter for CliReporter {
+    fn phase_start(&self, phase: Phase) {
+        match &self.renderer {
+            Renderer::Full(live) => live.phase_start(phase),
+            Renderer::Plain(plain) => plain.phase_start(phase),
+        }
+    }
+
+    fn overall_set_total(&self, total: u64) {
+        match &self.renderer {
+            Renderer::Full(live) => live.overall_set_total(total),
+            Renderer::Plain(plain) => plain.overall_set_total(total),
+        }
+    }
+
+    fn overall_inc(&self) {
+        match &self.renderer {
+            Renderer::Full(live) => live.dash.inc(1),
+            Renderer::Plain(plain) => plain.overall_inc(),
+        }
+    }
+
+    fn overall_set_message(&self, msg: &str) {
+        self.status(msg);
+    }
+
+    fn overall_finish(&self) {
+        match &self.renderer {
+            Renderer::Full(live) => live.overall_finish(),
+            Renderer::Plain(plain) => plain.overall_finish(),
+        }
+    }
+
+    fn begin_item(&self, name: &str, total_bytes: Option<u64>) -> Arc<dyn ProgressHandle> {
+        // The pipeline names extraction items "extracting <archive>"; the row
+        // glyph already says that, so show just the archive name.
+        let label = name.strip_prefix("extracting ").unwrap_or(name);
+        match &self.renderer {
+            Renderer::Full(live) => live.begin_item(label, total_bytes),
+            Renderer::Plain(plain) => plain.begin_item(label, total_bytes),
+        }
+    }
+
+    fn begin_status(&self, label: &str) -> Arc<dyn ProgressHandle> {
+        let counters = match &self.renderer {
+            Renderer::Full(live) => &live.counters,
+            Renderer::Plain(plain) => &plain.counters,
+        };
+        Arc::new(CounterHandle {
+            counters: Arc::clone(counters),
+            id: counters.add(label),
+            sink: Arc::clone(&self.sink),
+            label: label.to_string(),
+            finished: AtomicBool::new(false),
+        })
+    }
+
+    fn log(&self, msg: &str) {
+        self.sink.line(msg);
+    }
+
+    fn status(&self, msg: &str) {
+        match &self.renderer {
+            Renderer::Full(live) => live.set_status(msg),
+            Renderer::Plain(plain) => plain.set_status(msg),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared phase counters ("Extracted 40/300 · DDS 100/2000")
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct Counters {
+    inner: Mutex<CountersInner>,
+}
+
+#[derive(Default)]
+struct CountersInner {
+    next_id: u64,
+    entries: Vec<(u64, String, usize, usize)>,
+}
+
+impl Counters {
+    fn add(&self, label: &str) -> u64 {
+        let mut inner = self.inner.lock().expect("counters lock");
+        inner.next_id += 1;
+        let id = inner.next_id;
+        inner.entries.push((id, label.to_string(), 0, 0));
+        id
+    }
+
+    fn set(&self, id: u64, done: usize, total: usize) {
+        let mut inner = self.inner.lock().expect("counters lock");
+        if let Some(entry) = inner.entries.iter_mut().find(|e| e.0 == id) {
+            entry.2 = done;
+            entry.3 = total;
+        }
+    }
+
+    fn remove(&self, id: u64) {
+        self.inner
+            .lock()
+            .expect("counters lock")
+            .entries
+            .retain(|e| e.0 != id);
+    }
+
+    /// `None` when there are no live counters.
+    fn render(&self) -> Option<String> {
+        let inner = self.inner.lock().expect("counters lock");
+        if inner.entries.is_empty() {
+            return None;
+        }
+        Some(
+            inner
+                .entries
+                .iter()
+                .map(|(_, label, done, total)| format!("{} {}/{}", label, done, total))
+                .collect::<Vec<_>>()
+                .join(" · "),
+        )
+    }
+}
+
+struct CounterHandle {
+    counters: Arc<Counters>,
+    id: u64,
+    sink: Arc<LineSink>,
+    label: String,
+    finished: AtomicBool,
+}
+
+impl ProgressHandle for CounterHandle {
+    fn set_bytes(&self, _downloaded: u64, _total: u64, _speed: f64) {}
+
+    fn set_message(&self, msg: &str) {
+        self.sink.line(&format!("{}: {}", self.label, msg));
+    }
+
+    fn set_count(&self, done: usize, total: usize) {
+        self.counters.set(self.id, done, total);
+    }
+
+    fn finish(&self) {
+        if !self.finished.swap(true, Ordering::Relaxed) {
+            self.counters.remove(self.id);
+        }
+    }
+
+    fn finish_with_error(&self, msg: &str) {
+        if !self.finished.swap(true, Ordering::Relaxed) {
+            self.counters.remove(self.id);
+            self.sink
+                .line(&format!("{} {}: {}", style("✗").red(), self.label, msg));
+        }
+    }
+}
+
+impl Drop for CounterHandle {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Full (interactive) renderer
+// ---------------------------------------------------------------------------
+
+struct Live {
+    mp: MultiProgress,
+    out: LineSink,
+    max_rows: usize,
+    /// Dashboard block. Lives for the whole run; inserted into / removed from
+    /// `mp` as it becomes relevant, so overall updates are always lock-free.
+    dash: ProgressBar,
+    counters: Arc<Counters>,
+    state: Mutex<LiveState>,
+    /// Latest "Net · Disk · RAM" text, refreshed by the ticker.
+    system_line: Mutex<String>,
+    run_start: Instant,
+}
+
+struct LiveState {
+    phase: Option<Phase>,
+    phase_active: bool,
+    has_total: bool,
+    has_status: bool,
+    dash_shown: bool,
+    dash_has_extra: bool,
+    /// Active items, in start order.
+    items: Vec<Arc<LiveItem>>,
+}
+
+struct LiveItem {
+    bar: ProgressBar,
+    shown: AtomicBool,
+    is_bytes: bool,
+    /// Last reported speed (bytes/sec); summed into the Net figure.
+    speed: AtomicU64,
+    first_bytes: AtomicBool,
+    counting: AtomicBool,
+}
+
+impl Live {
+    fn new(mp: MultiProgress, max_rows: usize) -> Arc<Self> {
+        let dash = ProgressBar::with_draw_target(Some(0), ProgressDrawTarget::hidden());
+        let live = Arc::new(Self {
+            out: LineSink {
+                mp: Some(mp.clone()),
+            },
+            mp,
+            max_rows,
+            dash,
+            counters: Arc::new(Counters::default()),
+            state: Mutex::new(LiveState {
+                phase: None,
+                phase_active: false,
+                has_total: false,
+                has_status: false,
+                dash_shown: false,
+                dash_has_extra: false,
+                items: Vec::new(),
+            }),
+            system_line: Mutex::new(String::new()),
+            run_start: Instant::now(),
+        });
+        live.restyle_dash(&live.state.lock().expect("live state"));
+        Self::spawn_ticker(&live);
+        live
+    }
+
+    /// Phases with network/disk activity get the dashboard + system line.
     fn phase_is_active(phase: Phase) -> bool {
         matches!(
             phase,
@@ -94,171 +363,656 @@ impl CliReporter {
         )
     }
 
-    /// Switch the persistent bars between visible (real styles) and hidden
-    /// (blank). Idempotent — repeated calls with the same state are cheap.
-    /// Only meaningful in `ProgressMode::Full`.
-    fn set_status_visible(&self, visible: bool) {
-        if self.mode != ProgressMode::Full {
+    fn visible_rows(&self) -> usize {
+        let (rows, _cols) = console::Term::stderr().size();
+        (rows as usize)
+            .saturating_sub(RESERVED_ROWS)
+            .clamp(1, self.max_rows)
+    }
+
+    fn label_width(&self) -> usize {
+        let (_rows, cols) = console::Term::stderr().size();
+        (cols as usize).saturating_sub(58).clamp(16, 60)
+    }
+
+    fn phase_start(&self, phase: Phase) {
+        let elapsed = format_duration(self.run_start.elapsed());
+        self.out.line(&format!(
+            "{} {} {}",
+            style("==>").bold().cyan(),
+            style(phase).bold(),
+            style(format!("[{}]", elapsed)).dim()
+        ));
+
+        let mut st = self.state.lock().expect("live state");
+        st.phase = Some(phase);
+        st.phase_active = Self::phase_is_active(phase);
+        st.has_total = false;
+        st.has_status = false;
+        self.dash.reset();
+        self.dash.set_length(0);
+        self.dash.set_prefix("");
+        self.restyle_dash(&st);
+        self.sync_dash_visibility(&mut st);
+    }
+
+    fn overall_set_total(&self, total: u64) {
+        let mut st = self.state.lock().expect("live state");
+        st.has_total = true;
+        self.dash.set_length(total);
+        self.dash.set_position(0);
+        self.dash.reset_eta();
+        self.restyle_dash(&st);
+        self.sync_dash_visibility(&mut st);
+    }
+
+    fn overall_finish(&self) {
+        let mut st = self.state.lock().expect("live state");
+        st.has_total = false;
+        st.has_status = false;
+        self.dash.set_prefix("");
+        self.restyle_dash(&st);
+        self.sync_dash_visibility(&mut st);
+    }
+
+    fn set_status(&self, msg: &str) {
+        self.dash.set_prefix(msg.to_string());
+        let mut st = self.state.lock().expect("live state");
+        if !st.has_status {
+            st.has_status = true;
+            self.sync_dash_visibility(&mut st);
+        }
+    }
+
+    fn sync_dash_visibility(&self, st: &mut LiveState) {
+        let want = st.phase_active || st.has_total || st.has_status;
+        if want && !st.dash_shown {
+            self.mp.insert(0, self.dash.clone());
+            st.dash_shown = true;
+        } else if !want && st.dash_shown {
+            self.mp.remove(&self.dash);
+            st.dash_shown = false;
+        }
+    }
+
+    fn restyle_dash(&self, st: &LiveState) {
+        let phase = st
+            .phase
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "Working".to_string());
+        let phase = format!("{}", style(format!("{:<13}", phase)).bold().cyan());
+        let extra = if st.dash_has_extra { "\n{msg}" } else { "" };
+        let template = if st.has_total {
+            format!(
+                " {{spinner:.cyan}} {phase} {{bar:30.cyan/blue}} {{pos:>5}}/{{len:<5}} \
+                 {{percent:>3}}%  {{elapsed_precise}}  eta {{eta:<4}}  {{prefix:.dim}}{extra}"
+            )
+        } else {
+            format!(" {{spinner:.cyan}} {phase} {{elapsed_precise}}  {{prefix:.dim}}{extra}")
+        };
+        self.dash.set_style(
+            ProgressStyle::with_template(&template)
+                .unwrap_or_else(|_| ProgressStyle::default_spinner())
+                .progress_chars("━╸─"),
+        );
+    }
+
+    fn begin_item(self: &Arc<Self>, label: &str, total_bytes: Option<u64>) -> Arc<dyn ProgressHandle> {
+        let bar = ProgressBar::with_draw_target(total_bytes, ProgressDrawTarget::hidden());
+        let width = self.label_width();
+        if let Some(total) = total_bytes {
+            bar.set_style(
+                ProgressStyle::with_template(&format!(
+                    "   {{prefix:.green}} {{msg:<{width}}} {{bar:20.green/blue}} \
+                     {{bytes:>10}} / {{total_bytes:<10}} {{bytes_per_sec:>12}}"
+                ))
+                .expect("item template")
+                .progress_chars("━╸─"),
+            );
+            bar.set_prefix("↓");
+            bar.set_length(total);
+        } else {
+            bar.set_style(work_style(width, false));
+        }
+        bar.set_message(truncate_label(label, width));
+
+        let item = Arc::new(LiveItem {
+            bar,
+            shown: AtomicBool::new(false),
+            is_bytes: total_bytes.is_some(),
+            speed: AtomicU64::new(0),
+            first_bytes: AtomicBool::new(true),
+            counting: AtomicBool::new(false),
+        });
+
+        {
+            let mut st = self.state.lock().expect("live state");
+            let shown = st.items.iter().filter(|i| i.shown.load(Ordering::Relaxed)).count();
+            if shown < self.visible_rows() {
+                self.show_item(&item);
+            }
+            st.items.push(Arc::clone(&item));
+        }
+
+        Arc::new(LiveHandle {
+            live: Arc::clone(self),
+            item,
+            label: label.to_string(),
+            finished: AtomicBool::new(false),
+        })
+    }
+
+    fn show_item(&self, item: &LiveItem) {
+        self.mp.add(item.bar.clone());
+        item.shown.store(true, Ordering::Relaxed);
+    }
+
+    fn end_item(&self, item: &Arc<LiveItem>) {
+        let mut st = self.state.lock().expect("live state");
+        st.items.retain(|i| !Arc::ptr_eq(i, item));
+        if item.shown.swap(false, Ordering::Relaxed) {
+            item.bar.finish_and_clear();
+            self.mp.remove(&item.bar);
+        }
+        // Promote off-screen items into any free rows.
+        let limit = self.visible_rows();
+        let mut shown = st.items.iter().filter(|i| i.shown.load(Ordering::Relaxed)).count();
+        for candidate in &st.items {
+            if shown >= limit {
+                break;
+            }
+            if !candidate.shown.load(Ordering::Relaxed) {
+                self.show_item(candidate);
+                shown += 1;
+            }
+        }
+    }
+
+    fn spawn_ticker(this: &Arc<Self>) {
+        let weak: Weak<Self> = Arc::downgrade(this);
+        let total_mem_label = read_total_memory_bytes()
+            .map(|t| format!(" / {}", format_bytes(t)))
+            .unwrap_or_default();
+
+        std::thread::Builder::new()
+            .name("clf3-progress".into())
+            .spawn(move || {
+                let mut prev_disk = read_disk_write_bytes();
+                let mut prev_time = Instant::now();
+                let mut tick: u32 = 0;
+                loop {
+                    std::thread::sleep(TICK);
+                    let Some(live) = weak.upgrade() else { break };
+                    tick = tick.wrapping_add(1);
+
+                    if tick % SYSTEM_EVERY_TICKS == 0 {
+                        let now = Instant::now();
+                        let secs = now.duration_since(prev_time).as_secs_f64().max(0.001);
+                        prev_time = now;
+                        let cur_disk = read_disk_write_bytes();
+                        let disk_bps = match (cur_disk, prev_disk) {
+                            (Some(c), Some(p)) => (c.saturating_sub(p) as f64 / secs) as u64,
+                            _ => 0,
+                        };
+                        prev_disk = cur_disk;
+                        let rss = super::current_rss_kb().unwrap_or(0).saturating_mul(1024);
+                        *live.system_line.lock().expect("system line") = format!(
+                            "Disk {}/s · RAM {}{}",
+                            format_bytes(disk_bps),
+                            format_bytes(rss),
+                            total_mem_label
+                        );
+                    }
+
+                    live.refresh(tick);
+                }
+            })
+            .expect("spawn progress ticker");
+    }
+
+    /// Recompose the dashboard's extra lines and tick spinners.
+    fn refresh(&self, tick: u32) {
+        let mut st = self.state.lock().expect("live state");
+        if !st.dash_shown && st.items.is_empty() {
             return;
         }
-        let was = self.status_visible.swap(visible, Ordering::Relaxed);
-        if was == visible {
-            return;
+
+        let mut lines = Vec::new();
+        if let Some(counters) = self.counters.render() {
+            lines.push(format!("   {}", counters));
         }
-
-        let blank = blank_style();
-        if visible {
-            self.system_status
-                .set_style(ProgressStyle::default_spinner().template("{msg}").unwrap());
-            // Drop a placeholder; the ticker thread will overwrite within 500ms.
-            self.system_status.set_message("System: starting...");
-
-            self.active_header
-                .set_style(ProgressStyle::default_bar().template("{msg}").unwrap());
-            self.active_header
-                .set_message(format!("{}", style("Workers").bold().cyan()));
-
-            let idle = idle_slot_style();
-            for (index, bar) in self.pool.iter().enumerate() {
-                // Only restyle bars that are currently idle. In-flight bars
-                // own their own style (byte/spinner template from begin_item)
-                // and re-styling them would clobber their display.
-                let idle_now = self
-                    .pool_available
-                    .get(index)
-                    .map(|m| *m.lock().expect("pool lock"))
-                    .unwrap_or(true);
-                if idle_now {
-                    bar.set_style(idle.clone());
-                    bar.set_prefix(worker_slot_prefix(index));
-                    bar.set_message("");
+        if st.phase_active {
+            let mut downloading = false;
+            let mut net: u64 = 0;
+            for item in st.items.iter().filter(|i| i.is_bytes) {
+                downloading = true;
+                net += item.speed.load(Ordering::Relaxed);
+            }
+            let active = st.items.len();
+            let shown = st.items.iter().filter(|i| i.shown.load(Ordering::Relaxed)).count();
+            let mut parts = Vec::new();
+            if downloading {
+                parts.push(format!("Net {}/s", format_bytes(net)));
+            }
+            let system = self.system_line.lock().expect("system line").clone();
+            if !system.is_empty() {
+                parts.push(system);
+            }
+            let mut line = format!("   {}", parts.join(" · "));
+            if active > 0 {
+                if !parts.is_empty() {
+                    line.push_str(" ·");
+                }
+                line.push_str(&format!(" {} active", active));
+                if shown < active {
+                    line.push_str(&format!(" ({} more off-screen)", active - shown));
                 }
             }
-        } else {
-            self.system_status.set_style(blank.clone());
-            self.system_status.set_message("");
-            self.active_header.set_style(blank.clone());
-            self.active_header.set_message("");
-            for bar in &self.pool {
-                bar.set_style(blank.clone());
-                bar.set_message("");
+            lines.push(format!("{}", style(line).dim()));
+        }
+
+        let has_extra = !lines.is_empty();
+        if has_extra != st.dash_has_extra {
+            st.dash_has_extra = has_extra;
+            self.restyle_dash(&st);
+        }
+        if has_extra {
+            self.dash.set_message(lines.join("\n"));
+        }
+        if st.dash_shown {
+            self.dash.tick();
+        }
+        // Spinners on work rows; byte rows redraw on their own updates.
+        if tick % 2 == 0 {
+            for item in st.items.iter().filter(|i| !i.is_bytes) {
+                if item.shown.load(Ordering::Relaxed) {
+                    item.bar.tick();
+                }
             }
         }
     }
+}
 
-    /// Get a `MakeWriter` for the tracing subscriber that routes through this reporter's
-    /// `MultiProgress`. Call this before initializing the tracing subscriber.
-    pub fn make_writer_factory(self: &Arc<Self>) -> CliWriterFactory {
-        CliWriterFactory {
-            mp: self.mp.clone(),
+fn work_style(width: usize, counting: bool) -> ProgressStyle {
+    let template = if counting {
+        format!("   {{spinner:.yellow}} {{msg:<{width}}} {{pos}}/{{len}} files")
+    } else {
+        format!("   {{spinner:.yellow}} {{msg:<{width}}}")
+    };
+    ProgressStyle::with_template(&template).expect("work template")
+}
+
+struct LiveHandle {
+    live: Arc<Live>,
+    item: Arc<LiveItem>,
+    label: String,
+    finished: AtomicBool,
+}
+
+impl ProgressHandle for LiveHandle {
+    fn set_bytes(&self, downloaded: u64, total: u64, speed: f64) {
+        let bar = &self.item.bar;
+        if total > 0 {
+            bar.set_length(total);
+        }
+        bar.set_position(downloaded);
+        // A resumed download jumps straight to its offset; don't let that
+        // jump inflate indicatif's rate estimate.
+        if self.item.first_bytes.swap(false, Ordering::Relaxed) && downloaded > 0 {
+            bar.reset_eta();
+        }
+        self.item
+            .speed
+            .store(speed.max(0.0) as u64, Ordering::Relaxed);
+    }
+
+    fn set_message(&self, msg: &str) {
+        self.item
+            .bar
+            .set_message(truncate_label(msg, self.live.label_width()));
+    }
+
+    fn set_count(&self, done: usize, total: usize) {
+        let bar = &self.item.bar;
+        if !self.item.is_bytes && !self.item.counting.swap(true, Ordering::Relaxed) {
+            bar.set_style(work_style(self.live.label_width(), true));
+        }
+        bar.set_length(total as u64);
+        bar.set_position(done as u64);
+    }
+
+    fn finish(&self) {
+        if !self.finished.swap(true, Ordering::Relaxed) {
+            self.live.end_item(&self.item);
         }
     }
 
-    fn claim_pool_bar(&self) -> Option<usize> {
-        if self.mode != ProgressMode::Full {
-            return None;
+    fn finish_with_error(&self, msg: &str) {
+        if !self.finished.swap(true, Ordering::Relaxed) {
+            self.live.end_item(&self.item);
+            let line = format!("{} {}: {}", style("✗").red().bold(), self.label, msg);
+            self.live.out.line(&line);
         }
-        for (i, available) in self.pool_available.iter().enumerate() {
-            let mut guard = available.lock().expect("pool lock");
-            if *guard {
-                *guard = false;
-                return Some(i);
-            }
-        }
-        None
+    }
+}
+
+impl Drop for LiveHandle {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plain (line-oriented) renderer
+// ---------------------------------------------------------------------------
+
+struct Plain {
+    sink: Arc<LineSink>,
+    counters: Arc<Counters>,
+    state: Mutex<PlainState>,
+    ticker: Once,
+}
+
+struct PlainState {
+    phase: Option<Phase>,
+    total: u64,
+    done: u64,
+    status: String,
+    last_emit: Instant,
+    last_line: String,
+    items: Vec<Arc<PlainItem>>,
+}
+
+struct PlainItem {
+    pos: AtomicU64,
+    total: AtomicU64,
+    speed: AtomicU64,
+}
+
+impl Plain {
+    fn new(sink: Arc<LineSink>) -> Arc<Self> {
+        Arc::new(Self {
+            sink,
+            counters: Arc::new(Counters::default()),
+            state: Mutex::new(PlainState {
+                phase: None,
+                total: 0,
+                done: 0,
+                status: String::new(),
+                last_emit: Instant::now(),
+                last_line: String::new(),
+                items: Vec::new(),
+            }),
+            ticker: Once::new(),
+        })
     }
 
-    fn release_pool_bar(&self, index: usize) {
-        self.pool[index].set_style(idle_slot_style());
-        self.pool[index].set_prefix(worker_slot_prefix(index));
-        self.pool[index].set_message("");
-        self.pool[index].set_position(0);
-        self.pool[index].set_length(0);
-        self.pool[index].disable_steady_tick();
-        self.bar_speeds[index].store(0, Ordering::Relaxed);
-        *self.pool_available[index].lock().expect("pool lock") = true;
-    }
-
-    fn ensure_overall(&self) -> ProgressBar {
-        let mut guard = self.overall.lock().expect("overall lock");
-        if let Some(pb) = guard.as_ref() {
-            return pb.clone();
-        }
-        let pb = self.mp.add(ProgressBar::new(0));
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {msg}",
-                )
-                .unwrap()
-                .progress_chars("=>-"),
-        );
-        pb.enable_steady_tick(Duration::from_millis(100));
-        *guard = Some(pb.clone());
-        pb
-    }
-
-    fn spawn_system_ticker(this: &Arc<Self>) {
-        let system_status = this.system_status.clone();
-        let bar_speeds = Arc::clone(&this.bar_speeds);
-        let shutdown = Arc::clone(&this.ticker_shutdown);
-        let total_mem_bytes = read_total_memory_bytes();
-
-        std::thread::spawn(move || {
-            let mut prev_disk_write = read_disk_write_bytes();
-            let mut prev_time = Instant::now();
-            let total_mem_label = total_mem_bytes
-                .map(|t| format!(" / {}", format_bytes(t)))
-                .unwrap_or_default();
-
-            while !shutdown.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(500));
-
-                let now = Instant::now();
-                let elapsed = now
-                    .saturating_duration_since(prev_time)
-                    .as_secs_f64()
-                    .max(0.001);
-                prev_time = now;
-
-                let net_bps: u64 = bar_speeds.iter().map(|a| a.load(Ordering::Relaxed)).sum();
-
-                let cur_disk_write = read_disk_write_bytes();
-                let disk_bps = match (cur_disk_write, prev_disk_write) {
-                    (Some(cur), Some(prev)) => ((cur.saturating_sub(prev)) as f64 / elapsed) as u64,
-                    _ => 0,
-                };
-                prev_disk_write = cur_disk_write;
-
-                let rss_bytes = super::current_rss_kb().unwrap_or(0).saturating_mul(1024);
-                system_status.set_message(format!(
-                    "Net: {:>10}/s   Disk: {:>10}/s   RAM: {}{}",
-                    format_bytes(net_bps),
-                    format_bytes(disk_bps),
-                    format_bytes(rss_bytes),
-                    total_mem_label,
-                ));
-            }
-            system_status.finish_and_clear();
+    fn ensure_ticker(self: &Arc<Self>) {
+        self.ticker.call_once(|| {
+            let weak = Arc::downgrade(self);
+            let _ = std::thread::Builder::new()
+                .name("clf3-progress".into())
+                .spawn(move || loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let Some(plain) = weak.upgrade() else { break };
+                    let mut st = plain.state.lock().expect("plain state");
+                    if st.last_emit.elapsed() >= PLAIN_KEEPALIVE
+                        && (st.phase.is_some() || !st.items.is_empty())
+                    {
+                        plain.emit(&mut st, true, true);
+                    }
+                });
         });
     }
-}
 
-impl Drop for CliReporter {
-    fn drop(&mut self) {
-        self.ticker_shutdown.store(true, Ordering::Relaxed);
+    fn phase_start(self: &Arc<Self>, phase: Phase) {
+        self.ensure_ticker();
+        let mut st = self.state.lock().expect("plain state");
+        st.phase = Some(phase);
+        st.total = 0;
+        st.done = 0;
+        st.status.clear();
+        st.last_line.clear();
+        st.last_emit = Instant::now();
+        self.sink.line(&format!("==> {}", phase));
+    }
+
+    fn overall_set_total(&self, total: u64) {
+        let mut st = self.state.lock().expect("plain state");
+        st.total = total;
+        st.done = 0;
+        self.emit(&mut st, true, false);
+    }
+
+    fn overall_inc(&self) {
+        let mut st = self.state.lock().expect("plain state");
+        st.done += 1;
+        let complete = st.total > 0 && st.done >= st.total;
+        self.emit(&mut st, complete, false);
+    }
+
+    fn overall_finish(&self) {
+        let mut st = self.state.lock().expect("plain state");
+        if st.total > 0 {
+            self.emit(&mut st, true, false);
+        }
+        st.total = 0;
+        st.done = 0;
+        st.status.clear();
+    }
+
+    fn set_status(&self, msg: &str) {
+        let mut st = self.state.lock().expect("plain state");
+        if st.status != msg {
+            st.status = msg.to_string();
+            self.emit(&mut st, false, false);
+        }
+    }
+
+    /// Print a heartbeat line if forced or enough time has passed, skipping
+    /// exact repeats unless `keepalive` is set.
+    fn emit(&self, st: &mut PlainState, force: bool, keepalive: bool) {
+        if !force && st.last_emit.elapsed() < PLAIN_HEARTBEAT {
+            return;
+        }
+        let mut parts = Vec::new();
+        let phase = st.phase.map(|p| p.to_string()).unwrap_or_else(|| "Progress".into());
+        if st.total > 0 {
+            let pct = st.done.saturating_mul(100) / st.total.max(1);
+            parts.push(format!("[{} {}/{} {}%]", phase, st.done, st.total, pct));
+        } else {
+            parts.push(format!("[{}]", phase));
+        }
+        if !st.status.is_empty() {
+            parts.push(st.status.clone());
+        }
+        if let Some(counters) = self.counters.render() {
+            parts.push(counters);
+        }
+        let byte_items: Vec<_> = st
+            .items
+            .iter()
+            .filter(|i| i.total.load(Ordering::Relaxed) > 0)
+            .collect();
+        if keepalive && !byte_items.is_empty() {
+            let pos: u64 = byte_items.iter().map(|i| i.pos.load(Ordering::Relaxed)).sum();
+            let total: u64 = byte_items.iter().map(|i| i.total.load(Ordering::Relaxed)).sum();
+            let speed: u64 = byte_items.iter().map(|i| i.speed.load(Ordering::Relaxed)).sum();
+            parts.push(format!(
+                "{} active, {} / {} at {}/s",
+                byte_items.len(),
+                format_bytes(pos),
+                format_bytes(total),
+                format_bytes(speed)
+            ));
+        }
+        let line = parts.join(" · ");
+        if !keepalive && line == st.last_line {
+            return;
+        }
+        self.sink.line(&line);
+        st.last_line = line;
+        st.last_emit = Instant::now();
+    }
+
+    fn begin_item(self: &Arc<Self>, label: &str, total_bytes: Option<u64>) -> Arc<dyn ProgressHandle> {
+        self.ensure_ticker();
+        let item = Arc::new(PlainItem {
+            pos: AtomicU64::new(0),
+            total: AtomicU64::new(total_bytes.unwrap_or(0)),
+            speed: AtomicU64::new(0),
+        });
+        self.state
+            .lock()
+            .expect("plain state")
+            .items
+            .push(Arc::clone(&item));
+        Arc::new(PlainHandle {
+            plain: Arc::clone(self),
+            item,
+            label: label.to_string(),
+            is_bytes: total_bytes.is_some(),
+            started: Instant::now(),
+            finished: AtomicBool::new(false),
+        })
+    }
+
+    fn end_item(&self, item: &Arc<PlainItem>) {
+        self.state
+            .lock()
+            .expect("plain state")
+            .items
+            .retain(|i| !Arc::ptr_eq(i, item));
     }
 }
+
+struct PlainHandle {
+    plain: Arc<Plain>,
+    item: Arc<PlainItem>,
+    label: String,
+    is_bytes: bool,
+    started: Instant,
+    finished: AtomicBool,
+}
+
+impl ProgressHandle for PlainHandle {
+    fn set_bytes(&self, downloaded: u64, total: u64, speed: f64) {
+        self.item.pos.store(downloaded, Ordering::Relaxed);
+        if total > 0 {
+            self.item.total.store(total, Ordering::Relaxed);
+        }
+        self.item.speed.store(speed.max(0.0) as u64, Ordering::Relaxed);
+    }
+
+    // Item messages are display relabels ("Mega: foo", "foo (mirror)");
+    // anything noteworthy is also logged, so Plain mode skips them.
+    fn set_message(&self, _msg: &str) {}
+
+    fn set_count(&self, _done: usize, _total: usize) {}
+
+    fn finish(&self) {
+        if !self.finished.swap(true, Ordering::Relaxed) {
+            self.plain.end_item(&self.item);
+            if self.is_bytes {
+                let size = self.item.total.load(Ordering::Relaxed);
+                self.plain.sink.line(&format!(
+                    "  done  {} ({}, {})",
+                    self.label,
+                    format_bytes(size),
+                    format_duration(self.started.elapsed())
+                ));
+            }
+        }
+    }
+
+    fn finish_with_error(&self, msg: &str) {
+        if !self.finished.swap(true, Ordering::Relaxed) {
+            self.plain.end_item(&self.item);
+            self.plain
+                .sink
+                .line(&format!("  FAIL  {}: {}", self.label, msg));
+        }
+    }
+}
+
+impl Drop for PlainHandle {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tracing integration
+// ---------------------------------------------------------------------------
+
+/// `MakeWriter` factory for tracing that routes through the reporter's
+/// [`LineSink`].
+#[derive(Clone)]
+pub struct CliWriterFactory {
+    sink: Arc<LineSink>,
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CliWriterFactory {
+    type Writer = CliWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CliWriter {
+            sink: Arc::clone(&self.sink),
+            buffer: Vec::new(),
+        }
+    }
+}
+
+/// Buffers one formatted event and emits it as whole lines.
+///
+/// tracing-subscriber creates a writer per event and calls `write_all` but
+/// never `flush`, so the buffered event is emitted on drop.
+pub struct CliWriter {
+    sink: Arc<LineSink>,
+    buffer: Vec<u8>,
+}
+
+impl CliWriter {
+    fn emit(&mut self) {
+        if self.buffer.is_empty() {
+            return;
+        }
+        let msg = String::from_utf8_lossy(&self.buffer).trim_end().to_string();
+        self.buffer.clear();
+        if !msg.is_empty() {
+            self.sink.line(&msg);
+        }
+    }
+}
+
+impl std::io::Write for CliWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.emit();
+        Ok(())
+    }
+}
+
+impl Drop for CliWriter {
+    fn drop(&mut self) {
+        self.emit();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
 fn read_disk_write_bytes() -> Option<u64> {
     let s = std::fs::read_to_string("/proc/self/io").ok()?;
-    for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("write_bytes:") {
-            return rest.trim().parse().ok();
-        }
-    }
-    None
+    s.lines()
+        .find_map(|line| line.strip_prefix("write_bytes:"))
+        .and_then(|rest| rest.trim().parse().ok())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -269,13 +1023,9 @@ fn read_disk_write_bytes() -> Option<u64> {
 #[cfg(target_os = "linux")]
 fn read_total_memory_bytes() -> Option<u64> {
     let s = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("MemTotal:") {
-            let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
-            return Some(kb.saturating_mul(1024));
-        }
-    }
-    None
+    let rest = s.lines().find_map(|line| line.strip_prefix("MemTotal:"))?;
+    let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+    Some(kb.saturating_mul(1024))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -298,379 +1048,69 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn blank_style() -> ProgressStyle {
-    ProgressStyle::default_bar().template("").unwrap()
-}
-
-fn idle_slot_style() -> ProgressStyle {
-    ProgressStyle::default_bar()
-        .template("  [{prefix:.dim}] idle")
-        .unwrap()
-}
-
-fn worker_slot_prefix(index: usize) -> String {
-    format!("worker {:02}", index + 1)
-}
-
-fn active_label(name: &str) -> String {
-    const MAX_CHARS: usize = 52;
-    let mut label: String = name.chars().take(MAX_CHARS).collect();
-    if name.chars().count() > MAX_CHARS {
-        label.push('~');
-    }
-    format!("{:<53}", label)
-}
-
-impl ProgressReporter for CliReporter {
-    fn phase_start(&self, phase: Phase) {
-        // Finish any leftover overall bar from the previous phase
-        {
-            let mut guard = self.overall.lock().expect("overall lock");
-            if let Some(pb) = guard.take() {
-                pb.finish_and_clear();
-            }
-        }
-        // Toggle the persistent status line + worker pool to match the new
-        // phase. Active phases (Downloading / Installing / DdsTransform /
-        // BsaBuild) get the live Net/Disk/RAM display; GameCheck / Cleanup
-        // stay quiet.
-        self.set_status_visible(Self::phase_is_active(phase));
-
-        let header = format!("=== {} ===", phase);
-        let _ = self.mp.println(format!("{}", style(header).bold().cyan()));
-    }
-
-    fn overall_set_total(&self, total: u64) {
-        if self.mode == ProgressMode::Plain {
-            let _ = self.mp.println(format!("Total: {}", total));
-            return;
-        }
-        let pb = self.ensure_overall();
-        pb.set_length(total);
-        pb.set_position(0);
-    }
-
-    fn overall_inc(&self) {
-        if self.mode == ProgressMode::Plain {
-            return;
-        }
-        let pb = self.ensure_overall();
-        pb.inc(1);
-    }
-
-    fn overall_set_message(&self, msg: &str) {
-        if self.mode == ProgressMode::Plain {
-            let _ = self.mp.println(msg);
-            return;
-        }
-        let pb = self.ensure_overall();
-        pb.set_message(msg.to_string());
-    }
-
-    fn overall_finish(&self) {
-        if self.mode == ProgressMode::Plain {
-            return;
-        }
-        let mut guard = self.overall.lock().expect("overall lock");
-        if let Some(pb) = guard.take() {
-            pb.finish_and_clear();
-        }
-    }
-
-    fn begin_item(&self, name: &str, total_bytes: Option<u64>) -> Arc<dyn ProgressHandle> {
-        if self.mode == ProgressMode::Plain {
-            let _ = self.mp.println(format!("START {}", name));
-            return Arc::new(PlainHandle {
-                mp: self.mp.clone(),
-                name: name.to_string(),
-                finished: AtomicBool::new(false),
-            });
-        }
-
-        if let Some(index) = self.claim_pool_bar() {
-            let bar = &self.pool[index];
-            bar.reset();
-            bar.set_prefix(worker_slot_prefix(index));
-
-            if let Some(total) = total_bytes {
-                // Byte-progress style (downloads)
-                bar.set_style(
-                    ProgressStyle::default_bar()
-                        .template(
-                            "  [{prefix:.cyan}] {msg} [{bar:24.white/dim}] {bytes}/{total_bytes} {bytes_per_sec}",
-                        )
-                        .unwrap()
-                        .progress_chars("=>-"),
-                );
-                bar.set_length(total);
-            } else {
-                // Spinner style (archive extractions)
-                bar.set_style(
-                    ProgressStyle::default_spinner()
-                        .template("  [{prefix:.cyan}] {msg}")
-                        .unwrap(),
-                );
-            }
-
-            bar.set_message(active_label(name));
-            bar.enable_steady_tick(Duration::from_millis(500));
-
-            Arc::new(CliHandle {
-                reporter: self as *const CliReporter,
-                bar_index: index,
-                finished: AtomicBool::new(false),
-            })
-        } else {
-            // Pool exhausted — return a null handle
-            Arc::new(NullHandle)
-        }
-    }
-
-    fn begin_status(&self, label: &str) -> Arc<dyn ProgressHandle> {
-        if self.mode == ProgressMode::Plain {
-            return Arc::new(PlainStatusHandle {
-                mp: self.mp.clone(),
-                label: label.to_string(),
-                finished: AtomicBool::new(false),
-            });
-        }
-
-        let bar = self.mp.add(ProgressBar::new(0));
-        bar.set_style(
-            ProgressStyle::default_bar()
-                .template("  {spinner:.magenta} {wide_msg}")
-                .unwrap(),
-        );
-        bar.set_message(label.to_string());
-        bar.enable_steady_tick(Duration::from_millis(200));
-        Arc::new(StatusHandle {
-            bar,
-            label: label.to_string(),
-            finished: AtomicBool::new(false),
-        })
-    }
-
-    fn log(&self, msg: &str) {
-        let _ = self.mp.println(msg);
-    }
-
-    fn status(&self, msg: &str) {
-        if self.mode == ProgressMode::Plain {
-            let _ = self.mp.println(msg);
-            return;
-        }
-        let pb = self.ensure_overall();
-        pb.set_message(msg.to_string());
+fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    let (h, m, s) = (secs / 3600, (secs / 60) % 60, secs % 60);
+    if h > 0 {
+        format!("{}h{:02}m{:02}s", h, m, s)
+    } else if m > 0 {
+        format!("{}m{:02}s", m, s)
+    } else {
+        format!("{}s", s)
     }
 }
 
-struct PlainHandle {
-    mp: MultiProgress,
-    name: String,
-    finished: AtomicBool,
+/// Truncate on char boundaries, marking the cut with `…`.
+fn truncate_label(name: &str, max_chars: usize) -> String {
+    if name.chars().count() <= max_chars {
+        return name.to_string();
+    }
+    let mut label: String = name.chars().take(max_chars.saturating_sub(1)).collect();
+    label.push('…');
+    label
 }
 
-impl ProgressHandle for PlainHandle {
-    fn set_bytes(&self, _downloaded: u64, _total: u64, _speed: f64) {}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    fn set_message(&self, msg: &str) {
-        let _ = self.mp.println(format!("{}: {}", self.name, msg));
+    #[test]
+    fn truncate_label_respects_char_boundaries() {
+        assert_eq!(truncate_label("short", 10), "short");
+        assert_eq!(truncate_label("Ünïcödé-ärchïvé.7z", 8), "Ünïcödé…");
+        assert_eq!(truncate_label("Ünïcödé-ärchïvé.7z", 8).chars().count(), 8);
     }
 
-    fn set_count(&self, _done: usize, _total: usize) {}
-
-    fn finish(&self) {
-        if !self.finished.swap(true, Ordering::Relaxed) {
-            let _ = self.mp.println(format!("DONE {}", self.name));
-        }
+    #[test]
+    fn counters_render_joined_and_removed() {
+        let counters = Counters::default();
+        assert!(counters.render().is_none());
+        let a = counters.add("Extracted");
+        let b = counters.add("DDS");
+        counters.set(a, 4, 10);
+        counters.set(b, 1, 3);
+        assert_eq!(counters.render().as_deref(), Some("Extracted 4/10 · DDS 1/3"));
+        counters.remove(a);
+        assert_eq!(counters.render().as_deref(), Some("DDS 1/3"));
     }
 
-    fn finish_with_error(&self, msg: &str) {
-        if !self.finished.swap(true, Ordering::Relaxed) {
-            let _ = self.mp.println(format!("ERROR {}: {}", self.name, msg));
-        }
-    }
-}
-
-impl Drop for PlainHandle {
-    fn drop(&mut self) {
-        if !self.finished.load(Ordering::Relaxed) {
-            self.finish();
-        }
-    }
-}
-
-struct PlainStatusHandle {
-    mp: MultiProgress,
-    label: String,
-    finished: AtomicBool,
-}
-
-impl ProgressHandle for PlainStatusHandle {
-    fn set_bytes(&self, _downloaded: u64, _total: u64, _speed: f64) {}
-
-    fn set_message(&self, msg: &str) {
-        let _ = self.mp.println(format!("{}: {}", self.label, msg));
+    #[test]
+    fn format_duration_is_compact() {
+        assert_eq!(format_duration(Duration::from_secs(5)), "5s");
+        assert_eq!(format_duration(Duration::from_secs(125)), "2m05s");
+        assert_eq!(format_duration(Duration::from_secs(3723)), "1h02m03s");
     }
 
-    fn set_count(&self, _done: usize, _total: usize) {}
-
-    fn finish(&self) {
-        self.finished.store(true, Ordering::Relaxed);
-    }
-
-    fn finish_with_error(&self, msg: &str) {
-        if !self.finished.swap(true, Ordering::Relaxed) {
-            let _ = self.mp.println(format!("ERROR {}: {}", self.label, msg));
-        }
-    }
-}
-
-/// Handle to a pooled progress bar. Releases back to pool on finish/drop.
-struct CliHandle {
-    // Raw pointer because CliReporter is always behind Arc and outlives handles.
-    // We can't store Arc<CliReporter> because begin_item takes &self.
-    reporter: *const CliReporter,
-    bar_index: usize,
-    finished: AtomicBool,
-}
-
-// SAFETY: CliReporter is Send+Sync (behind Arc), and we only access it through shared refs.
-unsafe impl Send for CliHandle {}
-unsafe impl Sync for CliHandle {}
-
-impl CliHandle {
-    fn reporter(&self) -> &CliReporter {
-        // SAFETY: CliReporter is always behind Arc and outlives all handles.
-        unsafe { &*self.reporter }
-    }
-
-    fn bar(&self) -> &ProgressBar {
-        &self.reporter().pool[self.bar_index]
-    }
-}
-
-impl ProgressHandle for CliHandle {
-    fn set_bytes(&self, downloaded: u64, total: u64, speed: f64) {
-        let bar = self.bar();
-        bar.set_length(total);
-        bar.set_position(downloaded);
-        self.reporter().bar_speeds[self.bar_index].store(speed.max(0.0) as u64, Ordering::Relaxed);
-    }
-
-    fn set_message(&self, msg: &str) {
-        self.bar().set_message(active_label(msg));
-    }
-
-    fn set_count(&self, done: usize, total: usize) {
-        let bar = self.bar();
-        bar.set_length(total as u64);
-        bar.set_position(done as u64);
-    }
-
-    fn finish(&self) {
-        if !self.finished.swap(true, Ordering::Relaxed) {
-            self.reporter().release_pool_bar(self.bar_index);
-        }
-    }
-
-    fn finish_with_error(&self, msg: &str) {
-        if !self.finished.swap(true, Ordering::Relaxed) {
-            let _ = self.reporter().mp.println(format!("{}", style(msg).red()));
-            self.reporter().release_pool_bar(self.bar_index);
-        }
-    }
-}
-
-impl Drop for CliHandle {
-    fn drop(&mut self) {
-        // Auto-finish if caller forgot
-        if !self.finished.load(Ordering::Relaxed) {
-            self.finish();
-        }
-    }
-}
-
-/// Non-pooled persistent status bar (for Extract/DDS/BSA counters).
-struct StatusHandle {
-    bar: ProgressBar,
-    label: String,
-    finished: AtomicBool,
-}
-
-impl ProgressHandle for StatusHandle {
-    fn set_bytes(&self, _downloaded: u64, _total: u64, _speed: f64) {}
-
-    fn set_message(&self, msg: &str) {
-        self.bar.set_message(msg.to_string());
-    }
-
-    fn set_count(&self, done: usize, total: usize) {
-        self.bar
-            .set_message(format!("{}: {}/{}", self.label, done, total));
-    }
-
-    fn finish(&self) {
-        if !self.finished.swap(true, Ordering::Relaxed) {
-            self.bar.finish_and_clear();
-        }
-    }
-
-    fn finish_with_error(&self, msg: &str) {
-        if !self.finished.swap(true, Ordering::Relaxed) {
-            self.bar.set_message(format!("{}: {}", self.label, msg));
-            self.bar.finish_and_clear();
-        }
-    }
-}
-
-impl Drop for StatusHandle {
-    fn drop(&mut self) {
-        if !self.finished.load(Ordering::Relaxed) {
-            self.bar.finish_and_clear();
-        }
-    }
-}
-
-/// `MakeWriter` factory for tracing that routes through a `MultiProgress`.
-#[derive(Clone)]
-pub struct CliWriterFactory {
-    mp: MultiProgress,
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CliWriterFactory {
-    type Writer = CliWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        CliWriter {
-            mp: self.mp.clone(),
-            buffer: Vec::new(),
-        }
-    }
-}
-
-/// Buffered writer that flushes complete lines through `MultiProgress::println`.
-pub struct CliWriter {
-    mp: MultiProgress,
-    buffer: Vec<u8>,
-}
-
-impl std::io::Write for CliWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.buffer.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-        let msg = String::from_utf8_lossy(&self.buffer).trim_end().to_string();
-        self.buffer.clear();
-        if msg.is_empty() {
-            return Ok(());
-        }
-        let _ = self.mp.println(&msg);
-        Ok(())
+    #[test]
+    fn plain_items_are_tracked_and_released() {
+        let reporter = CliReporter::new(4, ProgressMode::Plain);
+        let Renderer::Plain(plain) = &reporter.renderer else {
+            panic!("expected plain renderer");
+        };
+        let handle = reporter.begin_item("archive.7z", Some(100));
+        handle.set_bytes(50, 100, 10.0);
+        assert_eq!(plain.state.lock().unwrap().items.len(), 1);
+        drop(handle);
+        assert!(plain.state.lock().unwrap().items.is_empty());
     }
 }
