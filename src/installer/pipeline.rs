@@ -227,7 +227,7 @@ impl ExtractionMetrics {
     }
 
     /// Log per-format throughput summary.
-    pub fn log_summary(&self, reporter: &Arc<dyn super::progress::ProgressReporter>) {
+    pub fn log_summary(&self) {
         let formats: &[(&str, &FormatBucket)] = &[
             ("ZIP", &self.zip),
             ("7z", &self.sevenz),
@@ -261,7 +261,7 @@ impl ExtractionMetrics {
             if !has_data {
                 // Header with wall-clock info
                 if let Some(ws) = wall_secs {
-                    reporter.log(&format!(
+                    crate::installer::log_detail(&format!(
                         "Extraction: {:.1} GB in {:.0}s ({:.0} MB/s effective, {} workers)",
                         total_mb / 1024.0,
                         ws,
@@ -269,7 +269,7 @@ impl ExtractionMetrics {
                         workers,
                     ));
                 } else {
-                    reporter.log("Extraction throughput:");
+                    crate::installer::log_detail("Extraction throughput:");
                 }
                 has_data = true;
             }
@@ -308,7 +308,7 @@ impl ExtractionMetrics {
                 };
                 parts.push(format!(", finalize: {:.1}s ({})", fin_s, fin_rate));
             }
-            reporter.log(&parts.join(""));
+            crate::installer::log_detail(&parts.join(""));
         }
 
         // Bottleneck analysis
@@ -331,7 +331,7 @@ impl ExtractionMetrics {
             } else {
                 0.0
             };
-            reporter.log(&format!(
+            crate::installer::log_detail(&format!(
                 "  Bottleneck: decompression ({:.0}% CPU utilization, {:.0}s decompress + {:.0}s finalize + {:.0}s dds of {:.0}s available)",
                 utilization, total_cpu_s, total_fin_s, total_dds_s, available_s,
             ));
@@ -346,7 +346,7 @@ impl ExtractionMetrics {
             let db = self.direct_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
             let cb = self.conflict_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
             let pb = self.patch_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
-            reporter.log(&format!(
+            crate::installer::log_detail(&format!(
                 "Extraction tiers: {} direct ({:.0} MB), {} conflict ({:.0} MB), {} patch ({:.0} MB)",
                 dc, db, cc, cb, pc, pb,
             ));
@@ -1342,7 +1342,7 @@ pub(crate) fn run_processing_loop(
     cleanup_temp_dirs(&ctx.config.downloads_dir, reporter);
 
     let rss_start = crate::installer::current_rss_kb().unwrap_or(0);
-    reporter.log(&format!(
+    crate::installer::log_detail(&format!(
         "[RSS-PIPELINE] processing loop start: {}MB",
         rss_start / 1024
     ));
@@ -1753,12 +1753,12 @@ pub(crate) fn run_processing_loop(
         }
 
         if bsa_tracker.built_count > 0 {
-            reporter.log(&format!(
+            crate::installer::log_detail(&format!(
                 "Pipeline complete: {} archives processed, {} failed, {} BSAs built early",
                 archives_processed, archives_failed, bsa_tracker.built_count
             ));
         } else {
-            reporter.log(&format!(
+            crate::installer::log_detail(&format!(
                 "Pipeline complete: {} archives processed, {} failed",
                 archives_processed, archives_failed
             ));
@@ -1787,7 +1787,7 @@ pub(crate) fn run_processing_loop(
         s.finish();
     }
 
-    extraction_metrics.log_summary(reporter);
+    extraction_metrics.log_summary();
 
     Ok(StreamingStats {
         extracted: extracted.load(Ordering::Relaxed),
@@ -1818,7 +1818,7 @@ pub(crate) fn run_processing_loop_phased(
     cleanup_temp_dirs(&ctx.config.downloads_dir, reporter);
 
     let rss_start = crate::installer::current_rss_kb().unwrap_or(0);
-    reporter.log(&format!("[RSS-PHASED] start: {}MB", rss_start / 1024));
+    crate::installer::log_detail(&format!("[RSS-PHASED] start: {}MB", rss_start / 1024));
 
     // Stats (Arc-wrapped for compatibility with streaming helpers)
     let extracted = Arc::new(AtomicUsize::new(0));
@@ -1847,7 +1847,7 @@ pub(crate) fn run_processing_loop_phased(
     // === Drain all archive events from channel ===
     // Must happen before whole-file processing so that GameFileSource archives
     // (copied from game dir by the download thread) have their paths registered.
-    reporter.log("Draining archive events...");
+    crate::installer::log_detail("Draining archive events...");
     let mut all_events: Vec<(String, String, PathBuf)> = Vec::new();
     while let Ok(event) = rx.recv() {
         match event {
@@ -1880,7 +1880,7 @@ pub(crate) fn run_processing_loop_phased(
     }
 
     // === Prepare all archives (DB work on main thread) ===
-    reporter.log(&format!("Preparing {} archives...", all_events.len()));
+    crate::installer::log_detail(&format!("Preparing {} archives...", all_events.len()));
     let mut all_prepared: Vec<PreparedArchive> = Vec::new();
     for (hash, name, path) in &all_events {
         if let Some(prepared) = prepare_archive(db, ctx, hash, name, path, grouped) {
@@ -1914,7 +1914,7 @@ pub(crate) fn run_processing_loop_phased(
         has_patched || has_nested || has_dds || feeds_bsa
     });
 
-    reporter.log(&format!(
+    crate::installer::log_detail(&format!(
         "  Phased extraction: {} complex + {} simple archives ({} cores)",
         complex.len(),
         simple.len(),
@@ -1956,7 +1956,7 @@ pub(crate) fn run_processing_loop_phased(
     // === Phase 1: Complex Extraction (full CPU, DDS spilled) ===
     let phase1_start = std::time::Instant::now();
     if !complex.is_empty() {
-        reporter.log(&format!("  Phase 1: {} complex archives...", complex.len()));
+        crate::installer::log_detail(&format!("  Phase 1: {} complex archives...", complex.len()));
 
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(extract_workers)
@@ -2051,7 +2051,7 @@ pub(crate) fn run_processing_loop_phased(
         drop(dds_tx);
         let spilled_count = collector_handle.join().unwrap_or(0);
         if spilled_count > 0 {
-            reporter.log(&format!(
+            crate::installer::log_detail(&format!(
                 "  Collected {} DDS textures for Phase 2",
                 spilled_count
             ));
@@ -2059,7 +2059,7 @@ pub(crate) fn run_processing_loop_phased(
     } else {
         drop(dds_tx);
     }
-    reporter.log(&format!(
+    crate::installer::log_detail(&format!(
         "  Phase 1 complete in {:.1}s ({} complex archives)",
         phase1_start.elapsed().as_secs_f64(),
         complex.len()
@@ -2073,7 +2073,7 @@ pub(crate) fn run_processing_loop_phased(
             std::mem::take(&mut *collected_dds_jobs.lock().unwrap_or_else(|e| e.into_inner()));
         if !dds_jobs.is_empty() {
             let dds_total = dds_jobs.len();
-            reporter.log(&format!(
+            crate::installer::log_detail(&format!(
                 "  Phase 2: Processing {} DDS textures...",
                 dds_total
             ));
@@ -2091,7 +2091,7 @@ pub(crate) fn run_processing_loop_phased(
                 }),
                 Some(&written),
             );
-            reporter.log(&format!(
+            crate::installer::log_detail(&format!(
                 "  Phase 2 complete in {:.1}s",
                 phase2_start.elapsed().as_secs_f64()
             ));
@@ -2129,7 +2129,7 @@ pub(crate) fn run_processing_loop_phased(
         if !bsa_directives.is_empty() {
             let bsa_total = bsa_directives.len();
             let bsa_workers = config.max_parallel_bsa_archives.unwrap_or(1).max(1);
-            reporter.log(&format!(
+            crate::installer::log_detail(&format!(
                 "  Phase 3: Building {} BSA archives ({} concurrent)...",
                 bsa_total, bsa_workers
             ));
@@ -2180,7 +2180,7 @@ pub(crate) fn run_processing_loop_phased(
             bsa_status.finish();
         }
     }
-    reporter.log(&format!(
+    crate::installer::log_detail(&format!(
         "  Phase 3 complete in {:.1}s",
         phase3_start.elapsed().as_secs_f64()
     ));
@@ -2189,7 +2189,7 @@ pub(crate) fn run_processing_loop_phased(
     let phase4_start = std::time::Instant::now();
     reporter.overall_set_message("Phase 4: Simple extraction...");
     if !simple.is_empty() {
-        reporter.log(&format!("  Phase 4: {} simple archives...", simple.len()));
+        crate::installer::log_detail(&format!("  Phase 4: {} simple archives...", simple.len()));
 
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(extract_workers)
@@ -2253,7 +2253,7 @@ pub(crate) fn run_processing_loop_phased(
             }
         });
     }
-    reporter.log(&format!(
+    crate::installer::log_detail(&format!(
         "  Phase 4 complete in {:.1}s ({} simple archives)",
         phase4_start.elapsed().as_secs_f64(),
         simple.len()
@@ -2287,9 +2287,9 @@ pub(crate) fn run_processing_loop_phased(
         s.finish();
     }
 
-    extraction_metrics.log_summary(reporter);
+    extraction_metrics.log_summary();
 
-    reporter.log(&format!(
+    crate::installer::log_detail(&format!(
         "Phased pipeline complete: {} complex + {} simple archives",
         complex.len(),
         simple.len()

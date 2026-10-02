@@ -120,7 +120,12 @@ pub fn validate_modlist_paths(modlist: &Modlist) -> Result<()> {
         if let Directive::CreateBSA(bsa) = directive {
             for state in &bsa.file_states {
                 if let Some(reason) = crate::paths::unsafe_relative_path_reason(state.path()) {
-                    record(format!("BSA entry {:?} in {:?}: {}", state.path(), to, reason));
+                    record(format!(
+                        "BSA entry {:?} in {:?}: {}",
+                        state.path(),
+                        to,
+                        reason
+                    ));
                 }
             }
         }
@@ -245,8 +250,8 @@ mod tests {
         let err = validate_modlist_paths(&modlist_with("ok.7z", "\\home\\u\\.bashrc")).unwrap_err();
         assert!(err.to_string().contains("absolute path"), "{err}");
 
-        let err =
-            validate_modlist_paths(&modlist_with("/home/u/thesis.docx", "mods\\a.esp")).unwrap_err();
+        let err = validate_modlist_paths(&modlist_with("/home/u/thesis.docx", "mods\\a.esp"))
+            .unwrap_err();
         assert!(err.to_string().contains("path separator"), "{err}");
     }
 

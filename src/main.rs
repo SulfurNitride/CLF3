@@ -394,9 +394,13 @@ async fn main() -> Result<()> {
             .with_filter(console_filter)
             .boxed()
     } else {
+        // Compact console lines ("WARN message"); the log file keeps
+        // timestamps and module targets.
         tracing_subscriber::fmt::layer()
             .with_writer(cli_reporter.make_writer_factory())
             .with_ansi(std::io::stderr().is_terminal())
+            .without_time()
+            .with_target(cli.verbose)
             .with_filter(console_filter)
             .boxed()
     };
@@ -734,14 +738,6 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
-            let detail = |message: String| {
-                if jackify {
-                    eprintln!("{}", message);
-                } else {
-                    println!("{}", message);
-                }
-            };
-
             // Remember the original CLI argument as a URL if it was one — it
             // ends up recorded in `.clf3-install.json` so `modlist update`
             // can fall back to it later.
@@ -830,6 +826,7 @@ async fn main() -> Result<()> {
             let ll_password = ll_password.unwrap_or_else(|| settings.loverslab_password.clone());
 
             // Game dir: CLI arg > auto-detect from modlist
+            let mut game_note = String::new();
             let game_dir = match game {
                 Some(g) => g,
                 None => {
@@ -838,11 +835,7 @@ async fn main() -> Result<()> {
                     // modlist's expected hashes (Steam first, then Heroic/GOG).
                     match auto_detect_game_dir(&wabbajack_file) {
                         Some((p, store)) => {
-                            detail(format!(
-                                "Auto-detected game directory: {} ({})",
-                                p.display(),
-                                store
-                            ));
+                            game_note = format!("{}, auto-detected", store);
                             p
                         }
                         None => {
@@ -865,14 +858,10 @@ async fn main() -> Result<()> {
             let bsa_workers = bsa_workers.unwrap_or(1).max(1);
             let sevenzip_workers = sevenzip_workers.unwrap_or(thread_count).max(1);
 
-            detail("CLF3 - Wabbajack Modlist Installer".to_string());
-            detail(format!("Concurrent downloads: {}", concurrent));
-            detail(format!(
-                "Install workers: {} (BSA archives in parallel: {})",
-                install_workers, bsa_workers
-            ));
-            detail(format!("7z archives in parallel: {}", sevenzip_workers));
-            detail(String::new());
+            let workers_line = format!(
+                "{} downloads · {} install · {} 7z · {} BSA",
+                concurrent, install_workers, sevenzip_workers, bsa_workers
+            );
 
             let patch_cache_dir = if settings.patch_cache_dir.is_empty() {
                 None
@@ -902,6 +891,14 @@ async fn main() -> Result<()> {
                 )
             } else {
                 (None, cli_reporter.clone() as Arc<dyn ProgressReporter>)
+            };
+
+            let summary_output = output.clone();
+            let summary_downloads = downloads.clone();
+            let header_game = if game_note.is_empty() {
+                game_dir.display().to_string()
+            } else {
+                format!("{}  ({})", game_dir.display(), game_note)
             };
 
             let config = InstallConfig {
@@ -934,59 +931,127 @@ async fn main() -> Result<()> {
                     .unwrap_or_default(),
             };
 
+            active_reporter.status("Loading modlist...");
+            let install_started = std::time::Instant::now();
             let mut installer = Installer::new(config)?;
-            let stats = installer.run_pipelined().await?;
 
             let reporter = active_reporter.as_ref();
-            let total_processed =
-                stats.directives_completed + stats.directives_skipped + stats.directives_failed;
+            let heading = |text: &str| {
+                console::style(text.to_string())
+                    .bold()
+                    .for_stderr()
+                    .to_string()
+            };
+            reporter.log(&heading(&format!("CLF3 {}", env!("CARGO_PKG_VERSION"))));
+            let rows = [
+                ("Modlist", installer.modlist_summary().unwrap_or_default()),
+                ("Game", header_game),
+                ("Install", summary_output.display().to_string()),
+                ("Downloads", summary_downloads.display().to_string()),
+                ("Workers", workers_line),
+                ("Log", log_path.display().to_string()),
+            ];
+            for (label, value) in rows.iter().filter(|(_, v)| !v.is_empty()) {
+                reporter.log(&format!(
+                    "  {} {}",
+                    console::style(format!("{:<10}", label)).dim().for_stderr(),
+                    value
+                ));
+            }
+            reporter.log("");
 
-            reporter.log("\n=== Installation Summary ===");
+            let stats = installer.run_pipelined().await?;
+            reporter.finish();
+
+            let installation_succeeded = stats.archives_manual == 0
+                && stats.archives_failed == 0
+                && stats.directives_failed == 0;
+            let needs_downloads = stats.archives_manual > 0 || stats.archives_failed > 0;
+            let elapsed = format_elapsed(install_started.elapsed());
+
+            let headline = if installation_succeeded {
+                console::style(format!("✓ Installation complete in {}", elapsed))
+                    .green()
+                    .bold()
+            } else if needs_downloads {
+                console::style(format!(
+                    "! Installation paused after {}: some archives need attention",
+                    elapsed
+                ))
+                .yellow()
+                .bold()
+            } else {
+                console::style(format!(
+                    "✗ Installation finished with errors after {}",
+                    elapsed
+                ))
+                .red()
+                .bold()
+            };
+            reporter.log("");
+            reporter.log(&headline.for_stderr().to_string());
+            let label = |text: &str| {
+                console::style(format!("{:<10}", text))
+                    .dim()
+                    .for_stderr()
+                    .to_string()
+            };
             reporter.log(&format!(
-                "Downloads:  {} downloaded, {} skipped, {} manual, {} failed",
+                "  {} {} downloaded · {} already present · {} manual · {} failed",
+                label("Downloads"),
                 stats.archives_downloaded,
                 stats.archives_skipped,
                 stats.archives_manual,
                 stats.archives_failed
             ));
             reporter.log(&format!(
-                "Directives: {} new, {} existing, {} failed ({} total)",
+                "  {} {} written · {} already up to date · {} failed",
+                label("Files"),
                 stats.directives_completed,
                 stats.directives_skipped,
-                stats.directives_failed,
-                total_processed
+                stats.directives_failed
             ));
+            reporter.log(&format!(
+                "  {} {}",
+                label("Location"),
+                summary_output.display()
+            ));
+            reporter.log(&format!("  {} {}", label("Log"), log_path.display()));
 
             if !stats.manual_downloads.is_empty() {
-                reporter.log(&format!(
-                    "\n=== Manual Downloads Needed ({}) ===",
-                    stats.manual_downloads.len()
-                ));
+                reporter.log("");
+                reporter.log(&heading(&format!(
+                    "Manual downloads needed ({}), save them to {}:",
+                    stats.manual_downloads.len(),
+                    summary_downloads.display()
+                )));
                 for (i, md) in stats.manual_downloads.iter().enumerate() {
-                    reporter.log(&format!("{}. {}", i + 1, md.name));
-                    reporter.log(&format!("   URL: {}", md.url));
-                    reporter.log(&format!("   Size: {} bytes", md.expected_size));
+                    reporter.log(&format!(
+                        "  {:>2}. {} ({})",
+                        i + 1,
+                        md.name,
+                        format_size(md.expected_size)
+                    ));
+                    reporter.log(&format!("      {}", md.url));
                     if let Some(ref prompt) = md.prompt {
-                        reporter.log(&format!("   Note: {}", prompt));
+                        reporter.log(&format!("      Note: {}", prompt));
                     }
                 }
             }
 
             if !stats.failed_downloads.is_empty() {
-                reporter.log(&format!(
-                    "\n=== Failed Downloads ({}) ===",
-                    stats.failed_downloads.len()
-                ));
+                reporter.log("");
+                reporter.log(&heading(&format!(
+                    "Failed downloads ({}), download them manually to {}:",
+                    stats.failed_downloads.len(),
+                    summary_downloads.display()
+                )));
                 for (i, fd) in stats.failed_downloads.iter().enumerate() {
-                    reporter.log(&format!("{}. {}", i + 1, fd.name));
-                    reporter.log(&format!("   URL: {}", fd.url));
-                    reporter.log(&format!("   Error: {}", fd.error));
+                    reporter.log(&format!("  {:>2}. {}", i + 1, fd.name));
+                    reporter.log(&format!("      {}", fd.url));
+                    reporter.log(&format!("      Error: {}", fd.error));
                 }
             }
-
-            let installation_succeeded = stats.archives_manual == 0
-                && stats.archives_failed == 0
-                && stats.directives_failed == 0;
 
             if let Some(host) = &hosted_bridge {
                 if installation_succeeded {
@@ -999,12 +1064,12 @@ async fn main() -> Result<()> {
                 }
             }
 
-            if stats.archives_manual > 0 || stats.archives_failed > 0 {
-                reporter.log("\nSome archives need manual download. Fix issues and run again.");
+            if needs_downloads {
+                reporter.log("");
+                reporter.log("Run the same command again once these archives are in place.");
             } else if stats.directives_failed > 0 {
-                reporter.log("\nSome directives failed. Check the log file for details.");
-            } else {
-                reporter.log("\nInstallation complete!");
+                reporter.log("");
+                reporter.log("Some files failed to install; the log has the details.");
             }
 
             // Optional structured report for external tooling.
@@ -1365,7 +1430,11 @@ async fn run_modlist_check(name: Option<String>, json: bool) -> Result<()> {
 
 /// `clf3 modlist update <name>`: re-install the modlist against the latest
 /// gallery version, reusing the original install and downloads directories.
-async fn run_modlist_update(name: String, yes: bool, cli_reporter: &Arc<CliReporter>) -> Result<()> {
+async fn run_modlist_update(
+    name: String,
+    yes: bool,
+    cli_reporter: &Arc<CliReporter>,
+) -> Result<()> {
     let settings = settings::Settings::load();
     let installs = modlist::update::discover_installs(&settings);
 
@@ -1736,6 +1805,35 @@ fn urlencoded_decode(s: &str) -> String {
         }
     }
     result
+}
+
+/// "1h02m03s" / "4m05s" / "12s".
+fn format_elapsed(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    let (h, m, s) = (secs / 3600, (secs / 60) % 60, secs % 60);
+    if h > 0 {
+        format!("{}h{:02}m{:02}s", h, m, s)
+    } else if m > 0 {
+        format!("{}m{:02}s", m, s)
+    } else {
+        format!("{}s", s)
+    }
+}
+
+/// Binary-unit size, e.g. "1.2 GiB".
+fn format_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut idx = 0;
+    while value >= 1024.0 && idx + 1 < UNITS.len() {
+        value /= 1024.0;
+        idx += 1;
+    }
+    if idx == 0 {
+        format!("{} B", bytes)
+    } else {
+        format!("{:.1} {}", value, UNITS[idx])
+    }
 }
 
 #[cfg(test)]

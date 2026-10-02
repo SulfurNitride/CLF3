@@ -72,7 +72,37 @@ fn write_stderr(msg: &str) {
 pub struct CliReporter {
     sink: Arc<LineSink>,
     renderer: Renderer,
+    flow: Mutex<Flow>,
+    /// Items and counters that ended with an error in the current phase.
+    failures: Arc<AtomicU64>,
+    fancy: bool,
 }
+
+/// The phase currently running, for headers, completion lines and indenting.
+#[derive(Default)]
+struct Flow {
+    current: Option<(Phase, Instant)>,
+}
+
+/// User-facing phase names. `Phase`'s `Display` is part of the JSON protocol,
+/// so the CLI keeps its own wording.
+fn phase_label(phase: Phase) -> &'static str {
+    match phase {
+        Phase::GameCheck => "Game check",
+        // In the pipelined installer this phase downloads and extracts
+        // concurrently.
+        Phase::Downloading => "Download & extract",
+        Phase::Validating => "Validate archives",
+        Phase::Extracting => "Extract archives",
+        Phase::Installing => "Write modlist files",
+        Phase::DdsTransform => "Convert textures",
+        Phase::BsaBuild => "Build BSA archives",
+        Phase::Cleanup => "Clean up",
+    }
+}
+
+/// Indent under the running phase's header.
+const INDENT: &str = "    ";
 
 enum Renderer {
     Full(Arc<Live>),
@@ -94,18 +124,54 @@ impl CliReporter {
             mode => mode,
         };
 
-        let (sink, renderer) = if mode == ProgressMode::Full {
+        let failures = Arc::new(AtomicU64::new(0));
+        let fancy = mode == ProgressMode::Full;
+        let (sink, renderer) = if fancy {
             let mp = MultiProgress::new();
             let sink = Arc::new(LineSink {
                 mp: Some(mp.clone()),
             });
-            let live = Live::new(mp, max_rows.max(1));
+            let live = Live::new(mp, max_rows.max(1), Arc::clone(&failures));
             (sink, Renderer::Full(live))
         } else {
             let sink = Arc::new(LineSink { mp: None });
-            (sink.clone(), Renderer::Plain(Plain::new(sink)))
+            let plain = Plain::new(sink.clone(), Arc::clone(&failures));
+            (sink, Renderer::Plain(plain))
         };
-        Arc::new(Self { sink, renderer })
+        Arc::new(Self {
+            sink,
+            renderer,
+            flow: Mutex::new(Flow::default()),
+            failures,
+            fancy,
+        })
+    }
+
+    /// Print the completion line for the running phase, if any.
+    fn close_phase(&self, flow: &mut Flow) {
+        let Some((phase, started)) = flow.current.take() else {
+            return;
+        };
+        let elapsed = format_duration(started.elapsed());
+        let failed = self.failures.swap(0, Ordering::Relaxed);
+        let label = phase_label(phase);
+        let line = match (self.fancy, failed) {
+            (true, 0) => format!(
+                "  {} {} {}",
+                style("✓").green().bold(),
+                label,
+                style(format!("({})", elapsed)).dim()
+            ),
+            (true, n) => format!(
+                "  {} {} {}",
+                style("!").yellow().bold(),
+                label,
+                style(format!("({}, {} failed)", elapsed, n)).yellow()
+            ),
+            (false, 0) => format!("  done: {} in {}", label, elapsed),
+            (false, n) => format!("  done: {} in {}, {} failed", label, elapsed, n),
+        };
+        self.sink.line(&line);
     }
 
     /// `MakeWriter` for the tracing subscriber that routes through this
@@ -119,10 +185,40 @@ impl CliReporter {
 
 impl ProgressReporter for CliReporter {
     fn phase_start(&self, phase: Phase) {
+        let mut flow = self.flow.lock().expect("flow lock");
+        // Some phases are announced both by the orchestrator and by the
+        // processor that runs them; one header is enough.
+        if matches!(flow.current, Some((current, _)) if current == phase) {
+            return;
+        }
+        self.close_phase(&mut flow);
+        let header = if self.fancy {
+            format!(
+                "{} {}",
+                style("==>").bold().cyan(),
+                style(phase_label(phase)).bold()
+            )
+        } else {
+            format!("==> {}", phase_label(phase))
+        };
+        self.sink.line(&header);
+        flow.current = Some((phase, Instant::now()));
+        self.failures.store(0, Ordering::Relaxed);
+        drop(flow);
+
         match &self.renderer {
             Renderer::Full(live) => live.phase_start(phase),
             Renderer::Plain(plain) => plain.phase_start(phase),
         }
+    }
+
+    fn finish(&self) {
+        match &self.renderer {
+            Renderer::Full(live) => live.finish(),
+            Renderer::Plain(plain) => plain.finish(),
+        }
+        let mut flow = self.flow.lock().expect("flow lock");
+        self.close_phase(&mut flow);
     }
 
     fn overall_set_total(&self, total: u64) {
@@ -166,6 +262,7 @@ impl ProgressReporter for CliReporter {
             Renderer::Plain(plain) => &plain.counters,
         };
         Arc::new(CounterHandle {
+            failures: Arc::clone(&self.failures),
             counters: Arc::clone(counters),
             id: counters.add(label),
             sink: Arc::clone(&self.sink),
@@ -175,7 +272,23 @@ impl ProgressReporter for CliReporter {
     }
 
     fn log(&self, msg: &str) {
-        self.sink.line(msg);
+        let in_phase = self.flow.lock().expect("flow lock").current.is_some();
+        if !in_phase {
+            self.sink.line(msg);
+            return;
+        }
+        let indented = msg
+            .split('\n')
+            .map(|line| {
+                if line.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}{}", INDENT, line)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.sink.line(&indented);
     }
 
     fn status(&self, msg: &str) {
@@ -244,6 +357,7 @@ impl Counters {
 }
 
 struct CounterHandle {
+    failures: Arc<AtomicU64>,
     counters: Arc<Counters>,
     id: u64,
     sink: Arc<LineSink>,
@@ -271,8 +385,14 @@ impl ProgressHandle for CounterHandle {
     fn finish_with_error(&self, msg: &str) {
         if !self.finished.swap(true, Ordering::Relaxed) {
             self.counters.remove(self.id);
-            self.sink
-                .line(&format!("{} {}: {}", style("✗").red(), self.label, msg));
+            self.failures.fetch_add(1, Ordering::Relaxed);
+            self.sink.line(&format!(
+                "{}{} {}: {}",
+                INDENT,
+                style("✗").red(),
+                self.label,
+                msg
+            ));
         }
     }
 }
@@ -298,7 +418,7 @@ struct Live {
     state: Mutex<LiveState>,
     /// Latest "Net · Disk · RAM" text, refreshed by the ticker.
     system_line: Mutex<String>,
-    run_start: Instant,
+    failures: Arc<AtomicU64>,
 }
 
 struct LiveState {
@@ -323,7 +443,7 @@ struct LiveItem {
 }
 
 impl Live {
-    fn new(mp: MultiProgress, max_rows: usize) -> Arc<Self> {
+    fn new(mp: MultiProgress, max_rows: usize, failures: Arc<AtomicU64>) -> Arc<Self> {
         let dash = ProgressBar::with_draw_target(Some(0), ProgressDrawTarget::hidden());
         let live = Arc::new(Self {
             out: LineSink {
@@ -343,7 +463,7 @@ impl Live {
                 items: Vec::new(),
             }),
             system_line: Mutex::new(String::new()),
-            run_start: Instant::now(),
+            failures,
         });
         live.restyle_dash(&live.state.lock().expect("live state"));
         Self::spawn_ticker(&live);
@@ -370,20 +490,15 @@ impl Live {
             .clamp(1, self.max_rows)
     }
 
+    /// Name column width so a download row fits on one line: the row spends
+    /// 63 columns on indent, glyph, bar, sizes and speed around the name,
+    /// plus one spare so the cursor never wraps.
     fn label_width(&self) -> usize {
         let (_rows, cols) = console::Term::stderr().size();
-        (cols as usize).saturating_sub(58).clamp(16, 60)
+        (cols as usize).saturating_sub(64).clamp(16, 60)
     }
 
     fn phase_start(&self, phase: Phase) {
-        let elapsed = format_duration(self.run_start.elapsed());
-        self.out.line(&format!(
-            "{} {} {}",
-            style("==>").bold().cyan(),
-            style(phase).bold(),
-            style(format!("[{}]", elapsed)).dim()
-        ));
-
         let mut st = self.state.lock().expect("live state");
         st.phase = Some(phase);
         st.phase_active = Self::phase_is_active(phase);
@@ -415,9 +530,23 @@ impl Live {
         self.sync_dash_visibility(&mut st);
     }
 
-    fn set_status(&self, msg: &str) {
-        self.dash.set_prefix(msg.to_string());
+    /// Take the dashboard down before the final summary.
+    fn finish(&self) {
         let mut st = self.state.lock().expect("live state");
+        st.phase = None;
+        st.phase_active = false;
+        st.has_total = false;
+        st.has_status = false;
+        self.sync_dash_visibility(&mut st);
+    }
+
+    fn set_status(&self, msg: &str) {
+        let mut st = self.state.lock().expect("live state");
+        // Keep the dashboard's first line on one row: a wrapped status line
+        // breaks indicatif's redraw. Bar mode spends ~92 columns before the
+        // status, spinner mode ~34.
+        let width = DashLayout::for_terminal(st.has_total).status_width;
+        self.dash.set_prefix(truncate_label(msg, width));
         if !st.has_status {
             st.has_status = true;
             self.sync_dash_visibility(&mut st);
@@ -436,19 +565,23 @@ impl Live {
     }
 
     fn restyle_dash(&self, st: &LiveState) {
-        let phase = st
-            .phase
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "Working".to_string());
-        let phase = format!("{}", style(format!("{:<13}", phase)).bold().cyan());
+        let phase = st.phase.map(phase_label).unwrap_or("Working");
+        let phase = format!("{}", style(format!("{:<18}", phase)).bold().cyan());
         let extra = if st.dash_has_extra { "\n{msg}" } else { "" };
+        let layout = DashLayout::for_terminal(st.has_total);
+        let elapsed = if layout.show_elapsed {
+            "{elapsed_precise}  "
+        } else {
+            ""
+        };
         let template = if st.has_total {
+            let bar = layout.bar_width;
             format!(
-                " {{spinner:.cyan}} {phase} {{bar:30.cyan/blue}} {{pos:>5}}/{{len:<5}} \
-                 {{percent:>3}}%  {{elapsed_precise}}  eta {{eta:<4}}  {{prefix:.dim}}{extra}"
+                " {{spinner:.cyan}} {phase} {{bar:{bar}.cyan/blue}} {{pos:>5}}/{{len:<5}} \
+                 {{percent:>3}}%  {elapsed}eta {{eta:<4}}  {{prefix:.dim}}{extra}"
             )
         } else {
-            format!(" {{spinner:.cyan}} {phase} {{elapsed_precise}}  {{prefix:.dim}}{extra}")
+            format!(" {{spinner:.cyan}} {phase} {elapsed}{{prefix:.dim}}{extra}")
         };
         self.dash.set_style(
             ProgressStyle::with_template(&template)
@@ -457,7 +590,11 @@ impl Live {
         );
     }
 
-    fn begin_item(self: &Arc<Self>, label: &str, total_bytes: Option<u64>) -> Arc<dyn ProgressHandle> {
+    fn begin_item(
+        self: &Arc<Self>,
+        label: &str,
+        total_bytes: Option<u64>,
+    ) -> Arc<dyn ProgressHandle> {
         let bar = ProgressBar::with_draw_target(total_bytes, ProgressDrawTarget::hidden());
         let width = self.label_width();
         if let Some(total) = total_bytes {
@@ -487,7 +624,11 @@ impl Live {
 
         {
             let mut st = self.state.lock().expect("live state");
-            let shown = st.items.iter().filter(|i| i.shown.load(Ordering::Relaxed)).count();
+            let shown = st
+                .items
+                .iter()
+                .filter(|i| i.shown.load(Ordering::Relaxed))
+                .count();
             if shown < self.visible_rows() {
                 self.show_item(&item);
             }
@@ -516,7 +657,11 @@ impl Live {
         }
         // Promote off-screen items into any free rows.
         let limit = self.visible_rows();
-        let mut shown = st.items.iter().filter(|i| i.shown.load(Ordering::Relaxed)).count();
+        let mut shown = st
+            .items
+            .iter()
+            .filter(|i| i.shown.load(Ordering::Relaxed))
+            .count();
         for candidate in &st.items {
             if shown >= limit {
                 break;
@@ -556,12 +701,16 @@ impl Live {
                         };
                         prev_disk = cur_disk;
                         let rss = super::current_rss_kb().unwrap_or(0).saturating_mul(1024);
-                        *live.system_line.lock().expect("system line") = format!(
-                            "Disk {}/s · RAM {}{}",
-                            format_bytes(disk_bps),
-                            format_bytes(rss),
-                            total_mem_label
-                        );
+                        // Writes by 7z child processes don't show in
+                        // /proc/self/io, so a zero reading usually means
+                        // "not measured" rather than "idle"; omit it.
+                        let disk = if disk_bps > 0 {
+                            format!("Disk {}/s · ", format_bytes(disk_bps))
+                        } else {
+                            String::new()
+                        };
+                        *live.system_line.lock().expect("system line") =
+                            format!("{}RAM {}{}", disk, format_bytes(rss), total_mem_label);
                     }
 
                     live.refresh(tick);
@@ -589,7 +738,11 @@ impl Live {
                 net += item.speed.load(Ordering::Relaxed);
             }
             let active = st.items.len();
-            let shown = st.items.iter().filter(|i| i.shown.load(Ordering::Relaxed)).count();
+            let shown = st
+                .items
+                .iter()
+                .filter(|i| i.shown.load(Ordering::Relaxed))
+                .count();
             let mut parts = Vec::new();
             if downloading {
                 parts.push(format!("Net {}/s", format_bytes(net)));
@@ -629,6 +782,50 @@ impl Live {
                     item.bar.tick();
                 }
             }
+        }
+    }
+}
+
+/// Column budget for the dashboard's first line, so it never wraps.
+struct DashLayout {
+    bar_width: usize,
+    show_elapsed: bool,
+    status_width: usize,
+}
+
+impl DashLayout {
+    // " ⠚ " + 18-col phase + space.
+    const LEAD: usize = 22;
+    // " 1234/5678  100%  " + "eta 59m " + spare columns.
+    const COUNTS: usize = 30;
+    const ELAPSED: usize = 10;
+
+    fn for_terminal(has_total: bool) -> Self {
+        let (_rows, cols) = console::Term::stderr().size();
+        Self::for_width(cols as usize, has_total)
+    }
+
+    fn for_width(cols: usize, has_total: bool) -> Self {
+        let show_elapsed = cols >= 100;
+        let elapsed = if show_elapsed { Self::ELAPSED } else { 0 };
+        if !has_total {
+            let status_width = cols.saturating_sub(Self::LEAD + elapsed + 1).max(12);
+            return Self {
+                bar_width: 0,
+                show_elapsed,
+                status_width,
+            };
+        }
+        // Give the status line at least 16 columns before the bar grows.
+        let room = cols.saturating_sub(Self::LEAD + Self::COUNTS + elapsed + 16);
+        let bar_width = room.clamp(8, 30);
+        let status_width = cols
+            .saturating_sub(Self::LEAD + bar_width + Self::COUNTS + elapsed)
+            .max(12);
+        Self {
+            bar_width,
+            show_elapsed,
+            status_width,
         }
     }
 }
@@ -690,7 +887,14 @@ impl ProgressHandle for LiveHandle {
     fn finish_with_error(&self, msg: &str) {
         if !self.finished.swap(true, Ordering::Relaxed) {
             self.live.end_item(&self.item);
-            let line = format!("{} {}: {}", style("✗").red().bold(), self.label, msg);
+            self.live.failures.fetch_add(1, Ordering::Relaxed);
+            let line = format!(
+                "{}{} {}: {}",
+                INDENT,
+                style("✗").red().bold(),
+                self.label,
+                msg
+            );
             self.live.out.line(&line);
         }
     }
@@ -708,6 +912,7 @@ impl Drop for LiveHandle {
 
 struct Plain {
     sink: Arc<LineSink>,
+    failures: Arc<AtomicU64>,
     counters: Arc<Counters>,
     state: Mutex<PlainState>,
     ticker: Once,
@@ -730,9 +935,10 @@ struct PlainItem {
 }
 
 impl Plain {
-    fn new(sink: Arc<LineSink>) -> Arc<Self> {
+    fn new(sink: Arc<LineSink>, failures: Arc<AtomicU64>) -> Arc<Self> {
         Arc::new(Self {
             sink,
+            failures,
             counters: Arc::new(Counters::default()),
             state: Mutex::new(PlainState {
                 phase: None,
@@ -774,7 +980,14 @@ impl Plain {
         st.status.clear();
         st.last_line.clear();
         st.last_emit = Instant::now();
-        self.sink.line(&format!("==> {}", phase));
+    }
+
+    fn finish(&self) {
+        let mut st = self.state.lock().expect("plain state");
+        st.phase = None;
+        st.total = 0;
+        st.done = 0;
+        st.status.clear();
     }
 
     fn overall_set_total(&self, total: u64) {
@@ -816,7 +1029,7 @@ impl Plain {
             return;
         }
         let mut parts = Vec::new();
-        let phase = st.phase.map(|p| p.to_string()).unwrap_or_else(|| "Progress".into());
+        let phase = st.phase.map(phase_label).unwrap_or("Progress");
         if st.total > 0 {
             let pct = st.done.saturating_mul(100) / st.total.max(1);
             parts.push(format!("[{} {}/{} {}%]", phase, st.done, st.total, pct));
@@ -835,9 +1048,18 @@ impl Plain {
             .filter(|i| i.total.load(Ordering::Relaxed) > 0)
             .collect();
         if keepalive && !byte_items.is_empty() {
-            let pos: u64 = byte_items.iter().map(|i| i.pos.load(Ordering::Relaxed)).sum();
-            let total: u64 = byte_items.iter().map(|i| i.total.load(Ordering::Relaxed)).sum();
-            let speed: u64 = byte_items.iter().map(|i| i.speed.load(Ordering::Relaxed)).sum();
+            let pos: u64 = byte_items
+                .iter()
+                .map(|i| i.pos.load(Ordering::Relaxed))
+                .sum();
+            let total: u64 = byte_items
+                .iter()
+                .map(|i| i.total.load(Ordering::Relaxed))
+                .sum();
+            let speed: u64 = byte_items
+                .iter()
+                .map(|i| i.speed.load(Ordering::Relaxed))
+                .sum();
             parts.push(format!(
                 "{} active, {} / {} at {}/s",
                 byte_items.len(),
@@ -850,12 +1072,16 @@ impl Plain {
         if !keepalive && line == st.last_line {
             return;
         }
-        self.sink.line(&line);
+        self.sink.line(&format!("{}{}", INDENT, line));
         st.last_line = line;
         st.last_emit = Instant::now();
     }
 
-    fn begin_item(self: &Arc<Self>, label: &str, total_bytes: Option<u64>) -> Arc<dyn ProgressHandle> {
+    fn begin_item(
+        self: &Arc<Self>,
+        label: &str,
+        total_bytes: Option<u64>,
+    ) -> Arc<dyn ProgressHandle> {
         self.ensure_ticker();
         let item = Arc::new(PlainItem {
             pos: AtomicU64::new(0),
@@ -901,7 +1127,9 @@ impl ProgressHandle for PlainHandle {
         if total > 0 {
             self.item.total.store(total, Ordering::Relaxed);
         }
-        self.item.speed.store(speed.max(0.0) as u64, Ordering::Relaxed);
+        self.item
+            .speed
+            .store(speed.max(0.0) as u64, Ordering::Relaxed);
     }
 
     // Item messages are display relabels ("Mega: foo", "foo (mirror)");
@@ -916,7 +1144,8 @@ impl ProgressHandle for PlainHandle {
             if self.is_bytes {
                 let size = self.item.total.load(Ordering::Relaxed);
                 self.plain.sink.line(&format!(
-                    "  done  {} ({}, {})",
+                    "{}done {} ({}, {})",
+                    INDENT,
                     self.label,
                     format_bytes(size),
                     format_duration(self.started.elapsed())
@@ -930,7 +1159,8 @@ impl ProgressHandle for PlainHandle {
             self.plain.end_item(&self.item);
             self.plain
                 .sink
-                .line(&format!("  FAIL  {}: {}", self.label, msg));
+                .line(&format!("{}FAIL {}: {}", INDENT, self.label, msg));
+            self.plain.failures.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -1033,7 +1263,7 @@ fn read_total_memory_bytes() -> Option<u64> {
     None
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub(crate) fn format_bytes(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
     let mut idx = 0;
@@ -1089,9 +1319,32 @@ mod tests {
         let b = counters.add("DDS");
         counters.set(a, 4, 10);
         counters.set(b, 1, 3);
-        assert_eq!(counters.render().as_deref(), Some("Extracted 4/10 · DDS 1/3"));
+        assert_eq!(
+            counters.render().as_deref(),
+            Some("Extracted 4/10 · DDS 1/3")
+        );
         counters.remove(a);
         assert_eq!(counters.render().as_deref(), Some("DDS 1/3"));
+    }
+
+    #[test]
+    fn dash_layout_fits_common_widths() {
+        for cols in [80usize, 100, 120, 200] {
+            let layout = DashLayout::for_width(cols, true);
+            let used = DashLayout::LEAD
+                + layout.bar_width
+                + DashLayout::COUNTS
+                + if layout.show_elapsed {
+                    DashLayout::ELAPSED
+                } else {
+                    0
+                }
+                + layout.status_width;
+            assert!(used <= cols, "{cols} cols: {used} used");
+            assert!(layout.status_width >= 12);
+        }
+        assert!(!DashLayout::for_width(80, true).show_elapsed);
+        assert_eq!(DashLayout::for_width(200, true).bar_width, 30);
     }
 
     #[test]

@@ -85,6 +85,12 @@ impl PeakRssTracker {
     }
 }
 
+/// Diagnostic detail for the log file only. Console output is reserved for
+/// progress, milestones, warnings and the final summary.
+pub(crate) fn log_detail(msg: &str) {
+    tracing::info!("{}", msg);
+}
+
 pub(crate) fn current_rss_kb() -> Option<u64> {
     let status = fs::read_to_string("/proc/self/status").ok()?;
     for line in status.lines() {
@@ -124,30 +130,26 @@ fn read_memory_stats() -> Option<MemoryStats> {
 }
 
 /// Log a post-install performance summary.
-fn log_install_summary(
-    stats: &InstallStats,
-    total_start: Instant,
-    reporter: &Arc<dyn progress::ProgressReporter>,
-) {
+fn log_install_summary(stats: &InstallStats, total_start: Instant) {
     let total_secs = total_start.elapsed().as_secs_f64();
     let total_min = total_secs / 60.0;
 
-    reporter.log("--- Performance Summary ---");
-    reporter.log(&format!(
+    crate::installer::log_detail("--- Performance Summary ---");
+    crate::installer::log_detail(&format!(
         "Total time: {:.1}m ({:.0}s)",
         total_min, total_secs
     ));
 
     for (phase, duration) in &stats.phase_durations {
         if *duration >= 0.1 {
-            reporter.log(&format!("  {:<30} {:>6.1}s", phase, duration));
+            crate::installer::log_detail(&format!("  {:<30} {:>6.1}s", phase, duration));
         }
     }
 
     let total_directives =
         stats.directives_completed + stats.directives_skipped + stats.directives_failed;
     if total_directives > 0 && total_secs > 0.0 {
-        reporter.log(&format!(
+        crate::installer::log_detail(&format!(
             "Directives: {} completed, {} skipped, {} failed ({:.0}/s)",
             stats.directives_completed,
             stats.directives_skipped,
@@ -165,7 +167,7 @@ fn log_install_summary(
             .map(|(_, d)| *d)
             .unwrap_or(total_secs);
         if extract_secs > 0.0 {
-            reporter.log(&format!(
+            crate::installer::log_detail(&format!(
                 "Archives: {} downloaded, {} skipped ({:.1} archives/min)",
                 stats.archives_downloaded,
                 stats.archives_skipped,
@@ -192,7 +194,7 @@ fn log_install_summary(
                 }
             }
         }
-        reporter.log(&mem_line);
+        crate::installer::log_detail(&mem_line);
     }
 }
 
@@ -258,6 +260,28 @@ pub struct Installer {
 }
 
 impl Installer {
+    /// "Name 1.2.3 by Author (Game)" from the imported modlist metadata.
+    pub fn modlist_summary(&self) -> Option<String> {
+        let get = |key: &str| {
+            self.db
+                .get_metadata(key)
+                .ok()
+                .flatten()
+                .filter(|value| !value.trim().is_empty())
+        };
+        let mut summary = get("name")?;
+        if let Some(version) = get("version") {
+            summary.push_str(&format!(" {}", version));
+        }
+        if let Some(author) = get("author") {
+            summary.push_str(&format!(" by {}", author));
+        }
+        if let Some(game) = get("game_type") {
+            summary.push_str(&format!(" ({})", game));
+        }
+        Some(summary)
+    }
+
     /// Create a new installer with the given configuration
     pub fn new(config: InstallConfig) -> Result<Self> {
         // Validate config
@@ -278,21 +302,17 @@ impl Installer {
         })?;
 
         // Parse wabbajack and import to database
-        config
-            .reporter
-            .log(&format!("Parsing: {}", config.wabbajack_path.display()));
+        crate::installer::log_detail(&format!("Parsing: {}", config.wabbajack_path.display()));
         let db = import_wabbajack_to_db(&config.wabbajack_path, &config.db_path())?;
 
         // Show modlist info
         if let (Some(name), Some(version)) = (db.get_metadata("name")?, db.get_metadata("version")?)
         {
-            config
-                .reporter
-                .log(&format!("Modlist: {} v{}", name, version));
+            crate::installer::log_detail(&format!("Modlist: {} v{}", name, version));
         }
 
         let stats = db.get_directive_stats()?;
-        config.reporter.log(&format!(
+        crate::installer::log_detail(&format!(
             "Directives: {} total ({} pending)\n",
             stats.total, stats.pending
         ));
@@ -434,7 +454,7 @@ impl Installer {
         // === Phase 1: Game Check ===
         let game_check_start = Instant::now();
         self.reporter().phase_start(Phase::GameCheck);
-        self.reporter().log(&format!(
+        crate::installer::log_detail(&format!(
             "Game directory: {}",
             self.config.game_dir.display()
         ));
@@ -444,7 +464,7 @@ impl Installer {
                 self.config.game_dir.display()
             );
         }
-        self.reporter().log("Game directory validated");
+        crate::installer::log_detail("Game directory validated");
 
         // Hash every GameFileSource archive against the chosen game directory
         // BEFORE spending bandwidth. Catches: game updated since modlist
@@ -453,11 +473,11 @@ impl Installer {
         // Runs parallel via rayon; typical cost <2s for Bethesda modlists.
         let preflight = game_preflight::check_game_files_from_db(&self.db, &self.config.game_dir)?;
         if preflight.total == 0 {
-            self.reporter()
-                .log("No game files required by this modlist — skipping hash preflight");
+            crate::installer::log_detail(
+                "No game files required by this modlist — skipping hash preflight",
+            );
         } else {
-            self.reporter()
-                .log(&format!("Verifying {} game files...", preflight.total));
+            crate::installer::log_detail(&format!("Verifying {} game files...", preflight.total));
             if preflight.all_ok() {
                 self.reporter()
                     .log(&format!("All {} game files verified", preflight.total));
@@ -507,12 +527,12 @@ impl Installer {
         let total_patched = grouped.patched.values().map(|v| v.len()).sum::<usize>();
         let total_textures = grouped.textures.values().map(|v| v.len()).sum::<usize>();
         let total_whole = grouped.whole_file.len();
-        self.reporter().log(&format!(
+        crate::installer::log_detail(&format!(
             "Grouped directives: {} FromArchive, {} Patched, {} Textures, {} whole-file ({} pre-skipped)",
             total_from, total_patched, total_textures, total_whole, grouped.pre_skipped
         ));
         let (direct, conflict, patch) = grouped.tier_counts;
-        self.reporter().log(&format!(
+        crate::installer::log_detail(&format!(
             "Extraction tiers: {} direct, {} conflict, {} patch",
             direct, conflict, patch
         ));
@@ -524,7 +544,7 @@ impl Installer {
             &self.config.reporter,
         )?;
         if reuse_stats.files_reused > 0 {
-            self.reporter().log(&format!(
+            crate::installer::log_detail(&format!(
                 "BSA reuse: {} files pre-extracted from {} existing BSAs ({} changed, need download)",
                 reuse_stats.files_reused, reuse_stats.bsas_with_reuse, reuse_stats.files_changed
             ));
@@ -584,8 +604,9 @@ impl Installer {
         // CLI flag.
         let streaming_stats = match self.config.extract_strategy {
             ExtractStrategy::Streaming => {
-                self.reporter()
-                    .log("Using streaming extraction (download and extract run concurrently)");
+                crate::installer::log_detail(
+                    "Using streaming extraction (download and extract run concurrently)",
+                );
                 pipeline::run_processing_loop(
                     &self.db,
                     &dp.ctx,
@@ -596,8 +617,9 @@ impl Installer {
                 )?
             }
             ExtractStrategy::Phased => {
-                self.reporter()
-                    .log("Using phased extraction (download completes, then 4 sequential phases)");
+                crate::installer::log_detail(
+                    "Using phased extraction (download completes, then 4 sequential phases)",
+                );
                 pipeline::run_processing_loop_phased(
                     &self.db,
                     &dp.ctx,
@@ -720,12 +742,12 @@ impl Installer {
         stats.directives_failed += process_stats.failed;
 
         if stats.directives_failed > 0 {
-            self.reporter().log(&format!(
+            crate::installer::log_detail(&format!(
                 "Directive processing incomplete. {} failures.",
                 stats.directives_failed
             ));
         } else {
-            self.reporter().log("Installation complete!");
+            crate::installer::log_detail("Installation complete!");
         }
 
         // Drop a `.clf3-install.json` manifest into the output dir so
@@ -741,7 +763,7 @@ impl Installer {
             }
         }
 
-        log_install_summary(&stats, total_start, &self.config.reporter);
+        log_install_summary(&stats, total_start);
 
         Ok(stats)
     }

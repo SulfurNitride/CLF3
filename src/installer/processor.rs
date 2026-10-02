@@ -350,7 +350,7 @@ fn index_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
     }
 
     let reporter = &ctx.config.reporter;
-    reporter.log(&format!("Indexing {} archives...", to_index.len()));
+    crate::installer::log_detail(&format!("Indexing {} archives...", to_index.len()));
     reporter.overall_set_total(to_index.len() as u64);
 
     for archive in to_index {
@@ -421,7 +421,10 @@ fn index_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
                 if let Err(e) = db.index_archive_files(&archive.hash, &files) {
                     reporter.log(&format!("WARN: Failed to index {}: {}", archive.name, e));
                 } else {
-                    reporter.log(&format!("OK: {} ({} files)", archive.name, count));
+                    crate::installer::log_detail(&format!(
+                        "OK: {} ({} files)",
+                        archive.name, count
+                    ));
                 }
             }
             Err(e) => {
@@ -433,7 +436,7 @@ fn index_archives(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
     }
 
     reporter.overall_finish();
-    reporter.log("Archive indexing complete");
+    crate::installer::log_detail("Archive indexing complete");
 
     Ok(())
 }
@@ -759,7 +762,7 @@ impl<'a> ProcessContext<'a> {
                 Ok(store) => {
                     let entries = store.load_verified().unwrap_or_default();
                     if !entries.is_empty() {
-                        config.reporter.log(&format!(
+                        crate::installer::log_detail(&format!(
                             "Loaded {} verified patch basis entries from cache",
                             entries.len()
                         ));
@@ -1207,7 +1210,7 @@ pub fn cleanup_bsa_temp_dirs(config: &InstallConfig) -> Result<()> {
     // 2. Clean up Working_BSA cache
     let working_dir = get_bsa_working_dir(&config.downloads_dir);
     if working_dir.exists() {
-        config.reporter.log("Cleaning up BSA working cache...");
+        crate::installer::log_detail("Cleaning up BSA working cache...");
         match std::fs::remove_dir_all(&working_dir) {
             Ok(()) => config
                 .reporter
@@ -1244,11 +1247,10 @@ impl<'a> DirectiveProcessor<'a> {
         // Show directive counts — route through reporter so indicatif bars
         // don't get clobbered by raw stdout writes.
         let type_counts = db.get_directive_type_counts()?;
-        reporter.log("Directive types:");
+        crate::installer::log_detail("Directive types:");
         for (dtype, count) in &type_counts {
-            reporter.log(&format!("  {:>8}  {}", count, dtype));
+            crate::installer::log_detail(&format!("  {:>8}  {}", count, dtype));
         }
-        reporter.log("");
 
         Ok(Self {
             ctx,
@@ -1364,7 +1366,7 @@ impl<'a> DirectiveProcessor<'a> {
         }
 
         self.ctx.set_needed_patch_basis_keys(keys);
-        self.reporter.log(&format!(
+        crate::installer::log_detail(&format!(
             "Patch basis prep: tracking {} basis keys ({} parse failures)",
             self.ctx.needed_patch_basis_count(),
             parse_failures
@@ -1378,7 +1380,7 @@ impl<'a> DirectiveProcessor<'a> {
         let remapped_count = self.get_type_count("RemappedInlineFile")?;
 
         if inline_count + remapped_count == 0 {
-            self.reporter.log("No inline directives to process");
+            crate::installer::log_detail("No inline directives to process");
             return Ok(());
         }
 
@@ -1508,7 +1510,7 @@ impl<'a> DirectiveProcessor<'a> {
             failed: self.failed.load(Ordering::Relaxed),
         };
 
-        self.reporter.log(&format!(
+        crate::installer::log_detail(&format!(
             "Processed {} directives ({} completed, {} skipped, {} failed)",
             stats.completed + stats.skipped + stats.failed,
             stats.completed,
@@ -1544,7 +1546,7 @@ fn cleanup_extra_files(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
         .map(|p| paths::normalize_for_lookup(p))
         .collect();
 
-    ctx.config.reporter.log(&format!(
+    crate::installer::log_detail(&format!(
         "Expected {} files in output directory",
         expected_set.len()
     ));
@@ -1674,7 +1676,7 @@ fn cleanup_extra_files(db: &ModlistDb, ctx: &ProcessContext) -> Result<()> {
             deleted_dirs
         ));
     } else {
-        ctx.config.reporter.log("No extra files to clean up");
+        crate::installer::log_detail("No extra files to clean up");
     }
 
     Ok(())
@@ -1904,7 +1906,7 @@ fn process_transformed_texture(
     let all_raw = db.get_all_pending_directives_of_type("TransformedTexture")?;
 
     if all_raw.is_empty() {
-        reporter.log("No TransformedTexture directives to process");
+        crate::installer::log_detail("No TransformedTexture directives to process");
         return Ok(());
     }
 
@@ -1946,7 +1948,7 @@ fn process_transformed_texture(
     }
 
     if pre_done > 0 {
-        reporter.log(&format!(
+        crate::installer::log_detail(&format!(
             "{} textures already processed during install phase",
             pre_done
         ));
@@ -1989,7 +1991,7 @@ fn process_transformed_texture(
     reporter.overall_set_message("Staging texture source files...");
     reporter.overall_set_total(total_archives as u64);
 
-    reporter.log(&format!(
+    crate::installer::log_detail(&format!(
         "Staging {} textures from {} archives...",
         total_directives, total_archives
     ));
@@ -2180,7 +2182,7 @@ fn process_transformed_texture(
     skipped.fetch_add(total_skipped, Ordering::Relaxed);
     failed.fetch_add(total_failed_stage, Ordering::Relaxed);
 
-    reporter.log(&format!(
+    crate::installer::log_detail(&format!(
         "Staged {} textures ({} skipped, {} failed to read)",
         total_staged, total_skipped, total_failed_stage
     ));
@@ -2218,7 +2220,7 @@ fn process_transformed_texture(
         .map(|(f, n)| format!("{}: {}", f, n))
         .collect::<Vec<_>>()
         .join(", ");
-    reporter.log(&format!("Processing textures by format [{}]", summary_str));
+    crate::installer::log_detail(&format!("Processing textures by format [{}]", summary_str));
 
     // Initialize GPU for BC7
     let _ = crate::textures::init_gpu();
@@ -2437,7 +2439,7 @@ fn process_create_bsa(
     directives.sort_by_key(|(_, d)| d.file_states.len());
 
     let bsa_total = directives.len();
-    reporter.log(&format!(
+    crate::installer::log_detail(&format!(
         "Processing {} BSA/BA2 archives (2 concurrent: overlap compress + write/hash)",
         bsa_total
     ));

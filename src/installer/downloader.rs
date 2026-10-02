@@ -50,7 +50,7 @@ fn build_valid_bsa_set(
         }
     }
     if !valid.is_empty() {
-        config.reporter.log(&format!(
+        crate::installer::log_detail(&format!(
             "Found {} BSAs with valid sidecar cache (skipping their source downloads)",
             valid.len()
         ));
@@ -417,9 +417,9 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
     let reporter = &config.reporter;
 
     // Smart check: scan output directory to find what's missing
-    reporter.log("Scanning output directory for existing files...");
+    crate::installer::log_detail("Scanning output directory for existing files...");
     let existing_outputs = scan_existing_outputs(&config.output_dir)?;
-    reporter.log(&format!(
+    crate::installer::log_detail(&format!(
         "Found {} existing output files",
         existing_outputs.len()
     ));
@@ -575,13 +575,13 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
         need_download.push(archive);
     }
     if sidecar_hits > 0 {
-        reporter.log(&format!(
+        crate::installer::log_detail(&format!(
             "  {} archives verified via sidecar cache (skipped re-hashing)",
             sidecar_hits
         ));
     }
     if verified_local_path_hits > 0 {
-        reporter.log(&format!(
+        crate::installer::log_detail(&format!(
             "  {} archives reused from verified database local paths",
             verified_local_path_hits
         ));
@@ -621,7 +621,7 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
         already_downloaded += 1;
         already_downloaded_size += archive.size as u64;
         fallback_hit_count += 1;
-        reporter.log(&format!(
+        crate::installer::log_detail(&format!(
             "Matched manually supplied archive '{}' to expected '{}' by size and hash",
             path.file_name()
                 .map(|name| name.to_string_lossy())
@@ -788,8 +788,9 @@ pub async fn download_archives(db: &ModlistDb, config: &InstallConfig) -> Result
 
     if already_downloaded > 0 {
         reporter.log(&format!(
-            "Found {} archives already downloaded ({} bytes)",
-            already_downloaded, already_downloaded_size
+            "Found {} archives already downloaded ({})",
+            already_downloaded,
+            super::progress_cli::format_bytes(already_downloaded_size)
         ));
         // Report skipped archives to progress callback
         if let Some(ref callback) = config.progress_callback {
@@ -1022,9 +1023,9 @@ pub async fn download_archives_streaming(
     let reporter = &config.reporter;
 
     // Smart check: scan output directory to find what's missing
-    reporter.log("Scanning output directory for existing files...");
+    crate::installer::log_detail("Scanning output directory for existing files...");
     let existing_outputs = scan_existing_outputs(&config.output_dir)?;
-    reporter.log(&format!(
+    crate::installer::log_detail(&format!(
         "Found {} existing output files",
         existing_outputs.len()
     ));
@@ -1195,7 +1196,7 @@ pub async fn download_archives_streaming(
         already_downloaded += 1;
         already_downloaded_size += archive.size as u64;
         fallback_hit_count += 1;
-        reporter.log(&format!(
+        crate::installer::log_detail(&format!(
             "Matched manually supplied archive '{}' to expected '{}' by size and hash",
             path.file_name()
                 .map(|name| name.to_string_lossy())
@@ -1220,7 +1221,7 @@ pub async fn download_archives_streaming(
     // Emit verified database paths in priority order, just like sidecar and
     // canonical-path hits, so reruns preserve BSA-first streaming behavior.
     if !verified_local_paths.is_empty() {
-        reporter.log(&format!(
+        crate::installer::log_detail(&format!(
             "  {} archives reused from verified database local paths",
             verified_local_paths.len()
         ));
@@ -1242,7 +1243,7 @@ pub async fn download_archives_streaming(
 
     // Emit sidecar-verified archives immediately (no hashing needed)
     if !sidecar_verified.is_empty() {
-        reporter.log(&format!(
+        crate::installer::log_detail(&format!(
             "  {} archives verified via sidecar cache (skipped re-hashing)",
             sidecar_verified.len()
         ));
@@ -1369,8 +1370,9 @@ pub async fn download_archives_streaming(
 
     if already_downloaded > 0 {
         reporter.log(&format!(
-            "Found {} archives already downloaded ({} bytes)",
-            already_downloaded, already_downloaded_size
+            "Found {} archives already downloaded ({})",
+            already_downloaded,
+            super::progress_cli::format_bytes(already_downloaded_size)
         ));
         if let Some(ref callback) = config.progress_callback {
             callback(super::ProgressEvent::DownloadSkipped {
@@ -1490,39 +1492,27 @@ pub async fn download_archives_streaming(
         manual_downloads: manual_downloads_list,
     };
 
-    // Print failed downloads with URLs for manual download
-    if !stats.failed_downloads.is_empty() {
-        reporter.log(&format!(
-            "\n=== Failed Downloads ({}) ===",
-            stats.failed_downloads.len()
-        ));
-        reporter.log(&format!(
-            "Download these manually to: {}\n",
-            config.downloads_dir.display()
-        ));
-        for (i, fd) in stats.failed_downloads.iter().enumerate() {
-            reporter.log(&format!("{}. {}", i + 1, fd.name));
-            reporter.log(&format!("   URL: {}", fd.url));
-            reporter.log(&format!("   Error: {}", fd.error));
-            reporter.log("");
-        }
-    }
-
-    // Print summary
-    reporter.log("\n=== Download Summary ===");
-    reporter.log(&format!("Downloaded: {}", stats.downloaded));
-    reporter.log(&format!("Skipped:    {}", stats.skipped));
-    reporter.log(&format!("Manual:     {}", stats.manual));
-    reporter.log(&format!("Failed:     {}", stats.failed));
-
+    // One line here; the failed/manual lists are printed once, in the final
+    // install summary, rather than mid-pipeline while extraction runs on.
+    let mut summary = format!(
+        "Downloads finished: {} downloaded, {} already present, {} manual, {} failed",
+        stats.downloaded, stats.skipped, stats.manual, stats.failed
+    );
     if let Some(nexus) = &ctx.nexus {
         let limits = nexus.rate_limits();
-        reporter.log(&format!(
-            "\nNexus API: {}/{} hourly, {}/{} daily",
+        summary.push_str(&format!(
+            " (Nexus API {}/{} hourly, {}/{} daily left)",
             limits.hourly_remaining,
             limits.hourly_limit,
             limits.daily_remaining,
             limits.daily_limit
+        ));
+    }
+    reporter.log(&summary);
+    for fd in &stats.failed_downloads {
+        crate::installer::log_detail(&format!(
+            "Failed download {} ({}): {}",
+            fd.name, fd.url, fd.error
         ));
     }
 

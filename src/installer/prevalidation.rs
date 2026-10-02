@@ -63,7 +63,7 @@ impl PreValidationResult {
 
         for (name, stats) in &types {
             if stats.total > 0 {
-                reporter.log(&format!(
+                crate::installer::log_detail(&format!(
                     "  {:<25} {:>7} valid / {:>7} need work",
                     name, stats.already_valid, stats.needs_work,
                 ));
@@ -72,14 +72,17 @@ impl PreValidationResult {
 
         let total_archives: usize = self.type_stats.values().map(|s| s.total).sum::<usize>();
         if total_archives > 0 {
-            reporter.log(&format!(
+            crate::installer::log_detail(&format!(
                 "Archives needed: {} (of directives needing work)",
                 self.needed_archive_hashes.len(),
             ));
         }
 
         if !self.extra_files.is_empty() {
-            reporter.log(&format!("Extra files to clean: {}", self.extra_files.len()));
+            crate::installer::log_detail(&format!(
+                "Extra files to clean: {}",
+                self.extra_files.len()
+            ));
         }
     }
 }

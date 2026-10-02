@@ -428,7 +428,12 @@ mod tests {
 
     #[test]
     fn unsafe_relative_paths_are_rejected() {
-        for ok in ["mods\\Foo\\foo.esp", "profiles/Default/modlist.txt", "a..b\\c...d", ".hidden"] {
+        for ok in [
+            "mods\\Foo\\foo.esp",
+            "profiles/Default/modlist.txt",
+            "a..b\\c...d",
+            ".hidden",
+        ] {
             assert_eq!(unsafe_relative_path_reason(ok), None, "{ok}");
         }
         for bad in [
@@ -448,10 +453,22 @@ mod tests {
 
     #[test]
     fn unsafe_archive_names_are_rejected() {
-        for ok in ["SkyUI_5_2_SE-12604-5-2SE.7z", "Ünïcödé Pack.zip", "..foo.7z"] {
+        for ok in [
+            "SkyUI_5_2_SE-12604-5-2SE.7z",
+            "Ünïcödé Pack.zip",
+            "..foo.7z",
+        ] {
             assert_eq!(unsafe_file_name_reason(ok), None, "{ok}");
         }
-        for bad in ["", ".", "..", "../x.7z", "sub\\x.7z", "/home/u/x.docx", "a\0b"] {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../x.7z",
+            "sub\\x.7z",
+            "/home/u/x.docx",
+            "a\0b",
+        ] {
             assert!(unsafe_file_name_reason(bad).is_some(), "{bad:?}");
         }
     }

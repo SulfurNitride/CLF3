@@ -100,6 +100,10 @@ pub trait ProgressReporter: Send + Sync {
         Arc::new(NullHandle)
     }
 
+    /// The run is over (successfully or not); close out the last phase
+    /// before the final summary is printed.
+    fn finish(&self) {}
+
     /// Print a persistent log line (survives progress bar redraws).
     fn log(&self, _msg: &str) {}
     /// Transient status line.
