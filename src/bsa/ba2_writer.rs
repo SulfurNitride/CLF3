@@ -170,6 +170,9 @@ pub struct Ba2Builder {
     format: Ba2Format,
     /// Compression format
     compression: Ba2CompressionFormat,
+    /// General-file compression flags from the original archive. Audio entries
+    /// are commonly stored while meshes in the same archive are compressed.
+    file_compression: HashMap<String, bool>,
     /// Whether to include string table
     strings: bool,
     /// BA2 version (v1 for OG FO4, v7/v8 for NG FO4, v2/v3 for Starfield)
@@ -182,6 +185,7 @@ impl Ba2Builder {
             files: HashMap::new(),
             format: Ba2Format::General,
             compression: Ba2CompressionFormat::None,
+            file_compression: HashMap::new(),
             strings: true,
             version: Ba2Version::V7,
         }
@@ -218,6 +222,7 @@ impl Ba2Builder {
             files: HashMap::new(),
             format,
             compression,
+            file_compression: HashMap::new(),
             strings: true,
             version: Ba2Version::V7,
         }
@@ -239,6 +244,17 @@ impl Ba2Builder {
     pub fn with_compression(mut self, compression: Ba2CompressionFormat) -> Self {
         self.compression = compression;
         self
+    }
+
+    /// Preserve a GNRL entry's stored/compressed state when reconstructing a
+    /// Wabbajack archive. Archive-wide defaults apply only without an override.
+    pub fn set_file_compression(&mut self, path: &str, compressed: bool) {
+        self.file_compression.insert(
+            path.replace('\\', "/")
+                .trim_start_matches('/')
+                .to_ascii_lowercase(),
+            compressed,
+        );
     }
 
     /// Enable or disable string table
@@ -315,6 +331,8 @@ impl Ba2Builder {
 
         let compress = self.compression != Ba2CompressionFormat::None;
 
+        let file_compression = self.file_compression;
+
         let spool = DiskSpool::new_near(output_path)?;
         let spool_writer = spool.writer();
         let compression_options = ChunkCompressionOptions::builder()
@@ -333,7 +351,11 @@ impl Ba2Builder {
 
                 let chunk = Chunk::from_decompressed(data.into_boxed_slice());
 
-                let chunk = if compress {
+                let compressed = file_compression
+                    .get(&entry.archive_path.to_ascii_lowercase())
+                    .copied()
+                    .unwrap_or(compress);
+                let chunk = if compressed {
                     match chunk.compress(&compression_options) {
                         Ok(compressed) => compressed,
                         Err(_) => chunk,

@@ -5,7 +5,7 @@
 use crate::bsa::{Ba2Builder, Ba2CompressionFormat, Ba2Version, BsaBuilder};
 use crate::installer::processor::ProcessContext;
 use crate::installer::sidecar;
-use crate::modlist::{BSAState, CreateBSADirective};
+use crate::modlist::{BSAFileState, BSAState, CreateBSADirective};
 use anyhow::{Context, Result};
 use ba2::tes4::{ArchiveFlags, ArchiveTypes, Version};
 use rayon::prelude::*;
@@ -23,6 +23,14 @@ enum ArchiveKind {
     },
     /// FO4 BA2 (Fallout 4, Fallout 76, Starfield)
     Ba2 { version: Ba2Version },
+}
+
+fn preserve_ba2_compression(builder: &mut Ba2Builder, states: &[BSAFileState]) {
+    for state in states {
+        if let BSAFileState::BA2(file) = state {
+            builder.set_file_compression(&file.path, file.compressed);
+        }
+    }
 }
 
 /// Collect staged file paths from a staging directory.
@@ -180,6 +188,8 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
                 builder.add_file(path, disk_path.clone());
             }
 
+            preserve_ba2_compression(&mut builder, &directive.file_states);
+
             builder
                 .build(&output_path)
                 .with_context(|| format!("Failed to build BA2: {}", output_path.display()))?;
@@ -235,4 +245,76 @@ pub fn handle_create_bsa(ctx: &ProcessContext, directive: &CreateBSADirective) -
 pub fn output_bsa_valid(ctx: &ProcessContext, directive: &CreateBSADirective) -> bool {
     let output_path = ctx.resolve_output_path(&directive.to);
     crate::installer::sidecar::sidecar_valid(&output_path, &directive.hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ba2::fo4::{Archive, ArchiveKey, FileWriteOptions};
+    use ba2::prelude::*;
+
+    #[test]
+    fn ba2_compression_preserves_wabbajack_file_states() -> Result<()> {
+        // WAV/XWM must remain stored for Fallout's streaming reader. FUZ
+        // containers and other files may be compressed in the same archive.
+        // Read real serialized state fields so a future handler regression
+        // cannot silently replace per-file flags with the archive default.
+        let states: Vec<BSAFileState> = serde_json::from_value(serde_json::json!([
+            {"$type":"BA2FileState, Compression.BSA", "Path":"Sound\\FX\\test.WAV", "Index":0, "Compressed":false},
+            {"$type":"BA2FileState, Compression.BSA", "Path":"music/test.xwm", "Index":1, "Compressed":false},
+            {"$type":"BA2FileState, Compression.BSA", "Path":"sound/voice/test.fuz", "Index":2, "Compressed":true},
+            {"$type":"BA2FileState, Compression.BSA", "Path":"meshes/test.nif", "Index":3, "Compressed":true},
+            {"$type":"BA2FileState, Compression.BSA", "Path":"other/stored.bin", "Index":4, "Compressed":false}
+        ]))?;
+        let directory = tempfile::tempdir()?;
+        let payload = b"RIFF test data repeated for a compressible regression fixture".repeat(100);
+        let staged = directory.path().join("staged");
+        fs::write(&staged, &payload)?;
+
+        for (index, (version, default)) in [
+            (Ba2Version::V1, Ba2CompressionFormat::Zlib),
+            (Ba2Version::V7, Ba2CompressionFormat::Zlib),
+            (Ba2Version::V8, Ba2CompressionFormat::None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let output = directory.path().join(format!("mixed-{index}.ba2"));
+            let mut builder = Ba2Builder::from_name("Mixed - Main.ba2")
+                .with_version(version)
+                .with_compression(default);
+            for state in &states {
+                // Staging and state paths need not use the same slash/case.
+                builder.add_file(
+                    &state.path().replace('\\', "/").to_ascii_lowercase(),
+                    staged.clone(),
+                );
+            }
+            preserve_ba2_compression(&mut builder, &states);
+            builder.build(&output)?;
+
+            let (archive, options) = Archive::read(output.as_path())?;
+            assert_eq!(archive.len(), states.len());
+            let write_options: FileWriteOptions = options.into();
+            for state in &states {
+                let BSAFileState::BA2(expected) = state else {
+                    unreachable!()
+                };
+                let key = ArchiveKey::from(expected.path.as_bytes());
+                let file = archive.get(&key).context("missing rebuilt entry")?;
+                for chunk in file.iter() {
+                    assert_eq!(
+                        chunk.decompressed_len().is_some(),
+                        expected.compressed,
+                        "compression changed for {}",
+                        expected.path
+                    );
+                }
+                let mut decoded = Vec::new();
+                file.write(&mut decoded, &write_options)?;
+                assert_eq!(decoded, payload, "payload changed for {}", expected.path);
+            }
+        }
+        Ok(())
+    }
 }
