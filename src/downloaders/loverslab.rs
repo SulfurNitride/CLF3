@@ -426,9 +426,17 @@ impl LoversLabDownloader {
             expected_name
         );
 
+        // A fragment is not sent in an HTTP request. IPS topic links often
+        // point at a comment on a later page, so ask the server to resolve
+        // that comment before looking for its attachments.
+        let page_url = forum_attachment_page_url(topic_url)?;
+        let comment_id = Url::parse(topic_url)
+            .ok()
+            .and_then(|url| topic_comment_id(&url).map(str::to_owned));
+
         let page_html = self
             .client
-            .get(topic_url)
+            .get(page_url)
             .send()
             .await
             .map_err(|e| e.without_url())
@@ -440,7 +448,7 @@ impl LoversLabDownloader {
             .context("Failed to read LL topic page")?;
 
         // Parse ipsAttachLink elements: <a class="ipsAttachLink" href="...attachment.php?id=X&key=Y">filename</a>
-        let attachments = parse_forum_attachments(&page_html)?;
+        let attachments = parse_forum_attachments(&page_html, comment_id.as_deref())?;
 
         let matched = match_filename(expected_name, &attachments).ok_or_else(|| {
             ManualDownloadRequired(format!(
@@ -454,6 +462,33 @@ impl LoversLabDownloader {
         self.download_file(&matched.download_url, output_path, progress)
             .await
     }
+}
+
+fn forum_attachment_page_url(topic_url: &str) -> Result<Url> {
+    let mut url = Url::parse(topic_url).context("Invalid LL topic URL")?;
+    if let Some(comment_id) = topic_comment_id(&url).map(str::to_owned) {
+        let other_query: Vec<_> = url
+            .query_pairs()
+            .filter(|(key, _)| key != "do" && key != "comment")
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        url.set_query(None);
+        url.query_pairs_mut()
+            .extend_pairs(other_query)
+            .append_pair("do", "findComment")
+            .append_pair("comment", &comment_id);
+    }
+    url.set_fragment(None);
+    Ok(url)
+}
+
+fn topic_comment_id(url: &Url) -> Option<&str> {
+    if !url.path().contains("/topic/") {
+        return None;
+    }
+    url.fragment()
+        .and_then(|fragment| fragment.strip_prefix("comment-"))
+        .filter(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// Extract csrfKey from page HTML.
@@ -727,14 +762,27 @@ fn strip_duplicate_suffix(name: &str) -> String {
 }
 
 /// Parse forum post attachments (ipsAttachLink elements).
-fn parse_forum_attachments(html: &str) -> Result<Vec<FileEntry>> {
+fn parse_forum_attachments(html: &str, comment_id: Option<&str>) -> Result<Vec<FileEntry>> {
     let document = Html::parse_document(html);
     let selector =
         Selector::parse("a.ipsAttachLink").map_err(|e| anyhow::anyhow!("Bad selector: {:?}", e))?;
 
+    // Quotes and other posts can repeat a filename or link to a different
+    // attachment with the same filename. A comment URL identifies one post.
+    let root = if let Some(comment_id) = comment_id {
+        let post_selector = Selector::parse(&format!("article#elComment_{comment_id}"))
+            .map_err(|e| anyhow::anyhow!("Bad comment selector: {:?}", e))?;
+        let Some(post) = document.select(&post_selector).next() else {
+            return Ok(Vec::new());
+        };
+        post
+    } else {
+        document.root_element()
+    };
+
     let mut entries = Vec::new();
 
-    for link in document.select(&selector) {
+    for link in root.select(&selector) {
         let name = link.text().collect::<String>().trim().to_string();
         let Some(href) = link.value().attr("href") else {
             continue;
@@ -767,6 +815,60 @@ pub fn is_loverslab_url(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comment_fragment_resolves_to_server_side_topic_page() {
+        let url = forum_attachment_page_url(
+            "https://www.loverslab.com/topic/161401-nibbles-animation-pack-571-se-conversion/#comment-4256017",
+        )
+        .unwrap();
+        assert_eq!(
+            url.path(),
+            "/topic/161401-nibbles-animation-pack-571-se-conversion/"
+        );
+        assert_eq!(query_value(&url, "do").as_deref(), Some("findComment"));
+        assert_eq!(query_value(&url, "comment").as_deref(), Some("4256017"));
+        assert!(url.fragment().is_none());
+    }
+
+    #[test]
+    fn comment_attachment_ignores_same_name_in_other_posts() {
+        let html = r#"
+            <article id="elComment_123"><a class="ipsAttachLink"
+                href="/applications/core/interface/file/attachment.php?id=1">Mod.7z</a></article>
+            <article id="elComment_456"><a class="ipsAttachLink"
+                href="/applications/core/interface/file/attachment.php?id=2">Mod.7z</a></article>
+        "#;
+        let scoped = parse_forum_attachments(html, Some("456")).unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert!(scoped[0].download_url.ends_with("id=2"));
+        assert!(match_filename("Mod.7z", &scoped).is_some());
+        assert!(parse_forum_attachments(html, Some("789"))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_nibbles_comment_attachment() {
+        let settings = crate::settings::Settings::load();
+        let downloader =
+            LoversLabDownloader::login(&settings.loverslab_email, &settings.loverslab_password)
+                .await
+                .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("NIbblesAnim581.7z");
+        downloader
+            .download(
+                "https://www.loverslab.com/topic/161401-nibbles-animation-pack-571-se-conversion/#comment-4256017",
+                "NIbblesAnim581.7z",
+                &output,
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::metadata(&output).unwrap().len(), 39_018_842);
+        assert!(crate::hash::verify_file_hash(&output, "mYU0NJHtOLU=").unwrap());
+    }
 
     #[test]
     fn controller_uses_ids_even_with_damaged_slugs() {
